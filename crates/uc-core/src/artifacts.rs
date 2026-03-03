@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
@@ -55,7 +56,11 @@ pub fn collect_artifact_digests(target_root: &Path) -> Result<Vec<ArtifactDigest
             continue;
         }
 
-        let (blake3_hex, size_bytes) = hash_file_with_limit(path)?;
+        let (blake3_hex, size_bytes) = if name.ends_with(".sierra.json") {
+            hash_sierra_json_semantic(path)?
+        } else {
+            hash_file_with_limit(path)?
+        };
 
         let relative = relative_path(target_root, path);
         digests.push(ArtifactDigest {
@@ -161,9 +166,72 @@ fn hash_file_with_limit(path: &Path) -> Result<(String, u64)> {
     Ok((hasher.finalize().to_hex().to_string(), total))
 }
 
+fn hash_sierra_json_semantic(path: &Path) -> Result<(String, u64)> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    if metadata.len() > MAX_ARTIFACT_SIZE_BYTES {
+        bail!(
+            "artifact {} exceeds size limit ({} bytes > {} bytes)",
+            path.display(),
+            metadata.len(),
+            MAX_ARTIFACT_SIZE_BYTES
+        );
+    }
+
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut value: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse JSON {}", path.display()))?;
+    normalize_sierra_json_ids(&mut value);
+    let canonical = canonicalize_json(&value);
+    let canonical_bytes = serde_json::to_vec(&canonical)
+        .with_context(|| format!("failed to serialize normalized JSON {}", path.display()))?;
+    let mut hasher = Hasher::new();
+    hasher.update(&canonical_bytes);
+    Ok((hasher.finalize().to_hex().to_string(), metadata.len()))
+}
+
+fn normalize_sierra_json_ids(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, item) in map.iter_mut() {
+                if key == "id" && item.is_number() {
+                    *item = Value::String("<normalized-id>".to_string());
+                } else {
+                    normalize_sierra_json_ids(item);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                normalize_sierra_json_ids(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn canonicalize_json(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+            let mut canonical = serde_json::Map::new();
+            for (key, item) in entries {
+                canonical.insert(key.clone(), canonicalize_json(item));
+            }
+            Value::Object(canonical)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonicalize_json).collect()),
+        _ => value.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{compare_artifact_sets, ArtifactDigest};
+    use super::{
+        canonicalize_json, compare_artifact_sets, normalize_sierra_json_ids, ArtifactDigest,
+    };
+    use serde_json::json;
 
     fn artifact(path: &str, hash: &str) -> ArtifactDigest {
         ArtifactDigest {
@@ -193,5 +261,25 @@ mod tests {
         assert!(mismatches
             .iter()
             .any(|m| m.relative_path == "c.sierra" && m.baseline_hash.is_none()));
+    }
+
+    #[test]
+    fn sierra_normalization_ignores_numeric_ids() {
+        let mut a = json!({
+            "type_declarations": [{"id": 123, "debug_name": "felt252"}],
+            "libfunc_declarations": [{"id": {"id": 7, "debug_name": "store_temp<felt252>"}}]
+        });
+        let mut b = json!({
+            "type_declarations": [{"id": 999, "debug_name": "felt252"}],
+            "libfunc_declarations": [{"id": {"id": 42, "debug_name": "store_temp<felt252>"}}]
+        });
+
+        normalize_sierra_json_ids(&mut a);
+        normalize_sierra_json_ids(&mut b);
+
+        assert_eq!(
+            serde_json::to_string(&canonicalize_json(&a)).unwrap(),
+            serde_json::to_string(&canonicalize_json(&b)).unwrap()
+        );
     }
 }
