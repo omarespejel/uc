@@ -30,8 +30,13 @@ const DEFAULT_SUFFIXES: [&str; 5] = [
     ".executable.json",
 ];
 const MAX_ARTIFACT_SIZE_BYTES: u64 = 64 * 1024 * 1024;
-const SIERRA_ID_NORMALIZATION_SECTIONS: [&str; 2] = ["type_declarations", "libfunc_declarations"];
-const SIERRA_NORMALIZATION_SCHEMA_TAG: &str = "sierra-normalization-v1";
+const SIERRA_ID_NORMALIZATION_SECTIONS: [&str; 4] = [
+    "type_declarations",
+    "libfunc_declarations",
+    "funcs",
+    "statements",
+];
+const SIERRA_NORMALIZATION_SCHEMA_TAG: &str = "sierra-normalization-v2";
 
 pub fn collect_artifact_digests(target_root: &Path) -> Result<Vec<ArtifactDigest>> {
     if !target_root.exists() {
@@ -314,6 +319,36 @@ mod tests {
         let mut b = json!({
             "type_declarations": [{"id": 999, "debug_name": "felt252"}],
             "libfunc_declarations": [{"id": {"id": 42, "debug_name": "store_temp<felt252>"}}]
+        });
+
+        normalize_sierra_json_ids(&mut a);
+        normalize_sierra_json_ids(&mut b);
+
+        assert_eq!(
+            serde_json::to_string(&canonicalize_json(&a)).unwrap(),
+            serde_json::to_string(&canonicalize_json(&b)).unwrap()
+        );
+    }
+
+    #[test]
+    fn sierra_normalization_ignores_function_and_statement_ids() {
+        let mut a = json!({
+            "funcs": [{
+                "id": {"id": 10, "debug_name": "foo"},
+                "signature": {"ret_types": [{"id": 5}]}
+            }],
+            "statements": [{
+                "Invocation": {"libfunc_id": {"id": 20}}
+            }]
+        });
+        let mut b = json!({
+            "funcs": [{
+                "id": {"id": 99, "debug_name": "foo"},
+                "signature": {"ret_types": [{"id": 42}]}
+            }],
+            "statements": [{
+                "Invocation": {"libfunc_id": {"id": 1234}}
+            }]
         });
 
         normalize_sierra_json_ids(&mut a);
