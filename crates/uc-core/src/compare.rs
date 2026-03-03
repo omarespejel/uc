@@ -31,24 +31,78 @@ pub fn compare_diagnostics(baseline: &[String], candidate: &[String]) -> Diagnos
 }
 
 pub fn extract_diagnostic_lines(stderr: &str) -> Vec<String> {
-    const DIAGNOSTIC_PREFIXES: [&str; 6] =
-        ["error:", "warn:", "warning:", "note:", "help:", "hint:"];
+    let mut extracted = Vec::new();
+    let mut current_block: Vec<String> = Vec::new();
 
-    stderr
-        .lines()
-        .map(str::trim)
-        .filter(|line| {
-            DIAGNOSTIC_PREFIXES
-                .iter()
-                .any(|prefix| line.starts_with(prefix))
-                || line.starts_with("Plugin diagnostic")
-        })
-        .map(str::to_string)
-        .collect()
+    for raw_line in stderr.lines() {
+        let line = raw_line.trim_end();
+        if is_diagnostic_lead(line) {
+            if !current_block.is_empty() {
+                extracted.push(current_block.join("\n"));
+                current_block.clear();
+            }
+            current_block.push(line.to_string());
+            continue;
+        }
+
+        if !current_block.is_empty() && is_diagnostic_continuation(line) {
+            current_block.push(line.to_string());
+            continue;
+        }
+
+        if !current_block.is_empty() {
+            extracted.push(current_block.join("\n"));
+            current_block.clear();
+        }
+    }
+
+    if !current_block.is_empty() {
+        extracted.push(current_block.join("\n"));
+    }
+
+    extracted
 }
 
 fn normalize_diagnostic_line(line: &String) -> String {
-    line.split_whitespace().collect::<Vec<_>>().join(" ")
+    line.lines()
+        .map(str::trim_end)
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn is_diagnostic_lead(line: &str) -> bool {
+    const DIAGNOSTIC_PREFIXES: [&str; 6] =
+        ["error:", "warn:", "warning:", "note:", "help:", "hint:"];
+    let trimmed = line.trim_start();
+    let lowered = trimmed.to_ascii_lowercase();
+    if DIAGNOSTIC_PREFIXES
+        .iter()
+        .any(|prefix| lowered.starts_with(prefix))
+    {
+        return true;
+    }
+    if trimmed.starts_with("Plugin diagnostic") {
+        return true;
+    }
+    trimmed.starts_with("{")
+        && trimmed.contains("\"level\"")
+        && (trimmed.contains("\"error\"")
+            || trimmed.contains("\"warning\"")
+            || trimmed.contains("\"warn\""))
+}
+
+fn is_diagnostic_continuation(line: &str) -> bool {
+    if line.trim().is_empty() {
+        return false;
+    }
+    line.starts_with(' ')
+        || line.starts_with('\t')
+        || line.trim_start().starts_with("-->")
+        || line.trim_start().starts_with('|')
+        || line.trim_start().starts_with('=')
 }
 
 #[cfg(test)]
@@ -72,5 +126,14 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines.iter().any(|l| l == "warn: one"));
         assert!(lines.iter().any(|l| l == "error: two"));
+    }
+
+    #[test]
+    fn extract_multiline_diagnostics_blocks() {
+        let stderr = "error: failed\n --> src/lib.cairo:1:1\n  |\n  | bad\nok";
+        let lines = extract_diagnostic_lines(stderr);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("error: failed"));
+        assert!(lines[0].contains("--> src/lib.cairo:1:1"));
     }
 }

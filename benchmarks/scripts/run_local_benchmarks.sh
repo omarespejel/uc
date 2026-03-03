@@ -1,6 +1,8 @@
 #!/usr/bin/env zsh
 set -euo pipefail
 zmodload zsh/datetime
+typeset -gi MONO_LAST_US=0
+typeset -gi MONO_OFFSET_US=0
 
 SCRIPT_DIR="$(cd "$(dirname "${(%):-%N}")" && pwd -P)"
 ROOT_DIR="$(git -C "$SCRIPT_DIR/../.." rev-parse --show-toplevel 2>/dev/null || (cd "$SCRIPT_DIR/../.." && pwd -P))"
@@ -155,6 +157,25 @@ command_to_string() {
   printf "%s" "${(j: :)escaped}"
 }
 
+monotonic_now_us() {
+  local now="$EPOCHREALTIME"
+  local sec="${now%%.*}"
+  local frac="${now#*.}"
+  frac="${frac}000000"
+  frac="${frac[1,6]}"
+  local raw_us=$((10#$sec * 1000000 + 10#$frac))
+  local adjusted_us=$((raw_us + MONO_OFFSET_US))
+  if (( adjusted_us < MONO_LAST_US )); then
+    MONO_OFFSET_US=$((MONO_OFFSET_US + MONO_LAST_US - adjusted_us))
+    adjusted_us=$((raw_us + MONO_OFFSET_US))
+  fi
+  if (( adjusted_us < MONO_LAST_US )); then
+    adjusted_us=$MONO_LAST_US
+  fi
+  MONO_LAST_US=$adjusted_us
+  printf "%s" "$adjusted_us"
+}
+
 measure_command_ms() {
   local cwd="$1"
   shift
@@ -169,15 +190,17 @@ measure_command_ms() {
 
   display="$(command_to_string "${argv[@]}")"
 
-  local start="$EPOCHREALTIME"
+  local start_us
+  local end_us
+  start_us="$(monotonic_now_us)"
   if ! (cd "$cwd" && "${argv[@]}" >/dev/null 2>"$stderr_file"); then
     echo "Command failed in $cwd: $display" >&2
     cat "$stderr_file" >&2
     return 1
   fi
-  local end="$EPOCHREALTIME"
+  end_us="$(monotonic_now_us)"
 
-  awk -v s="$start" -v e="$end" 'BEGIN { printf "%.3f\n", (e - s) * 1000 }'
+  awk -v s="$start_us" -v e="$end_us" 'BEGIN { printf "%.3f\n", (e - s) / 1000 }'
 }
 
 stats_json_from_samples() {
@@ -260,7 +283,7 @@ prepare_workload_copy() {
   local source_dir="$2"
   local isolated_dir="$TMP_DIR/workloads/$workload"
   mkdir -p "$isolated_dir"
-  cp -R "$source_dir/." "$isolated_dir"
+  cp -PR "$source_dir/." "$isolated_dir"
   printf "%s" "$isolated_dir"
 }
 
@@ -289,11 +312,11 @@ run_build_cold() {
   ensure_isolated_workload_dir "$cwd"
   mkdir -p "$(dirname "$baseline_dir")"
   rm -rf "$baseline_dir"
-  cp -R "$cwd" "$baseline_dir"
+  cp -PR "$cwd" "$baseline_dir"
 
   for i in $(seq 1 "$runs"); do
     rm -rf "$cwd"
-    cp -R "$baseline_dir" "$cwd"
+    cp -PR "$baseline_dir" "$cwd"
     measure_command_ms "$cwd" "${command[@]}" >> "$samples_file"
   done
 

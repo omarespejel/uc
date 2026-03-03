@@ -33,11 +33,16 @@ const SESSION_KEY_LEN: usize = 64;
 const MAX_FINGERPRINT_FILES: usize = 50_000;
 const MAX_FINGERPRINT_DEPTH: usize = 32;
 const MAX_FINGERPRINT_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_FINGERPRINT_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+const FINGERPRINT_TIMEOUT_MS: u64 = 30_000;
+const FINGERPRINT_MTIME_RECHECK_WINDOW_MS: u64 = 2_000;
 const MAX_CACHEABLE_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_CACHE_ENTRY_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_FINGERPRINT_INDEX_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_ARTIFACT_INDEX_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_CAPTURE_STDOUT_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_CAPTURE_STDERR_BYTES: u64 = 16 * 1024 * 1024;
 const FINGERPRINT_INDEX_SCHEMA_VERSION: u32 = 1;
 const ARTIFACT_INDEX_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_DIAGNOSTICS_SIMILARITY_THRESHOLD: f64 = 99.5;
@@ -481,7 +486,14 @@ impl ArtifactIndex {
 
 impl Drop for CacheLockGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        if let Err(err) = fs::remove_file(&self.path) {
+            if err.kind() != io::ErrorKind::NotFound {
+                eprintln!(
+                    "uc: warning: failed to remove cache lock {}: {err}",
+                    self.path.display()
+                );
+            }
+        }
     }
 }
 
@@ -509,6 +521,98 @@ fn parse_diagnostics_threshold(input: &str) -> std::result::Result<f64, String> 
         ));
     }
     Ok(parsed)
+}
+
+fn parse_env_u64(name: &str, default: u64) -> u64 {
+    match std::env::var(name) {
+        Ok(raw) => match raw.parse::<u64>() {
+            Ok(value) => value,
+            Err(_) => {
+                eprintln!("uc: warning: invalid {name} value `{raw}`, using default {default}");
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
+fn parse_env_usize(name: &str, default: usize) -> usize {
+    match std::env::var(name) {
+        Ok(raw) => match raw.parse::<usize>() {
+            Ok(value) => value,
+            Err(_) => {
+                eprintln!("uc: warning: invalid {name} value `{raw}`, using default {default}");
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
+fn max_fingerprint_files() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| parse_env_usize("UC_MAX_FINGERPRINT_FILES", MAX_FINGERPRINT_FILES))
+}
+
+fn max_fingerprint_file_bytes() -> u64 {
+    static VALUE: OnceLock<u64> = OnceLock::new();
+    *VALUE
+        .get_or_init(|| parse_env_u64("UC_MAX_FINGERPRINT_FILE_BYTES", MAX_FINGERPRINT_FILE_BYTES))
+}
+
+fn max_fingerprint_total_bytes() -> u64 {
+    static VALUE: OnceLock<u64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_env_u64(
+            "UC_MAX_FINGERPRINT_TOTAL_BYTES",
+            MAX_FINGERPRINT_TOTAL_BYTES,
+        )
+    })
+}
+
+fn fingerprint_timeout_ms() -> u64 {
+    static VALUE: OnceLock<u64> = OnceLock::new();
+    *VALUE.get_or_init(|| parse_env_u64("UC_FINGERPRINT_TIMEOUT_MS", FINGERPRINT_TIMEOUT_MS))
+}
+
+fn fingerprint_mtime_recheck_window_ms() -> u64 {
+    static VALUE: OnceLock<u64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_env_u64(
+            "UC_FINGERPRINT_MTIME_RECHECK_WINDOW_MS",
+            FINGERPRINT_MTIME_RECHECK_WINDOW_MS,
+        )
+    })
+}
+
+fn max_cache_entry_bytes() -> u64 {
+    static VALUE: OnceLock<u64> = OnceLock::new();
+    *VALUE.get_or_init(|| parse_env_u64("UC_MAX_CACHE_ENTRY_BYTES", MAX_CACHE_ENTRY_BYTES))
+}
+
+fn max_fingerprint_index_bytes() -> u64 {
+    static VALUE: OnceLock<u64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_env_u64(
+            "UC_MAX_FINGERPRINT_INDEX_BYTES",
+            MAX_FINGERPRINT_INDEX_BYTES,
+        )
+    })
+}
+
+fn max_artifact_index_bytes() -> u64 {
+    static VALUE: OnceLock<u64> = OnceLock::new();
+    *VALUE.get_or_init(|| parse_env_u64("UC_MAX_ARTIFACT_INDEX_BYTES", MAX_ARTIFACT_INDEX_BYTES))
+}
+
+fn max_capture_stdout_bytes() -> u64 {
+    static VALUE: OnceLock<u64> = OnceLock::new();
+    *VALUE.get_or_init(|| parse_env_u64("UC_MAX_CAPTURE_STDOUT_BYTES", MAX_CAPTURE_STDOUT_BYTES))
+}
+
+fn max_capture_stderr_bytes() -> u64 {
+    static VALUE: OnceLock<u64> = OnceLock::new();
+    *VALUE.get_or_init(|| parse_env_u64("UC_MAX_CAPTURE_STDERR_BYTES", MAX_CAPTURE_STDERR_BYTES))
 }
 
 fn resolve_diagnostics_threshold(cli_value: Option<f64>) -> Result<f64> {
@@ -695,10 +799,6 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
             started_at_epoch_ms: epoch_ms_u64()?,
             socket_path: socket_path.display().to_string(),
         };
-        let daemon_root = std::env::current_dir()
-            .context("failed to resolve daemon current directory")?
-            .canonicalize()
-            .context("failed to canonicalize daemon root")?;
         let mut rate_limiter = DaemonRateLimiter::new();
 
         let mut should_shutdown = false;
@@ -710,7 +810,6 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
                         &status,
                         &mut should_shutdown,
                         &mut rate_limiter,
-                        &daemon_root,
                     ) {
                         eprintln!("uc daemon: request handling failed: {err:#}");
                     }
@@ -944,19 +1043,9 @@ fn common_args_from_daemon_request(request: &DaemonBuildRequest) -> BuildCommonA
     }
 }
 
-fn execute_daemon_build(
-    request: DaemonBuildRequest,
-    daemon_root: &Path,
-) -> Result<DaemonBuildResponse> {
+fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildResponse> {
     let common = common_args_from_daemon_request(&request);
     let manifest_path = resolve_manifest_path(&common.manifest_path)?;
-    if !manifest_path.starts_with(daemon_root) {
-        bail!(
-            "daemon denied manifest outside allowed root: {} not under {}",
-            manifest_path.display(),
-            daemon_root.display()
-        );
-    }
     let workspace_root = manifest_path
         .parent()
         .context("manifest path has no parent")?
@@ -1244,38 +1333,47 @@ fn run_build_with_uc_cache(
         Some(&cache_root),
     )?;
 
-    let restore_start = Instant::now();
-    {
+    let cached_entry = {
         let _cache_lock = acquire_cache_lock(&cache_root)?;
         if let Some(entry) = load_cache_entry(&entry_path)? {
             if entry.schema_version == BUILD_CACHE_SCHEMA_VERSION
                 && entry.profile == profile
                 && entry.fingerprint == fingerprint
-                && restore_cached_artifacts(
-                    &canonical_workspace_root,
-                    profile,
-                    &objects_dir,
-                    &entry.artifacts,
-                )?
             {
-                let run = CommandRun {
-                    command: vec![
-                        "uc".to_string(),
-                        "build".to_string(),
-                        "--engine".to_string(),
-                        "uc".to_string(),
-                        "--cache-hit".to_string(),
-                    ],
-                    exit_code: 0,
-                    elapsed_ms: restore_start.elapsed().as_secs_f64() * 1000.0,
-                    stdout: format!(
-                        "uc: cache hit, restored {} artifacts\n",
-                        entry.artifacts.len()
-                    ),
-                    stderr: String::new(),
-                };
-                return Ok((run, true, fingerprint));
+                Some(entry)
+            } else {
+                None
             }
+        } else {
+            None
+        }
+    };
+
+    if let Some(entry) = cached_entry {
+        let restore_start = Instant::now();
+        if restore_cached_artifacts(
+            &canonical_workspace_root,
+            profile,
+            &objects_dir,
+            &entry.artifacts,
+        )? {
+            let run = CommandRun {
+                command: vec![
+                    "uc".to_string(),
+                    "build".to_string(),
+                    "--engine".to_string(),
+                    "uc".to_string(),
+                    "--cache-hit".to_string(),
+                ],
+                exit_code: 0,
+                elapsed_ms: restore_start.elapsed().as_secs_f64() * 1000.0,
+                stdout: format!(
+                    "uc: cache hit, restored {} artifacts\n",
+                    entry.artifacts.len()
+                ),
+                stderr: String::new(),
+            };
+            return Ok((run, true, fingerprint));
         }
     }
 
@@ -1373,14 +1471,8 @@ fn persist_cache_entry(
         artifacts: cached_artifacts.to_vec(),
     };
 
-    if let Some(parent) = entry_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-
     let bytes = serde_json::to_vec(&entry)?;
-    fs::write(entry_path, bytes)
-        .with_context(|| format!("failed to write cache entry {}", entry_path.display()))?;
+    atomic_write_bytes(entry_path, &bytes, "cache entry")?;
 
     Ok(())
 }
@@ -1406,26 +1498,27 @@ fn load_cache_entry(path: &Path) -> Result<Option<BuildCacheEntry>> {
 
     let metadata =
         fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
-    if metadata.len() > MAX_CACHE_ENTRY_BYTES {
+    let max_bytes = max_cache_entry_bytes();
+    if metadata.len() > max_bytes {
         eprintln!(
             "uc: warning: ignoring oversized cache entry {} ({} bytes > {} bytes)",
             path.display(),
             metadata.len(),
-            MAX_CACHE_ENTRY_BYTES
+            max_bytes
         );
         return Ok(None);
     }
     let file = File::open(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let mut reader = BufReader::new(file).take(MAX_CACHE_ENTRY_BYTES + 1);
+    let mut reader = BufReader::new(file).take(max_bytes + 1);
     let mut bytes = Vec::new();
     reader
         .read_to_end(&mut bytes)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    if bytes.len() as u64 > MAX_CACHE_ENTRY_BYTES {
+    if bytes.len() as u64 > max_bytes {
         eprintln!(
             "uc: warning: ignoring oversized cache entry {} (>{} bytes)",
             path.display(),
-            MAX_CACHE_ENTRY_BYTES
+            max_bytes
         );
         return Ok(None);
     }
@@ -1549,11 +1642,41 @@ fn normalize_fingerprint_path(path: &Path) -> String {
     without_windows_prefix.replace('\\', "/")
 }
 
+fn atomic_write_bytes(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("cannot atomically write file without parent directory")?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let stem = path.file_name().and_then(|v| v.to_str()).unwrap_or("file");
+    let temp_path = parent.join(format!(
+        ".{stem}.tmp.{}.{}",
+        std::process::id(),
+        epoch_ms_u64().unwrap_or_default()
+    ));
+    fs::write(&temp_path, bytes).with_context(|| {
+        format!(
+            "failed to write temporary {label} file {}",
+            temp_path.display()
+        )
+    })?;
+    if let Err(err) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err).with_context(|| {
+            format!(
+                "failed to move temporary {label} {} to {}",
+                temp_path.display(),
+                path.display()
+            )
+        });
+    }
+    Ok(())
+}
+
 fn load_fingerprint_index(path: &Path) -> Result<FingerprintIndex> {
     if !path.exists() {
         return Ok(FingerprintIndex::empty());
     }
-    let bytes = read_bytes_with_limit(path, MAX_FINGERPRINT_INDEX_BYTES, "fingerprint index")?;
+    let bytes = read_bytes_with_limit(path, max_fingerprint_index_bytes(), "fingerprint index")?;
     match serde_json::from_slice::<FingerprintIndex>(&bytes) {
         Ok(index) if index.schema_version == FINGERPRINT_INDEX_SCHEMA_VERSION => Ok(index),
         Ok(_) => Ok(FingerprintIndex::empty()),
@@ -1569,21 +1692,8 @@ fn load_fingerprint_index(path: &Path) -> Result<FingerprintIndex> {
 }
 
 fn save_fingerprint_index(path: &Path, index: &FingerprintIndex) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
     let bytes = serde_json::to_vec(index).context("failed to encode fingerprint index")?;
-    let temp_path = path.with_extension("tmp");
-    fs::write(&temp_path, &bytes)
-        .with_context(|| format!("failed to write {}", temp_path.display()))?;
-    fs::rename(&temp_path, path).with_context(|| {
-        format!(
-            "failed to move fingerprint index {} to {}",
-            temp_path.display(),
-            path.display()
-        )
-    })?;
+    atomic_write_bytes(path, &bytes, "fingerprint index")?;
     Ok(())
 }
 
@@ -1591,7 +1701,7 @@ fn load_artifact_index(path: &Path) -> Result<ArtifactIndex> {
     if !path.exists() {
         return Ok(ArtifactIndex::empty());
     }
-    let bytes = read_bytes_with_limit(path, MAX_ARTIFACT_INDEX_BYTES, "artifact index")?;
+    let bytes = read_bytes_with_limit(path, max_artifact_index_bytes(), "artifact index")?;
     match serde_json::from_slice::<ArtifactIndex>(&bytes) {
         Ok(index) if index.schema_version == ARTIFACT_INDEX_SCHEMA_VERSION => Ok(index),
         Ok(_) => Ok(ArtifactIndex::empty()),
@@ -1607,21 +1717,8 @@ fn load_artifact_index(path: &Path) -> Result<ArtifactIndex> {
 }
 
 fn save_artifact_index(path: &Path, index: &ArtifactIndex) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
     let bytes = serde_json::to_vec(index).context("failed to encode artifact index")?;
-    let temp_path = path.with_extension("tmp");
-    fs::write(&temp_path, &bytes)
-        .with_context(|| format!("failed to write {}", temp_path.display()))?;
-    fs::rename(&temp_path, path).with_context(|| {
-        format!(
-            "failed to move artifact index {} to {}",
-            temp_path.display(),
-            path.display()
-        )
-    })?;
+    atomic_write_bytes(path, &bytes, "artifact index")?;
     Ok(())
 }
 
@@ -1665,31 +1762,52 @@ fn compute_build_fingerprint(
     } else {
         (None, FingerprintIndex::empty())
     };
+    let max_files = max_fingerprint_files();
+    let max_file_bytes = max_fingerprint_file_bytes();
+    let max_total_bytes = max_fingerprint_total_bytes();
+    let fingerprint_timeout = Duration::from_millis(fingerprint_timeout_ms());
+    let fingerprint_started = Instant::now();
+    let mtime_recheck_window_ms = fingerprint_mtime_recheck_window_ms();
+    let now_ms = epoch_ms_u64().unwrap_or_default();
     let mut updated_entries: BTreeMap<String, FingerprintIndexEntry> = BTreeMap::new();
 
     let mut files = Vec::new();
     let walker = WalkDir::new(workspace_root)
+        .follow_links(false)
         .max_depth(MAX_FINGERPRINT_DEPTH)
         .into_iter()
         .filter_entry(|entry| !is_ignored_entry(workspace_root, entry.path()));
 
     for entry in walker.filter_map(|e| e.ok()) {
+        if fingerprint_started.elapsed() > fingerprint_timeout {
+            bail!(
+                "fingerprinting timed out after {} ms",
+                fingerprint_timeout.as_millis()
+            );
+        }
         if !entry.file_type().is_file() {
             continue;
         }
         let path = entry.path();
         if should_include_fingerprint_file(path) {
-            if files.len() >= MAX_FINGERPRINT_FILES {
+            if files.len() >= max_files {
                 bail!(
-                    "workspace has too many fingerprintable files (>{MAX_FINGERPRINT_FILES}); refusing to hash more"
+                    "workspace has too many fingerprintable files (>{max_files}); refusing to hash more"
                 );
             }
             files.push(path.to_path_buf());
         }
     }
     files.sort();
+    let mut total_fingerprint_bytes = 0_u64;
 
     for path in files {
+        if fingerprint_started.elapsed() > fingerprint_timeout {
+            bail!(
+                "fingerprinting timed out after {} ms",
+                fingerprint_timeout.as_millis()
+            );
+        }
         let rel = path
             .strip_prefix(workspace_root)
             .unwrap_or(&path)
@@ -1698,17 +1816,30 @@ fn compute_build_fingerprint(
         let metadata =
             fs::metadata(&path).with_context(|| format!("failed to stat {}", path.display()))?;
         let file_size = metadata.len();
-        if file_size > MAX_FINGERPRINT_FILE_BYTES {
+        if file_size > max_file_bytes {
             bail!(
                 "fingerprint file {} exceeds size limit ({} bytes > {} bytes)",
                 path.display(),
                 file_size,
-                MAX_FINGERPRINT_FILE_BYTES
+                max_file_bytes
+            );
+        }
+        total_fingerprint_bytes = total_fingerprint_bytes.saturating_add(file_size);
+        if total_fingerprint_bytes > max_total_bytes {
+            bail!(
+                "fingerprint source budget exceeded ({} bytes > {} bytes)",
+                total_fingerprint_bytes,
+                max_total_bytes
             );
         }
         let modified_unix_ms = metadata_modified_unix_ms(&metadata)?;
         let file_hash = if let Some(cached) = index.entries.get(&rel) {
-            if cached.size_bytes == file_size && cached.modified_unix_ms == modified_unix_ms {
+            let should_rehash_recent =
+                now_ms.saturating_sub(modified_unix_ms) <= mtime_recheck_window_ms;
+            if cached.size_bytes == file_size
+                && cached.modified_unix_ms == modified_unix_ms
+                && !should_rehash_recent
+            {
                 cached.blake3_hex.clone()
             } else {
                 hash_file_blake3(&path)?
@@ -1904,17 +2035,56 @@ fn run_uc_build_subprocess(
 }
 
 fn run_command_capture(mut command: Command, command_vec: Vec<String>) -> Result<CommandRun> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let start = Instant::now();
-    let output = command.output().context("failed to run command")?;
+    let mut child = command.spawn().context("failed to run command")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture command stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture command stderr")?;
+
+    let stdout_limit = max_capture_stdout_bytes();
+    let stderr_limit = max_capture_stderr_bytes();
+    let stdout_thread =
+        thread::spawn(move || read_stream_with_limit(stdout, stdout_limit, "stdout"));
+    let stderr_thread =
+        thread::spawn(move || read_stream_with_limit(stderr, stderr_limit, "stderr"));
+
+    let status = child.wait().context("failed waiting for command")?;
+    let stdout_bytes = join_stream_thread(stdout_thread, "stdout")?;
+    let stderr_bytes = join_stream_thread(stderr_thread, "stderr")?;
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     Ok(CommandRun {
         command: command_vec,
-        exit_code: exit_code_from_status(&output.status),
+        exit_code: exit_code_from_status(&status),
         elapsed_ms,
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        stdout: String::from_utf8_lossy(&stdout_bytes).to_string(),
+        stderr: String::from_utf8_lossy(&stderr_bytes).to_string(),
     })
+}
+
+fn read_stream_with_limit<R: Read>(mut reader: R, max_bytes: u64, label: &str) -> Result<Vec<u8>> {
+    let mut limited = (&mut reader).take(max_bytes + 1);
+    let mut bytes = Vec::new();
+    limited
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read command {label}"))?;
+    if bytes.len() as u64 > max_bytes {
+        bail!("command {label} exceeded capture limit of {max_bytes} bytes");
+    }
+    Ok(bytes)
+}
+
+fn join_stream_thread(handle: thread::JoinHandle<Result<Vec<u8>>>, label: &str) -> Result<Vec<u8>> {
+    match handle.join() {
+        Ok(result) => result,
+        Err(_) => bail!("command {label} reader thread panicked"),
+    }
 }
 
 fn run_command_status(mut command: Command, command_vec: Vec<String>) -> Result<CommandRun> {
@@ -1962,6 +2132,8 @@ fn collect_cached_artifacts_for_entry(
     let mut index = load_artifact_index(&index_path)?;
     let mut updated_index_entries: BTreeMap<String, ArtifactIndexEntry> = BTreeMap::new();
     let mut cached_artifacts = Vec::new();
+    let now_ms = epoch_ms_u64().unwrap_or_default();
+    let mtime_recheck_window_ms = fingerprint_mtime_recheck_window_ms();
 
     for entry in WalkDir::new(&target_root).follow_links(false).into_iter() {
         let entry = entry.with_context(|| {
@@ -2002,7 +2174,12 @@ fn collect_cached_artifacts_for_entry(
         let modified_unix_ms = metadata_modified_unix_ms(&metadata)?;
 
         let canonical_hash = if let Some(cached) = index.entries.get(&relative_path) {
-            if cached.size_bytes == metadata.len() && cached.modified_unix_ms == modified_unix_ms {
+            let should_rehash_recent =
+                now_ms.saturating_sub(modified_unix_ms) <= mtime_recheck_window_ms;
+            if cached.size_bytes == metadata.len()
+                && cached.modified_unix_ms == modified_unix_ms
+                && !should_rehash_recent
+            {
                 cached.blake3_hex.clone()
             } else {
                 hash_file_blake3(path)?
@@ -2042,12 +2219,8 @@ fn collect_cached_artifacts_for_entry(
     cached_artifacts.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     index.schema_version = ARTIFACT_INDEX_SCHEMA_VERSION;
     index.entries = updated_index_entries;
-    if let Err(err) = save_artifact_index(&index_path, &index) {
-        eprintln!(
-            "uc: warning: failed to update artifact index {}: {err:#}",
-            index_path.display()
-        );
-    }
+    save_artifact_index(&index_path, &index)
+        .with_context(|| format!("failed to update artifact index {}", index_path.display()))?;
     Ok(cached_artifacts)
 }
 
@@ -2274,7 +2447,7 @@ fn exit_code_from_status(status: &ExitStatus) -> i32 {
     #[cfg(unix)]
     {
         if let Some(signal) = status.signal() {
-            return -signal;
+            return 128 + signal;
         }
     }
     -1
@@ -2439,8 +2612,13 @@ fn is_process_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_process_alive(_pid: u32) -> bool {
-    true
+fn is_process_alive(pid: u32) -> bool {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+
+    let mut system = System::new();
+    let target = Pid::from_u32(pid);
+    let _ = system.refresh_processes(ProcessesToUpdate::Some(&[target]), true);
+    system.process(target).is_some()
 }
 
 fn daemon_socket_path(override_path: Option<PathBuf>) -> Result<PathBuf> {
@@ -2565,7 +2743,6 @@ fn handle_daemon_connection(
     status: &DaemonStatusPayload,
     should_shutdown: &mut bool,
     rate_limiter: &mut DaemonRateLimiter,
-    daemon_root: &Path,
 ) -> Result<()> {
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
@@ -2608,7 +2785,7 @@ fn handle_daemon_connection(
             *should_shutdown = true;
             DaemonResponse::Ack
         }
-        DaemonRequest::Build(request) => match execute_daemon_build(request, daemon_root) {
+        DaemonRequest::Build(request) => match execute_daemon_build(request) {
             Ok(result) => DaemonResponse::Build(result),
             Err(err) => DaemonResponse::Error {
                 message: format!("{err:#}"),
@@ -2663,10 +2840,32 @@ fn write_uc_toml(
     let version = package_version.unwrap_or("0.1.0");
     let edition = edition.unwrap_or("2024_07");
 
-    let body = format!(
-        "[project]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"{edition}\"\n\n[source]\nscarb_manifest = \"{}\"\n",
-        source_manifest.display()
+    let mut project = toml::map::Map::new();
+    project.insert("name".to_string(), TomlValue::String(name.to_string()));
+    project.insert(
+        "version".to_string(),
+        TomlValue::String(version.to_string()),
     );
+    project.insert(
+        "edition".to_string(),
+        TomlValue::String(edition.to_string()),
+    );
+
+    let mut source = toml::map::Map::new();
+    source.insert(
+        "scarb_manifest".to_string(),
+        TomlValue::String(source_manifest.to_string_lossy().to_string()),
+    );
+
+    let mut root = toml::map::Map::new();
+    root.insert("project".to_string(), TomlValue::Table(project));
+    root.insert("source".to_string(), TomlValue::Table(source));
+
+    let mut body = toml::to_string_pretty(&TomlValue::Table(root))
+        .context("failed to encode Uc.toml contents")?;
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
 
     fs::write(path, body).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
@@ -2700,17 +2899,19 @@ fn epoch_ms_u64() -> Result<u64> {
 }
 
 fn workspace_root() -> Result<PathBuf> {
+    if let Some(root) = std::env::var_os("UC_WORKSPACE_ROOT") {
+        return PathBuf::from(root)
+            .canonicalize()
+            .context("failed to canonicalize UC_WORKSPACE_ROOT");
+    }
     let cwd = std::env::current_dir()?.canonicalize()?;
     for candidate in cwd.ancestors() {
         let root = candidate.to_path_buf();
-        let benchmarks_script = root.join("benchmarks/scripts/run_local_benchmarks.sh");
         let cargo_manifest = root.join("Cargo.toml");
-        if benchmarks_script.is_file() && cargo_manifest.is_file() {
+        let uc_cli_manifest = root.join("crates/uc-cli/Cargo.toml");
+        if cargo_manifest.is_file() && uc_cli_manifest.is_file() {
             return Ok(root);
         }
     }
-    bail!(
-        "failed to locate uc workspace root from {}; expected Cargo.toml and benchmarks/scripts/run_local_benchmarks.sh in an ancestor directory",
-        cwd.display()
-    )
+    Ok(cwd)
 }

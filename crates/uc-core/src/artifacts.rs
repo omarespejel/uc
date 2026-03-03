@@ -30,6 +30,7 @@ const DEFAULT_SUFFIXES: [&str; 5] = [
     ".executable.json",
 ];
 const MAX_ARTIFACT_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+const SIERRA_ID_NORMALIZATION_SECTIONS: [&str; 2] = ["type_declarations", "libfunc_declarations"];
 
 pub fn collect_artifact_digests(target_root: &Path) -> Result<Vec<ArtifactDigest>> {
     if !target_root.exists() {
@@ -193,19 +194,27 @@ fn hash_sierra_json_semantic(path: &Path) -> Result<(String, u64)> {
 }
 
 fn normalize_sierra_json_ids(value: &mut Value) {
+    normalize_sierra_json_ids_scoped(value, false);
+}
+
+fn normalize_sierra_json_ids_scoped(value: &mut Value, in_section: bool) {
     match value {
         Value::Object(map) => {
             for (key, item) in map.iter_mut() {
-                if key == "id" && item.is_number() {
+                let child_in_section = in_section
+                    || SIERRA_ID_NORMALIZATION_SECTIONS
+                        .iter()
+                        .any(|section| *section == key);
+                if key == "id" && in_section && item.is_number() {
                     *item = Value::String("<normalized-id>".to_string());
                 } else {
-                    normalize_sierra_json_ids(item);
+                    normalize_sierra_json_ids_scoped(item, child_in_section);
                 }
             }
         }
         Value::Array(items) => {
             for item in items {
-                normalize_sierra_json_ids(item);
+                normalize_sierra_json_ids_scoped(item, in_section);
             }
         }
         _ => {}
@@ -282,6 +291,20 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&canonicalize_json(&a)).unwrap(),
             serde_json::to_string(&canonicalize_json(&b)).unwrap()
+        );
+    }
+
+    #[test]
+    fn sierra_normalization_preserves_unscoped_ids() {
+        let mut value = json!({
+            "metadata": {"id": 123, "name": "config"},
+            "type_declarations": [{"id": 1, "debug_name": "felt252"}]
+        });
+        normalize_sierra_json_ids(&mut value);
+        assert_eq!(value["metadata"]["id"], json!(123));
+        assert_eq!(
+            value["type_declarations"][0]["id"],
+            json!("<normalized-id>")
         );
     }
 }
