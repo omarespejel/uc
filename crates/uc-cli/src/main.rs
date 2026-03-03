@@ -810,6 +810,7 @@ fn run_build(args: BuildArgs) -> Result<()> {
                     &profile,
                     &local_session_key,
                     false,
+                    false,
                 )?;
                 Ok((run, cache_hit, fingerprint, local_session_key))
             };
@@ -969,6 +970,7 @@ fn execute_daemon_build(
         &workspace_root,
         &profile,
         &session_key,
+        true,
         true,
     )?;
 
@@ -1214,6 +1216,7 @@ fn run_build_with_uc_cache(
     profile: &str,
     session_key: &str,
     capture_output: bool,
+    async_cache_persist: bool,
 ) -> Result<(CommandRun, bool, String)> {
     let canonical_workspace_root = workspace_root.canonicalize().with_context(|| {
         format!(
@@ -1279,14 +1282,35 @@ fn run_build_with_uc_cache(
     let run = run_command(command, command_vec, capture_output)?;
 
     if run.exit_code == 0 {
-        let cached_artifacts = collect_cached_artifacts_for_entry(
-            &canonical_workspace_root,
-            profile,
-            &cache_root,
-            &objects_dir,
-        )?;
-        let _cache_lock = acquire_cache_lock(&cache_root)?;
-        persist_cache_entry(profile, &fingerprint, &cached_artifacts, &entry_path)?;
+        if async_cache_persist {
+            let workspace_root = canonical_workspace_root.clone();
+            let profile = profile.to_string();
+            let fingerprint = fingerprint.clone();
+            let cache_root = cache_root.clone();
+            let objects_dir = objects_dir.clone();
+            let entry_path = entry_path.clone();
+            thread::spawn(move || {
+                if let Err(err) = persist_cache_entry_for_build(
+                    &workspace_root,
+                    &profile,
+                    &fingerprint,
+                    &cache_root,
+                    &objects_dir,
+                    &entry_path,
+                ) {
+                    eprintln!("uc: warning: async cache persistence failed: {err:#}");
+                }
+            });
+        } else {
+            persist_cache_entry_for_build(
+                &canonical_workspace_root,
+                profile,
+                &fingerprint,
+                &cache_root,
+                &objects_dir,
+                &entry_path,
+            )?;
+        }
     }
 
     Ok((run, false, fingerprint))
@@ -1315,6 +1339,20 @@ fn persist_cache_entry(
         .with_context(|| format!("failed to write cache entry {}", entry_path.display()))?;
 
     Ok(())
+}
+
+fn persist_cache_entry_for_build(
+    workspace_root: &Path,
+    profile: &str,
+    fingerprint: &str,
+    cache_root: &Path,
+    objects_dir: &Path,
+    entry_path: &Path,
+) -> Result<()> {
+    let cached_artifacts =
+        collect_cached_artifacts_for_entry(workspace_root, profile, cache_root, objects_dir)?;
+    let _cache_lock = acquire_cache_lock(cache_root)?;
+    persist_cache_entry(profile, fingerprint, &cached_artifacts, entry_path)
 }
 
 fn load_cache_entry(path: &Path) -> Result<Option<BuildCacheEntry>> {
