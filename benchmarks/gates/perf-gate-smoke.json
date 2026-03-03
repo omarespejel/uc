@@ -3,7 +3,8 @@
     {
       "scenario": "build.warm_noop",
       "workload": "scarb_smoke",
-      "min_median_p95_delta_percent": 20.0
+      "min_median_p95_delta_percent": 20.0,
+      "min_single_cycle_p95_delta_percent": -20.0
     },
     {
       "scenario": "build.warm_edit",

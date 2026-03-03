@@ -1,0 +1,210 @@
+{
+  "generated_at": "2026-03-03T22:33:06Z",
+  "matrix": "smoke",
+  "workspace_root": null,
+  "runs": 12,
+  "cold_runs": 12,
+  "cycles": 5,
+  "pinned_conditions": {
+    "cpu_set": null,
+    "nice_level": 0,
+    "build_offline": true,
+    "uc_daemon_mode": "off",
+    "strict_pinning": false,
+    "warm_settle_seconds": 2.2
+  },
+  "cycle_reports": [
+    {
+      "cycle": 1,
+      "run_order": "scarb-first",
+      "baseline_json": "benchmarks/results/scarb-baseline-20260303-162831.json",
+      "candidate_json": "benchmarks/results/uc-baseline-20260303-162902.json"
+    },
+    {
+      "cycle": 2,
+      "run_order": "uc-first",
+      "baseline_json": "benchmarks/results/scarb-baseline-20260303-162953.json",
+      "candidate_json": "benchmarks/results/uc-baseline-20260303-162927.json"
+    },
+    {
+      "cycle": 3,
+      "run_order": "scarb-first",
+      "baseline_json": "benchmarks/results/scarb-baseline-20260303-163023.json",
+      "candidate_json": "benchmarks/results/uc-baseline-20260303-163050.json"
+    },
+    {
+      "cycle": 4,
+      "run_order": "uc-first",
+      "baseline_json": "benchmarks/results/scarb-baseline-20260303-163142.json",
+      "candidate_json": "benchmarks/results/uc-baseline-20260303-163116.json"
+    },
+    {
+      "cycle": 5,
+      "run_order": "scarb-first",
+      "baseline_json": "benchmarks/results/scarb-baseline-20260303-163212.json",
+      "candidate_json": "benchmarks/results/uc-baseline-20260303-163241.json"
+    }
+  ],
+  "scenarios": [
+    {
+      "scenario": "build.cold",
+      "workload": "scarb_smoke",
+      "p50_deltas": [
+        -1.7505026274308353,
+        6.523511838871874,
+        -7.003470710159267,
+        1.7761231686351797,
+        -6.600809412407569
+      ],
+      "p95_deltas": [
+        4.524082602374607,
+        29.152773273792803,
+        -57.0355207787457,
+        36.05907732262992,
+        -27.418413682946802
+      ],
+      "baseline_p95": [
+        1041.9991,
+        1321.2065499999999,
+        859.4744,
+        1519.544149999999,
+        851.3897000000001
+      ],
+      "candidate_p95": [
+        994.8582,
+        936.0382,
+        1349.6800999999998,
+        971.6105499999999,
+        1084.8272499999998
+      ],
+      "median_p50_delta_percent": -1.7505026274308353,
+      "median_p95_delta_percent": 4.524082602374607,
+      "mean_p95_delta_percent": -2.943600252579035,
+      "stdev_p95_delta_percent": 35.020293252520595,
+      "min_p95_delta_percent": -57.0355207787457,
+      "max_p95_delta_percent": 36.05907732262992,
+      "median_baseline_p95_ms": 1041.9991,
+      "median_candidate_p95_ms": 994.8582
+    },
+    {
+      "scenario": "build.warm_edit",
+      "workload": "scarb_smoke",
+      "p50_deltas": [
+        98.30569245750972,
+        98.45030098446462,
+        98.59191122485369,
+        98.43570334187892,
+        98.4244068416264
+      ],
+      "p95_deltas": [
+        95.21564104061721,
+        98.87951529540338,
+        98.54312589212168,
+        97.50390794728878,
+        98.07779257402683
+      ],
+      "baseline_p95": [
+        490.52235,
+        687.9076499999998,
+        518.4970999999999,
+        527.6107499999999,
+        569.6263499999999
+      ],
+      "candidate_p95": [
+        23.468349999999983,
+        7.7078999999999995,
+        7.553850000000001,
+        13.169649999999992,
+        10.949399999999997
+      ],
+      "median_p50_delta_percent": 98.43570334187892,
+      "median_p95_delta_percent": 98.07779257402683,
+      "mean_p95_delta_percent": 97.64399654989157,
+      "stdev_p95_delta_percent": 1.299203943276659,
+      "min_p95_delta_percent": 95.21564104061721,
+      "max_p95_delta_percent": 98.87951529540338,
+      "median_baseline_p95_ms": 527.6107499999999,
+      "median_candidate_p95_ms": 10.949399999999997
+    },
+    {
+      "scenario": "build.warm_edit_semantic",
+      "workload": "scarb_smoke",
+      "p50_deltas": [
+        -0.7531687439630007,
+        -4.462093371891938,
+        -3.074902779275637,
+        -7.356816252427017,
+        5.153738627119024
+      ],
+      "p95_deltas": [
+        6.648002557085805,
+        -8.500075549754868,
+        -3.619089788183543,
+        -30.452677526863713,
+        6.717173311038679
+      ],
+      "baseline_p95": [
+        534.9839999999999,
+        484.11805,
+        493.0259,
+        508.585,
+        592.5490999999998
+      ],
+      "candidate_p95": [
+        499.41825,
+        525.26845,
+        510.86895,
+        663.4627499999998,
+        552.74655
+      ],
+      "median_p50_delta_percent": -3.074902779275637,
+      "median_p95_delta_percent": -3.619089788183543,
+      "mean_p95_delta_percent": -5.841333399335528,
+      "stdev_p95_delta_percent": 13.648627327905258,
+      "min_p95_delta_percent": -30.452677526863713,
+      "max_p95_delta_percent": 6.717173311038679,
+      "median_baseline_p95_ms": 508.585,
+      "median_candidate_p95_ms": 525.26845
+    },
+    {
+      "scenario": "build.warm_noop",
+      "workload": "scarb_smoke",
+      "p50_deltas": [
+        70.86648343700274,
+        67.69681339336452,
+        72.28422775143709,
+        71.69648067287764,
+        69.66956521739131
+      ],
+      "p95_deltas": [
+        70.18468620186371,
+        60.82978003942301,
+        71.57838315704477,
+        74.40768522426428,
+        61.428198611770355
+      ],
+      "baseline_p95": [
+        26.720999999999997,
+        24.2498,
+        28.7313,
+        31.2756,
+        28.54715
+      ],
+      "candidate_p95": [
+        7.966949999999999,
+        9.4987,
+        8.165899999999999,
+        8.00415,
+        11.011149999999997
+      ],
+      "median_p50_delta_percent": 70.86648343700274,
+      "median_p95_delta_percent": 70.18468620186371,
+      "mean_p95_delta_percent": 67.68574664687324,
+      "stdev_p95_delta_percent": 5.527078100988386,
+      "min_p95_delta_percent": 60.82978003942301,
+      "max_p95_delta_percent": 74.40768522426428,
+      "median_baseline_p95_ms": 28.54715,
+      "median_candidate_p95_ms": 8.165899999999999
+    }
+  ]
+}

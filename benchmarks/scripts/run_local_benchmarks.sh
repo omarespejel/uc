@@ -204,11 +204,22 @@ configure_execution_prefix() {
     if command -v taskset >/dev/null 2>&1; then
       EXEC_PREFIX+=(taskset -c "$CPU_SET")
       TASKSET_ENABLED=1
+    elif command -v hwloc-bind >/dev/null 2>&1; then
+      local hwloc_location="pu:$CPU_SET"
+      if hwloc-bind "$hwloc_location" -- /usr/bin/true >/dev/null 2>&1; then
+        EXEC_PREFIX+=(hwloc-bind "$hwloc_location" --)
+        TASKSET_ENABLED=1
+      elif [[ "$STRICT_PINNING" == "1" ]]; then
+        echo "Requested --cpu-set but hwloc-bind cannot enforce affinity for '$CPU_SET'." >&2
+        exit 1
+      else
+        echo "Benchmark warning: hwloc-bind cannot enforce affinity for '$CPU_SET'; CPU pinning skipped." >&2
+      fi
     elif [[ "$STRICT_PINNING" == "1" ]]; then
-      echo "Requested --cpu-set but taskset is unavailable." >&2
+      echo "Requested --cpu-set but no supported affinity tool is available (taskset/hwloc-bind)." >&2
       exit 1
     else
-      echo "Benchmark warning: taskset unavailable; CPU pinning skipped." >&2
+      echo "Benchmark warning: no supported affinity tool available; CPU pinning skipped." >&2
     fi
   fi
 

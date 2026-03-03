@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(git -C "$SCRIPT_DIR/../.." rev-parse --show-toplevel 2>/dev/null || (cd "$SCRIPT_DIR/../.." && pwd -P))"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
 MATRIX="${MATRIX:-research}"
 RUNS="${RUNS:-12}"
 COLD_RUNS="${COLD_RUNS:-12}"
@@ -15,6 +15,8 @@ CPU_SET="${CPU_SET:-${UC_BENCH_CPU_SET:-}}"
 NICE_LEVEL="${NICE_LEVEL:-${UC_BENCH_NICE_LEVEL:-0}}"
 STRICT_PINNING="${STRICT_PINNING:-${UC_BENCH_STRICT_PINNING:-0}}"
 WARM_SETTLE_SECONDS="${WARM_SETTLE_SECONDS:-2.2}"
+LOCK_BASELINE="${LOCK_BASELINE:-0}"
+ALLOW_UNPINNED="${ALLOW_UNPINNED:-0}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR="$ROOT_DIR/benchmarks/results"
 OUT_JSON="$OUT_DIR/stability-summary-$STAMP.json"
@@ -42,6 +44,8 @@ Options:
   --nice-level <n>             Optional process nice level passed to local runner
   --warm-settle-seconds <n>    Wait after warm-up before warm-noop samples (default: 2.2)
   --strict-pinning             Fail if requested pinning cannot be applied
+  --allow-unpinned             Allow running without CPU affinity pinning safeguards
+  --lock-baseline              Copy passing stability summary into benchmarks/baselines
   --gate-config <path>         Optional gate rules JSON path
   --help                       Show this help
 USAGE
@@ -112,6 +116,14 @@ while [[ $# -gt 0 ]]; do
       STRICT_PINNING=1
       shift
       ;;
+    --allow-unpinned)
+      ALLOW_UNPINNED=1
+      shift
+      ;;
+    --lock-baseline)
+      LOCK_BASELINE=1
+      shift
+      ;;
     --gate-config)
       require_option_value "$1" "${2-}"
       GATE_CONFIG="$2"
@@ -160,6 +172,19 @@ fi
 if [[ "$MATRIX" == "research" && -z "$WORKSPACE_ROOT" ]]; then
   echo "--workspace-root is required for research matrix" >&2
   exit 1
+fi
+if [[ "$RUNS" -ne 12 || "$COLD_RUNS" -ne 12 ]]; then
+  echo "Stability lane requires --runs 12 and --cold-runs 12 (got runs=$RUNS cold-runs=$COLD_RUNS)." >&2
+  exit 1
+fi
+if [[ -z "$CPU_SET" || "$STRICT_PINNING" != "1" ]]; then
+  if [[ "$ALLOW_UNPINNED" == "1" ]]; then
+    echo "Stability warning: running in unpinned mode (cpu-set='${CPU_SET:-<unset>}', strict-pinning=$STRICT_PINNING)." >&2
+  else
+    echo "Stability lane requires --cpu-set and --strict-pinning for reproducibility." >&2
+    echo "Use --allow-unpinned only when affinity pinning is unavailable on this host." >&2
+    exit 1
+  fi
 fi
 if [[ -n "$GATE_CONFIG" && ! -f "$GATE_CONFIG" ]]; then
   echo "Gate config not found: $GATE_CONFIG" >&2
@@ -386,4 +411,25 @@ if [[ -n "$GATE_CONFIG" ]]; then
   "$ROOT_DIR/benchmarks/scripts/gate_benchmark_summary.sh" \
     --summary "$OUT_JSON" \
     --config "$GATE_CONFIG"
+fi
+
+if [[ "$LOCK_BASELINE" == "1" ]]; then
+  BASELINE_DIR="$ROOT_DIR/benchmarks/baselines"
+  mkdir -p "$BASELINE_DIR"
+  LOCKED_JSON="$BASELINE_DIR/stability-${MATRIX}-latest.json"
+  LOCKED_MD="$BASELINE_DIR/stability-${MATRIX}-latest.md"
+  jq '
+    def rel_result_path:
+      if test("/benchmarks/results/")
+      then sub("^.*/benchmarks/results/"; "benchmarks/results/")
+      else .
+      end;
+    .cycle_reports |= map(
+      .baseline_json |= rel_result_path
+      | .candidate_json |= rel_result_path
+    )
+  ' "$OUT_JSON" > "$LOCKED_JSON"
+  cp "$OUT_MD" "$LOCKED_MD"
+  echo "Locked baseline JSON: $LOCKED_JSON"
+  echo "Locked baseline Markdown: $LOCKED_MD"
 fi

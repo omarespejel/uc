@@ -90,6 +90,36 @@ violations="$(jq -n --slurpfile s "$SUMMARY" --slurpfile c "$CONFIG" '
                   + " > max "
                   + ((($rule.max_median_p95_delta_percent * 100 | round) / 100) | tostring)
                 )
+              } else empty end,
+              if ($rule | has("min_single_cycle_p95_delta_percent")) and
+                 ($metric.min_p95_delta_percent < $rule.min_single_cycle_p95_delta_percent)
+              then {
+                scenario: $rule.scenario,
+                workload: $rule.workload,
+                kind: "single_cycle_below_min",
+                actual: $metric.min_p95_delta_percent,
+                expected: $rule.min_single_cycle_p95_delta_percent,
+                message: (
+                  "worst single-cycle p95 delta "
+                  + ((($metric.min_p95_delta_percent * 100 | round) / 100) | tostring)
+                  + " < min "
+                  + ((($rule.min_single_cycle_p95_delta_percent * 100 | round) / 100) | tostring)
+                )
+              } else empty end,
+              if ($rule | has("max_single_cycle_p95_delta_percent")) and
+                 ($metric.max_p95_delta_percent > $rule.max_single_cycle_p95_delta_percent)
+              then {
+                scenario: $rule.scenario,
+                workload: $rule.workload,
+                kind: "single_cycle_above_max",
+                actual: $metric.max_p95_delta_percent,
+                expected: $rule.max_single_cycle_p95_delta_percent,
+                message: (
+                  "best single-cycle p95 delta "
+                  + ((($metric.max_p95_delta_percent * 100 | round) / 100) | tostring)
+                  + " > max "
+                  + ((($rule.max_single_cycle_p95_delta_percent * 100 | round) / 100) | tostring)
+                )
               } else empty end
             ]
           )[]

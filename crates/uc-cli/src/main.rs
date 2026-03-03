@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use blake3::Hasher;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
@@ -510,7 +510,14 @@ struct CacheLockGuard {
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct FingerprintIndex {
     schema_version: u32,
+    #[serde(default)]
     entries: BTreeMap<String, FingerprintIndexEntry>,
+    #[serde(default)]
+    directories: BTreeMap<String, u64>,
+    #[serde(default)]
+    context_digest: Option<String>,
+    #[serde(default)]
+    last_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -576,6 +583,9 @@ impl FingerprintIndex {
         Self {
             schema_version: FINGERPRINT_INDEX_SCHEMA_VERSION,
             entries: BTreeMap::new(),
+            directories: BTreeMap::new(),
+            context_digest: None,
+            last_fingerprint: None,
         }
     }
 }
@@ -1864,6 +1874,7 @@ fn run_build_with_uc_cache(
         if restore_cached_artifacts(
             &canonical_workspace_root,
             profile,
+            &cache_root,
             &objects_dir,
             &entry.artifacts,
         )? {
@@ -2243,15 +2254,52 @@ fn load_cache_entry(path: &Path) -> Result<Option<BuildCacheEntry>> {
     Ok(Some(parsed))
 }
 
+fn artifact_index_entry_matches_expected(
+    index_entry: &ArtifactIndexEntry,
+    metadata: &fs::Metadata,
+    expected_hash: &str,
+    expected_size: u64,
+) -> Result<bool> {
+    let modified_unix_ms = metadata_modified_unix_ms(metadata)?;
+    Ok(index_entry.size_bytes == expected_size
+        && index_entry.size_bytes == metadata.len()
+        && index_entry.modified_unix_ms == modified_unix_ms
+        && index_entry.blake3_hex == expected_hash)
+}
+
+fn upsert_artifact_index_entry_from_metadata(
+    index: &mut ArtifactIndex,
+    relative_path: &str,
+    metadata: &fs::Metadata,
+    expected_hash: &str,
+) -> Result<()> {
+    let modified_unix_ms = metadata_modified_unix_ms(metadata)?;
+    index.entries.insert(
+        relative_path.to_string(),
+        ArtifactIndexEntry {
+            size_bytes: metadata.len(),
+            modified_unix_ms,
+            blake3_hex: expected_hash.to_string(),
+        },
+    );
+    Ok(())
+}
+
 fn restore_cached_artifacts(
     workspace_root: &Path,
     profile: &str,
+    cache_root: &Path,
     objects_dir: &Path,
     artifacts: &[CachedArtifact],
 ) -> Result<bool> {
     if artifacts.is_empty() {
         return Ok(false);
     }
+
+    let index_path = cache_root.join("artifact-index-v1.json");
+    let mut artifact_index = load_artifact_index(&index_path)?;
+    let mut artifact_index_changed = false;
+    let target_root = workspace_root.join("target").join(profile);
 
     for artifact in artifacts {
         validate_hex_digest(
@@ -2260,30 +2308,53 @@ fn restore_cached_artifacts(
             MIN_HASH_LEN,
         )?;
         validate_cache_object_rel_path(&artifact.object_rel_path)?;
+        let expected_hash = artifact.blake3_hex.as_str();
+        let relative_path = validated_relative_artifact_path(&artifact.relative_path)?;
+        let relative_path_key = normalize_fingerprint_path(&relative_path);
+        let out_path = target_root.join(&relative_path);
+        ensure_path_within_root(&target_root, &out_path, "cache restore path")?;
+
+        if let Ok(existing_metadata) = fs::metadata(&out_path) {
+            let mut matches_cached_artifact = false;
+            if existing_metadata.is_file() {
+                if let Some(index_entry) = artifact_index.entries.get(&relative_path_key) {
+                    if artifact_index_entry_matches_expected(
+                        index_entry,
+                        &existing_metadata,
+                        expected_hash,
+                        artifact.size_bytes,
+                    )? {
+                        matches_cached_artifact = true;
+                    }
+                }
+                if !matches_cached_artifact && existing_metadata.len() == artifact.size_bytes {
+                    if hash_file_blake3(&out_path)? == *expected_hash {
+                        upsert_artifact_index_entry_from_metadata(
+                            &mut artifact_index,
+                            &relative_path_key,
+                            &existing_metadata,
+                            expected_hash,
+                        )?;
+                        artifact_index_changed = true;
+                        matches_cached_artifact = true;
+                    }
+                }
+            }
+            if matches_cached_artifact {
+                continue;
+            }
+        }
+
         let object_path = objects_dir.join(&artifact.object_rel_path);
+        ensure_path_within_root(objects_dir, &object_path, "cache object path")?;
         if !object_path.exists() {
             return Ok(false);
         }
-    }
-
-    let target_root = workspace_root.join("target").join(profile);
-    for artifact in artifacts {
-        let expected_hash = &artifact.blake3_hex;
-        let relative_path = validated_relative_artifact_path(&artifact.relative_path)?;
-        let out_path = target_root.join(relative_path);
-        ensure_path_within_root(&target_root, &out_path, "cache restore path")?;
-
-        // Cache validity is content-addressed; permissions/ownership are not normalized.
-        if out_path.exists() && hash_file_blake3(&out_path)? == *expected_hash {
-            continue;
-        }
-
         if let Some(parent) = out_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
 
-        let object_path = objects_dir.join(&artifact.object_rel_path);
         restore_cache_object(&object_path, &out_path).with_context(|| {
             format!(
                 "failed to restore cache object {} to {}",
@@ -2291,18 +2362,28 @@ fn restore_cached_artifacts(
                 out_path.display()
             )
         })?;
+        let restored_metadata = fs::metadata(&out_path)
+            .with_context(|| format!("failed to stat {}", out_path.display()))?;
+        upsert_artifact_index_entry_from_metadata(
+            &mut artifact_index,
+            &relative_path_key,
+            &restored_metadata,
+            expected_hash,
+        )?;
+        artifact_index_changed = true;
     }
 
-    let expected: Vec<ArtifactDigest> = artifacts
-        .iter()
-        .map(|item| ArtifactDigest {
-            relative_path: item.relative_path.clone(),
-            blake3_hex: item.blake3_hex.clone(),
-            size_bytes: item.size_bytes,
-        })
-        .collect();
-    let restored = collect_artifact_digests_fast(&target_root)?;
-    Ok(compare_artifact_sets(&expected, &restored).is_empty())
+    if artifact_index_changed {
+        artifact_index.schema_version = ARTIFACT_INDEX_SCHEMA_VERSION;
+        if let Err(err) = save_artifact_index(&index_path, &artifact_index) {
+            eprintln!(
+                "uc: warning: failed to update artifact index {}: {err:#}",
+                index_path.display()
+            );
+        }
+    }
+
+    Ok(true)
 }
 
 fn try_reflink_file(source: &Path, destination: &Path) -> io::Result<()> {
@@ -2682,22 +2763,17 @@ fn compute_build_fingerprint(
     )
 }
 
-fn compute_build_fingerprint_with_scarb_version(
-    workspace_root: &Path,
-    manifest_path: &Path,
+fn build_fingerprint_context_digest(
+    canonical_manifest: &Path,
     common: &BuildCommonArgs,
     profile: &str,
-    cache_root: Option<&Path>,
     scarb_version: &str,
-) -> Result<String> {
+) -> String {
     let mut hasher = Hasher::new();
-    hasher.update(b"uc-build-fingerprint-v1");
+    hasher.update(b"uc-build-fingerprint-context-v1");
     hasher.update(scarb_version.as_bytes());
     hasher.update(compute_build_env_fingerprint().as_bytes());
-    let canonical_manifest = manifest_path
-        .canonicalize()
-        .with_context(|| format!("failed to canonicalize {}", manifest_path.display()))?;
-    hasher.update(normalize_fingerprint_path(&canonical_manifest).as_bytes());
+    hasher.update(normalize_fingerprint_path(canonical_manifest).as_bytes());
     hasher.update(profile.as_bytes());
     hasher.update(common.package.as_deref().unwrap_or("*").as_bytes());
     hasher.update(if common.workspace {
@@ -2710,7 +2786,6 @@ fn compute_build_fingerprint_with_scarb_version(
     } else {
         b"online"
     });
-
     let mut features = common.features.clone();
     features.sort_unstable();
     features.dedup();
@@ -2718,6 +2793,117 @@ fn compute_build_fingerprint_with_scarb_version(
         hasher.update(feature.as_bytes());
         hasher.update(b",");
     }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn try_reuse_hot_fingerprint(
+    workspace_root: &Path,
+    index: &FingerprintIndex,
+    context_digest: &str,
+    now_ms: u64,
+    mtime_recheck_window_ms: u64,
+) -> Result<Option<String>> {
+    if index.context_digest.as_deref() != Some(context_digest) {
+        return Ok(None);
+    }
+    let Some(last_fingerprint) = index.last_fingerprint.as_ref() else {
+        return Ok(None);
+    };
+    if last_fingerprint.is_empty() {
+        return Ok(None);
+    }
+
+    for (relative_dir, expected_modified_unix_ms) in &index.directories {
+        let dir_path = if relative_dir == "." {
+            workspace_root.to_path_buf()
+        } else {
+            workspace_root.join(relative_dir)
+        };
+        let metadata = match fs::metadata(&dir_path) {
+            Ok(metadata) => metadata,
+            Err(_) => return Ok(None),
+        };
+        if !metadata.is_dir() {
+            return Ok(None);
+        }
+        let modified_unix_ms = metadata_modified_unix_ms(&metadata)?;
+        if modified_unix_ms != *expected_modified_unix_ms {
+            return Ok(None);
+        }
+    }
+
+    for (relative_path, cached_entry) in &index.entries {
+        let file_path = workspace_root.join(relative_path);
+        let metadata = match fs::metadata(&file_path) {
+            Ok(metadata) => metadata,
+            Err(_) => return Ok(None),
+        };
+        if !metadata.is_file() {
+            return Ok(None);
+        }
+        let modified_unix_ms = metadata_modified_unix_ms(&metadata)?;
+        if metadata.len() != cached_entry.size_bytes
+            || modified_unix_ms != cached_entry.modified_unix_ms
+        {
+            return Ok(None);
+        }
+        if now_ms.saturating_sub(modified_unix_ms) <= mtime_recheck_window_ms {
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(last_fingerprint.clone()))
+}
+
+fn track_fingerprint_directories_for_relative_path(
+    tracked_directories: &mut BTreeSet<String>,
+    relative_path: &Path,
+) {
+    tracked_directories.insert(".".to_string());
+    let mut cursor = relative_path.parent();
+    while let Some(parent) = cursor {
+        if parent.as_os_str().is_empty() {
+            break;
+        }
+        tracked_directories.insert(normalize_fingerprint_path(parent));
+        cursor = parent.parent();
+    }
+}
+
+fn snapshot_tracked_fingerprint_directories(
+    workspace_root: &Path,
+    tracked_directories: &BTreeSet<String>,
+) -> Result<BTreeMap<String, u64>> {
+    let mut snapshot = BTreeMap::new();
+    for relative_dir in tracked_directories {
+        let dir_path = if relative_dir == "." {
+            workspace_root.to_path_buf()
+        } else {
+            workspace_root.join(relative_dir)
+        };
+        let metadata = fs::metadata(&dir_path)
+            .with_context(|| format!("failed to stat {}", dir_path.display()))?;
+        if !metadata.is_dir() {
+            continue;
+        }
+        snapshot.insert(relative_dir.clone(), metadata_modified_unix_ms(&metadata)?);
+    }
+    Ok(snapshot)
+}
+
+fn compute_build_fingerprint_with_scarb_version(
+    workspace_root: &Path,
+    manifest_path: &Path,
+    common: &BuildCommonArgs,
+    profile: &str,
+    cache_root: Option<&Path>,
+    scarb_version: &str,
+) -> Result<String> {
+    let canonical_manifest = manifest_path
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", manifest_path.display()))?;
+    let context_digest =
+        build_fingerprint_context_digest(&canonical_manifest, common, profile, scarb_version);
 
     let (index_path, mut index) = if let Some(root) = cache_root {
         let path = root.join("fingerprint/index-v1.json");
@@ -2732,7 +2918,23 @@ fn compute_build_fingerprint_with_scarb_version(
     let fingerprint_started = Instant::now();
     let mtime_recheck_window_ms = fingerprint_mtime_recheck_window_ms();
     let now_ms = epoch_ms_u64().unwrap_or_default();
+
+    if let Some(reused) = try_reuse_hot_fingerprint(
+        workspace_root,
+        &index,
+        &context_digest,
+        now_ms,
+        mtime_recheck_window_ms,
+    )? {
+        return Ok(reused);
+    }
+
+    let mut hasher = Hasher::new();
+    hasher.update(b"uc-build-fingerprint-v2");
+    hasher.update(context_digest.as_bytes());
+
     let mut updated_entries: BTreeMap<String, FingerprintIndexEntry> = BTreeMap::new();
+    let mut tracked_directories: BTreeSet<String> = BTreeSet::from([".".to_string()]);
 
     let mut files = Vec::new();
     let walker = WalkDir::new(workspace_root)
@@ -2776,6 +2978,7 @@ fn compute_build_fingerprint_with_scarb_version(
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
+        track_fingerprint_directories_for_relative_path(&mut tracked_directories, Path::new(&rel));
         let metadata =
             fs::metadata(&path).with_context(|| format!("failed to stat {}", path.display()))?;
         let file_size = metadata.len();
@@ -2823,10 +3026,20 @@ fn compute_build_fingerprint_with_scarb_version(
         hasher.update(file_hash.as_bytes());
         hasher.update(b"\n");
     }
+    let tracked_directory_mtimes =
+        snapshot_tracked_fingerprint_directories(workspace_root, &tracked_directories)?;
+    let fingerprint = hasher.finalize().to_hex().to_string();
     if let Some(path) = index_path {
-        let changed = index.entries != updated_entries;
+        let changed = index.entries != updated_entries
+            || index.directories != tracked_directory_mtimes
+            || index.context_digest.as_deref() != Some(context_digest.as_str())
+            || index.last_fingerprint.as_deref() != Some(fingerprint.as_str())
+            || index.schema_version != FINGERPRINT_INDEX_SCHEMA_VERSION;
         index.schema_version = FINGERPRINT_INDEX_SCHEMA_VERSION;
         index.entries = updated_entries;
+        index.directories = tracked_directory_mtimes;
+        index.context_digest = Some(context_digest);
+        index.last_fingerprint = Some(fingerprint.clone());
         store_fingerprint_index_cached(&path, &index);
         if changed {
             if let Err(err) = save_fingerprint_index(&path, &index) {
@@ -2838,7 +3051,7 @@ fn compute_build_fingerprint_with_scarb_version(
         }
     }
 
-    Ok(hasher.finalize().to_hex().to_string())
+    Ok(fingerprint)
 }
 
 fn is_ignored_entry(root: &Path, path: &Path) -> bool {
@@ -3219,57 +3432,6 @@ fn persist_artifact_object(source: &Path, destination: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn collect_artifact_digests_fast(target_root: &Path) -> Result<Vec<ArtifactDigest>> {
-    if !target_root.exists() {
-        return Ok(Vec::new());
-    }
-    let mut digests = Vec::new();
-    for entry in WalkDir::new(target_root).follow_links(false).into_iter() {
-        let entry = entry.with_context(|| {
-            format!(
-                "failed to traverse artifact tree under {}",
-                target_root.display()
-            )
-        })?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if !CACHEABLE_ARTIFACT_SUFFIXES
-            .iter()
-            .any(|suffix| name.ends_with(suffix))
-        {
-            continue;
-        }
-        let metadata =
-            fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
-        if metadata.len() > MAX_CACHEABLE_ARTIFACT_BYTES {
-            bail!(
-                "cacheable artifact {} exceeds size limit ({} bytes > {} bytes)",
-                path.display(),
-                metadata.len(),
-                MAX_CACHEABLE_ARTIFACT_BYTES
-            );
-        }
-        let hash = hash_file_blake3(path)?;
-        let relative_path = path
-            .strip_prefix(target_root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        digests.push(ArtifactDigest {
-            relative_path,
-            blake3_hex: hash,
-            size_bytes: metadata.len(),
-        });
-    }
-    digests.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
-    Ok(digests)
 }
 
 fn replay_output(stdout: &str, stderr: &str) -> Result<()> {
@@ -4693,6 +4855,92 @@ mod tests {
     }
 
     #[test]
+    fn restore_cached_artifacts_skips_object_restore_when_index_matches() {
+        let dir = unique_test_dir("uc-restore-index-hit");
+        let workspace = dir.join("workspace");
+        let target_root = workspace.join("target/dev");
+        let cache_root = workspace.join(".uc/cache");
+        let objects_dir = cache_root.join("objects");
+        fs::create_dir_all(&target_root).expect("failed to create target root");
+        fs::create_dir_all(&objects_dir).expect("failed to create objects root");
+
+        let output = target_root.join("demo.sierra.json");
+        fs::write(&output, b"cached-artifact").expect("failed to write target artifact");
+        let output_metadata = fs::metadata(&output).expect("failed to stat target artifact");
+        let expected_hash = hash_file_blake3(&output).expect("failed to hash target artifact");
+
+        let mut artifact_index = ArtifactIndex::empty();
+        artifact_index.entries.insert(
+            "demo.sierra.json".to_string(),
+            ArtifactIndexEntry {
+                size_bytes: output_metadata.len(),
+                modified_unix_ms: metadata_modified_unix_ms(&output_metadata)
+                    .expect("failed to read target mtime"),
+                blake3_hex: expected_hash.clone(),
+            },
+        );
+        save_artifact_index(&cache_root.join("artifact-index-v1.json"), &artifact_index)
+            .expect("failed to write artifact index");
+
+        let artifacts = vec![CachedArtifact {
+            relative_path: "demo.sierra.json".to_string(),
+            blake3_hex: expected_hash,
+            size_bytes: output_metadata.len(),
+            object_rel_path: "aa/missing-object.bin".to_string(),
+        }];
+
+        let restored =
+            restore_cached_artifacts(&workspace, "dev", &cache_root, &objects_dir, &artifacts)
+                .expect("restore should succeed");
+        assert!(restored);
+        assert_eq!(
+            fs::read(&output).expect("failed to read target artifact"),
+            b"cached-artifact"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn restore_cached_artifacts_restores_when_target_mismatch() {
+        let dir = unique_test_dir("uc-restore-index-miss");
+        let workspace = dir.join("workspace");
+        let target_root = workspace.join("target/dev");
+        let cache_root = workspace.join(".uc/cache");
+        let objects_dir = cache_root.join("objects/aa");
+        fs::create_dir_all(&target_root).expect("failed to create target root");
+        fs::create_dir_all(&objects_dir).expect("failed to create objects root");
+
+        let output = target_root.join("demo.sierra.json");
+        fs::write(&output, b"stale-artifact").expect("failed to write stale artifact");
+        let object = objects_dir.join("fresh-object.bin");
+        fs::write(&object, b"fresh-artifact").expect("failed to write cache object");
+        let expected_hash = hash_file_blake3(&object).expect("failed to hash cache object");
+        let object_metadata = fs::metadata(&object).expect("failed to stat cache object");
+
+        let artifacts = vec![CachedArtifact {
+            relative_path: "demo.sierra.json".to_string(),
+            blake3_hex: expected_hash,
+            size_bytes: object_metadata.len(),
+            object_rel_path: "aa/fresh-object.bin".to_string(),
+        }];
+
+        let restored = restore_cached_artifacts(
+            &workspace,
+            "dev",
+            &cache_root,
+            &cache_root.join("objects"),
+            &artifacts,
+        )
+        .expect("restore should succeed");
+        assert!(restored);
+        assert_eq!(
+            fs::read(&output).expect("failed to read restored artifact"),
+            b"fresh-artifact"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn validate_manifest_dependency_sanity_rejects_self_dependency() {
         let dir = unique_test_dir("uc-self-dependency");
         let manifest_path = dir.join("Scarb.toml");
@@ -4720,6 +4968,101 @@ demo = "1.0.0"
             normalize_fingerprint_path(Path::new(r"\\?\C:\tmp\demo\Scarb.toml")),
             "C:/tmp/demo/Scarb.toml"
         );
+    }
+
+    #[test]
+    fn hot_fingerprint_reuses_digest_when_tracked_metadata_is_unchanged() {
+        let dir = unique_test_dir("uc-hot-fingerprint-hit");
+        let src_dir = dir.join("src");
+        fs::create_dir_all(&src_dir).expect("failed to create src dir");
+        let source = src_dir.join("lib.cairo");
+        fs::write(&source, b"fn main() -> felt252 { 1 }").expect("failed to write source file");
+
+        let source_metadata = fs::metadata(&source).expect("failed to stat source");
+        let src_dir_metadata = fs::metadata(&src_dir).expect("failed to stat src dir");
+        let root_metadata = fs::metadata(&dir).expect("failed to stat workspace");
+
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "src/lib.cairo".to_string(),
+            FingerprintIndexEntry {
+                size_bytes: source_metadata.len(),
+                modified_unix_ms: metadata_modified_unix_ms(&source_metadata)
+                    .expect("failed to read source mtime"),
+                blake3_hex: "abc123".to_string(),
+            },
+        );
+        let mut directories = BTreeMap::new();
+        directories.insert(
+            ".".to_string(),
+            metadata_modified_unix_ms(&root_metadata).expect("failed to read workspace mtime"),
+        );
+        directories.insert(
+            "src".to_string(),
+            metadata_modified_unix_ms(&src_dir_metadata).expect("failed to read src dir mtime"),
+        );
+
+        let index = FingerprintIndex {
+            schema_version: FINGERPRINT_INDEX_SCHEMA_VERSION,
+            entries,
+            directories,
+            context_digest: Some("ctx".to_string()),
+            last_fingerprint: Some("fp-hot-hit".to_string()),
+        };
+        let reused = try_reuse_hot_fingerprint(&dir, &index, "ctx", u64::MAX, 0)
+            .expect("hot-path check should succeed");
+        assert_eq!(reused, Some("fp-hot-hit".to_string()));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hot_fingerprint_invalidates_when_tracked_directory_mtime_changes() {
+        let dir = unique_test_dir("uc-hot-fingerprint-dir-change");
+        let src_dir = dir.join("src");
+        fs::create_dir_all(&src_dir).expect("failed to create src dir");
+        let source = src_dir.join("lib.cairo");
+        fs::write(&source, b"fn main() -> felt252 { 1 }").expect("failed to write source file");
+
+        let source_metadata = fs::metadata(&source).expect("failed to stat source");
+        let src_dir_metadata = fs::metadata(&src_dir).expect("failed to stat src dir");
+        let root_metadata = fs::metadata(&dir).expect("failed to stat workspace");
+
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "src/lib.cairo".to_string(),
+            FingerprintIndexEntry {
+                size_bytes: source_metadata.len(),
+                modified_unix_ms: metadata_modified_unix_ms(&source_metadata)
+                    .expect("failed to read source mtime"),
+                blake3_hex: "abc123".to_string(),
+            },
+        );
+        let mut directories = BTreeMap::new();
+        directories.insert(
+            ".".to_string(),
+            metadata_modified_unix_ms(&root_metadata).expect("failed to read workspace mtime"),
+        );
+        directories.insert(
+            "src".to_string(),
+            metadata_modified_unix_ms(&src_dir_metadata).expect("failed to read src dir mtime"),
+        );
+
+        let index = FingerprintIndex {
+            schema_version: FINGERPRINT_INDEX_SCHEMA_VERSION,
+            entries,
+            directories,
+            context_digest: Some("ctx".to_string()),
+            last_fingerprint: Some("fp-hot-hit".to_string()),
+        };
+
+        thread::sleep(Duration::from_millis(20));
+        fs::write(src_dir.join("new.cairo"), b"fn extra() -> felt252 { 2 }")
+            .expect("failed to add new source");
+
+        let reused = try_reuse_hot_fingerprint(&dir, &index, "ctx", u64::MAX, 0)
+            .expect("hot-path check should succeed");
+        assert!(reused.is_none());
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
