@@ -1,3 +1,6 @@
+mod math;
+
 fn smoke() -> felt252 {
-    1
+    let seed = math::fib(8);
+    math::weighted_sum(seed)
 }

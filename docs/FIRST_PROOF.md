@@ -31,6 +31,7 @@ For repeated builds in the same workspace:
 ## Current Status (2026-03-03)
 - Comparator gate: passing on sampled workloads (0 artifact mismatches, diagnostics similarity 100%).
 - Performance signal: strong gains on warm no-op, mixed on warm-edit p95 across workloads.
+- Hardening in progress: integration coverage for cache hit/miss, corruption recovery, and concurrent access is being expanded before Gate A sign-off.
 - Gate A is not passed yet; optimization work continues.
 
 ## Gate Outcome

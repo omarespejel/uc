@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use toml::Value as TomlValue;
+use tracing_subscriber::EnvFilter;
 use uc_core::artifacts::{
     collect_artifact_digests, compare_artifact_sets, ArtifactDigest, ArtifactMismatch,
 };
@@ -52,6 +53,7 @@ const DAEMON_RATE_WINDOW_SECONDS: u64 = 1;
 const DAEMON_MAX_REQUESTS_PER_WINDOW: usize = 32;
 const DAEMON_LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 const CACHE_LOCK_STALE_AFTER_SECONDS: u64 = 300;
+const DEFAULT_MIN_SCARB_VERSION: &str = "2.14.0";
 const CACHEABLE_ARTIFACT_SUFFIXES: [&str; 5] = [
     ".sierra.json",
     ".sierra",
@@ -574,6 +576,7 @@ impl Drop for CacheLockGuard {
 }
 
 fn main() -> Result<()> {
+    init_observability();
     let cli = Cli::parse();
 
     match cli.command {
@@ -586,6 +589,24 @@ fn main() -> Result<()> {
         Commands::CompareBuild(args) => run_compare_build(args),
         Commands::Migrate(args) => run_migrate(args),
     }
+}
+
+fn init_observability() {
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        let filter = EnvFilter::try_from_default_env()
+            .or_else(|_| {
+                let fallback = std::env::var("UC_LOG").unwrap_or_else(|_| "uc=info".to_string());
+                EnvFilter::try_new(fallback)
+            })
+            .unwrap_or_else(|_| EnvFilter::new("info"));
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .with_ansi(false)
+            .without_time()
+            .try_init();
+    });
 }
 
 fn parse_diagnostics_threshold(input: &str) -> std::result::Result<f64, String> {
@@ -605,7 +626,7 @@ fn parse_env_u64(name: &str, default: u64) -> u64 {
         Ok(raw) => match raw.parse::<u64>() {
             Ok(value) => value,
             Err(_) => {
-                eprintln!("uc: warning: invalid {name} value `{raw}`, using default {default}");
+                tracing::warn!(env = name, value = %raw, default, "invalid numeric setting; using default");
                 default
             }
         },
@@ -618,7 +639,7 @@ fn parse_env_usize(name: &str, default: usize) -> usize {
         Ok(raw) => match raw.parse::<usize>() {
             Ok(value) => value,
             Err(_) => {
-                eprintln!("uc: warning: invalid {name} value `{raw}`, using default {default}");
+                tracing::warn!(env = name, value = %raw, default, "invalid numeric setting; using default");
                 default
             }
         },
@@ -634,7 +655,7 @@ fn parse_env_bool(name: &str, default: bool) -> bool {
                 "1" | "true" | "yes" | "on" => true,
                 "0" | "false" | "no" | "off" => false,
                 _ => {
-                    eprintln!("uc: warning: invalid {name} value `{raw}`, using default {default}");
+                    tracing::warn!(env = name, value = %raw, default, "invalid boolean setting; using default");
                     default
                 }
             }
@@ -1005,10 +1026,12 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
                         &mut rate_limiter,
                     ) {
                         record_daemon_failure(&health, format!("{err:#}"));
+                        tracing::error!(error = %format!("{err:#}"), "daemon request handling failed");
                         eprintln!("uc daemon: request handling failed: {err:#}");
                     }
                 }
                 Err(err) => {
+                    tracing::error!(error = %err, "daemon socket accept failed");
                     eprintln!("uc daemon: socket accept failed: {err}");
                 }
             }
@@ -1029,14 +1052,15 @@ fn run_benchmark(args: BenchmarkArgs) -> Result<()> {
     }
     let script = if let Some(path) = std::env::var_os("UC_BENCHMARK_SCRIPT") {
         PathBuf::from(path)
+    } else if let Some(root) = std::env::var_os("UC_BENCHMARK_REPO_ROOT") {
+        PathBuf::from(root).join("benchmarks/scripts/run_local_benchmarks.sh")
     } else {
-        let root = benchmark_repo_root().context("failed to resolve benchmark script root")?;
-        root.join("benchmarks/scripts/run_local_benchmarks.sh")
+        bail!("`uc benchmark` requires UC_BENCHMARK_SCRIPT or UC_BENCHMARK_REPO_ROOT to be set");
     };
 
     if !script.exists() {
         bail!(
-            "benchmark script not found at {}. Set UC_BENCHMARK_SCRIPT to an explicit path.",
+            "benchmark script not found at {}. Set UC_BENCHMARK_SCRIPT or UC_BENCHMARK_REPO_ROOT.",
             script.display()
         );
     }
@@ -1663,6 +1687,7 @@ fn run_build_with_uc_cache(
         if fail_on_async_cache_error() {
             bail!("previous async cache persistence failed: {err}");
         }
+        tracing::warn!(error = %err, "previous async cache persistence failed");
         eprintln!("uc: warning: previous async cache persistence failed: {err}");
     }
     let mut telemetry = BuildPhaseTelemetry::default();
@@ -1770,6 +1795,7 @@ fn run_build_with_uc_cache(
                         &entry_path,
                     ) {
                         record_async_persist_error(err.to_string());
+                        tracing::warn!(error = %format!("{err:#}"), "async cache persistence failed");
                         eprintln!("uc: warning: async cache persistence failed: {err:#}");
                     }
                 });
@@ -2231,9 +2257,28 @@ fn compute_build_fingerprint(
     profile: &str,
     cache_root: Option<&Path>,
 ) -> Result<String> {
+    let scarb_version = scarb_version_line()?;
+    compute_build_fingerprint_with_scarb_version(
+        workspace_root,
+        manifest_path,
+        common,
+        profile,
+        cache_root,
+        &scarb_version,
+    )
+}
+
+fn compute_build_fingerprint_with_scarb_version(
+    workspace_root: &Path,
+    manifest_path: &Path,
+    common: &BuildCommonArgs,
+    profile: &str,
+    cache_root: Option<&Path>,
+    scarb_version: &str,
+) -> Result<String> {
     let mut hasher = Hasher::new();
     hasher.update(b"uc-build-fingerprint-v1");
-    hasher.update(scarb_version_line()?.as_bytes());
+    hasher.update(scarb_version.as_bytes());
     let canonical_manifest = manifest_path
         .canonicalize()
         .with_context(|| format!("failed to canonicalize {}", manifest_path.display()))?;
@@ -3582,34 +3627,66 @@ fn workspace_root() -> Result<PathBuf> {
     Ok(cwd)
 }
 
-fn benchmark_repo_root() -> Result<PathBuf> {
-    if let Some(root) = std::env::var_os("UC_BENCHMARK_REPO_ROOT") {
-        return PathBuf::from(root)
-            .canonicalize()
-            .context("failed to canonicalize UC_BENCHMARK_REPO_ROOT");
-    }
+fn parse_semver_triplet(value: &str) -> Result<(u64, u64, u64)> {
+    let mut parts = value.trim().split('.');
+    let major = parts
+        .next()
+        .context("missing major version")?
+        .parse::<u64>()
+        .context("invalid major version")?;
+    let minor = parts
+        .next()
+        .context("missing minor version")?
+        .parse::<u64>()
+        .context("invalid minor version")?;
+    let patch_raw = parts.next().context("missing patch version")?;
+    let patch_text = patch_raw
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>();
+    let patch = patch_text.parse::<u64>().context("invalid patch version")?;
+    Ok((major, minor, patch))
+}
 
-    let cwd = std::env::current_dir()?.canonicalize()?;
-    for candidate in cwd.ancestors() {
-        let root = candidate.to_path_buf();
-        if root
-            .join("benchmarks/scripts/run_local_benchmarks.sh")
-            .is_file()
-        {
-            return Ok(root);
-        }
+fn parse_scarb_semver(version_line: &str) -> Result<(u64, u64, u64)> {
+    let mut parts = version_line.split_whitespace();
+    let tool = parts.next().unwrap_or_default();
+    if tool.to_ascii_lowercase() != "scarb" {
+        bail!("unexpected `scarb --version` output: {version_line}");
     }
+    let semver = parts
+        .next()
+        .context("missing scarb semantic version token")?;
+    parse_semver_triplet(semver)
+}
 
-    bail!(
-        "failed to locate benchmark repository root from {} (set UC_BENCHMARK_SCRIPT or UC_BENCHMARK_REPO_ROOT)",
-        cwd.display()
-    )
+fn min_scarb_version() -> String {
+    static VALUE: OnceLock<String> = OnceLock::new();
+    VALUE
+        .get_or_init(|| {
+            std::env::var("UC_MIN_SCARB_VERSION")
+                .ok()
+                .map(|raw| raw.trim().to_string())
+                .filter(|raw| !raw.is_empty())
+                .unwrap_or_else(|| DEFAULT_MIN_SCARB_VERSION.to_string())
+        })
+        .clone()
 }
 
 fn validate_scarb_toolchain() -> Result<()> {
     let version = scarb_version_line()?;
-    if !version.to_ascii_lowercase().starts_with("scarb ") {
-        bail!("unexpected `scarb --version` output: {version}");
+    let current = parse_scarb_semver(&version)
+        .with_context(|| format!("failed to parse scarb semantic version from `{version}`"))?;
+    let minimum_text = min_scarb_version();
+    let minimum = parse_semver_triplet(&minimum_text).with_context(|| {
+        format!("invalid UC_MIN_SCARB_VERSION `{minimum_text}` (expected `major.minor.patch`)")
+    })?;
+    if current < minimum {
+        bail!(
+            "scarb version {} is below minimum required {}",
+            version,
+            minimum_text
+        );
     }
     if let Ok(expected) = std::env::var("UC_EXPECT_SCARB_VERSION") {
         if !version.contains(&expected) {
@@ -3625,6 +3702,8 @@ fn validate_scarb_toolchain() -> Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::{Mutex, OnceLock as TestOnceLock};
+    use std::thread;
 
     fn unique_test_dir(prefix: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -3634,6 +3713,81 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
         fs::create_dir_all(&dir).expect("failed to create test directory");
         dir
+    }
+
+    fn integration_env_lock() -> &'static Mutex<()> {
+        static LOCK: TestOnceLock<Mutex<()>> = TestOnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn scarb_available() -> bool {
+        Command::new("scarb")
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    fn smoke_fixture_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../benchmarks/fixtures/scarb_smoke")
+            .canonicalize()
+            .expect("failed to locate scarb_smoke fixture")
+    }
+
+    fn copy_dir_recursive(src: &Path, dst: &Path) {
+        for entry in walkdir::WalkDir::new(src) {
+            let entry = entry.expect("failed to traverse fixture directory");
+            let rel = entry
+                .path()
+                .strip_prefix(src)
+                .expect("failed to strip fixture prefix");
+            let out = dst.join(rel);
+            if entry.file_type().is_dir() {
+                fs::create_dir_all(&out).expect("failed to create fixture output directory");
+            } else {
+                if let Some(parent) = out.parent() {
+                    fs::create_dir_all(parent).expect("failed to create fixture parent");
+                }
+                fs::copy(entry.path(), &out).expect("failed to copy fixture file");
+            }
+        }
+    }
+
+    fn prepare_smoke_workspace(prefix: &str) -> PathBuf {
+        let dir = unique_test_dir(prefix);
+        copy_dir_recursive(&smoke_fixture_dir(), &dir);
+        dir
+    }
+
+    fn smoke_common_args(manifest_path: &Path) -> BuildCommonArgs {
+        BuildCommonArgs {
+            manifest_path: Some(manifest_path.to_path_buf()),
+            package: None,
+            workspace: false,
+            features: Vec::new(),
+            offline: false,
+            release: false,
+            profile: None,
+        }
+    }
+
+    fn run_smoke_cached_build(
+        common: &BuildCommonArgs,
+        manifest_path: &Path,
+        workspace_root: &Path,
+        profile: &str,
+        session_key: &str,
+    ) -> Result<(CommandRun, bool, String, BuildPhaseTelemetry)> {
+        run_build_with_uc_cache(
+            common,
+            manifest_path,
+            workspace_root,
+            profile,
+            session_key,
+            true,
+            false,
+        )
     }
 
     #[test]
@@ -3792,5 +3946,211 @@ mod tests {
                 "2",
             ]
         );
+    }
+
+    #[test]
+    fn parse_scarb_semver_extracts_triplet() {
+        assert_eq!(
+            parse_scarb_semver("scarb 2.14.0 (682b29e13 2025-11-25)").unwrap(),
+            (2, 14, 0)
+        );
+        assert!(parse_scarb_semver("invalid-output").is_err());
+    }
+
+    #[test]
+    fn compute_build_fingerprint_changes_when_scarb_version_changes() {
+        let _guard = integration_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let workspace = prepare_smoke_workspace("uc-fingerprint-version");
+        let manifest_path = workspace.join("Scarb.toml");
+        let common = smoke_common_args(&manifest_path);
+        let profile = effective_profile(&common);
+
+        let v1 = compute_build_fingerprint_with_scarb_version(
+            &workspace,
+            &manifest_path,
+            &common,
+            &profile,
+            None,
+            "scarb 2.14.0 (test)",
+        )
+        .expect("failed to compute fingerprint for v1");
+        let v2 = compute_build_fingerprint_with_scarb_version(
+            &workspace,
+            &manifest_path,
+            &common,
+            &profile,
+            None,
+            "scarb 2.15.0 (test)",
+        )
+        .expect("failed to compute fingerprint for v2");
+        assert_ne!(v1, v2);
+
+        fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[test]
+    fn run_build_with_uc_cache_hits_after_initial_compile() {
+        let _guard = integration_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !scarb_available() {
+            return;
+        }
+        let workspace = prepare_smoke_workspace("uc-cache-hit");
+        let manifest_path = workspace.join("Scarb.toml");
+        let common = smoke_common_args(&manifest_path);
+        let profile = effective_profile(&common);
+        let session_key = build_session_input(&common, &manifest_path, &profile)
+            .expect("failed to compute session input")
+            .deterministic_key_hex();
+
+        let (first_run, first_hit, first_fingerprint, _) =
+            run_smoke_cached_build(&common, &manifest_path, &workspace, &profile, &session_key)
+                .expect("first build should succeed");
+        assert_eq!(first_run.exit_code, 0);
+        assert!(!first_hit);
+
+        let (second_run, second_hit, second_fingerprint, _) =
+            run_smoke_cached_build(&common, &manifest_path, &workspace, &profile, &session_key)
+                .expect("second build should succeed");
+        assert_eq!(second_run.exit_code, 0);
+        assert!(second_hit);
+        assert_eq!(first_fingerprint, second_fingerprint);
+
+        fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[test]
+    fn run_build_with_uc_cache_recovers_from_corrupted_entry() {
+        let _guard = integration_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !scarb_available() {
+            return;
+        }
+        let workspace = prepare_smoke_workspace("uc-cache-corruption");
+        let manifest_path = workspace.join("Scarb.toml");
+        let common = smoke_common_args(&manifest_path);
+        let profile = effective_profile(&common);
+        let session_key = build_session_input(&common, &manifest_path, &profile)
+            .expect("failed to compute session input")
+            .deterministic_key_hex();
+
+        run_smoke_cached_build(&common, &manifest_path, &workspace, &profile, &session_key)
+            .expect("initial build should succeed");
+
+        let entry_path = workspace
+            .join(".uc/cache/build")
+            .join(format!("{session_key}.json"));
+        fs::write(&entry_path, b"{not-json").expect("failed to corrupt cache entry");
+
+        let (run, cache_hit, _, _) =
+            run_smoke_cached_build(&common, &manifest_path, &workspace, &profile, &session_key)
+                .expect("build should recover from corrupted cache entry");
+        assert_eq!(run.exit_code, 0);
+        assert!(!cache_hit);
+
+        fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[test]
+    fn run_build_with_uc_cache_allows_concurrent_builds() {
+        let _guard = integration_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !scarb_available() {
+            return;
+        }
+        let workspace = prepare_smoke_workspace("uc-cache-concurrency");
+        let manifest_path = workspace.join("Scarb.toml");
+        let common = smoke_common_args(&manifest_path);
+        let profile = effective_profile(&common);
+        let session_key = build_session_input(&common, &manifest_path, &profile)
+            .expect("failed to compute session input")
+            .deterministic_key_hex();
+
+        let workspace_a = workspace.clone();
+        let manifest_a = manifest_path.clone();
+        let profile_a = profile.clone();
+        let session_a = session_key.clone();
+        let common_a = common.clone();
+        let worker_a = thread::spawn(move || {
+            run_smoke_cached_build(&common_a, &manifest_a, &workspace_a, &profile_a, &session_a)
+        });
+
+        let workspace_b = workspace.clone();
+        let manifest_b = manifest_path.clone();
+        let profile_b = profile.clone();
+        let session_b = session_key.clone();
+        let common_b = common.clone();
+        let worker_b = thread::spawn(move || {
+            run_smoke_cached_build(&common_b, &manifest_b, &workspace_b, &profile_b, &session_b)
+        });
+
+        let (run_a, _, _, _) = worker_a
+            .join()
+            .expect("worker A panicked")
+            .expect("worker A build failed");
+        let (run_b, _, _, _) = worker_b
+            .join()
+            .expect("worker B panicked")
+            .expect("worker B build failed");
+        assert_eq!(run_a.exit_code, 0);
+        assert_eq!(run_b.exit_code, 0);
+
+        fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[test]
+    fn build_session_cfg_set_changes_when_cairo_target_or_tool_changes() {
+        let dir = unique_test_dir("uc-session-cfg");
+        let manifest_path = dir.join("Scarb.toml");
+
+        fs::write(
+            &manifest_path,
+            r#"[package]
+name = "cfg_test"
+version = "0.1.0"
+edition = "2024_07"
+
+[cairo]
+allow-warnings = true
+
+[target.starknet-contract]
+sierra = true
+
+[tool.uc]
+mode = "fast"
+"#,
+        )
+        .expect("failed to write manifest");
+
+        let cfg_a = build_session_cfg_set(&manifest_path).expect("failed to compute cfg A");
+
+        fs::write(
+            &manifest_path,
+            r#"[package]
+name = "cfg_test"
+version = "0.1.0"
+edition = "2024_07"
+
+[cairo]
+allow-warnings = false
+
+[target.starknet-contract]
+sierra = true
+
+[tool.uc]
+mode = "safe"
+"#,
+        )
+        .expect("failed to rewrite manifest");
+
+        let cfg_b = build_session_cfg_set(&manifest_path).expect("failed to compute cfg B");
+        assert_ne!(cfg_a, cfg_b);
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

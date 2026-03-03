@@ -167,6 +167,15 @@ PY
     return
   fi
 
+  if command -v perl >/dev/null 2>&1; then
+    local perl_now
+    perl_now="$(LC_ALL=C perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e 'print int(clock_gettime(CLOCK_MONOTONIC) * 1000000)' 2>/dev/null || true)"
+    if [[ -n "$perl_now" && "$perl_now" == <-> ]]; then
+      printf "%s" "$perl_now"
+      return
+    fi
+  fi
+
   local now="$EPOCHREALTIME"
   local sec="${now%%.*}"
   local frac="${now#*.}"

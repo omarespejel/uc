@@ -1,7 +1,7 @@
 # Product Charter
 
 ## Product
-`uc`: next-generation Cairo package manager + build/prove platform for 2026+ workflows.
+`uc`: Cairo build acceleration and package-management platform for 2026+ workflows.
 
 ## Vision
 By default, Cairo developers and CI should run `uc` for package resolution, build, test, execute, prove, lint, and format workflows with better speed, stronger observability, and deterministic outputs.
