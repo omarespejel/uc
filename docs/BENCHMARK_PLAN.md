@@ -1,32 +1,34 @@
 # Benchmark Plan
 
 ## Objective
-Prove measurable value and protect against regressions with reproducible benchmarks.
+Measure and prove that `uc` outperforms Scarb on real workflows while maintaining correctness.
 
-## Workload Matrix
-1. Warm no-op rebuild.
-2. Warm single-file edit rebuild.
-3. Cold build.
-4. Profile/feature change rebuild.
-5. CI-like clean environment run.
+## Matrix
+1. `build.cold`: remove workspace build artifacts and build.
+2. `build.warm_noop`: build again without changes.
+3. `build.warm_edit`: edit one Cairo file and rebuild.
+4. `metadata.online_cold`: metadata with empty global cache.
+5. `metadata.offline_warm`: metadata with warm cache and `--offline`.
 
-## Reference Repositories
-- Large workspace representative.
-- Medium workspace representative.
-- Proof-heavy representative.
+## Workloads
+- `scarb/examples/hello_world`
+- `scarb/examples/workspaces`
+- `scarb/examples/dependencies` (metadata path)
+- Optional heavy profile: `stwo_cairo_verifier` with required features.
 
-## Outputs
-- Raw JSON per run.
-- Summary Markdown in `benchmarks/results/`.
-- Weekly trend comparison report.
+## Output Artifacts
+- JSON per run under `benchmarks/results/`.
+- Markdown summary per run under `benchmarks/results/`.
+- Reviewed baseline snapshots under `benchmarks/baselines/`.
 
-## Tooling
-- `hyperfine` for timing stats.
-- Structured output JSON.
-- Optional system-level stats (`/usr/bin/time -lp`).
+## Baseline Rule
+Before changing `uc` engine behavior, rerun baseline against current Scarb and snapshot results.
 
-## Acceptance Thresholds
-- Warm p95 improvement >=40% by Gate A.
-- CI cache-hit >=70% by Gate C.
-- Flake rate <=5%.
+## Gate Thresholds
+- Gate A: warm rebuild p95 >= 40% faster than Scarb baseline.
+- Gate A: zero artifact hash mismatches and diagnostics parity >= 99.5%.
 
+## Execution
+```bash
+./benchmarks/scripts/run_local_benchmarks.sh
+```

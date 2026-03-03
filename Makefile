@@ -1,15 +1,17 @@
 SHELL := /bin/zsh
 
-.PHONY: bootstrap benchmark-local gh-bootstrap
+.PHONY: bootstrap benchmark-local benchmark-smoke gh-bootstrap
 
 bootstrap:
-	@mkdir -p benchmarks/results
+	@mkdir -p benchmarks/results benchmarks/baselines
 	@chmod +x benchmarks/scripts/run_local_benchmarks.sh scripts/github/bootstrap_github_stack.sh
-	@echo "Local bootstrap done."
+	@echo "Bootstrap complete."
 
 benchmark-local:
-	@./benchmarks/scripts/run_local_benchmarks.sh
+	@./benchmarks/scripts/run_local_benchmarks.sh --matrix research
+
+benchmark-smoke:
+	@./benchmarks/scripts/run_local_benchmarks.sh --matrix smoke
 
 gh-bootstrap:
 	@./scripts/github/bootstrap_github_stack.sh
-

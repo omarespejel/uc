@@ -1,26 +1,31 @@
 # uc
 
-Future-first Cairo build and proving platform.
+`uc` is a next-generation Cairo package manager and build/proving engine that will replace Scarb for our workflows.
 
 ## Mission
-- Replace legacy project tooling with a faster, deterministic, cloud-ready developer and CI workflow.
-- Prioritize measurable performance, reproducibility, and migration at scale.
+- Deliver materially faster developer and CI loops than Scarb.
+- Keep deterministic artifacts and reproducible builds as hard requirements.
+- Provide a modern 2026 architecture: sessionized compiler state, content-addressed cache, and measurable performance gates.
 
-## Program Targets
-- p95 warm edit->build under 3 seconds on representative large workspaces.
-- 70%+ CI cache reuse across branches.
-- Deterministic artifacts and auditable build provenance.
+## First Product Proof
+The first thing we must prove is that `uc` beats Scarb on warm rebuild latency while preserving correctness.
+
+- Hypothesis: `uc` can reduce warm `edit -> build` p95 by at least 40%.
+- Guardrails: zero artifact hash mismatches and diagnostics parity >= 99.5%.
+- Decision gate: continue full replacement only if proof passes.
+
+See:
+- `docs/FIRST_PROOF.md`
+- `docs/BENCHMARK_PLAN.md`
+- `docs/ARCHITECTURE_BLUEPRINT.md`
 
 ## Repository Structure
-- `docs/`: product, roadmap, KPIs, benchmark strategy, cutover plan.
-- `.github/`: issue/PR templates and automation workflows.
-- `benchmarks/`: scenario definitions and benchmark outputs.
-- `scripts/github/`: scripts to bootstrap labels, milestones, issues, and project setup.
-
-## Operating Model
-- Work tracked by Milestones + Project board + seeded issues.
-- Weekly metric review from benchmark and KPI scorecard.
-- Go/No-Go gates based on latency, correctness, and reliability.
+- `docs/`: product, architecture, roadmap, KPIs, operating model, cutover.
+- `docs/research/`: imported and synthesized research from the codebase exploration.
+- `docs/adr/`: architecture decision records.
+- `benchmarks/`: scenario matrix, harness, fixtures, results, and baselines.
+- `scripts/github/`: GitHub milestones/labels/issues bootstrap.
+- `.github/`: issue templates, PR template, and benchmark CI workflow.
 
 ## Quick Start
 ```bash
@@ -29,12 +34,12 @@ make benchmark-local
 make gh-bootstrap
 ```
 
-## Required Tooling
-- `gh` (authenticated with `repo` scope)
+## Tooling
+- `scarb`
 - `jq`
-- `hyperfine`
 - `git`
 
-## Notes
-- Project name is `uc`.
-- Migration from existing tooling is explicit and staged; this repo is the source of truth for execution.
+## Current Status
+- Program foundations are set.
+- Baseline benchmarking against Scarb is now automated and tracked in this repo.
+- Work is executed in a single delivery stream with milestone gates.

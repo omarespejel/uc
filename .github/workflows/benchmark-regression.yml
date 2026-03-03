@@ -7,23 +7,25 @@ on:
     branches: [main]
 
 jobs:
-  benchmark:
+  benchmark-smoke:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install hyperfine
-        run: sudo apt-get update && sudo apt-get install -y hyperfine
+      - name: Install Scarb
+        uses: software-mansion/setup-scarb@v1
 
-      - name: Run local benchmark harness
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Run smoke benchmark matrix
         run: |
           chmod +x benchmarks/scripts/run_local_benchmarks.sh
-          ./benchmarks/scripts/run_local_benchmarks.sh
+          ./benchmarks/scripts/run_local_benchmarks.sh --matrix smoke
 
       - name: Upload benchmark artifacts
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results
           path: benchmarks/results/
-

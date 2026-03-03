@@ -1,0 +1,9 @@
+[package]
+name = "uc-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3.workspace = true
+serde.workspace = true
