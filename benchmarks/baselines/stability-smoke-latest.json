@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-03-03T23:22:51Z",
+  "generated_at": "2026-03-03T23:35:26Z",
   "matrix": "smoke",
   "workspace_root": null,
   "runs": 12,
@@ -17,32 +17,32 @@
     {
       "cycle": 1,
       "run_order": "scarb-first",
-      "baseline_json": "benchmarks/results/scarb-baseline-20260303-171713.json",
-      "candidate_json": "benchmarks/results/uc-baseline-20260303-171747.json"
+      "baseline_json": "benchmarks/results/scarb-baseline-20260303-172944.json",
+      "candidate_json": "benchmarks/results/uc-baseline-20260303-173021.json"
     },
     {
       "cycle": 2,
       "run_order": "uc-first",
-      "baseline_json": "benchmarks/results/scarb-baseline-20260303-171849.json",
-      "candidate_json": "benchmarks/results/uc-baseline-20260303-171819.json"
+      "baseline_json": "benchmarks/results/scarb-baseline-20260303-173125.json",
+      "candidate_json": "benchmarks/results/uc-baseline-20260303-173053.json"
     },
     {
       "cycle": 3,
       "run_order": "scarb-first",
-      "baseline_json": "benchmarks/results/scarb-baseline-20260303-171925.json",
-      "candidate_json": "benchmarks/results/uc-baseline-20260303-172002.json"
+      "baseline_json": "benchmarks/results/scarb-baseline-20260303-173202.json",
+      "candidate_json": "benchmarks/results/uc-baseline-20260303-173238.json"
     },
     {
       "cycle": 4,
       "run_order": "uc-first",
-      "baseline_json": "benchmarks/results/scarb-baseline-20260303-172107.json",
-      "candidate_json": "benchmarks/results/uc-baseline-20260303-172035.json"
+      "baseline_json": "benchmarks/results/scarb-baseline-20260303-173340.json",
+      "candidate_json": "benchmarks/results/uc-baseline-20260303-173309.json"
     },
     {
       "cycle": 5,
       "run_order": "scarb-first",
-      "baseline_json": "benchmarks/results/scarb-baseline-20260303-172143.json",
-      "candidate_json": "benchmarks/results/uc-baseline-20260303-172219.json"
+      "baseline_json": "benchmarks/results/scarb-baseline-20260303-173417.json",
+      "candidate_json": "benchmarks/results/uc-baseline-20260303-173453.json"
     }
   ],
   "scenarios": [
@@ -50,161 +50,161 @@
       "scenario": "build.cold",
       "workload": "scarb_smoke",
       "p50_deltas": [
-        -3.107726784740035,
-        3.362937238101006,
-        0.460450748831869,
-        1.283660595427889,
-        -2.7797608621909107
+        7.64428753340123,
+        -3.637191596369089,
+        -3.0055798505021136,
+        -0.2816653413929531,
+        -5.959130037158536
       ],
       "p95_deltas": [
-        -54.35660829025157,
-        32.31710185243918,
-        19.313875711248688,
-        16.560051537524632,
-        -17.041594460597114
+        22.79014723232318,
+        -0.9734672484363459,
+        -1.2292107990380026,
+        3.008266509962244,
+        -8.794063608989996
       ],
       "baseline_p95": [
-        952.9276499999999,
-        1305.3275999999998,
-        1265.0637999999994,
-        1130.6712999999997,
-        1035.9817
+        1314.0388999999998,
+        1082.5017499999997,
+        931.7848499999999,
+        948.7075,
+        1023.6792
       ],
       "candidate_p95": [
-        1470.9067999999993,
-        883.48355,
-        1020.7309499999999,
-        943.43155,
-        1212.5294999999999
+        1014.5674999999999,
+        1093.03955,
+        943.23845,
+        920.1678499999999,
+        1113.7022
       ],
-      "median_p50_delta_percent": 0.460450748831869,
-      "median_p95_delta_percent": 16.560051537524632,
-      "mean_p95_delta_percent": -0.6414347299272372,
-      "stdev_p95_delta_percent": 31.41546048706426,
-      "min_p95_delta_percent": -54.35660829025157,
-      "max_p95_delta_percent": 32.31710185243918,
-      "median_baseline_p95_ms": 1130.6712999999997,
-      "median_candidate_p95_ms": 1020.7309499999999
+      "median_p50_delta_percent": -3.0055798505021136,
+      "median_p95_delta_percent": -0.9734672484363459,
+      "mean_p95_delta_percent": 2.960334417164215,
+      "stdev_p95_delta_percent": 10.624657466383614,
+      "min_p95_delta_percent": -8.794063608989996,
+      "max_p95_delta_percent": 22.79014723232318,
+      "median_baseline_p95_ms": 1023.6792,
+      "median_candidate_p95_ms": 1014.5674999999999
     },
     {
       "scenario": "build.warm_edit",
       "workload": "scarb_smoke",
       "p50_deltas": [
-        98.63532449472336,
-        98.54934895509064,
-        98.62361534945317,
-        98.67046133434003,
-        98.60933341907364
+        98.66111619264369,
+        98.68318762763589,
+        98.60336475037379,
+        98.75668671764413,
+        98.65898687662184
       ],
       "p95_deltas": [
-        98.54221867113391,
-        98.47719987269389,
-        97.42223894332223,
-        98.31837817168659,
-        96.36224956657385
+        98.6839511032581,
+        97.99196693561217,
+        98.3568575633415,
+        99.02863394723919,
+        98.60695605191967
       ],
       "baseline_p95": [
-        546.43655,
-        546.8708499999999,
-        603.36275,
-        565.1449,
-        589.2584
+        584.7997,
+        579.31815,
+        585.3113999999999,
+        841.1658999999997,
+        623.9214499999999
       ],
       "candidate_p95": [
-        7.96585,
-        8.32775,
-        15.553249999999993,
-        9.503599999999997,
-        21.43574999999999
+        7.69625,
+        11.632899999999996,
+        9.6175,
+        8.1708,
+        8.6915
       ],
-      "median_p50_delta_percent": 98.62361534945317,
-      "median_p95_delta_percent": 98.31837817168659,
-      "mean_p95_delta_percent": 97.82445704508208,
-      "stdev_p95_delta_percent": 0.8348704260813391,
-      "min_p95_delta_percent": 96.36224956657385,
-      "max_p95_delta_percent": 98.54221867113391,
-      "median_baseline_p95_ms": 565.1449,
-      "median_candidate_p95_ms": 9.503599999999997
+      "median_p50_delta_percent": 98.66111619264369,
+      "median_p95_delta_percent": 98.60695605191967,
+      "mean_p95_delta_percent": 98.53367312027413,
+      "stdev_p95_delta_percent": 0.3457309393573674,
+      "min_p95_delta_percent": 97.99196693561217,
+      "max_p95_delta_percent": 99.02863394723919,
+      "median_baseline_p95_ms": 585.3113999999999,
+      "median_candidate_p95_ms": 8.6915
     },
     {
       "scenario": "build.warm_edit_semantic",
       "workload": "scarb_smoke",
       "p50_deltas": [
-        -0.7232248788619328,
-        -0.42622725918771176,
-        -1.2504614086586687,
-        -4.550957571223929,
-        -1.3130835715227478
+        -1.8516433938159536,
+        2.1300925480032546,
+        3.534251651102396,
+        -2.778202460200246,
+        1.4281828435537658
       ],
       "p95_deltas": [
-        2.527722219075809,
-        -4.580430491785573,
-        25.929650458328616,
-        -44.908026670478705,
-        -2.9859687518168117
+        0.605182179828985,
+        36.872830207856445,
+        9.486040725016503,
+        -16.083304483459138,
+        19.836995519755142
       ],
       "baseline_p95": [
-        603.8657999999999,
-        569.59275,
-        972.33185,
-        626.7903999999999,
-        608.03215
+        628.2240499999999,
+        928.7755999999999,
+        684.4589,
+        582.9026,
+        740.0041999999999
       ],
       "candidate_p95": [
-        588.60175,
-        595.68255,
-        720.2095999999999,
-        908.2696,
-        626.1877999999999
+        624.42215,
+        586.30975,
+        619.53085,
+        676.6525999999999,
+        593.2096
       ],
-      "median_p50_delta_percent": -1.2504614086586687,
-      "median_p95_delta_percent": -2.9859687518168117,
-      "mean_p95_delta_percent": -4.803410647335333,
-      "stdev_p95_delta_percent": 22.847317547522163,
-      "min_p95_delta_percent": -44.908026670478705,
-      "max_p95_delta_percent": 25.929650458328616,
-      "median_baseline_p95_ms": 608.03215,
-      "median_candidate_p95_ms": 626.1877999999999
+      "median_p50_delta_percent": 1.4281828435537658,
+      "median_p95_delta_percent": 9.486040725016503,
+      "mean_p95_delta_percent": 10.143548829799588,
+      "stdev_p95_delta_percent": 17.81952851054519,
+      "min_p95_delta_percent": -16.083304483459138,
+      "max_p95_delta_percent": 36.872830207856445,
+      "median_baseline_p95_ms": 684.4589,
+      "median_candidate_p95_ms": 619.53085
     },
     {
       "scenario": "build.warm_noop",
       "workload": "scarb_smoke",
       "p50_deltas": [
-        68.67961122253323,
-        69.33342083962285,
-        69.90887480190175,
-        68.67150906252122,
-        69.7613276917389
+        71.15142298500979,
+        72.67028482477174,
+        71.18857622847543,
+        72.58175739212204,
+        72.47813159822468
       ],
       "p95_deltas": [
-        61.0716175966957,
-        65.98018065202662,
-        66.99247615208922,
-        71.18583486843914,
-        76.24909019398646
+        74.36755695565279,
+        79.707736799075,
+        70.4809595754565,
+        73.23100698635649,
+        75.3181503397489
       ],
       "baseline_p95": [
-        24.08975,
-        24.0573,
-        23.817600000000002,
-        25.459699999999998,
-        44.240199999999994
+        29.696349999999992,
+        37.79469999999998,
+        23.8939,
+        32.806799999999996,
+        29.168599999999994
       ],
       "candidate_p95": [
-        9.377749999999997,
-        8.18425,
-        7.861599999999999,
-        7.335999999999999,
-        10.507449999999999
+        7.6118999999999994,
+        7.6693999999999996,
+        7.05325,
+        8.782049999999998,
+        7.19935
       ],
-      "median_p50_delta_percent": 69.33342083962285,
-      "median_p95_delta_percent": 66.99247615208922,
-      "mean_p95_delta_percent": 68.29583989264742,
-      "stdev_p95_delta_percent": 5.1157928780600805,
-      "min_p95_delta_percent": 61.0716175966957,
-      "max_p95_delta_percent": 76.24909019398646,
-      "median_baseline_p95_ms": 24.08975,
-      "median_candidate_p95_ms": 8.18425
+      "median_p50_delta_percent": 72.47813159822468,
+      "median_p95_delta_percent": 74.36755695565279,
+      "mean_p95_delta_percent": 74.62108213125794,
+      "stdev_p95_delta_percent": 3.0165264294253453,
+      "min_p95_delta_percent": 70.4809595754565,
+      "max_p95_delta_percent": 79.707736799075,
+      "median_baseline_p95_ms": 29.696349999999992,
+      "median_candidate_p95_ms": 7.6118999999999994
     }
   ]
 }

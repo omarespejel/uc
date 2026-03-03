@@ -387,6 +387,13 @@ struct BuildCacheEntry {
     artifacts: Vec<CachedArtifact>,
 }
 
+#[derive(Clone)]
+struct SessionInputCacheEntry {
+    manifest_size_bytes: u64,
+    manifest_modified_unix_ms: u64,
+    input: SessionInput,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DaemonStatusPayload {
     pid: u32,
@@ -3601,12 +3608,77 @@ fn scarb_version_line() -> Result<String> {
     Ok(version)
 }
 
+fn session_input_cache() -> &'static Mutex<HashMap<String, SessionInputCacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, SessionInputCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn session_input_cache_key(
+    common: &BuildCommonArgs,
+    manifest_path: &Path,
+    profile: &str,
+    scarb_version: &str,
+    build_env_fingerprint: &str,
+) -> String {
+    let mut hasher = Hasher::new();
+    hasher.update(b"uc-session-input-cache-v1");
+    hasher.update(normalize_fingerprint_path(manifest_path).as_bytes());
+    hasher.update(scarb_version.as_bytes());
+    hasher.update(build_env_fingerprint.as_bytes());
+    hasher.update(profile.as_bytes());
+    hasher.update(common.package.as_deref().unwrap_or("*").as_bytes());
+    hasher.update(if common.workspace {
+        b"workspace"
+    } else {
+        b"package"
+    });
+    hasher.update(if common.offline {
+        b"offline"
+    } else {
+        b"online"
+    });
+    hasher.update(if common.release { b"release" } else { b"dev" });
+    let mut features = common.features.clone();
+    features.sort_unstable();
+    features.dedup();
+    for feature in features {
+        hasher.update(feature.as_bytes());
+        hasher.update(b",");
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 fn build_session_input(
     common: &BuildCommonArgs,
     manifest_path: &Path,
     profile: &str,
 ) -> Result<SessionInput> {
     let scarb_version = scarb_version_line()?;
+    let build_env_fingerprint = compute_build_env_fingerprint();
+    let manifest_metadata = fs::metadata(manifest_path)
+        .with_context(|| format!("failed to stat {}", manifest_path.display()))?;
+    let manifest_size_bytes = manifest_metadata.len();
+    let manifest_modified_unix_ms = metadata_modified_unix_ms(&manifest_metadata)?;
+    let cache_key = session_input_cache_key(
+        common,
+        manifest_path,
+        profile,
+        &scarb_version,
+        &build_env_fingerprint,
+    );
+    {
+        let cache = session_input_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = cache.get(&cache_key) {
+            if entry.manifest_size_bytes == manifest_size_bytes
+                && entry.manifest_modified_unix_ms == manifest_modified_unix_ms
+            {
+                return Ok(entry.input.clone());
+            }
+        }
+    }
+
     let manifest_text = read_text_file_with_limit(manifest_path, MAX_MANIFEST_BYTES, "manifest")?;
     let manifest = parse_manifest_toml(
         &manifest_text,
@@ -3617,11 +3689,10 @@ fn build_session_input(
     let manifest_content_hash = compute_manifest_content_hash_bytes(manifest_text.as_bytes());
     let (cairo_edition, cairo_lang_version) =
         resolve_manifest_cairo_settings_from_manifest(&manifest);
-    let build_env_fingerprint = compute_build_env_fingerprint();
     let mut cfg_set = build_session_cfg_set_from_manifest(&manifest)?;
     cfg_set.push(format!("workspace:{}", common.workspace));
     cfg_set.push(format!("release:{}", common.release));
-    Ok(SessionInput {
+    let input = SessionInput {
         compiler_version: scarb_version,
         profile: profile.to_string(),
         offline: common.offline,
@@ -3637,7 +3708,21 @@ fn build_session_input(
         cairo_edition,
         cairo_lang_version,
         build_env_fingerprint,
-    })
+    };
+    {
+        let mut cache = session_input_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.insert(
+            cache_key,
+            SessionInputCacheEntry {
+                manifest_size_bytes,
+                manifest_modified_unix_ms,
+                input: input.clone(),
+            },
+        );
+    }
+    Ok(input)
 }
 
 fn resolve_manifest_cairo_settings_from_manifest(
@@ -4786,6 +4871,72 @@ mod tests {
 
         std::env::remove_var("XBUILD_TEST_FINGERPRINT");
         std::env::remove_var("UC_BUILD_ENV_PREFIXES_EXTRA");
+    }
+
+    #[test]
+    fn session_input_cache_key_is_order_independent_for_features() {
+        let common_a = BuildCommonArgs {
+            manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
+            package: Some("demo".to_string()),
+            workspace: false,
+            features: vec!["b".to_string(), "a".to_string()],
+            offline: false,
+            release: false,
+            profile: None,
+        };
+        let common_b = BuildCommonArgs {
+            manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
+            package: Some("demo".to_string()),
+            workspace: false,
+            features: vec!["a".to_string(), "b".to_string(), "a".to_string()],
+            offline: false,
+            release: false,
+            profile: None,
+        };
+
+        let key_a = session_input_cache_key(
+            &common_a,
+            Path::new("/tmp/workspace/Scarb.toml"),
+            "dev",
+            "scarb 2.14.0",
+            "env-a",
+        );
+        let key_b = session_input_cache_key(
+            &common_b,
+            Path::new("/tmp/workspace/Scarb.toml"),
+            "dev",
+            "scarb 2.14.0",
+            "env-a",
+        );
+        assert_eq!(key_a, key_b);
+    }
+
+    #[test]
+    fn session_input_cache_key_changes_with_build_env_fingerprint() {
+        let common = BuildCommonArgs {
+            manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
+            package: Some("demo".to_string()),
+            workspace: false,
+            features: vec!["a".to_string()],
+            offline: false,
+            release: false,
+            profile: None,
+        };
+        let key_a = session_input_cache_key(
+            &common,
+            Path::new("/tmp/workspace/Scarb.toml"),
+            "dev",
+            "scarb 2.14.0",
+            "env-a",
+        );
+        let key_b = session_input_cache_key(
+            &common,
+            Path::new("/tmp/workspace/Scarb.toml"),
+            "dev",
+            "scarb 2.14.0",
+            "env-b",
+        );
+        assert_ne!(key_a, key_b);
     }
 
     #[test]

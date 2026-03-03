@@ -1,6 +1,6 @@
-# Stability Benchmark Summary (20260303-171712)
+# Stability Benchmark Summary (20260303-172944)
 
-- Generated at: 2026-03-03T23:22:51Z
+- Generated at: 2026-03-03T23:35:26Z
 - Matrix: smoke
 - Cycles: 5
 - Runs: 12
@@ -15,7 +15,7 @@
 
 | Scenario | Workload | Median p95 delta % | Mean p95 delta % | p95 delta stdev | Min p95 delta % | Max p95 delta % |
 |---|---|---:|---:|---:|---:|---:|
-| build.cold | scarb_smoke | 16.56 | -0.64 | 31.42 | -54.36 | 32.32 |
-| build.warm_edit | scarb_smoke | 98.32 | 97.82 | 0.83 | 96.36 | 98.54 |
-| build.warm_edit_semantic | scarb_smoke | -2.99 | -4.8 | 22.85 | -44.91 | 25.93 |
-| build.warm_noop | scarb_smoke | 66.99 | 68.3 | 5.12 | 61.07 | 76.25 |
+| build.cold | scarb_smoke | -0.97 | 2.96 | 10.62 | -8.79 | 22.79 |
+| build.warm_edit | scarb_smoke | 98.61 | 98.53 | 0.35 | 97.99 | 99.03 |
+| build.warm_edit_semantic | scarb_smoke | 9.49 | 10.14 | 17.82 | -16.08 | 36.87 |
+| build.warm_noop | scarb_smoke | 74.37 | 74.62 | 3.02 | 70.48 | 79.71 |
