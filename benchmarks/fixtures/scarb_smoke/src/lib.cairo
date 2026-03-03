@@ -1,4 +1,5 @@
 mod math;
+mod contract_patterns;
 
 fn smoke() -> felt252 {
     let seed = math::fib(8);

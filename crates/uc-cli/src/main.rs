@@ -52,6 +52,7 @@ const DAEMON_REQUEST_SIZE_LIMIT_BYTES: usize = 1024 * 1024;
 const DAEMON_RATE_WINDOW_SECONDS: u64 = 1;
 const DAEMON_MAX_REQUESTS_PER_WINDOW: usize = 32;
 const DAEMON_LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
+const ASYNC_PERSIST_ERROR_QUEUE_LIMIT: usize = 32;
 const CACHE_LOCK_STALE_AFTER_SECONDS: u64 = 300;
 const DEFAULT_MIN_SCARB_VERSION: &str = "2.14.0";
 const CACHEABLE_ARTIFACT_SUFFIXES: [&str; 5] = [
@@ -1683,12 +1684,18 @@ fn run_build_with_uc_cache(
     capture_output: bool,
     async_cache_persist: bool,
 ) -> Result<(CommandRun, bool, String, BuildPhaseTelemetry)> {
-    if let Some(err) = take_async_persist_error() {
+    let async_errors = take_async_persist_errors();
+    if !async_errors.is_empty() {
         if fail_on_async_cache_error() {
-            bail!("previous async cache persistence failed: {err}");
+            bail!(
+                "previous async cache persistence failed: {}",
+                async_errors.join(" | ")
+            );
         }
-        tracing::warn!(error = %err, "previous async cache persistence failed");
-        eprintln!("uc: warning: previous async cache persistence failed: {err}");
+        for err in async_errors {
+            tracing::warn!(error = %err, "previous async cache persistence failed");
+            eprintln!("uc: warning: previous async cache persistence failed: {err}");
+        }
     }
     let mut telemetry = BuildPhaseTelemetry::default();
     let canonical_workspace_root = workspace_root.canonicalize().with_context(|| {
@@ -1840,23 +1847,26 @@ fn clear_async_persist_in_flight(scope_key: &str) {
     in_flight.remove(scope_key);
 }
 
-fn async_persist_error_slot() -> &'static Mutex<Option<String>> {
-    static SLOT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(None))
+fn async_persist_error_slot() -> &'static Mutex<VecDeque<String>> {
+    static SLOT: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
 fn record_async_persist_error(error: String) {
     let mut slot = async_persist_error_slot()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *slot = Some(error);
+    slot.push_back(error);
+    while slot.len() > ASYNC_PERSIST_ERROR_QUEUE_LIMIT {
+        slot.pop_front();
+    }
 }
 
-fn take_async_persist_error() -> Option<String> {
+fn take_async_persist_errors() -> Vec<String> {
     let mut slot = async_persist_error_slot()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    slot.take()
+    slot.drain(..).collect()
 }
 
 struct AsyncPersistGuard {
@@ -3955,6 +3965,35 @@ mod tests {
             (2, 14, 0)
         );
         assert!(parse_scarb_semver("invalid-output").is_err());
+    }
+
+    #[test]
+    fn async_persist_error_queue_retains_multiple_failures() {
+        let _ = take_async_persist_errors();
+        record_async_persist_error("err-a".to_string());
+        record_async_persist_error("err-b".to_string());
+
+        assert_eq!(
+            take_async_persist_errors(),
+            vec!["err-a".to_string(), "err-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn async_persist_error_queue_drops_oldest_when_over_capacity() {
+        let _ = take_async_persist_errors();
+        let overflow = ASYNC_PERSIST_ERROR_QUEUE_LIMIT + 3;
+        for i in 0..overflow {
+            record_async_persist_error(format!("err-{i}"));
+        }
+
+        let drained = take_async_persist_errors();
+        assert_eq!(drained.len(), ASYNC_PERSIST_ERROR_QUEUE_LIMIT);
+        assert_eq!(drained.first().map(String::as_str), Some("err-3"));
+        assert_eq!(
+            drained.last().map(String::as_str),
+            Some(format!("err-{}", overflow - 1).as_str())
+        );
     }
 
     #[test]
