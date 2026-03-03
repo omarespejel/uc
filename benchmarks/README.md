@@ -1,17 +1,22 @@
 # Benchmarks
 
-Benchmark harness and baseline artifacts for Scarb vs `uc` performance tracking.
+Benchmark harness and baseline artifacts for Scarb vs `uc` performance and parity tracking.
 
 ## Folders
 - `scenarios.md`: scenario definitions.
-- `scripts/`: benchmark runner scripts.
+- `scripts/`: benchmark and comparator runners.
 - `fixtures/`: local fixture projects for CI smoke runs.
-- `results/`: transient benchmark outputs.
+- `results/`: transient benchmark and comparator outputs.
 - `baselines/`: committed baseline snapshots.
 
-## Run
+## Run Baseline Matrix
 ```bash
-./benchmarks/scripts/run_local_benchmarks.sh
+./benchmarks/scripts/run_local_benchmarks.sh --matrix research
+```
+
+## Run Dual-Run Comparator
+```bash
+./benchmarks/scripts/run_dual_run_comparator.sh
 ```
 
 ## Modes

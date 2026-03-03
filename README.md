@@ -18,6 +18,7 @@ See:
 - `docs/FIRST_PROOF.md`
 - `docs/BENCHMARK_PLAN.md`
 - `docs/ARCHITECTURE_BLUEPRINT.md`
+- `docs/COMMAND_SURFACE.md`
 
 ## Repository Structure
 - `docs/`: product, architecture, roadmap, KPIs, operating model, cutover.
@@ -31,15 +32,18 @@ See:
 ```bash
 make bootstrap
 make benchmark-local
-make gh-bootstrap
+make compare-local
+cargo run -p uc-cli -- build --manifest-path /path/to/Scarb.toml
+cargo run -p uc-cli -- compare-build --manifest-path /path/to/Scarb.toml
 ```
 
 ## Tooling
 - `scarb`
 - `jq`
 - `git`
+- `cargo`
 
 ## Current Status
 - Program foundations are set.
-- Baseline benchmarking against Scarb is now automated and tracked in this repo.
-- Work is executed in a single delivery stream with milestone gates.
+- Baseline benchmarking against Scarb is automated and committed.
+- `uc` now has executable commands for build, metadata, benchmark orchestration, and dual-run comparator reports.

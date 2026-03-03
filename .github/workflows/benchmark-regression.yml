@@ -24,6 +24,16 @@ jobs:
           chmod +x benchmarks/scripts/run_local_benchmarks.sh
           ./benchmarks/scripts/run_local_benchmarks.sh --matrix smoke
 
+      - name: Build uc CLI
+        run: cargo build -p uc-cli
+
+      - name: Run smoke compare-build gate
+        run: |
+          ./target/debug/uc compare-build \
+            --manifest-path benchmarks/fixtures/scarb_smoke/Scarb.toml \
+            --clean-before-each true \
+            --output-path benchmarks/results/compare-smoke.json
+
       - name: Upload benchmark artifacts
         uses: actions/upload-artifact@v4
         with:

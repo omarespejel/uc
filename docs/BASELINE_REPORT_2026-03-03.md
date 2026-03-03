@@ -34,3 +34,11 @@ Command used:
 ## Artifacts
 - `benchmarks/baselines/2026-03-03-scarb-baseline.json`
 - `benchmarks/baselines/2026-03-03-scarb-baseline.md`
+
+## Comparator Baseline
+- `hello_world`: 0 artifact mismatches, diagnostics similarity 100%.
+- `workspaces`: 0 artifact mismatches, diagnostics similarity 100%.
+- Detailed artifacts:
+  - `benchmarks/baselines/2026-03-03-compare-summary.md`
+  - `benchmarks/baselines/2026-03-03-compare-hello_world.json`
+  - `benchmarks/baselines/2026-03-03-compare-workspaces.json`

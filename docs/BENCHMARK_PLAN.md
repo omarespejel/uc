@@ -24,11 +24,18 @@ Measure and prove that `uc` outperforms Scarb on real workflows while maintainin
 ## Baseline Rule
 Before changing `uc` engine behavior, rerun baseline against current Scarb and snapshot results.
 
+## Comparator Rule
+Every build-path engine change must run dual-run comparison (`scarb-direct` vs `uc build`) and record:
+- artifact mismatch count,
+- diagnostics similarity,
+- candidate vs baseline elapsed time.
+
 ## Gate Thresholds
 - Gate A: warm rebuild p95 >= 40% faster than Scarb baseline.
 - Gate A: zero artifact hash mismatches and diagnostics parity >= 99.5%.
 
 ## Execution
 ```bash
-./benchmarks/scripts/run_local_benchmarks.sh
+./benchmarks/scripts/run_local_benchmarks.sh --matrix research
+./benchmarks/scripts/run_dual_run_comparator.sh
 ```

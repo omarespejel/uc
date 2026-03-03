@@ -20,6 +20,11 @@ For repeated builds in the same workspace:
 3. Diagnostics comparator report.
 4. Reliability report for fallback and daemon restart behavior.
 
+## Current Execution Hooks
+- Baseline benchmark harness: `benchmarks/scripts/run_local_benchmarks.sh`
+- Dual-run comparator harness: `benchmarks/scripts/run_dual_run_comparator.sh`
+- CLI compare command: `uc compare-build --manifest-path <Scarb.toml>`
+
 ## Gate Outcome
 - Go: all criteria pass.
 - No-Go: criteria miss after one stabilization cycle.
