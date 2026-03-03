@@ -16,7 +16,7 @@ This synthesis consolidates all prior deep research completed in `/Users/espejel
 - Lint/test workflows are strong candidates for incremental reuse wins.
 
 ## Product Implication
-`uc` should be built as a full replacement, but the first validated wedge is build-path acceleration with hard correctness gates.
+`uc` should be built as a next-generation compiler platform, with build-path acceleration as the first validated wedge and hard correctness gates.
 
 ## Program Decision
 - Replacement strategy: full `uc` command surface over time.

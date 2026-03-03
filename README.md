@@ -1,6 +1,6 @@
 # uc
 
-`uc` is a next-generation Cairo package manager and build/proving engine that will replace Scarb for our workflows.
+`uc` is a next-generation Cairo package manager and build/proving engine for high-performance workflows.
 
 ## Mission
 - Deliver materially faster developer and CI loops than Scarb.
@@ -12,7 +12,7 @@ The first thing we must prove is that `uc` beats Scarb on warm rebuild latency w
 
 - Hypothesis: `uc` can reduce warm `edit -> build` p95 by at least 40%.
 - Guardrails: zero artifact hash mismatches and diagnostics parity >= 99.5%.
-- Decision gate: continue full replacement only if proof passes.
+- Decision gate: continue platform rollout only if proof passes.
 
 See:
 - `docs/FIRST_PROOF.md`

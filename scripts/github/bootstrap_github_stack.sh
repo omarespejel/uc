@@ -49,7 +49,7 @@ create_milestone "M0 Foundations" "Program setup, benchmark harness, KPI stack."
 create_milestone "M1 Core Engine MVP" "Daemonized build MVP and dual-run comparator."
 create_milestone "M2 Migration Tooling" "Project migration path and core command surface."
 create_milestone "M3 CI and Proving" "Remote cache and proving acceleration."
-create_milestone "M4 Cutover" "Org-wide cutover and legacy sunset."
+create_milestone "M4 Cutover" "Org-wide rollout and legacy lane deprecation."
 
 echo "Seeding core issues"
 
@@ -158,8 +158,8 @@ create_issue_if_missing \
   "$M3"
 
 create_issue_if_missing \
-  "epic: Cutover and Scarb sunset execution" \
-  "Drive uc default switch in CI and manage legacy lane retirement." \
+  "epic: Platform cutover execution" \
+  "Drive uc default switch in CI and manage legacy compatibility lane retirement." \
   "type:epic,priority:p1,area:migration" \
   "$M4"
 

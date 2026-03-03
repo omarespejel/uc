@@ -12,7 +12,7 @@ For repeated builds in the same workspace:
 ## Why This First
 - It validates the core product value quickly.
 - It derisks architecture before broad command implementation.
-- It creates a hard Go/No-Go gate for replacement investment.
+- It creates a hard Go/No-Go gate for platform investment.
 
 ## Required Evidence
 1. Benchmark report across matrix workloads.

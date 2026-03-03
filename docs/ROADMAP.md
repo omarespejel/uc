@@ -10,7 +10,7 @@
 - `uc` compile service MVP with session lifecycle.
 - Dual-run comparator for artifact and diagnostics parity.
 - Performance gate run across benchmark matrix.
-- Go/No-Go decision for full replacement continuation.
+- Go/No-Go decision for platform continuation.
 
 ## Milestone 2: Command Surface Expansion (6 weeks)
 - Add `check`, `test`, `lint`, `metadata` on `uc` core path.
@@ -25,7 +25,7 @@
 ## Milestone 4: Cutover and Sunset (4 weeks)
 - `uc` default in org CI.
 - Workspace migration completion dashboard.
-- Legacy Scarb lane deprecation and sunset.
+- Legacy compatibility lane deprecation and sunset.
 
 ## Stage Gates
 - Gate A: warm p95 improvement >= 40% with correctness parity.

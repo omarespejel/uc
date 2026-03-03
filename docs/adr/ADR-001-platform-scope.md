@@ -1,10 +1,10 @@
-# ADR-001: Full Replacement Scope
+# ADR-001: Platform Scope
 
 ## Status
 Accepted
 
 ## Decision
-`uc` will replace Scarb for our workflows rather than remaining a narrow compatibility acceleration layer.
+`uc` is positioned as a next-generation Cairo compiler/build platform rather than a narrow acceleration add-on.
 
 ## Rationale
 - Maximizes architecture freedom for 2026+ performance and platform goals.

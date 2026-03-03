@@ -1,7 +1,7 @@
 # Decision Log (2026-03-03)
 
 ## D1: Product Direction
-Decision: `uc` is a full Scarb replacement program, not a small plugin-only acceleration layer.
+Decision: `uc` is a next-generation compiler program, not a small plugin-only acceleration layer.
 
 ## D2: First Proof Gate
 Decision: first gate is warm rebuild performance + correctness parity on benchmark matrix.

@@ -1,7 +1,7 @@
 # Architecture Blueprint
 
 ## Goal
-Build `uc` as a full Scarb replacement with a performance-first architecture.
+Build `uc` as a next-generation compiler platform with a performance-first architecture.
 
 ## Top-Level Components
 1. `uc-cli`
@@ -34,7 +34,7 @@ Build `uc` as a full Scarb replacement with a performance-first architecture.
 5. Comparator runs in dual mode until cutover confidence is met.
 
 ## Non-Goals (initial proof)
-- LSP replacement.
+- LSP-native support.
 - Full STWO proof cache optimization.
 
 ## Key Technical Constraints
