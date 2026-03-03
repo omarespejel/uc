@@ -15,8 +15,8 @@ use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::Mutex;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use toml::Value as TomlValue;
@@ -43,6 +43,7 @@ const MAX_FINGERPRINT_INDEX_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_ARTIFACT_INDEX_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CAPTURE_STDOUT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CAPTURE_STDERR_BYTES: u64 = 16 * 1024 * 1024;
+const DEFAULT_MAX_CACHE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const FINGERPRINT_INDEX_SCHEMA_VERSION: u32 = 1;
 const ARTIFACT_INDEX_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_DIAGNOSTICS_SIMILARITY_THRESHOLD: f64 = 99.5;
@@ -70,7 +71,9 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     Daemon(DaemonArgs),
+    #[command(hide = true)]
     Benchmark(BenchmarkArgs),
+    Cache(CacheArgs),
     SessionKey(SessionKeyArgs),
     Build(BuildArgs),
     Metadata(MetadataArgs),
@@ -88,9 +91,27 @@ struct DaemonArgs {
 enum DaemonCommand {
     Start(DaemonSocketArgs),
     Status(DaemonSocketArgs),
+    Health(DaemonSocketArgs),
     Stop(DaemonSocketArgs),
     #[command(hide = true)]
     Serve(DaemonSocketArgs),
+}
+
+#[derive(Args, Debug)]
+struct CacheArgs {
+    #[command(subcommand)]
+    command: CacheCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum CacheCommand {
+    Clean(CacheCleanArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct CacheCleanArgs {
+    #[arg(long)]
+    manifest_path: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -176,6 +197,12 @@ struct SessionKeyArgs {
 
     #[arg(long)]
     profile: String,
+
+    #[arg(long, default_value_t = false)]
+    offline: bool,
+
+    #[arg(long)]
+    package: Option<String>,
 
     #[arg(long, value_delimiter = ',')]
     features: Vec<String>,
@@ -382,6 +409,11 @@ struct DaemonStatusPayload {
     pid: u32,
     started_at_epoch_ms: u64,
     socket_path: String,
+    healthy: bool,
+    total_requests: u64,
+    failed_requests: u64,
+    rate_limited_requests: u64,
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -456,6 +488,15 @@ struct DaemonRateLimiter {
     events: VecDeque<Instant>,
 }
 
+#[derive(Debug, Default, Clone)]
+struct DaemonHealth {
+    total_requests: u64,
+    failed_requests: u64,
+    rate_limited_requests: u64,
+    consecutive_failures: u64,
+    last_error: Option<String>,
+}
+
 impl DaemonRateLimiter {
     fn new() -> Self {
         Self {
@@ -517,6 +558,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Daemon(args) => run_daemon(args),
         Commands::Benchmark(args) => run_benchmark(args),
+        Commands::Cache(args) => run_cache(args),
         Commands::SessionKey(args) => run_session_key(args),
         Commands::Build(args) => run_build(args),
         Commands::Metadata(args) => run_metadata(args),
@@ -559,6 +601,23 @@ fn parse_env_usize(name: &str, default: usize) -> usize {
                 default
             }
         },
+        Err(_) => default,
+    }
+}
+
+fn parse_env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(raw) => {
+            let normalized = raw.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "1" | "true" | "yes" | "on" => true,
+                "0" | "false" | "no" | "off" => false,
+                _ => {
+                    eprintln!("uc: warning: invalid {name} value `{raw}`, using default {default}");
+                    default
+                }
+            }
+        }
         Err(_) => default,
     }
 }
@@ -629,6 +688,16 @@ fn max_capture_stderr_bytes() -> u64 {
     *VALUE.get_or_init(|| parse_env_u64("UC_MAX_CAPTURE_STDERR_BYTES", MAX_CAPTURE_STDERR_BYTES))
 }
 
+fn max_cache_bytes() -> u64 {
+    static VALUE: OnceLock<u64> = OnceLock::new();
+    *VALUE.get_or_init(|| parse_env_u64("UC_MAX_CACHE_BYTES", DEFAULT_MAX_CACHE_BYTES))
+}
+
+fn fail_on_async_cache_error() -> bool {
+    static VALUE: OnceLock<bool> = OnceLock::new();
+    *VALUE.get_or_init(|| parse_env_bool("UC_FAIL_ON_ASYNC_CACHE_ERROR", false))
+}
+
 fn should_log_phase_telemetry() -> bool {
     match std::env::var("UC_PHASE_TIMING") {
         Ok(raw) => {
@@ -655,9 +724,33 @@ fn run_daemon(args: DaemonArgs) -> Result<()> {
     match args.command {
         DaemonCommand::Start(socket) => run_daemon_start(socket),
         DaemonCommand::Status(socket) => run_daemon_status(socket),
+        DaemonCommand::Health(socket) => run_daemon_health(socket),
         DaemonCommand::Stop(socket) => run_daemon_stop(socket),
         DaemonCommand::Serve(socket) => run_daemon_serve(socket),
     }
+}
+
+fn run_cache(args: CacheArgs) -> Result<()> {
+    match args.command {
+        CacheCommand::Clean(clean) => run_cache_clean(clean),
+    }
+}
+
+fn run_cache_clean(args: CacheCleanArgs) -> Result<()> {
+    let manifest_path = resolve_manifest_path(&args.manifest_path)?;
+    let workspace_root = manifest_path
+        .parent()
+        .context("manifest path has no parent")?
+        .to_path_buf();
+    let cache_root = workspace_root.join(".uc/cache");
+    if !cache_root.exists() {
+        println!("uc cache is already clean: {}", cache_root.display());
+        return Ok(());
+    }
+    fs::remove_dir_all(&cache_root)
+        .with_context(|| format!("failed to remove cache directory {}", cache_root.display()))?;
+    println!("uc cache cleaned: {}", cache_root.display());
+    Ok(())
 }
 
 fn run_daemon_start(args: DaemonSocketArgs) -> Result<()> {
@@ -747,10 +840,53 @@ fn run_daemon_status(args: DaemonSocketArgs) -> Result<()> {
         let status = daemon_ping(&socket_path)
             .with_context(|| format!("daemon not reachable on {}", socket_path.display()))?;
         println!(
-            "uc daemon running (pid={}, started_at_epoch_ms={}, socket={})",
-            status.pid, status.started_at_epoch_ms, status.socket_path
+            "uc daemon running (pid={}, started_at_epoch_ms={}, socket={}, healthy={}, total_requests={}, failed_requests={}, rate_limited_requests={}, last_error={})",
+            status.pid,
+            status.started_at_epoch_ms,
+            status.socket_path,
+            status.healthy,
+            status.total_requests,
+            status.failed_requests,
+            status.rate_limited_requests,
+            status
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "none".to_string())
         );
         Ok(())
+    }
+}
+
+fn run_daemon_health(args: DaemonSocketArgs) -> Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = args;
+        bail!("daemon mode is currently supported on Unix platforms only");
+    }
+    #[cfg(unix)]
+    {
+        let socket_path = daemon_socket_path(args.socket_path)?;
+        let status = daemon_ping(&socket_path)
+            .with_context(|| format!("daemon not reachable on {}", socket_path.display()))?;
+        if status.healthy {
+            println!(
+                "healthy (pid={}, total_requests={}, failed_requests={}, rate_limited_requests={})",
+                status.pid,
+                status.total_requests,
+                status.failed_requests,
+                status.rate_limited_requests
+            );
+            Ok(())
+        } else {
+            bail!(
+                "unhealthy daemon on {}: last_error={}",
+                status.socket_path,
+                status
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string())
+            )
+        }
     }
 }
 
@@ -822,7 +958,13 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
             pid: std::process::id(),
             started_at_epoch_ms: epoch_ms_u64()?,
             socket_path: socket_path.display().to_string(),
+            healthy: true,
+            total_requests: 0,
+            failed_requests: 0,
+            rate_limited_requests: 0,
+            last_error: None,
         };
+        let health = Arc::new(Mutex::new(DaemonHealth::default()));
         let mut rate_limiter = DaemonRateLimiter::new();
 
         let mut should_shutdown = false;
@@ -832,9 +974,11 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
                     if let Err(err) = handle_daemon_connection(
                         stream,
                         &status,
+                        &health,
                         &mut should_shutdown,
                         &mut rate_limiter,
                     ) {
+                        record_daemon_failure(&health, format!("{err:#}"));
                         eprintln!("uc daemon: request handling failed: {err:#}");
                     }
                 }
@@ -852,11 +996,23 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
 }
 
 fn run_benchmark(args: BenchmarkArgs) -> Result<()> {
-    let root = workspace_root().context("failed to resolve workspace root")?;
-    let script = root.join("benchmarks/scripts/run_local_benchmarks.sh");
+    if !parse_env_bool("UC_ENABLE_BENCHMARK_COMMAND", false) {
+        bail!(
+            "`uc benchmark` is a development-only command. Set UC_ENABLE_BENCHMARK_COMMAND=1 to enable it."
+        );
+    }
+    let script = if let Some(path) = std::env::var_os("UC_BENCHMARK_SCRIPT") {
+        PathBuf::from(path)
+    } else {
+        let root = benchmark_repo_root().context("failed to resolve benchmark script root")?;
+        root.join("benchmarks/scripts/run_local_benchmarks.sh")
+    };
 
     if !script.exists() {
-        bail!("benchmark script not found at {}", script.display());
+        bail!(
+            "benchmark script not found at {}. Set UC_BENCHMARK_SCRIPT to an explicit path.",
+            script.display()
+        );
     }
 
     let mut command = Command::new(&script);
@@ -887,6 +1043,8 @@ fn run_session_key(args: SessionKeyArgs) -> Result<()> {
     let input = SessionInput {
         compiler_version: args.compiler_version,
         profile: args.profile,
+        offline: args.offline,
+        package: args.package,
         features: args.features,
         cfg_set: args.cfg_set,
         manifest_content_hash: args.manifest_content_hash,
@@ -898,6 +1056,7 @@ fn run_session_key(args: SessionKeyArgs) -> Result<()> {
 }
 
 fn run_build(args: BuildArgs) -> Result<()> {
+    validate_scarb_toolchain()?;
     let common = args.common;
     let report_path = args.report_path;
     let write_report = report_path.is_some();
@@ -1122,6 +1281,7 @@ fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildRespon
 }
 
 fn run_metadata(args: MetadataArgs) -> Result<()> {
+    validate_scarb_toolchain()?;
     let manifest_path = resolve_manifest_path(&args.manifest_path)?;
     let (command, command_vec) = scarb_metadata_command(&args, &manifest_path);
     let write_report = args.report_path.is_some();
@@ -1265,6 +1425,7 @@ fn run_migrate(args: MigrateArgs) -> Result<()> {
 }
 
 fn run_compare_build(args: CompareBuildArgs) -> Result<()> {
+    validate_scarb_toolchain()?;
     let common = args.common;
     let manifest_path = resolve_manifest_path(&common.manifest_path)?;
     let workspace_root = manifest_path
@@ -1357,6 +1518,12 @@ fn run_build_with_uc_cache(
     capture_output: bool,
     async_cache_persist: bool,
 ) -> Result<(CommandRun, bool, String, BuildPhaseTelemetry)> {
+    if let Some(err) = take_async_persist_error() {
+        if fail_on_async_cache_error() {
+            bail!("previous async cache persistence failed: {err}");
+        }
+        eprintln!("uc: warning: previous async cache persistence failed: {err}");
+    }
     let mut telemetry = BuildPhaseTelemetry::default();
     let canonical_workspace_root = workspace_root.canonicalize().with_context(|| {
         format!(
@@ -1461,6 +1628,7 @@ fn run_build_with_uc_cache(
                         &objects_dir,
                         &entry_path,
                     ) {
+                        record_async_persist_error(err.to_string());
                         eprintln!("uc: warning: async cache persistence failed: {err:#}");
                     }
                 });
@@ -1503,6 +1671,25 @@ fn clear_async_persist_in_flight(scope_key: &str) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     in_flight.remove(scope_key);
+}
+
+fn async_persist_error_slot() -> &'static Mutex<Option<String>> {
+    static SLOT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+fn record_async_persist_error(error: String) {
+    let mut slot = async_persist_error_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = Some(error);
+}
+
+fn take_async_persist_error() -> Option<String> {
+    let mut slot = async_persist_error_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    slot.take()
 }
 
 struct AsyncPersistGuard {
@@ -1551,7 +1738,113 @@ fn persist_cache_entry_for_build(
     let cached_artifacts =
         collect_cached_artifacts_for_entry(workspace_root, profile, cache_root, objects_dir)?;
     let _cache_lock = acquire_cache_lock(cache_root)?;
-    persist_cache_entry(profile, fingerprint, &cached_artifacts, entry_path)
+    persist_cache_entry(profile, fingerprint, &cached_artifacts, entry_path)?;
+    enforce_cache_size_budget(cache_root)
+}
+
+fn enforce_cache_size_budget(cache_root: &Path) -> Result<()> {
+    let budget = max_cache_bytes();
+    if budget == 0 || !cache_root.exists() {
+        return Ok(());
+    }
+
+    #[derive(Clone)]
+    struct CacheFile {
+        path: PathBuf,
+        size: u64,
+        modified_ms: u64,
+        is_object: bool,
+    }
+
+    let mut files = Vec::<CacheFile>::new();
+    let mut total = 0_u64;
+    for entry in WalkDir::new(cache_root).follow_links(false).into_iter() {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to traverse cache tree under {}",
+                cache_root.display()
+            )
+        })?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if !is_removable_cache_file(path) {
+            continue;
+        }
+        let metadata =
+            fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+        let size = metadata.len();
+        total = total.saturating_add(size);
+        let modified_ms = metadata_modified_unix_ms(&metadata).unwrap_or_default();
+        let is_object = path
+            .components()
+            .any(|c| matches!(c, Component::Normal(name) if name == "objects"));
+        files.push(CacheFile {
+            path: path.to_path_buf(),
+            size,
+            modified_ms,
+            is_object,
+        });
+    }
+
+    if total <= budget {
+        if total > (budget.saturating_mul(9) / 10) {
+            eprintln!("uc: cache usage is high: {total} / {budget} bytes");
+        }
+        return Ok(());
+    }
+
+    files.sort_by(|a, b| {
+        a.is_object
+            .cmp(&b.is_object)
+            .reverse()
+            .then_with(|| a.modified_ms.cmp(&b.modified_ms))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+
+    let mut removed = 0_u64;
+    for file in files {
+        if total <= budget {
+            break;
+        }
+        match fs::remove_file(&file.path) {
+            Ok(()) => {
+                total = total.saturating_sub(file.size);
+                removed = removed.saturating_add(file.size);
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                total = total.saturating_sub(file.size);
+            }
+            Err(err) => {
+                eprintln!(
+                    "uc: warning: failed to evict cache file {}: {err}",
+                    file.path.display()
+                );
+            }
+        }
+    }
+
+    if removed > 0 {
+        eprintln!(
+            "uc: cache eviction removed {} bytes (budget {} bytes)",
+            removed, budget
+        );
+    }
+    if total > budget {
+        eprintln!(
+            "uc: warning: cache remains over budget after eviction ({} > {} bytes)",
+            total, budget
+        );
+    }
+    Ok(())
+}
+
+fn is_removable_cache_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|v| v.to_str()) else {
+        return false;
+    };
+    name != ".lock"
 }
 
 fn load_cache_entry(path: &Path) -> Result<Option<BuildCacheEntry>> {
@@ -1706,14 +1999,19 @@ fn normalize_fingerprint_path(path: &Path) -> String {
 }
 
 fn atomic_write_bytes(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
     let parent = path
         .parent()
         .context("cannot atomically write file without parent directory")?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
     let stem = path.file_name().and_then(|v| v.to_str()).unwrap_or("file");
+    let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let thread_id = format!("{:?}", thread::current().id());
     let temp_path = parent.join(format!(
-        ".{stem}.tmp.{}.{}",
+        ".{stem}.tmp.{}.{}.{}.{}",
         std::process::id(),
+        thread_id,
+        temp_id,
         epoch_ms_u64().unwrap_or_default()
     ));
     fs::write(&temp_path, bytes).with_context(|| {
@@ -1794,6 +2092,7 @@ fn compute_build_fingerprint(
 ) -> Result<String> {
     let mut hasher = Hasher::new();
     hasher.update(b"uc-build-fingerprint-v1");
+    hasher.update(scarb_version_line()?.as_bytes());
     let canonical_manifest = manifest_path
         .canonicalize()
         .with_context(|| format!("failed to canonicalize {}", manifest_path.display()))?;
@@ -2475,8 +2774,15 @@ fn scarb_version_line() -> Result<String> {
         .arg("--version")
         .output()
         .context("failed to execute `scarb --version`")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("`scarb --version` failed: {}", stderr.trim());
+    }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let first = stdout.lines().next().unwrap_or("scarb unknown").trim();
+    if first.is_empty() || first == "scarb unknown" {
+        bail!("failed to parse `scarb --version` output");
+    }
     let version = first.to_string();
     let _ = SCARB_VERSION_CACHE.set(version.clone());
     Ok(version)
@@ -2489,11 +2795,16 @@ fn build_session_input(
 ) -> Result<SessionInput> {
     let scarb_version = scarb_version_line()?;
     let manifest_content_hash = compute_manifest_content_hash(manifest_path)?;
+    let mut cfg_set = build_session_cfg_set(manifest_path)?;
+    cfg_set.push(format!("workspace:{}", common.workspace));
+    cfg_set.push(format!("release:{}", common.release));
     Ok(SessionInput {
         compiler_version: scarb_version,
         profile: profile.to_string(),
+        offline: common.offline,
+        package: common.package.clone(),
         features: common.features.clone(),
-        cfg_set: Vec::new(),
+        cfg_set,
         manifest_content_hash,
         target_family: if common.workspace {
             "workspace".to_string()
@@ -2501,6 +2812,65 @@ fn build_session_input(
             "package".to_string()
         },
     })
+}
+
+fn build_session_cfg_set(manifest_path: &Path) -> Result<Vec<String>> {
+    let manifest_text = read_text_file_with_limit(manifest_path, MAX_MANIFEST_BYTES, "manifest")?;
+    let manifest = manifest_text.parse::<TomlValue>().with_context(|| {
+        format!(
+            "failed to parse manifest for session key {}",
+            manifest_path.display()
+        )
+    })?;
+    let mut cfg_set = Vec::new();
+    if let Some(cairo) = manifest.get("cairo") {
+        cfg_set.push(format!(
+            "manifest:cairo={}",
+            stable_toml_fragment_hash(cairo)?
+        ));
+    }
+    if let Some(target) = manifest.get("target") {
+        cfg_set.push(format!(
+            "manifest:target={}",
+            stable_toml_fragment_hash(target)?
+        ));
+    }
+    if let Some(tool) = manifest.get("tool") {
+        cfg_set.push(format!(
+            "manifest:tool={}",
+            stable_toml_fragment_hash(tool)?
+        ));
+    }
+    Ok(cfg_set)
+}
+
+fn stable_toml_fragment_hash(value: &TomlValue) -> Result<String> {
+    let json_value =
+        serde_json::to_value(value).context("failed to serialize TOML fragment for session key")?;
+    let canonical_json = canonicalize_json_value(&json_value);
+    let canonical_bytes = serde_json::to_vec(&canonical_json)
+        .context("failed to encode canonical TOML fragment for session key")?;
+    let mut hasher = Hasher::new();
+    hasher.update(&canonical_bytes);
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn canonicalize_json_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            let mut canonical = serde_json::Map::new();
+            for (key, item) in entries {
+                canonical.insert(key.clone(), canonicalize_json_value(item));
+            }
+            serde_json::Value::Object(canonical)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(canonicalize_json_value).collect())
+        }
+        _ => value.clone(),
+    }
 }
 
 fn exit_code_from_status(status: &ExitStatus) -> i32 {
@@ -2801,9 +3171,64 @@ fn daemon_ping(socket_path: &Path) -> Result<DaemonStatusPayload> {
 }
 
 #[cfg(unix)]
+fn daemon_status_snapshot(
+    base: &DaemonStatusPayload,
+    health: &Arc<Mutex<DaemonHealth>>,
+) -> DaemonStatusPayload {
+    let snapshot = health
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    DaemonStatusPayload {
+        pid: base.pid,
+        started_at_epoch_ms: base.started_at_epoch_ms,
+        socket_path: base.socket_path.clone(),
+        healthy: snapshot.consecutive_failures < 3,
+        total_requests: snapshot.total_requests,
+        failed_requests: snapshot.failed_requests,
+        rate_limited_requests: snapshot.rate_limited_requests,
+        last_error: snapshot.last_error,
+    }
+}
+
+#[cfg(unix)]
+fn record_daemon_success(health: &Arc<Mutex<DaemonHealth>>) {
+    let mut state = health
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.total_requests = state.total_requests.saturating_add(1);
+    state.consecutive_failures = 0;
+    state.last_error = None;
+}
+
+#[cfg(unix)]
+fn record_daemon_failure(health: &Arc<Mutex<DaemonHealth>>, error: String) {
+    let mut state = health
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.total_requests = state.total_requests.saturating_add(1);
+    state.failed_requests = state.failed_requests.saturating_add(1);
+    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+    state.last_error = Some(error);
+}
+
+#[cfg(unix)]
+fn record_daemon_rate_limit(health: &Arc<Mutex<DaemonHealth>>) {
+    let mut state = health
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.total_requests = state.total_requests.saturating_add(1);
+    state.failed_requests = state.failed_requests.saturating_add(1);
+    state.rate_limited_requests = state.rate_limited_requests.saturating_add(1);
+    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+    state.last_error = Some("daemon rate limit exceeded; retry shortly".to_string());
+}
+
+#[cfg(unix)]
 fn handle_daemon_connection(
     mut stream: UnixStream,
     status: &DaemonStatusPayload,
+    health: &Arc<Mutex<DaemonHealth>>,
     should_shutdown: &mut bool,
     rate_limiter: &mut DaemonRateLimiter,
 ) -> Result<()> {
@@ -2825,7 +3250,9 @@ fn handle_daemon_connection(
     if request_line.trim().is_empty() {
         return Ok(());
     }
+
     if !rate_limiter.allow() {
+        record_daemon_rate_limit(health);
         let response = DaemonResponse::Error {
             message: "daemon rate limit exceeded; retry shortly".to_string(),
         };
@@ -2840,19 +3267,45 @@ fn handle_daemon_connection(
         return Ok(());
     }
 
-    let request: DaemonRequest =
-        serde_json::from_str(request_line.trim_end()).context("failed to parse daemon request")?;
+    let request: DaemonRequest = match serde_json::from_str(request_line.trim_end()) {
+        Ok(request) => request,
+        Err(err) => {
+            let message = format!("failed to parse daemon request: {err}");
+            record_daemon_failure(health, message.clone());
+            let response = DaemonResponse::Error { message };
+            let payload =
+                serde_json::to_vec(&response).context("failed to encode daemon response")?;
+            stream
+                .write_all(&payload)
+                .context("failed to write daemon response")?;
+            stream
+                .write_all(b"\n")
+                .context("failed to write daemon response newline")?;
+            stream.flush().context("failed to flush daemon response")?;
+            return Ok(());
+        }
+    };
+
     let response = match request {
-        DaemonRequest::Ping => DaemonResponse::Pong(status.clone()),
+        DaemonRequest::Ping => {
+            record_daemon_success(health);
+            DaemonResponse::Pong(daemon_status_snapshot(status, health))
+        }
         DaemonRequest::Shutdown => {
+            record_daemon_success(health);
             *should_shutdown = true;
             DaemonResponse::Ack
         }
         DaemonRequest::Build(request) => match execute_daemon_build(request) {
-            Ok(result) => DaemonResponse::Build(result),
-            Err(err) => DaemonResponse::Error {
-                message: format!("{err:#}"),
-            },
+            Ok(result) => {
+                record_daemon_success(health);
+                DaemonResponse::Build(result)
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                record_daemon_failure(health, message.clone());
+                DaemonResponse::Error { message }
+            }
         },
     };
 
@@ -2917,7 +3370,7 @@ fn write_uc_toml(
     let mut source = toml::map::Map::new();
     source.insert(
         "scarb_manifest".to_string(),
-        TomlValue::String(source_manifest.to_string_lossy().to_string()),
+        TomlValue::String(source_manifest.to_string_lossy().replace('\\', "/")),
     );
 
     let mut root = toml::map::Map::new();
@@ -2970,11 +3423,48 @@ fn workspace_root() -> Result<PathBuf> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     for candidate in cwd.ancestors() {
         let root = candidate.to_path_buf();
-        let cargo_manifest = root.join("Cargo.toml");
-        let uc_cli_manifest = root.join("crates/uc-cli/Cargo.toml");
-        if cargo_manifest.is_file() && uc_cli_manifest.is_file() {
+        if root.join("Scarb.toml").is_file() {
             return Ok(root);
         }
     }
     Ok(cwd)
+}
+
+fn benchmark_repo_root() -> Result<PathBuf> {
+    if let Some(root) = std::env::var_os("UC_BENCHMARK_REPO_ROOT") {
+        return PathBuf::from(root)
+            .canonicalize()
+            .context("failed to canonicalize UC_BENCHMARK_REPO_ROOT");
+    }
+
+    let cwd = std::env::current_dir()?.canonicalize()?;
+    for candidate in cwd.ancestors() {
+        let root = candidate.to_path_buf();
+        if root
+            .join("benchmarks/scripts/run_local_benchmarks.sh")
+            .is_file()
+        {
+            return Ok(root);
+        }
+    }
+
+    bail!(
+        "failed to locate benchmark repository root from {} (set UC_BENCHMARK_SCRIPT or UC_BENCHMARK_REPO_ROOT)",
+        cwd.display()
+    )
+}
+
+fn validate_scarb_toolchain() -> Result<()> {
+    let version = scarb_version_line()?;
+    if !version.to_ascii_lowercase().starts_with("scarb ") {
+        bail!("unexpected `scarb --version` output: {version}");
+    }
+    if let Ok(expected) = std::env::var("UC_EXPECT_SCARB_VERSION") {
+        if !version.contains(&expected) {
+            bail!(
+                "scarb version mismatch: expected token `{expected}` in `{version}` (set by UC_EXPECT_SCARB_VERSION)"
+            );
+        }
+    }
+    Ok(())
 }

@@ -2,6 +2,8 @@
 
 Benchmark harness and baseline artifacts for Scarb vs `uc` performance and parity tracking.
 
+`run_local_benchmarks.sh` requires `zsh` (used by CI and local benchmark runs).
+
 ## Folders
 - `scenarios.md`: scenario definitions.
 - `scripts/`: benchmark and comparator runners.

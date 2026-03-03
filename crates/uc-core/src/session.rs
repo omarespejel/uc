@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 pub struct SessionInput {
     pub compiler_version: String,
     pub profile: String,
+    pub offline: bool,
+    pub package: Option<String>,
     pub features: Vec<String>,
     pub cfg_set: Vec<String>,
     pub manifest_content_hash: String,
@@ -15,6 +17,8 @@ pub struct SessionInput {
 struct NormalizedSessionInput<'a> {
     compiler_version: &'a str,
     profile: &'a str,
+    offline: bool,
+    package: Option<String>,
     features: Vec<String>,
     cfg_set: Vec<String>,
     manifest_content_hash: &'a str,
@@ -33,6 +37,8 @@ impl SessionInput {
         let normalized = serde_json::to_vec(&NormalizedSessionInput {
             compiler_version: &self.compiler_version,
             profile: &self.profile,
+            offline: self.offline,
+            package: self.package.clone(),
             features,
             cfg_set,
             manifest_content_hash: &self.manifest_content_hash,
@@ -54,6 +60,8 @@ mod tests {
         SessionInput {
             compiler_version: "2.14.0".to_string(),
             profile: "dev".to_string(),
+            offline: false,
+            package: Some("core".to_string()),
             features: features.into_iter().map(ToString::to_string).collect(),
             cfg_set: cfg_set.into_iter().map(ToString::to_string).collect(),
             manifest_content_hash: "manifest-blake3:abc".to_string(),
@@ -76,5 +84,17 @@ mod tests {
         assert_ne!(a.deterministic_key_hex(), b.deterministic_key_hex());
         a.profile = "release".to_string();
         assert_eq!(a.deterministic_key_hex(), b.deterministic_key_hex());
+    }
+
+    #[test]
+    fn session_key_changes_when_offline_or_package_changes() {
+        let a = sample_input(vec!["a"], vec!["cfg1"]);
+        let mut b = a.clone();
+        b.offline = true;
+        assert_ne!(a.deterministic_key_hex(), b.deterministic_key_hex());
+
+        let mut c = a.clone();
+        c.package = Some("other".to_string());
+        assert_ne!(a.deterministic_key_hex(), c.deterministic_key_hex());
     }
 }

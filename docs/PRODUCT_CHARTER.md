@@ -21,7 +21,7 @@ By default, Cairo developers and CI should run `uc` for package resolution, buil
 ## Success Outcomes
 - Warm rebuild p95: at least 40% faster than Scarb baseline on target matrix.
 - CI reuse: at least 70% cache hit rate on mainline + PR flows.
-- Correctness: 0 artifact hash mismatches and diagnostics parity >= 99.5% before default rollout.
+- Correctness gate target before default rollout: 0 artifact hash mismatches and diagnostics parity >= 99.5%.
 - Reliability: fallback/recovery path success 100% in rollout matrix.
 
 ## Scope

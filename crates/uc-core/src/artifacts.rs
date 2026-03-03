@@ -31,6 +31,7 @@ const DEFAULT_SUFFIXES: [&str; 5] = [
 ];
 const MAX_ARTIFACT_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 const SIERRA_ID_NORMALIZATION_SECTIONS: [&str; 2] = ["type_declarations", "libfunc_declarations"];
+const SIERRA_NORMALIZATION_SCHEMA_TAG: &str = "sierra-normalization-v1";
 
 pub fn collect_artifact_digests(target_root: &Path) -> Result<Vec<ArtifactDigest>> {
     if !target_root.exists() {
@@ -184,13 +185,43 @@ fn hash_sierra_json_semantic(path: &Path) -> Result<(String, u64)> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let mut value: Value = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed to parse JSON {}", path.display()))?;
+    validate_supported_sierra_schema(&value, path)?;
     normalize_sierra_json_ids(&mut value);
     let canonical = canonicalize_json(&value);
     let canonical_bytes = serde_json::to_vec(&canonical)
         .with_context(|| format!("failed to serialize normalized JSON {}", path.display()))?;
     let mut hasher = Hasher::new();
+    hasher.update(SIERRA_NORMALIZATION_SCHEMA_TAG.as_bytes());
     hasher.update(&canonical_bytes);
     Ok((hasher.finalize().to_hex().to_string(), metadata.len()))
+}
+
+fn validate_supported_sierra_schema(value: &Value, path: &Path) -> Result<()> {
+    let Some(version_value) = value
+        .get("sierra_format_version")
+        .or_else(|| value.get("sierra_version"))
+    else {
+        return Ok(());
+    };
+
+    let version = match version_value {
+        Value::String(text) => text.trim().to_string(),
+        Value::Number(num) => num.to_string(),
+        _ => bail!(
+            "unsupported Sierra schema marker type in {} (expected string/number)",
+            path.display()
+        ),
+    };
+
+    let major = version.split('.').next().unwrap_or_default();
+    if major != "1" {
+        bail!(
+            "unsupported Sierra schema version `{}` in {} (expected major version 1)",
+            version,
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn normalize_sierra_json_ids(value: &mut Value) {

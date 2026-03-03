@@ -1,4 +1,5 @@
 #!/usr/bin/env zsh
+# Requires zsh (arrays, extended globs, and zsh/datetime module).
 set -euo pipefail
 zmodload zsh/datetime
 typeset -gi MONO_LAST_US=0
@@ -158,6 +159,14 @@ command_to_string() {
 }
 
 monotonic_now_us() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<'PY'
+import time
+print(time.monotonic_ns() // 1000)
+PY
+    return
+  fi
+
   local now="$EPOCHREALTIME"
   local sec="${now%%.*}"
   local frac="${now#*.}"
@@ -192,12 +201,20 @@ measure_command_ms() {
 
   local start_us
   local end_us
+  local original_dir
+  original_dir="$(pwd -P)"
   start_us="$(monotonic_now_us)"
-  if ! (cd "$cwd" && "${argv[@]}" >/dev/null 2>"$stderr_file"); then
+  if ! cd "$cwd"; then
+    echo "Failed to enter benchmark directory: $cwd" >&2
+    return 1
+  fi
+  if ! "${argv[@]}" >/dev/null 2>"$stderr_file"; then
+    cd "$original_dir" >/dev/null 2>&1 || true
     echo "Command failed in $cwd: $display" >&2
     cat "$stderr_file" >&2
     return 1
   fi
+  cd "$original_dir" >/dev/null 2>&1 || true
   end_us="$(monotonic_now_us)"
 
   awk -v s="$start_us" -v e="$end_us" 'BEGIN { printf "%.3f\n", (e - s) / 1000 }'
