@@ -2,11 +2,14 @@ use anyhow::{bail, Context, Result};
 use blake3::Hasher;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::process::{Command, ExitStatus};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use toml::Value as TomlValue;
 use uc_core::artifacts::{
     collect_artifact_digests, compare_artifact_sets, ArtifactDigest, ArtifactMismatch,
@@ -20,6 +23,7 @@ const MIN_HASH_LEN: usize = 2;
 const SESSION_KEY_LEN: usize = 64;
 const MAX_FINGERPRINT_FILES: usize = 50_000;
 const MAX_FINGERPRINT_DEPTH: usize = 32;
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(name = "uc")]
@@ -293,6 +297,16 @@ struct BuildCacheEntry {
     artifacts: Vec<CachedArtifact>,
 }
 
+struct CacheLockGuard {
+    path: PathBuf,
+}
+
+impl Drop for CacheLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -453,8 +467,7 @@ fn run_migrate(args: MigrateArgs) -> Result<()> {
         .parent()
         .context("manifest path has no parent")?
         .to_path_buf();
-    let raw = fs::read_to_string(&manifest_path)
-        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+    let raw = read_text_file_with_limit(&manifest_path, MAX_MANIFEST_BYTES, "manifest")?;
     let parsed: TomlValue = raw
         .parse()
         .with_context(|| format!("failed to parse TOML in {}", manifest_path.display()))?;
@@ -650,18 +663,38 @@ fn run_build_with_uc_cache(
     profile: &str,
     session_key: &str,
 ) -> Result<(CommandRun, bool, String)> {
-    let fingerprint = compute_build_fingerprint(workspace_root, manifest_path, common, profile)?;
+    let canonical_workspace_root = workspace_root.canonicalize().with_context(|| {
+        format!(
+            "failed to resolve workspace root for cache path {}",
+            workspace_root.display()
+        )
+    })?;
+    let fingerprint =
+        compute_build_fingerprint(&canonical_workspace_root, manifest_path, common, profile)?;
     validate_hex_digest("session key", session_key, SESSION_KEY_LEN)?;
-    let cache_root = workspace_root.join(".uc/cache");
+    let cache_root = canonical_workspace_root.join(".uc/cache");
+    ensure_path_within_root(&canonical_workspace_root, &cache_root, "cache root")?;
     let objects_dir = cache_root.join("objects");
     let entry_path = cache_root.join("build").join(format!("{session_key}.json"));
+    ensure_path_within_root(
+        &canonical_workspace_root,
+        &objects_dir,
+        "cache objects directory",
+    )?;
+    ensure_path_within_root(&canonical_workspace_root, &entry_path, "cache entry path")?;
+    let _cache_lock = acquire_cache_lock(&cache_root)?;
 
     let restore_start = Instant::now();
     if let Some(entry) = load_cache_entry(&entry_path)? {
         if entry.schema_version == BUILD_CACHE_SCHEMA_VERSION
             && entry.profile == profile
             && entry.fingerprint == fingerprint
-            && restore_cached_artifacts(workspace_root, profile, &objects_dir, &entry.artifacts)?
+            && restore_cached_artifacts(
+                &canonical_workspace_root,
+                profile,
+                &objects_dir,
+                &entry.artifacts,
+            )?
         {
             let run = CommandRun {
                 command: vec![
@@ -687,9 +720,9 @@ fn run_build_with_uc_cache(
     let run = run_command_capture(command, command_vec)?;
 
     if run.exit_code == 0 {
-        let artifacts = collect_profile_artifacts(workspace_root, profile)?;
+        let artifacts = collect_profile_artifacts(&canonical_workspace_root, profile)?;
         persist_cache_entry(
-            workspace_root,
+            &canonical_workspace_root,
             profile,
             &fingerprint,
             &artifacts,
@@ -811,6 +844,7 @@ fn restore_cached_artifacts(
         let expected_hash = &artifact.blake3_hex;
         let out_path = target_root.join(&artifact.relative_path);
 
+        // Cache validity is content-addressed; permissions/ownership are not normalized.
         if out_path.exists() && hash_file_blake3(&out_path)? == *expected_hash {
             continue;
         }
@@ -870,7 +904,10 @@ fn compute_build_fingerprint(
 ) -> Result<String> {
     let mut hasher = Hasher::new();
     hasher.update(b"uc-build-fingerprint-v1");
-    hasher.update(manifest_path.display().to_string().as_bytes());
+    let canonical_manifest = manifest_path
+        .canonicalize()
+        .unwrap_or_else(|_| manifest_path.to_path_buf());
+    hasher.update(canonical_manifest.display().to_string().as_bytes());
     hasher.update(profile.as_bytes());
     hasher.update(common.package.as_deref().unwrap_or("*").as_bytes());
     hasher.update(if common.workspace {
@@ -1096,7 +1133,7 @@ fn run_command_capture(mut command: Command, command_vec: Vec<String>) -> Result
 
     Ok(CommandRun {
         command: command_vec,
-        exit_code: output.status.code().unwrap_or(-1),
+        exit_code: exit_code_from_status(&output.status),
         elapsed_ms,
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
@@ -1204,9 +1241,21 @@ fn scarb_version_line() -> Result<String> {
     Ok(first.to_string())
 }
 
+fn exit_code_from_status(status: &ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        if let Some(signal) = status.signal() {
+            return -signal;
+        }
+    }
+    -1
+}
+
 fn compute_plugin_signature(manifest_path: &Path) -> Result<String> {
-    let bytes = fs::read(manifest_path)
-        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+    let bytes = read_bytes_with_limit(manifest_path, MAX_MANIFEST_BYTES, "manifest")?;
     let mut hasher = Hasher::new();
     hasher.update(&bytes);
     Ok(format!("manifest-blake3:{}", hasher.finalize().to_hex()))
@@ -1237,6 +1286,70 @@ fn validate_cache_object_rel_path(path: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn ensure_path_within_root(root: &Path, path: &Path, label: &str) -> Result<()> {
+    if !path.starts_with(root) {
+        bail!(
+            "{label} escapes workspace root: {} not under {}",
+            path.display(),
+            root.display()
+        );
+    }
+    Ok(())
+}
+
+fn acquire_cache_lock(cache_root: &Path) -> Result<CacheLockGuard> {
+    fs::create_dir_all(cache_root)
+        .with_context(|| format!("failed to create cache root {}", cache_root.display()))?;
+    let lock_path = cache_root.join(".lock");
+    let deadline = Instant::now() + Duration::from_secs(10);
+
+    loop {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut file) => {
+                writeln!(file, "pid={}", std::process::id()).with_context(|| {
+                    format!("failed to write lock file {}", lock_path.display())
+                })?;
+                return Ok(CacheLockGuard { path: lock_path });
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                if Instant::now() >= deadline {
+                    bail!("timed out waiting for cache lock {}", lock_path.display());
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to acquire cache lock {}", lock_path.display())
+                });
+            }
+        }
+    }
+}
+
+fn read_bytes_with_limit(path: &Path, max_bytes: u64, label: &str) -> Result<Vec<u8>> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    if metadata.len() > max_bytes {
+        bail!(
+            "{label} {} exceeds size limit ({} bytes > {} bytes)",
+            path.display(),
+            metadata.len(),
+            max_bytes
+        );
+    }
+    fs::read(path).with_context(|| format!("failed to read {}", path.display()))
+}
+
+fn read_text_file_with_limit(path: &Path, max_bytes: u64, label: &str) -> Result<String> {
+    let bytes = read_bytes_with_limit(path, max_bytes, label)?;
+    String::from_utf8(bytes)
+        .with_context(|| format!("{} is not valid UTF-8: {}", label, path.display()))
 }
 
 fn write_uc_toml(

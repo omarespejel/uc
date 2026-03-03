@@ -1,4 +1,4 @@
-#!/usr/bin/env zsh
+#!/usr/bin/env bash
 set -euo pipefail
 
 BASELINE=""
@@ -70,10 +70,15 @@ TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
       | ($c[0]) as $cc
       | (reduce $bb.scenarios[] as $item ({}; .[$item.scenario + "|" + $item.workload] = $item)) as $bm
       | (reduce $cc.scenarios[] as $item ({}; .[$item.scenario + "|" + $item.workload] = $item)) as $cm
-      | ($bm + $cm | keys_unsorted | unique | sort)[] as $k
+      | ($bm | keys_unsorted | sort) as $bk
+      | ($cm | keys_unsorted | sort) as $ck
+      | if $bk != $ck then
+          error("baseline/candidate scenario keys differ")
+        else
+          ($bk[])
+        end as $k
       | ($bm[$k]) as $base
       | ($cm[$k]) as $cand
-      | select($base != null and $cand != null)
       | ($base.scenario) as $scenario
       | ($base.workload) as $workload
       | ($base.stats.p50_ms) as $bp50

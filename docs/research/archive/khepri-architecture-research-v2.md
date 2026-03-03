@@ -15,7 +15,7 @@ Khepri is still a strong direction, but the first implementation must be narrowe
 - No assumption that Salsa DB can be persisted/restored as-is.
 - No LSP/STWO work in MVP.
 
-The first product milestone is to prove that daemonized compile service improves warm build latency **without breaking correctness**.
+The first product milestone is to prove that daemonized compile service improves warm build latency **without degrading correctness beyond the defined MVP tolerance**.
 
 ---
 
@@ -127,7 +127,7 @@ For repeated local development builds in the same workspace, a sessionized Khepr
   - `p95` warm rebuild improvement >= 40% on both repos.
 - Correctness:
   - zero artifact hash mismatches in test matrix.
-  - diagnostics parity >= 99.5% (exact match goal).
+  - diagnostics parity >= 99.5% (exact match goal; 99.5% is the temporary MVP tolerance for formatting-only diagnostic drift).
 - Reliability:
   - daemon crash fallback to Scarb works 100% in matrix.
 

@@ -31,14 +31,17 @@ pub fn compare_diagnostics(baseline: &[String], candidate: &[String]) -> Diagnos
 }
 
 pub fn extract_diagnostic_lines(stderr: &str) -> Vec<String> {
+    const DIAGNOSTIC_PREFIXES: [&str; 6] =
+        ["error:", "warn:", "warning:", "note:", "help:", "hint:"];
+
     stderr
         .lines()
         .map(str::trim)
         .filter(|line| {
-            line.starts_with("error:")
-                || line.starts_with("warn:")
-                || line.starts_with("warning:")
-                || line.contains("Plugin diagnostic")
+            DIAGNOSTIC_PREFIXES
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+                || line.starts_with("Plugin diagnostic")
         })
         .map(str::to_string)
         .collect()
