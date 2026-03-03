@@ -160,23 +160,7 @@ command_to_string() {
 }
 
 monotonic_now_us() {
-  if command -v python3 >/dev/null 2>&1; then
-    python3 - <<'PY'
-import time
-print(time.monotonic_ns() // 1000)
-PY
-    return
-  fi
-
-  if command -v perl >/dev/null 2>&1; then
-    local perl_now
-    perl_now="$(LC_ALL=C perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC -e 'print int(clock_gettime(CLOCK_MONOTONIC) * 1000000)' 2>/dev/null || true)"
-    if [[ -n "$perl_now" && "$perl_now" == <-> ]]; then
-      printf "%s" "$perl_now"
-      return
-    fi
-  fi
-
+  # Use zsh's high-resolution clock to avoid per-sample subprocess overhead.
   local now="$EPOCHREALTIME"
   local sec="${now%%.*}"
   local frac="${now#*.}"
@@ -311,6 +295,7 @@ prepare_workload_copy() {
   local isolated_dir="$TMP_DIR/workloads/$workload"
   mkdir -p "$isolated_dir"
   cp -PR "$source_dir/." "$isolated_dir"
+  rm -rf "$isolated_dir/.uc" "$isolated_dir/target" "$isolated_dir/.scarb"
   printf "%s" "$isolated_dir"
 }
 
