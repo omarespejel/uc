@@ -15,8 +15,12 @@ OUT_JSON=""
 OUT_MD=""
 TMP_DIR="$(mktemp -d)"
 UC_BIN="$ROOT_DIR/target/debug/uc"
+UC_DAEMON_SOCKET_PATH="${UC_DAEMON_SOCKET_PATH:-$TMP_DIR/uc-daemon.sock}"
 
 cleanup() {
+  if [[ "$TOOL" == "uc" && -x "$UC_BIN" ]]; then
+    UC_DAEMON_SOCKET_PATH="$UC_DAEMON_SOCKET_PATH" "$UC_BIN" daemon stop >/dev/null 2>&1 || true
+  fi
   rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
@@ -117,6 +121,7 @@ fi
 if [[ "$TOOL" == "uc" ]]; then
   require_cmd cargo
   (cd "$ROOT_DIR" && cargo build -p uc-cli >/dev/null)
+  UC_DAEMON_SOCKET_PATH="$UC_DAEMON_SOCKET_PATH" "$UC_BIN" daemon start >/dev/null
 fi
 
 mkdir -p "$OUT_DIR"
@@ -226,7 +231,7 @@ build_command_for_manifest() {
   if [[ "$TOOL" == "scarb" ]]; then
     reply=(scarb --manifest-path "$manifest" build)
   else
-    reply=("$UC_BIN" build --engine uc --manifest-path "$manifest")
+    reply=("$UC_BIN" build --engine uc --daemon-mode auto --manifest-path "$manifest")
   fi
 }
 

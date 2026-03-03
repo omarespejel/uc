@@ -2335,6 +2335,9 @@ fn daemon_socket_path(override_path: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = override_path {
         return Ok(path);
     }
+    if let Some(path) = std::env::var_os("UC_DAEMON_SOCKET_PATH") {
+        return Ok(PathBuf::from(path));
+    }
     let home = std::env::var_os("HOME").context("HOME is not set; provide --socket-path")?;
     Ok(PathBuf::from(home).join(".uc/daemon/uc.sock"))
 }
