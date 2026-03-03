@@ -375,6 +375,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "clap",
+ "libc",
  "serde",
  "serde_json",
  "toml",

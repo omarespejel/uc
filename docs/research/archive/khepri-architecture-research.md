@@ -403,9 +403,11 @@ fn start_watcher(state: Arc<KhepriState>, roots: Vec<PathBuf>) {
     for event in rx {
         match event.kind {
             EventKind::Modify(_) | EventKind::Create(_) => {
-                if event.path.extension() == Some("cairo") {
-                    let content = fs::read_to_string(&event.path)?;
-                    state.on_file_changed(&event.path, content.into());
+                for path in &event.paths {
+                    if path.extension() == Some(OsStr::new("cairo")) {
+                        let content = fs::read_to_string(path)?;
+                        state.on_file_changed(path, content.into());
+                    }
                 }
             }
             _ => {}

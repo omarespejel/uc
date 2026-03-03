@@ -75,8 +75,9 @@ TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
       | if $bk != $ck then
           error("baseline/candidate scenario keys differ")
         else
-          ($bk[])
-        end as $k
+          $bk[]
+        end
+      | . as $k
       | ($bm[$k]) as $base
       | ($cm[$k]) as $cand
       | ($base.scenario) as $scenario

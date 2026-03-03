@@ -2,13 +2,18 @@ use anyhow::{bail, Context, Result};
 use blake3::Hasher;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, OpenOptions};
+use std::collections::VecDeque;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -25,7 +30,15 @@ const MIN_HASH_LEN: usize = 2;
 const SESSION_KEY_LEN: usize = 64;
 const MAX_FINGERPRINT_FILES: usize = 50_000;
 const MAX_FINGERPRINT_DEPTH: usize = 32;
+const MAX_FINGERPRINT_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_CACHE_ENTRY_BYTES: u64 = 10 * 1024 * 1024;
+const DEFAULT_DIAGNOSTICS_SIMILARITY_THRESHOLD: f64 = 99.5;
+const DAEMON_REQUEST_SIZE_LIMIT_BYTES: usize = 1024 * 1024;
+const DAEMON_RATE_WINDOW_SECONDS: u64 = 1;
+const DAEMON_MAX_REQUESTS_PER_WINDOW: usize = 32;
+const DAEMON_LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
+const CACHE_LOCK_STALE_AFTER_SECONDS: u64 = 300;
 
 #[derive(Parser, Debug)]
 #[command(name = "uc")]
@@ -154,8 +167,8 @@ struct SessionKeyArgs {
     #[arg(long = "cfg", value_delimiter = ',')]
     cfg_set: Vec<String>,
 
-    #[arg(long)]
-    plugin_signature: String,
+    #[arg(long = "manifest-content-hash", alias = "plugin-signature")]
+    manifest_content_hash: String,
 
     #[arg(long)]
     target_family: String,
@@ -228,6 +241,9 @@ struct CompareBuildArgs {
 
     #[arg(long, action = ArgAction::Set, default_value_t = true)]
     clean_before_each: bool,
+
+    #[arg(long, value_parser = parse_diagnostics_threshold)]
+    diagnostics_threshold: Option<f64>,
 }
 
 #[derive(Args, Debug)]
@@ -293,6 +309,7 @@ struct CompareBuildReport {
     manifest_path: String,
     workspace_root: String,
     clean_before_each: bool,
+    diagnostics_threshold: f64,
     baseline: CompareRunSnapshot,
     candidate: CompareRunSnapshot,
     diagnostics: DiagnosticsComparison,
@@ -379,6 +396,34 @@ struct CacheLockGuard {
     path: PathBuf,
 }
 
+struct DaemonRateLimiter {
+    events: VecDeque<Instant>,
+}
+
+impl DaemonRateLimiter {
+    fn new() -> Self {
+        Self {
+            events: VecDeque::new(),
+        }
+    }
+
+    fn allow(&mut self) -> bool {
+        let now = Instant::now();
+        let window = Duration::from_secs(DAEMON_RATE_WINDOW_SECONDS);
+        while let Some(oldest) = self.events.front() {
+            if now.duration_since(*oldest) < window {
+                break;
+            }
+            self.events.pop_front();
+        }
+        if self.events.len() >= DAEMON_MAX_REQUESTS_PER_WINDOW {
+            return false;
+        }
+        self.events.push_back(now);
+        true
+    }
+}
+
 impl Drop for CacheLockGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
@@ -397,6 +442,30 @@ fn main() -> Result<()> {
         Commands::CompareBuild(args) => run_compare_build(args),
         Commands::Migrate(args) => run_migrate(args),
     }
+}
+
+fn parse_diagnostics_threshold(input: &str) -> std::result::Result<f64, String> {
+    let parsed = input
+        .parse::<f64>()
+        .map_err(|_| format!("invalid diagnostics threshold `{input}`"))?;
+    if !(0.0..=100.0).contains(&parsed) {
+        return Err(format!(
+            "diagnostics threshold must be between 0 and 100, got {parsed}"
+        ));
+    }
+    Ok(parsed)
+}
+
+fn resolve_diagnostics_threshold(cli_value: Option<f64>) -> Result<f64> {
+    if let Some(value) = cli_value {
+        return Ok(value);
+    }
+    if let Ok(raw) = std::env::var("UC_DIAGNOSTICS_THRESHOLD") {
+        return parse_diagnostics_threshold(&raw)
+            .map_err(anyhow::Error::msg)
+            .context("failed to parse UC_DIAGNOSTICS_THRESHOLD");
+    }
+    Ok(DEFAULT_DIAGNOSTICS_SIMILARITY_THRESHOLD)
 }
 
 fn run_daemon(args: DaemonArgs) -> Result<()> {
@@ -426,11 +495,10 @@ fn run_daemon_start(args: DaemonSocketArgs) -> Result<()> {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        if socket_path.exists() {
-            let _ = fs::remove_file(&socket_path);
-        }
+        remove_socket_if_exists(&socket_path)?;
 
         let log_path = daemon_log_path(&socket_path);
+        rotate_daemon_log_if_needed(&log_path)?;
         let log_file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -450,6 +518,15 @@ fn run_daemon_start(args: DaemonSocketArgs) -> Result<()> {
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(log_file_err));
+        #[cfg(unix)]
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         command.spawn().with_context(|| {
             format!(
                 "failed to launch daemon process for {}",
@@ -528,9 +605,7 @@ fn run_daemon_stop(args: DaemonSocketArgs) -> Result<()> {
             }
             thread::sleep(Duration::from_millis(50));
         }
-        if socket_path.exists() {
-            let _ = fs::remove_file(&socket_path);
-        }
+        remove_socket_if_exists(&socket_path)?;
         println!("uc daemon stopped ({})", socket_path.display());
         Ok(())
     }
@@ -549,24 +624,39 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        if socket_path.exists() {
-            let _ = fs::remove_file(&socket_path);
-        }
+        remove_socket_if_exists(&socket_path)?;
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("failed to bind daemon socket {}", socket_path.display()))?;
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).with_context(
+            || {
+                format!(
+                    "failed to set daemon socket permissions for {}",
+                    socket_path.display()
+                )
+            },
+        )?;
         let status = DaemonStatusPayload {
             pid: std::process::id(),
             started_at_epoch_ms: epoch_ms_u64()?,
             socket_path: socket_path.display().to_string(),
         };
+        let daemon_root = std::env::current_dir()
+            .context("failed to resolve daemon current directory")?
+            .canonicalize()
+            .context("failed to canonicalize daemon root")?;
+        let mut rate_limiter = DaemonRateLimiter::new();
 
         let mut should_shutdown = false;
         for incoming in listener.incoming() {
             match incoming {
                 Ok(stream) => {
-                    if let Err(err) =
-                        handle_daemon_connection(stream, &status, &mut should_shutdown)
-                    {
+                    if let Err(err) = handle_daemon_connection(
+                        stream,
+                        &status,
+                        &mut should_shutdown,
+                        &mut rate_limiter,
+                        &daemon_root,
+                    ) {
                         eprintln!("uc daemon: request handling failed: {err:#}");
                     }
                 }
@@ -578,7 +668,7 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
                 break;
             }
         }
-        let _ = fs::remove_file(&socket_path);
+        remove_socket_if_exists(&socket_path)?;
         Ok(())
     }
 }
@@ -622,7 +712,7 @@ fn run_session_key(args: SessionKeyArgs) -> Result<()> {
         profile: args.profile,
         features: args.features,
         cfg_set: args.cfg_set,
-        plugin_signature: args.plugin_signature,
+        manifest_content_hash: args.manifest_content_hash,
         target_family: args.target_family,
     };
 
@@ -783,9 +873,19 @@ fn common_args_from_daemon_request(request: &DaemonBuildRequest) -> BuildCommonA
     }
 }
 
-fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildResponse> {
+fn execute_daemon_build(
+    request: DaemonBuildRequest,
+    daemon_root: &Path,
+) -> Result<DaemonBuildResponse> {
     let common = common_args_from_daemon_request(&request);
     let manifest_path = resolve_manifest_path(&common.manifest_path)?;
+    if !manifest_path.starts_with(daemon_root) {
+        bail!(
+            "daemon denied manifest outside allowed root: {} not under {}",
+            manifest_path.display(),
+            daemon_root.display()
+        );
+    }
     let workspace_root = manifest_path
         .parent()
         .context("manifest path has no parent")?
@@ -979,13 +1079,15 @@ fn run_compare_build(args: CompareBuildArgs) -> Result<()> {
     let mismatches = compare_artifact_sets(&baseline_artifacts, &candidate_artifacts);
     let diagnostics = compare_diagnostics(&baseline_diag, &candidate_diag);
     let artifacts_match = mismatches.is_empty();
-    let diagnostics_ok = diagnostics.similarity_percent >= 99.5;
+    let diagnostics_threshold = resolve_diagnostics_threshold(args.diagnostics_threshold)?;
+    let diagnostics_ok = diagnostics.similarity_percent >= diagnostics_threshold;
 
     let report = CompareBuildReport {
         generated_at_epoch_ms: epoch_ms()?,
         manifest_path: manifest_path.display().to_string(),
         workspace_root: workspace_root.display().to_string(),
         clean_before_each: args.clean_before_each,
+        diagnostics_threshold,
         baseline: CompareRunSnapshot {
             label: "scarb-direct".to_string(),
             command: baseline_run.command.clone(),
@@ -1019,8 +1121,10 @@ fn run_compare_build(args: CompareBuildArgs) -> Result<()> {
 
     println!("Compare report: {}", output_path.display());
     println!(
-        "Artifact mismatches: {} | Diagnostics similarity: {:.2}%",
-        report.artifact_mismatch_count, report.diagnostics.similarity_percent
+        "Artifact mismatches: {} | Diagnostics similarity: {:.2}% (threshold: {:.2}%)",
+        report.artifact_mismatch_count,
+        report.diagnostics.similarity_percent,
+        diagnostics_threshold
     );
 
     if !report.passed {
@@ -1175,7 +1279,31 @@ fn load_cache_entry(path: &Path) -> Result<Option<BuildCacheEntry>> {
         return Ok(None);
     }
 
-    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    if metadata.len() > MAX_CACHE_ENTRY_BYTES {
+        eprintln!(
+            "uc: warning: ignoring oversized cache entry {} ({} bytes > {} bytes)",
+            path.display(),
+            metadata.len(),
+            MAX_CACHE_ENTRY_BYTES
+        );
+        return Ok(None);
+    }
+    let file = File::open(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut reader = BufReader::new(file).take(MAX_CACHE_ENTRY_BYTES + 1);
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    if bytes.len() as u64 > MAX_CACHE_ENTRY_BYTES {
+        eprintln!(
+            "uc: warning: ignoring oversized cache entry {} (>{} bytes)",
+            path.display(),
+            MAX_CACHE_ENTRY_BYTES
+        );
+        return Ok(None);
+    }
     let parsed: BuildCacheEntry = match serde_json::from_slice(&bytes) {
         Ok(entry) => entry,
         Err(err) => {
@@ -1216,7 +1344,9 @@ fn restore_cached_artifacts(
     let target_root = workspace_root.join("target").join(profile);
     for artifact in artifacts {
         let expected_hash = &artifact.blake3_hex;
-        let out_path = target_root.join(&artifact.relative_path);
+        let relative_path = validated_relative_artifact_path(&artifact.relative_path)?;
+        let out_path = target_root.join(relative_path);
+        ensure_path_within_root(&target_root, &out_path, "cache restore path")?;
 
         // Cache validity is content-addressed; permissions/ownership are not normalized.
         if out_path.exists() && hash_file_blake3(&out_path)? == *expected_hash {
@@ -1280,7 +1410,7 @@ fn compute_build_fingerprint(
     hasher.update(b"uc-build-fingerprint-v1");
     let canonical_manifest = manifest_path
         .canonicalize()
-        .unwrap_or_else(|_| manifest_path.to_path_buf());
+        .with_context(|| format!("failed to canonicalize {}", manifest_path.display()))?;
     hasher.update(canonical_manifest.display().to_string().as_bytes());
     hasher.update(profile.as_bytes());
     hasher.update(common.package.as_deref().unwrap_or("*").as_bytes());
@@ -1296,7 +1426,8 @@ fn compute_build_fingerprint(
     });
 
     let mut features = common.features.clone();
-    features.sort();
+    features.sort_unstable();
+    features.dedup();
     for feature in features {
         hasher.update(feature.as_bytes());
         hasher.update(b",");
@@ -1330,6 +1461,17 @@ fn compute_build_fingerprint(
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
+        let file_size = fs::metadata(&path)
+            .with_context(|| format!("failed to stat {}", path.display()))?
+            .len();
+        if file_size > MAX_FINGERPRINT_FILE_BYTES {
+            bail!(
+                "fingerprint file {} exceeds size limit ({} bytes > {} bytes)",
+                path.display(),
+                file_size,
+                MAX_FINGERPRINT_FILE_BYTES
+            );
+        }
         let file_hash = hash_file_blake3(&path)?;
         hasher.update(rel.as_bytes());
         hasher.update(b":");
@@ -1532,9 +1674,15 @@ fn remove_build_outputs(workspace_root: &Path) -> Result<()> {
             workspace_root.display()
         )
     })?;
-    if canonical_root == Path::new("/") || canonical_root.ancestors().count() < 3 {
+    if canonical_root == Path::new("/") {
         bail!(
-            "workspace root {} is too close to filesystem root; refusing cleanup",
+            "workspace root {} is filesystem root; refusing cleanup",
+            canonical_root.display()
+        );
+    }
+    if !canonical_root.join("Scarb.toml").is_file() {
+        bail!(
+            "workspace root {} has no Scarb.toml marker; refusing cleanup",
             canonical_root.display()
         );
     }
@@ -1622,14 +1770,14 @@ fn build_session_input(
     profile: &str,
 ) -> Result<SessionInput> {
     let scarb_version = scarb_version_line()?;
-    let plugin_signature = compute_plugin_signature(manifest_path)?;
+    let manifest_content_hash = compute_manifest_content_hash(manifest_path)?;
     Ok(SessionInput {
         workspace_root: workspace_root.display().to_string(),
         compiler_version: scarb_version,
         profile: profile.to_string(),
         features: common.features.clone(),
         cfg_set: Vec::new(),
-        plugin_signature,
+        manifest_content_hash,
         target_family: if common.workspace {
             "workspace".to_string()
         } else {
@@ -1651,7 +1799,7 @@ fn exit_code_from_status(status: &ExitStatus) -> i32 {
     -1
 }
 
-fn compute_plugin_signature(manifest_path: &Path) -> Result<String> {
+fn compute_manifest_content_hash(manifest_path: &Path) -> Result<String> {
     let bytes = read_bytes_with_limit(manifest_path, MAX_MANIFEST_BYTES, "manifest")?;
     let mut hasher = Hasher::new();
     hasher.update(&bytes);
@@ -1685,6 +1833,27 @@ fn validate_cache_object_rel_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+fn validated_relative_artifact_path(path: &str) -> Result<PathBuf> {
+    let rel = Path::new(path);
+    if rel.is_absolute() {
+        bail!("cached artifact path must be relative");
+    }
+    let mut sanitized = PathBuf::new();
+    for component in rel.components() {
+        match component {
+            Component::Normal(value) => sanitized.push(value),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("cached artifact path contains invalid component")
+            }
+        }
+    }
+    if sanitized.as_os_str().is_empty() {
+        bail!("cached artifact path must not be empty");
+    }
+    Ok(sanitized)
+}
+
 fn ensure_path_within_root(root: &Path, path: &Path, label: &str) -> Result<()> {
     if !path.starts_with(root) {
         bail!(
@@ -1715,6 +1884,9 @@ fn acquire_cache_lock(cache_root: &Path) -> Result<CacheLockGuard> {
                 return Ok(CacheLockGuard { path: lock_path });
             }
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                if maybe_cleanup_stale_lock(&lock_path)? {
+                    continue;
+                }
                 if Instant::now() >= deadline {
                     bail!("timed out waiting for cache lock {}", lock_path.display());
                 }
@@ -1729,6 +1901,67 @@ fn acquire_cache_lock(cache_root: &Path) -> Result<CacheLockGuard> {
     }
 }
 
+fn maybe_cleanup_stale_lock(lock_path: &Path) -> Result<bool> {
+    let metadata = match fs::metadata(lock_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to stat cache lock {}", lock_path.display()));
+        }
+    };
+
+    if let Ok(contents) = fs::read_to_string(lock_path) {
+        if let Some(pid) = lock_file_pid(&contents) {
+            if !is_process_alive(pid) {
+                fs::remove_file(lock_path).with_context(|| {
+                    format!("failed to remove stale lock {}", lock_path.display())
+                })?;
+                return Ok(true);
+            }
+        }
+    }
+
+    let modified = match metadata.modified() {
+        Ok(value) => value,
+        Err(_) => return Ok(false),
+    };
+    let age = match SystemTime::now().duration_since(modified) {
+        Ok(duration) => duration,
+        Err(_) => return Ok(false),
+    };
+    if age > Duration::from_secs(CACHE_LOCK_STALE_AFTER_SECONDS) {
+        fs::remove_file(lock_path)
+            .with_context(|| format!("failed to remove stale lock {}", lock_path.display()))?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn lock_file_pid(contents: &str) -> Option<u32> {
+    contents.lines().find_map(|line| {
+        let value = line.strip_prefix("pid=")?;
+        value.trim().parse::<u32>().ok()
+    })
+}
+
+#[cfg(unix)]
+fn is_process_alive(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+    matches!(
+        io::Error::last_os_error().raw_os_error(),
+        Some(code) if code == libc::EPERM
+    )
+}
+
+#[cfg(not(unix))]
+fn is_process_alive(_pid: u32) -> bool {
+    true
+}
+
 fn daemon_socket_path(override_path: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = override_path {
         return Ok(path);
@@ -1739,6 +1972,64 @@ fn daemon_socket_path(override_path: Option<PathBuf>) -> Result<PathBuf> {
 
 fn daemon_log_path(socket_path: &Path) -> PathBuf {
     socket_path.with_extension("log")
+}
+
+fn remove_socket_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to remove {}", path.display())),
+    }
+}
+
+fn rotate_daemon_log_if_needed(log_path: &Path) -> Result<()> {
+    let metadata = match fs::metadata(log_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", log_path.display()));
+        }
+    };
+    if metadata.len() < DAEMON_LOG_ROTATE_BYTES {
+        return Ok(());
+    }
+    let rotated = PathBuf::from(format!("{}.1", log_path.display()));
+    if rotated.exists() {
+        fs::remove_file(&rotated)
+            .with_context(|| format!("failed to remove {}", rotated.display()))?;
+    }
+    fs::rename(log_path, &rotated).with_context(|| {
+        format!(
+            "failed to rotate daemon log {} to {}",
+            log_path.display(),
+            rotated.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn read_line_limited<R: BufRead>(reader: &mut R, max_bytes: usize, label: &str) -> Result<String> {
+    let mut bytes = Vec::with_capacity(128);
+    loop {
+        let mut byte = [0_u8; 1];
+        let read = reader
+            .read(&mut byte)
+            .with_context(|| format!("failed to read {label}"))?;
+        if read == 0 {
+            break;
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        bytes.push(byte[0]);
+        if bytes.len() > max_bytes {
+            bail!("{label} exceeds size limit ({max_bytes} bytes)");
+        }
+    }
+    if bytes.is_empty() {
+        return Ok(String::new());
+    }
+    String::from_utf8(bytes).with_context(|| format!("{label} is not valid UTF-8"))
 }
 
 #[cfg(unix)]
@@ -1761,13 +2052,14 @@ fn daemon_request(socket_path: &Path, request: &DaemonRequest) -> Result<DaemonR
         .context("failed to write daemon request newline")?;
     stream.flush().context("failed to flush daemon request")?;
 
-    let mut response_line = String::new();
-    {
+    let response_line = {
         let mut reader = BufReader::new(&mut stream);
-        reader
-            .read_line(&mut response_line)
-            .context("failed to read daemon response")?;
-    }
+        read_line_limited(
+            &mut reader,
+            DAEMON_REQUEST_SIZE_LIMIT_BYTES,
+            "daemon response",
+        )?
+    };
     if response_line.trim().is_empty() {
         bail!("daemon returned empty response");
     }
@@ -1788,15 +2080,39 @@ fn handle_daemon_connection(
     mut stream: UnixStream,
     status: &DaemonStatusPayload,
     should_shutdown: &mut bool,
+    rate_limiter: &mut DaemonRateLimiter,
+    daemon_root: &Path,
 ) -> Result<()> {
-    let mut request_line = String::new();
-    {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .context("failed to set daemon read timeout")?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(120)))
+        .context("failed to set daemon write timeout")?;
+
+    let request_line = {
         let mut reader = BufReader::new(&mut stream);
-        reader
-            .read_line(&mut request_line)
-            .context("failed to read daemon request line")?;
-    }
+        read_line_limited(
+            &mut reader,
+            DAEMON_REQUEST_SIZE_LIMIT_BYTES,
+            "daemon request",
+        )?
+    };
     if request_line.trim().is_empty() {
+        return Ok(());
+    }
+    if !rate_limiter.allow() {
+        let response = DaemonResponse::Error {
+            message: "daemon rate limit exceeded; retry shortly".to_string(),
+        };
+        let payload = serde_json::to_vec(&response).context("failed to encode daemon response")?;
+        stream
+            .write_all(&payload)
+            .context("failed to write daemon response")?;
+        stream
+            .write_all(b"\n")
+            .context("failed to write daemon response newline")?;
+        stream.flush().context("failed to flush daemon response")?;
         return Ok(());
     }
 
@@ -1808,7 +2124,7 @@ fn handle_daemon_connection(
             *should_shutdown = true;
             DaemonResponse::Ack
         }
-        DaemonRequest::Build(request) => match execute_daemon_build(request) {
+        DaemonRequest::Build(request) => match execute_daemon_build(request, daemon_root) {
             Ok(result) => DaemonResponse::Build(result),
             Err(err) => DaemonResponse::Error {
                 message: format!("{err:#}"),

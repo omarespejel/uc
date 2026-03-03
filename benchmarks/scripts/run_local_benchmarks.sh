@@ -2,8 +2,9 @@
 set -euo pipefail
 zmodload zsh/datetime
 
-ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-DEFAULT_WORKSPACE_ROOT="$(cd "$ROOT_DIR/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%N}")" && pwd -P)"
+ROOT_DIR="$(git -C "$SCRIPT_DIR/../.." rev-parse --show-toplevel 2>/dev/null || (cd "$SCRIPT_DIR/../.." && pwd -P))"
+DEFAULT_WORKSPACE_ROOT="$(cd "$ROOT_DIR/.." && pwd -P)"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-}"
 MATRIX="${MATRIX:-research}"
 TOOL="${TOOL:-scarb}"
@@ -35,25 +36,40 @@ Options:
 USAGE
 }
 
+require_option_value() {
+  local flag="$1"
+  local value="${2-}"
+  if [[ -z "$value" || "$value" == --* ]]; then
+    echo "Missing value for $flag" >&2
+    usage
+    exit 1
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --matrix)
+      require_option_value "$1" "${2-}"
       MATRIX="$2"
       shift 2
       ;;
     --tool)
+      require_option_value "$1" "${2-}"
       TOOL="$2"
       shift 2
       ;;
     --workspace-root)
+      require_option_value "$1" "${2-}"
       WORKSPACE_ROOT="$2"
       shift 2
       ;;
     --runs)
+      require_option_value "$1" "${2-}"
       RUNS="$2"
       shift 2
       ;;
     --cold-runs)
+      require_option_value "$1" "${2-}"
       COLD_RUNS="$2"
       shift 2
       ;;
@@ -68,6 +84,15 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ "$RUNS" != <-> || "$RUNS" -le 0 ]]; then
+  echo "--runs must be a positive integer, got: $RUNS" >&2
+  exit 1
+fi
+if [[ "$COLD_RUNS" != <-> || "$COLD_RUNS" -le 0 ]]; then
+  echo "--cold-runs must be a positive integer, got: $COLD_RUNS" >&2
+  exit 1
+fi
 
 OUT_JSON="$OUT_DIR/${TOOL}-baseline-$STAMP.json"
 OUT_MD="$OUT_DIR/${TOOL}-baseline-$STAMP.md"
@@ -116,21 +141,33 @@ workspace_root_for_report() {
   fi
 }
 
+command_to_string() {
+  local -a argv=("$@")
+  local -a escaped=()
+  local arg
+  for arg in "${argv[@]}"; do
+    escaped+=("${(q)arg}")
+  done
+  printf "%s" "${(j: :)escaped}"
+}
+
 measure_command_ms() {
   local cwd="$1"
-  local command="$2"
+  shift
+  local -a argv=("$@")
   local stderr_file="$TMP_DIR/stderr.log"
-  local -a argv
+  local display
 
-  argv=("${(@Q)${(z)command}}")
   if [[ ${#argv[@]} -eq 0 ]]; then
-    echo "Command parse failed: $command" >&2
+    echo "Command parse failed: empty argv" >&2
     return 1
   fi
 
+  display="$(command_to_string "${argv[@]}")"
+
   local start="$EPOCHREALTIME"
   if ! (cd "$cwd" && "${argv[@]}" >/dev/null 2>"$stderr_file"); then
-    echo "Command failed in $cwd: $command" >&2
+    echo "Command failed in $cwd: $display" >&2
     cat "$stderr_file" >&2
     return 1
   fi
@@ -188,9 +225,9 @@ append_result() {
 build_command_for_manifest() {
   local manifest="$1"
   if [[ "$TOOL" == "scarb" ]]; then
-    echo "scarb --manifest-path '$manifest' build"
+    reply=(scarb --manifest-path "$manifest" build)
   else
-    echo "'$UC_BIN' build --engine uc --manifest-path '$manifest'"
+    reply=("$UC_BIN" build --engine uc --manifest-path "$manifest")
   fi
 }
 
@@ -198,9 +235,9 @@ metadata_online_command_for_manifest() {
   local manifest="$1"
   local cache_dir="$2"
   if [[ "$TOOL" == "scarb" ]]; then
-    echo "scarb --manifest-path '$manifest' --global-cache-dir '$cache_dir' metadata --format-version 1"
+    reply=(scarb --manifest-path "$manifest" --global-cache-dir "$cache_dir" metadata --format-version 1)
   else
-    echo "'$UC_BIN' metadata --manifest-path '$manifest' --global-cache-dir '$cache_dir' --format-version 1"
+    reply=("$UC_BIN" metadata --manifest-path "$manifest" --global-cache-dir "$cache_dir" --format-version 1)
   fi
 }
 
@@ -208,151 +245,191 @@ metadata_offline_command_for_manifest() {
   local manifest="$1"
   local cache_dir="$2"
   if [[ "$TOOL" == "scarb" ]]; then
-    echo "scarb --manifest-path '$manifest' --global-cache-dir '$cache_dir' --offline metadata --format-version 1"
+    reply=(scarb --manifest-path "$manifest" --global-cache-dir "$cache_dir" --offline metadata --format-version 1)
   else
-    echo "'$UC_BIN' metadata --manifest-path '$manifest' --offline --global-cache-dir '$cache_dir' --format-version 1"
+    reply=("$UC_BIN" metadata --manifest-path "$manifest" --offline --global-cache-dir "$cache_dir" --format-version 1)
   fi
+}
+
+prepare_workload_copy() {
+  local workload="$1"
+  local source_dir="$2"
+  local isolated_dir="$TMP_DIR/workloads/$workload"
+  mkdir -p "$isolated_dir"
+  cp -R "$source_dir/." "$isolated_dir"
+  printf "%s" "$isolated_dir"
 }
 
 run_build_cold() {
   local workload="$1"
   local cwd="$2"
-  local command="$3"
-  local runs="$4"
+  local runs="$3"
+  shift 3
+  local -a command=("$@")
+  local command_string="$(command_to_string "${command[@]}")"
   local samples_file="$TMP_DIR/${TOOL}-${workload//\//_}-build-cold.samples"
   : > "$samples_file"
 
   for i in $(seq 1 "$runs"); do
-    rm -rf "$cwd/target" "$cwd/.scarb"
-    measure_command_ms "$cwd" "$command" >> "$samples_file"
+    rm -rf "$cwd/target" "$cwd/.scarb" "$cwd/.uc"
+    measure_command_ms "$cwd" "${command[@]}" >> "$samples_file"
   done
 
-  append_result "build.cold" "$workload" "$command" "$samples_file" "$runs"
+  append_result "build.cold" "$workload" "$command_string" "$samples_file" "$runs"
 }
 
 run_build_warm_noop() {
   local workload="$1"
   local cwd="$2"
-  local command="$3"
-  local runs="$4"
+  local runs="$3"
+  shift 3
+  local -a command=("$@")
+  local command_string="$(command_to_string "${command[@]}")"
   local samples_file="$TMP_DIR/${TOOL}-${workload//\//_}-build-warm-noop.samples"
   : > "$samples_file"
 
-  measure_command_ms "$cwd" "$command" > /dev/null
+  measure_command_ms "$cwd" "${command[@]}" > /dev/null
   for i in $(seq 1 "$runs"); do
-    measure_command_ms "$cwd" "$command" >> "$samples_file"
+    measure_command_ms "$cwd" "${command[@]}" >> "$samples_file"
   done
 
-  append_result "build.warm_noop" "$workload" "$command" "$samples_file" "$runs"
+  append_result "build.warm_noop" "$workload" "$command_string" "$samples_file" "$runs"
 }
 
 run_build_warm_edit() {
   local workload="$1"
   local cwd="$2"
-  local command="$3"
-  local edit_file="$4"
-  local runs="$5"
+  local edit_file="$3"
+  local runs="$4"
+  shift 4
+  local -a command=("$@")
+  local command_string="$(command_to_string "${command[@]}")"
   local samples_file="$TMP_DIR/${TOOL}-${workload//\//_}-build-warm-edit.samples"
   local backup_file="$TMP_DIR/${TOOL}-${workload//\//_}-edit.backup"
   : > "$samples_file"
 
   cp "$edit_file" "$backup_file"
   {
-    measure_command_ms "$cwd" "$command" > /dev/null
+    measure_command_ms "$cwd" "${command[@]}" > /dev/null
 
     for i in $(seq 1 "$runs"); do
       cp "$backup_file" "$edit_file"
       printf "\n// uc benchmark edit %s %s\n" "$i" "$STAMP" >> "$edit_file"
-      measure_command_ms "$cwd" "$command" >> "$samples_file"
+      measure_command_ms "$cwd" "${command[@]}" >> "$samples_file"
     done
   } always {
     cp "$backup_file" "$edit_file" >/dev/null 2>&1 || true
   }
 
-  append_result "build.warm_edit" "$workload" "$command" "$samples_file" "$runs"
+  append_result "build.warm_edit" "$workload" "$command_string" "$samples_file" "$runs"
 }
 
 run_metadata_online_cold() {
   local workload="$1"
   local cwd="$2"
-  local command="$3"
-  local cache_dir="$4"
-  local runs="$5"
+  local cache_dir="$3"
+  local runs="$4"
+  shift 4
+  local -a command=("$@")
+  local command_string="$(command_to_string "${command[@]}")"
   local samples_file="$TMP_DIR/${TOOL}-${workload//\//_}-metadata-online-cold.samples"
   : > "$samples_file"
 
   for i in $(seq 1 "$runs"); do
     rm -rf "$cache_dir"
-    measure_command_ms "$cwd" "$command" >> "$samples_file"
+    measure_command_ms "$cwd" "${command[@]}" >> "$samples_file"
   done
 
-  append_result "metadata.online_cold" "$workload" "$command" "$samples_file" "$runs"
+  append_result "metadata.online_cold" "$workload" "$command_string" "$samples_file" "$runs"
 }
 
 run_metadata_offline_warm() {
   local workload="$1"
   local cwd="$2"
-  local warm_command="$3"
-  local command="$4"
-  local cache_dir="$5"
-  local runs="$6"
+  local cache_dir="$3"
+  local runs="$4"
+  shift 4
+  local -a warm_command=()
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--" ]]; then
+      shift
+      break
+    fi
+    warm_command+=("$1")
+    shift
+  done
+  local -a command=("$@")
+  local command_string="$(command_to_string "${command[@]}")"
   local samples_file="$TMP_DIR/${TOOL}-${workload//\//_}-metadata-offline-warm.samples"
   : > "$samples_file"
 
   rm -rf "$cache_dir"
-  measure_command_ms "$cwd" "$warm_command" > /dev/null
+  measure_command_ms "$cwd" "${warm_command[@]}" > /dev/null
 
   for i in $(seq 1 "$runs"); do
-    measure_command_ms "$cwd" "$command" >> "$samples_file"
+    measure_command_ms "$cwd" "${command[@]}" >> "$samples_file"
   done
 
-  append_result "metadata.offline_warm" "$workload" "$command" "$samples_file" "$runs"
+  append_result "metadata.offline_warm" "$workload" "$command_string" "$samples_file" "$runs"
 }
 
 if [[ "$MATRIX" == "research" ]]; then
   if [[ -z "$WORKSPACE_ROOT" ]]; then
     WORKSPACE_ROOT="$DEFAULT_WORKSPACE_ROOT"
   fi
+  WORKSPACE_ROOT="$(cd "$WORKSPACE_ROOT" && pwd -P)"
 
-  HELLO_DIR="$WORKSPACE_ROOT/scarb/examples/hello_world"
-  WS_DIR="$WORKSPACE_ROOT/scarb/examples/workspaces"
-  DEPS_DIR="$WORKSPACE_ROOT/scarb/examples/dependencies"
+  HELLO_SRC="$WORKSPACE_ROOT/scarb/examples/hello_world"
+  WS_SRC="$WORKSPACE_ROOT/scarb/examples/workspaces"
+  DEPS_SRC="$WORKSPACE_ROOT/scarb/examples/dependencies"
 
-  if [[ ! -d "$HELLO_DIR" || ! -d "$WS_DIR" || ! -d "$DEPS_DIR" ]]; then
+  if [[ ! -d "$HELLO_SRC" || ! -d "$WS_SRC" || ! -d "$DEPS_SRC" ]]; then
     echo "Research matrix directories not found under: $WORKSPACE_ROOT" >&2
     echo "Hint: pass --workspace-root <path> (or WORKSPACE_ROOT=<path>) where scarb/examples exists." >&2
     echo "Expected: scarb/examples/hello_world, scarb/examples/workspaces, scarb/examples/dependencies" >&2
     exit 1
   fi
 
+  HELLO_DIR="$(prepare_workload_copy "hello_world" "$HELLO_SRC")"
+  WS_DIR="$(prepare_workload_copy "workspaces" "$WS_SRC")"
+  DEPS_DIR="$(prepare_workload_copy "dependencies" "$DEPS_SRC")"
+
   HELLO_MANIFEST="$HELLO_DIR/Scarb.toml"
   WS_MANIFEST="$WS_DIR/Scarb.toml"
   DEPS_MANIFEST="$DEPS_DIR/Scarb.toml"
 
-  HELLO_BUILD_CMD="$(build_command_for_manifest "$HELLO_MANIFEST")"
-  WS_BUILD_CMD="$(build_command_for_manifest "$WS_MANIFEST")"
+  build_command_for_manifest "$HELLO_MANIFEST"
+  HELLO_BUILD_CMD=("${reply[@]}")
+  build_command_for_manifest "$WS_MANIFEST"
+  WS_BUILD_CMD=("${reply[@]}")
 
-  run_build_cold "hello_world" "$HELLO_DIR" "$HELLO_BUILD_CMD" "$COLD_RUNS"
-  run_build_warm_noop "hello_world" "$HELLO_DIR" "$HELLO_BUILD_CMD" "$RUNS"
-  run_build_warm_edit "hello_world" "$HELLO_DIR" "$HELLO_BUILD_CMD" "$HELLO_DIR/src/lib.cairo" "$RUNS"
+  run_build_cold "hello_world" "$HELLO_DIR" "$COLD_RUNS" "${HELLO_BUILD_CMD[@]}"
+  run_build_warm_noop "hello_world" "$HELLO_DIR" "$RUNS" "${HELLO_BUILD_CMD[@]}"
+  run_build_warm_edit "hello_world" "$HELLO_DIR" "$HELLO_DIR/src/lib.cairo" "$RUNS" "${HELLO_BUILD_CMD[@]}"
 
-  run_build_cold "workspaces" "$WS_DIR" "$WS_BUILD_CMD" "$COLD_RUNS"
-  run_build_warm_noop "workspaces" "$WS_DIR" "$WS_BUILD_CMD" "$RUNS"
-  run_build_warm_edit "workspaces" "$WS_DIR" "$WS_BUILD_CMD" "$WS_DIR/crates/fibonacci/src/lib.cairo" "$RUNS"
+  run_build_cold "workspaces" "$WS_DIR" "$COLD_RUNS" "${WS_BUILD_CMD[@]}"
+  run_build_warm_noop "workspaces" "$WS_DIR" "$RUNS" "${WS_BUILD_CMD[@]}"
+  run_build_warm_edit "workspaces" "$WS_DIR" "$WS_DIR/crates/fibonacci/src/lib.cairo" "$RUNS" "${WS_BUILD_CMD[@]}"
 
-  DEPS_META_WARM_CMD="$(metadata_online_command_for_manifest "$DEPS_MANIFEST" "$TMP_DIR/deps-cache")"
-  DEPS_META_OFFLINE_CMD="$(metadata_offline_command_for_manifest "$DEPS_MANIFEST" "$TMP_DIR/deps-cache")"
+  DEPS_CACHE_DIR="$TMP_DIR/deps-cache"
+  metadata_online_command_for_manifest "$DEPS_MANIFEST" "$DEPS_CACHE_DIR"
+  DEPS_META_WARM_CMD=("${reply[@]}")
+  metadata_offline_command_for_manifest "$DEPS_MANIFEST" "$DEPS_CACHE_DIR"
+  DEPS_META_OFFLINE_CMD=("${reply[@]}")
 
-  run_metadata_online_cold "dependencies" "$DEPS_DIR" "$DEPS_META_WARM_CMD" "$TMP_DIR/deps-cache" "$COLD_RUNS"
-  run_metadata_offline_warm "dependencies" "$DEPS_DIR" "$DEPS_META_WARM_CMD" "$DEPS_META_OFFLINE_CMD" "$TMP_DIR/deps-cache" "$RUNS"
+  run_metadata_online_cold "dependencies" "$DEPS_DIR" "$DEPS_CACHE_DIR" "$COLD_RUNS" "${DEPS_META_WARM_CMD[@]}"
+  run_metadata_offline_warm "dependencies" "$DEPS_DIR" "$DEPS_CACHE_DIR" "$RUNS" "${DEPS_META_WARM_CMD[@]}" -- "${DEPS_META_OFFLINE_CMD[@]}"
 elif [[ "$MATRIX" == "smoke" ]]; then
-  SMOKE_DIR="$ROOT_DIR/benchmarks/fixtures/scarb_smoke"
+  SMOKE_SRC="$ROOT_DIR/benchmarks/fixtures/scarb_smoke"
+  SMOKE_DIR="$(prepare_workload_copy "scarb_smoke" "$SMOKE_SRC")"
   SMOKE_MANIFEST="$SMOKE_DIR/Scarb.toml"
-  SMOKE_BUILD_CMD="$(build_command_for_manifest "$SMOKE_MANIFEST")"
 
-  run_build_cold "scarb_smoke" "$SMOKE_DIR" "$SMOKE_BUILD_CMD" 1
-  run_build_warm_noop "scarb_smoke" "$SMOKE_DIR" "$SMOKE_BUILD_CMD" 2
-  run_build_warm_edit "scarb_smoke" "$SMOKE_DIR" "$SMOKE_BUILD_CMD" "$SMOKE_DIR/src/lib.cairo" 2
+  build_command_for_manifest "$SMOKE_MANIFEST"
+  SMOKE_BUILD_CMD=("${reply[@]}")
+
+  run_build_cold "scarb_smoke" "$SMOKE_DIR" 1 "${SMOKE_BUILD_CMD[@]}"
+  run_build_warm_noop "scarb_smoke" "$SMOKE_DIR" 2 "${SMOKE_BUILD_CMD[@]}"
+  run_build_warm_edit "scarb_smoke" "$SMOKE_DIR" "$SMOKE_DIR/src/lib.cairo" 2 "${SMOKE_BUILD_CMD[@]}"
 else
   echo "Unsupported matrix: $MATRIX" >&2
   exit 1

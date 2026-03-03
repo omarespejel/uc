@@ -8,18 +8,17 @@ pub struct SessionInput {
     pub profile: String,
     pub features: Vec<String>,
     pub cfg_set: Vec<String>,
-    pub plugin_signature: String,
+    pub manifest_content_hash: String,
     pub target_family: String,
 }
 
 #[derive(Debug, Serialize)]
 struct NormalizedSessionInput<'a> {
-    workspace_root: &'a str,
     compiler_version: &'a str,
     profile: &'a str,
     features: Vec<String>,
     cfg_set: Vec<String>,
-    plugin_signature: &'a str,
+    manifest_content_hash: &'a str,
     target_family: &'a str,
 }
 
@@ -33,12 +32,11 @@ impl SessionInput {
         cfg_set.dedup();
 
         let normalized = serde_json::to_vec(&NormalizedSessionInput {
-            workspace_root: &self.workspace_root,
             compiler_version: &self.compiler_version,
             profile: &self.profile,
             features,
             cfg_set,
-            plugin_signature: &self.plugin_signature,
+            manifest_content_hash: &self.manifest_content_hash,
             target_family: &self.target_family,
         })
         .expect("session key normalization serialization must not fail");
@@ -60,7 +58,7 @@ mod tests {
             profile: "dev".to_string(),
             features: features.into_iter().map(ToString::to_string).collect(),
             cfg_set: cfg_set.into_iter().map(ToString::to_string).collect(),
-            plugin_signature: "plugin-v1".to_string(),
+            manifest_content_hash: "manifest-blake3:abc".to_string(),
             target_family: "lib".to_string(),
         }
     }

@@ -38,11 +38,13 @@ pub fn collect_artifact_digests(target_root: &Path) -> Result<Vec<ArtifactDigest
 
     let mut digests = Vec::new();
 
-    for entry in WalkDir::new(target_root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
+    for entry in WalkDir::new(target_root).follow_links(false).into_iter() {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to traverse artifact tree under {}",
+                target_root.display()
+            )
+        })?;
         if !entry.file_type().is_file() {
             continue;
         }

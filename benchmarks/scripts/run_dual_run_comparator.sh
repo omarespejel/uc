@@ -1,12 +1,18 @@
 #!/usr/bin/env zsh
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-DEFAULT_WORKSPACE_ROOT="$(cd "$ROOT_DIR/.." && pwd)"
-WORKSPACE_ROOT="${WORKSPACE_ROOT:-$DEFAULT_WORKSPACE_ROOT}"
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%N}")" && pwd -P)"
+ROOT_DIR="$(git -C "$SCRIPT_DIR/../.." rev-parse --show-toplevel 2>/dev/null || (cd "$SCRIPT_DIR/../.." && pwd -P))"
+DEFAULT_WORKSPACE_ROOT="$(cd "$ROOT_DIR/.." && pwd -P)"
+WORKSPACE_ROOT="${WORKSPACE_ROOT:-}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR="$ROOT_DIR/benchmarks/results"
 SUMMARY_MD="$OUT_DIR/compare-summary-$STAMP.md"
+
+if [[ -z "$WORKSPACE_ROOT" ]]; then
+  WORKSPACE_ROOT="$DEFAULT_WORKSPACE_ROOT"
+fi
+WORKSPACE_ROOT="$(cd "$WORKSPACE_ROOT" && pwd -P)"
 
 mkdir -p "$OUT_DIR"
 
@@ -33,7 +39,7 @@ WORKSPACES_MANIFEST="$WORKSPACE_ROOT/scarb/examples/workspaces/Scarb.toml"
 
 if [[ ! -f "$HELLO_MANIFEST" || ! -f "$WORKSPACES_MANIFEST" ]]; then
   echo "Expected benchmark manifests not found under $WORKSPACE_ROOT" >&2
-  echo "Hint: set WORKSPACE_ROOT or pass WORKSPACE_ROOT=<path> where scarb/examples exists." >&2
+  echo "Hint: set WORKSPACE_ROOT to a path where scarb/examples exists." >&2
   exit 1
 fi
 
