@@ -5,6 +5,7 @@ Benchmark harness and baseline artifacts for Scarb vs `uc` performance and parit
 ## Folders
 - `scenarios.md`: scenario definitions.
 - `scripts/`: benchmark and comparator runners.
+- `gates/`: performance gate rule sets.
 - `fixtures/`: local fixture projects for CI smoke runs.
 - `results/`: transient benchmark and comparator outputs.
 - `baselines/`: committed baseline snapshots.
@@ -18,6 +19,17 @@ Benchmark harness and baseline artifacts for Scarb vs `uc` performance and parit
 ## Run Dual-Run Comparator
 ```bash
 WORKSPACE_ROOT=/path/to/compiler-starknet ./benchmarks/scripts/run_dual_run_comparator.sh
+```
+
+## Run Stability Cycles + Gate
+```bash
+./benchmarks/scripts/run_stability_benchmarks.sh \
+  --matrix research \
+  --workspace-root /path/to/compiler-starknet \
+  --runs 10 \
+  --cold-runs 5 \
+  --cycles 5 \
+  --gate-config benchmarks/gates/perf-gate-research.json
 ```
 
 ## Compare Two Benchmark Runs

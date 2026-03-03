@@ -16,20 +16,23 @@ jobs:
       - name: Install Scarb
         uses: software-mansion/setup-scarb@v1
 
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
-
-      - name: Run smoke benchmark matrix
-        run: |
-          chmod +x benchmarks/scripts/run_local_benchmarks.sh
-          ./benchmarks/scripts/run_local_benchmarks.sh --matrix smoke --tool scarb
+      - name: Install jq and zsh
+        run: sudo apt-get update && sudo apt-get install -y jq zsh
 
       - name: Build uc CLI
         run: cargo build -p uc-cli
 
-      - name: Run smoke benchmark matrix (uc engine)
+      - name: Run smoke stability benchmark cycles
         run: |
-          ./benchmarks/scripts/run_local_benchmarks.sh --matrix smoke --tool uc
+          chmod +x benchmarks/scripts/run_local_benchmarks.sh
+          chmod +x benchmarks/scripts/run_stability_benchmarks.sh
+          chmod +x benchmarks/scripts/gate_benchmark_summary.sh
+          ./benchmarks/scripts/run_stability_benchmarks.sh \
+            --matrix smoke \
+            --runs 3 \
+            --cold-runs 2 \
+            --cycles 3 \
+            --gate-config benchmarks/gates/perf-gate-smoke.json
 
       - name: Run smoke compare-build gate
         run: |

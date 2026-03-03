@@ -35,8 +35,10 @@ make bootstrap
 make benchmark-local
 make benchmark-uc
 make compare-local
+./benchmarks/scripts/run_stability_benchmarks.sh --matrix research --workspace-root /path/to/compiler-starknet --runs 10 --cold-runs 5 --cycles 5 --gate-config benchmarks/gates/perf-gate-research.json
 ./benchmarks/scripts/compare_benchmark_results.sh --baseline <scarb.json> --candidate <uc.json> --out <delta.md>
 cargo run -p uc-cli -- build --manifest-path /path/to/Scarb.toml
+UC_PHASE_TIMING=1 cargo run -p uc-cli -- build --engine uc --daemon-mode off --manifest-path /path/to/Scarb.toml
 cargo run -p uc-cli -- daemon start
 cargo run -p uc-cli -- daemon status
 cargo run -p uc-cli -- build --engine uc --daemon-mode require --manifest-path /path/to/Scarb.toml

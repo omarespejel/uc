@@ -283,6 +283,17 @@ struct CommandRun {
     stderr: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct BuildPhaseTelemetry {
+    fingerprint_ms: f64,
+    cache_lookup_ms: f64,
+    cache_restore_ms: f64,
+    compile_ms: f64,
+    cache_persist_ms: f64,
+    cache_persist_async: bool,
+    cache_persist_scheduled: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct BuildReport {
     generated_at_epoch_ms: u128,
@@ -298,6 +309,7 @@ struct BuildReport {
     cache_hit: bool,
     fingerprint: String,
     artifact_count: usize,
+    phase_telemetry: Option<BuildPhaseTelemetry>,
 }
 
 #[derive(Debug, Serialize)]
@@ -389,6 +401,8 @@ struct DaemonBuildResponse {
     cache_hit: bool,
     fingerprint: String,
     session_key: String,
+    #[serde(default)]
+    telemetry: BuildPhaseTelemetry,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -613,6 +627,16 @@ fn max_capture_stdout_bytes() -> u64 {
 fn max_capture_stderr_bytes() -> u64 {
     static VALUE: OnceLock<u64> = OnceLock::new();
     *VALUE.get_or_init(|| parse_env_u64("UC_MAX_CAPTURE_STDERR_BYTES", MAX_CAPTURE_STDERR_BYTES))
+}
+
+fn should_log_phase_telemetry() -> bool {
+    match std::env::var("UC_PHASE_TIMING") {
+        Ok(raw) => {
+            let normalized = raw.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => false,
+    }
 }
 
 fn resolve_diagnostics_threshold(cli_value: Option<f64>) -> Result<f64> {
@@ -888,6 +912,7 @@ fn run_build(args: BuildArgs) -> Result<()> {
 
     let mut session_key = String::new();
     let mut daemon_used = false;
+    let mut phase_telemetry: Option<BuildPhaseTelemetry> = None;
     let (run, cache_hit, fingerprint) = match engine {
         EngineArg::Scarb => {
             let (command, command_vec) = scarb_build_command(&common, &manifest_path);
@@ -900,35 +925,40 @@ fn run_build(args: BuildArgs) -> Result<()> {
             (run, false, fingerprint)
         }
         EngineArg::Uc => {
-            let run_local = || -> Result<(CommandRun, bool, String, String)> {
-                let local_session_key =
-                    build_session_input(&common, &manifest_path, &profile)?.deterministic_key_hex();
-                let (run, cache_hit, fingerprint) = run_build_with_uc_cache(
-                    &common,
-                    &manifest_path,
-                    &workspace_root,
-                    &profile,
-                    &local_session_key,
-                    false,
-                    false,
-                )?;
-                Ok((run, cache_hit, fingerprint, local_session_key))
-            };
+            let run_local =
+                || -> Result<(CommandRun, bool, String, String, BuildPhaseTelemetry)> {
+                    let local_session_key = build_session_input(&common, &manifest_path, &profile)?
+                        .deterministic_key_hex();
+                    let (run, cache_hit, fingerprint, telemetry) = run_build_with_uc_cache(
+                        &common,
+                        &manifest_path,
+                        &workspace_root,
+                        &profile,
+                        &local_session_key,
+                        false,
+                        false,
+                    )?;
+                    Ok((run, cache_hit, fingerprint, local_session_key, telemetry))
+                };
 
             match daemon_mode {
                 DaemonModeArg::Off => {
-                    let (run, cache_hit, fingerprint, local_session_key) = run_local()?;
+                    let (run, cache_hit, fingerprint, local_session_key, telemetry) = run_local()?;
                     session_key = local_session_key;
+                    phase_telemetry = Some(telemetry);
                     (run, cache_hit, fingerprint)
                 }
                 DaemonModeArg::Auto => {
                     if let Some(response) = try_uc_build_via_daemon(&common, &manifest_path)? {
                         daemon_used = true;
                         session_key = response.session_key;
+                        phase_telemetry = Some(response.telemetry);
                         (response.run, response.cache_hit, response.fingerprint)
                     } else {
-                        let (run, cache_hit, fingerprint, local_session_key) = run_local()?;
+                        let (run, cache_hit, fingerprint, local_session_key, telemetry) =
+                            run_local()?;
                         session_key = local_session_key;
+                        phase_telemetry = Some(telemetry);
                         (run, cache_hit, fingerprint)
                     }
                 }
@@ -937,12 +967,29 @@ fn run_build(args: BuildArgs) -> Result<()> {
                         .context("daemon mode is require but daemon is unavailable")?;
                     daemon_used = true;
                     session_key = response.session_key;
+                    phase_telemetry = Some(response.telemetry);
                     (response.run, response.cache_hit, response.fingerprint)
                 }
             }
         }
     };
     replay_output(&run.stdout, &run.stderr)?;
+    if should_log_phase_telemetry() {
+        if let Some(telemetry) = phase_telemetry.as_ref() {
+            eprintln!(
+                "uc: phase timings (ms) fingerprint={:.3} cache_lookup={:.3} cache_restore={:.3} compile={:.3} cache_persist={:.3} async={} scheduled={} daemon_used={} cache_hit={}",
+                telemetry.fingerprint_ms,
+                telemetry.cache_lookup_ms,
+                telemetry.cache_restore_ms,
+                telemetry.compile_ms,
+                telemetry.cache_persist_ms,
+                telemetry.cache_persist_async,
+                telemetry.cache_persist_scheduled,
+                daemon_used,
+                cache_hit
+            );
+        }
+    }
     if session_key.is_empty() {
         session_key = "n/a".to_string();
     }
@@ -963,6 +1010,7 @@ fn run_build(args: BuildArgs) -> Result<()> {
             cache_hit,
             fingerprint,
             artifact_count: artifacts.len(),
+            phase_telemetry,
         };
         write_json_report(&path, &report)?;
     }
@@ -1054,7 +1102,7 @@ fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildRespon
     let session_input = build_session_input(&common, &manifest_path, &profile)?;
     let session_key = session_input.deterministic_key_hex();
 
-    let (run, cache_hit, fingerprint) = run_build_with_uc_cache(
+    let (run, cache_hit, fingerprint, telemetry) = run_build_with_uc_cache(
         &common,
         &manifest_path,
         &workspace_root,
@@ -1069,6 +1117,7 @@ fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildRespon
         cache_hit,
         fingerprint,
         session_key,
+        telemetry,
     })
 }
 
@@ -1307,7 +1356,8 @@ fn run_build_with_uc_cache(
     session_key: &str,
     capture_output: bool,
     async_cache_persist: bool,
-) -> Result<(CommandRun, bool, String)> {
+) -> Result<(CommandRun, bool, String, BuildPhaseTelemetry)> {
+    let mut telemetry = BuildPhaseTelemetry::default();
     let canonical_workspace_root = workspace_root.canonicalize().with_context(|| {
         format!(
             "failed to resolve workspace root for cache path {}",
@@ -1325,6 +1375,7 @@ fn run_build_with_uc_cache(
         "cache objects directory",
     )?;
     ensure_path_within_root(&canonical_workspace_root, &entry_path, "cache entry path")?;
+    let fingerprint_start = Instant::now();
     let fingerprint = compute_build_fingerprint(
         &canonical_workspace_root,
         manifest_path,
@@ -1332,7 +1383,9 @@ fn run_build_with_uc_cache(
         profile,
         Some(&cache_root),
     )?;
+    telemetry.fingerprint_ms = fingerprint_start.elapsed().as_secs_f64() * 1000.0;
 
+    let cache_lookup_start = Instant::now();
     let cached_entry = {
         let _cache_lock = acquire_cache_lock(&cache_root)?;
         if let Some(entry) = load_cache_entry(&entry_path)? {
@@ -1348,6 +1401,7 @@ fn run_build_with_uc_cache(
             None
         }
     };
+    telemetry.cache_lookup_ms = cache_lookup_start.elapsed().as_secs_f64() * 1000.0;
 
     if let Some(entry) = cached_entry {
         let restore_start = Instant::now();
@@ -1357,6 +1411,9 @@ fn run_build_with_uc_cache(
             &objects_dir,
             &entry.artifacts,
         )? {
+            telemetry.cache_restore_ms = restore_start.elapsed().as_secs_f64() * 1000.0;
+            let total_elapsed_ms =
+                telemetry.fingerprint_ms + telemetry.cache_lookup_ms + telemetry.cache_restore_ms;
             let run = CommandRun {
                 command: vec![
                     "uc".to_string(),
@@ -1366,22 +1423,25 @@ fn run_build_with_uc_cache(
                     "--cache-hit".to_string(),
                 ],
                 exit_code: 0,
-                elapsed_ms: restore_start.elapsed().as_secs_f64() * 1000.0,
+                elapsed_ms: total_elapsed_ms,
                 stdout: format!(
                     "uc: cache hit, restored {} artifacts\n",
                     entry.artifacts.len()
                 ),
                 stderr: String::new(),
             };
-            return Ok((run, true, fingerprint));
+            return Ok((run, true, fingerprint, telemetry));
         }
+        telemetry.cache_restore_ms = restore_start.elapsed().as_secs_f64() * 1000.0;
     }
 
     let (command, command_vec) = scarb_build_command(common, manifest_path);
     let run = run_command(command, command_vec, capture_output)?;
+    telemetry.compile_ms = run.elapsed_ms;
 
     if run.exit_code == 0 {
         if async_cache_persist {
+            telemetry.cache_persist_async = true;
             let persist_scope_key = async_persist_scope_key(&canonical_workspace_root, profile);
             let workspace_root = canonical_workspace_root.clone();
             let profile = profile.to_string();
@@ -1390,6 +1450,7 @@ fn run_build_with_uc_cache(
             let objects_dir = objects_dir.clone();
             let entry_path = entry_path.clone();
             if try_mark_async_persist_in_flight(&persist_scope_key) {
+                telemetry.cache_persist_scheduled = true;
                 thread::spawn(move || {
                     let _guard = AsyncPersistGuard::new(persist_scope_key);
                     if let Err(err) = persist_cache_entry_for_build(
@@ -1405,6 +1466,7 @@ fn run_build_with_uc_cache(
                 });
             }
         } else {
+            let persist_start = Instant::now();
             persist_cache_entry_for_build(
                 &canonical_workspace_root,
                 profile,
@@ -1413,10 +1475,11 @@ fn run_build_with_uc_cache(
                 &objects_dir,
                 &entry_path,
             )?;
+            telemetry.cache_persist_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
         }
     }
 
-    Ok((run, false, fingerprint))
+    Ok((run, false, fingerprint, telemetry))
 }
 
 fn async_persist_scope_key(workspace_root: &Path, profile: &str) -> String {
