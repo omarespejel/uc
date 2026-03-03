@@ -3,11 +3,13 @@ use blake3::Hasher;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use toml::Value as TomlValue;
@@ -35,12 +37,34 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    Daemon(DaemonArgs),
     Benchmark(BenchmarkArgs),
     SessionKey(SessionKeyArgs),
     Build(BuildArgs),
     Metadata(MetadataArgs),
     CompareBuild(CompareBuildArgs),
     Migrate(MigrateArgs),
+}
+
+#[derive(Args, Debug)]
+struct DaemonArgs {
+    #[command(subcommand)]
+    command: DaemonCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum DaemonCommand {
+    Start(DaemonSocketArgs),
+    Status(DaemonSocketArgs),
+    Stop(DaemonSocketArgs),
+    #[command(hide = true)]
+    Serve(DaemonSocketArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct DaemonSocketArgs {
+    #[arg(long)]
+    socket_path: Option<PathBuf>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -86,6 +110,13 @@ impl EngineArg {
             EngineArg::Uc => "uc",
         }
     }
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum DaemonModeArg {
+    Off,
+    Auto,
+    Require,
 }
 
 #[derive(Args, Debug)]
@@ -162,6 +193,9 @@ struct BuildArgs {
     #[arg(long, value_enum, default_value_t = EngineArg::Uc)]
     engine: EngineArg,
 
+    #[arg(long, value_enum, default_value_t = DaemonModeArg::Off)]
+    daemon_mode: DaemonModeArg,
+
     #[arg(long)]
     report_path: Option<PathBuf>,
 }
@@ -208,7 +242,7 @@ struct MigrateArgs {
     emit_uc_toml: Option<PathBuf>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CommandRun {
     command: Vec<String>,
     exit_code: i32,
@@ -221,6 +255,7 @@ struct CommandRun {
 struct BuildReport {
     generated_at_epoch_ms: u128,
     engine: String,
+    daemon_used: bool,
     manifest_path: String,
     workspace_root: String,
     profile: String,
@@ -297,6 +332,49 @@ struct BuildCacheEntry {
     artifacts: Vec<CachedArtifact>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DaemonStatusPayload {
+    pid: u32,
+    started_at_epoch_ms: u64,
+    socket_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DaemonBuildRequest {
+    manifest_path: String,
+    package: Option<String>,
+    workspace: bool,
+    features: Vec<String>,
+    offline: bool,
+    release: bool,
+    profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DaemonBuildResponse {
+    run: CommandRun,
+    cache_hit: bool,
+    fingerprint: String,
+    session_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum DaemonRequest {
+    Ping,
+    Shutdown,
+    Build(DaemonBuildRequest),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum DaemonResponse {
+    Pong(DaemonStatusPayload),
+    Ack,
+    Build(DaemonBuildResponse),
+    Error { message: String },
+}
+
 struct CacheLockGuard {
     path: PathBuf,
 }
@@ -311,12 +389,197 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Daemon(args) => run_daemon(args),
         Commands::Benchmark(args) => run_benchmark(args),
         Commands::SessionKey(args) => run_session_key(args),
         Commands::Build(args) => run_build(args),
         Commands::Metadata(args) => run_metadata(args),
         Commands::CompareBuild(args) => run_compare_build(args),
         Commands::Migrate(args) => run_migrate(args),
+    }
+}
+
+fn run_daemon(args: DaemonArgs) -> Result<()> {
+    match args.command {
+        DaemonCommand::Start(socket) => run_daemon_start(socket),
+        DaemonCommand::Status(socket) => run_daemon_status(socket),
+        DaemonCommand::Stop(socket) => run_daemon_stop(socket),
+        DaemonCommand::Serve(socket) => run_daemon_serve(socket),
+    }
+}
+
+fn run_daemon_start(args: DaemonSocketArgs) -> Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = args;
+        bail!("daemon mode is currently supported on Unix platforms only");
+    }
+    #[cfg(unix)]
+    {
+        let socket_path = daemon_socket_path(args.socket_path)?;
+        if daemon_ping(&socket_path).is_ok() {
+            println!("uc daemon already running on {}", socket_path.display());
+            return Ok(());
+        }
+
+        if let Some(parent) = socket_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        if socket_path.exists() {
+            let _ = fs::remove_file(&socket_path);
+        }
+
+        let log_path = daemon_log_path(&socket_path);
+        let log_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .with_context(|| format!("failed to open daemon log {}", log_path.display()))?;
+        let log_file_err = log_file
+            .try_clone()
+            .with_context(|| format!("failed to clone log file {}", log_path.display()))?;
+
+        let exe = std::env::current_exe().context("failed to resolve uc binary path")?;
+        let mut command = Command::new(exe);
+        command
+            .arg("daemon")
+            .arg("serve")
+            .arg("--socket-path")
+            .arg(&socket_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log_file))
+            .stderr(Stdio::from(log_file_err));
+        command.spawn().with_context(|| {
+            format!(
+                "failed to launch daemon process for {}",
+                socket_path.display()
+            )
+        })?;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Ok(status) = daemon_ping(&socket_path) {
+                println!(
+                    "uc daemon started (pid={}, socket={})",
+                    status.pid, status.socket_path
+                );
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        bail!(
+            "daemon failed to become ready; inspect log at {}",
+            log_path.display()
+        );
+    }
+}
+
+fn run_daemon_status(args: DaemonSocketArgs) -> Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = args;
+        bail!("daemon mode is currently supported on Unix platforms only");
+    }
+    #[cfg(unix)]
+    {
+        let socket_path = daemon_socket_path(args.socket_path)?;
+        let status = daemon_ping(&socket_path)
+            .with_context(|| format!("daemon not reachable on {}", socket_path.display()))?;
+        println!(
+            "uc daemon running (pid={}, started_at_epoch_ms={}, socket={})",
+            status.pid, status.started_at_epoch_ms, status.socket_path
+        );
+        Ok(())
+    }
+}
+
+fn run_daemon_stop(args: DaemonSocketArgs) -> Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = args;
+        bail!("daemon mode is currently supported on Unix platforms only");
+    }
+    #[cfg(unix)]
+    {
+        let socket_path = daemon_socket_path(args.socket_path)?;
+        if !socket_path.exists() {
+            println!("uc daemon is not running ({})", socket_path.display());
+            return Ok(());
+        }
+
+        let response =
+            daemon_request(&socket_path, &DaemonRequest::Shutdown).with_context(|| {
+                format!(
+                    "failed to request daemon shutdown {}",
+                    socket_path.display()
+                )
+            })?;
+        match response {
+            DaemonResponse::Ack => {}
+            DaemonResponse::Error { message } => bail!("daemon shutdown failed: {message}"),
+            _ => {}
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if daemon_ping(&socket_path).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        if socket_path.exists() {
+            let _ = fs::remove_file(&socket_path);
+        }
+        println!("uc daemon stopped ({})", socket_path.display());
+        Ok(())
+    }
+}
+
+fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = args;
+        bail!("daemon mode is currently supported on Unix platforms only");
+    }
+    #[cfg(unix)]
+    {
+        let socket_path = daemon_socket_path(args.socket_path)?;
+        if let Some(parent) = socket_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        if socket_path.exists() {
+            let _ = fs::remove_file(&socket_path);
+        }
+        let listener = UnixListener::bind(&socket_path)
+            .with_context(|| format!("failed to bind daemon socket {}", socket_path.display()))?;
+        let status = DaemonStatusPayload {
+            pid: std::process::id(),
+            started_at_epoch_ms: epoch_ms_u64()?,
+            socket_path: socket_path.display().to_string(),
+        };
+
+        let mut should_shutdown = false;
+        for incoming in listener.incoming() {
+            match incoming {
+                Ok(stream) => {
+                    if let Err(err) =
+                        handle_daemon_connection(stream, &status, &mut should_shutdown)
+                    {
+                        eprintln!("uc daemon: request handling failed: {err:#}");
+                    }
+                }
+                Err(err) => {
+                    eprintln!("uc daemon: socket accept failed: {err}");
+                }
+            }
+            if should_shutdown {
+                break;
+            }
+        }
+        let _ = fs::remove_file(&socket_path);
+        Ok(())
     }
 }
 
@@ -370,6 +633,7 @@ fn run_session_key(args: SessionKeyArgs) -> Result<()> {
 fn run_build(args: BuildArgs) -> Result<()> {
     let common = args.common;
     let engine = args.engine;
+    let daemon_mode = args.daemon_mode;
     let manifest_path = resolve_manifest_path(&common.manifest_path)?;
     let workspace_root = manifest_path
         .parent()
@@ -377,23 +641,9 @@ fn run_build(args: BuildArgs) -> Result<()> {
         .to_path_buf();
     let profile = effective_profile(&common);
 
-    let scarb_version = scarb_version_line()?;
-    let plugin_signature = compute_plugin_signature(&manifest_path)?;
-    let session_input = SessionInput {
-        workspace_root: workspace_root.display().to_string(),
-        compiler_version: scarb_version,
-        profile: profile.clone(),
-        features: common.features.clone(),
-        cfg_set: Vec::new(),
-        plugin_signature,
-        target_family: if common.workspace {
-            "workspace".to_string()
-        } else {
-            "package".to_string()
-        },
-    };
-
-    let session_key = session_input.deterministic_key_hex();
+    let session_input = build_session_input(&common, &manifest_path, &workspace_root, &profile)?;
+    let mut session_key = session_input.deterministic_key_hex();
+    let mut daemon_used = false;
     let (run, cache_hit, fingerprint) = match engine {
         EngineArg::Scarb => {
             let (command, command_vec) = scarb_build_command(&common, &manifest_path);
@@ -402,13 +652,37 @@ fn run_build(args: BuildArgs) -> Result<()> {
                 compute_build_fingerprint(&workspace_root, &manifest_path, &common, &profile)?;
             (run, false, fingerprint)
         }
-        EngineArg::Uc => run_build_with_uc_cache(
-            &common,
-            &manifest_path,
-            &workspace_root,
-            &profile,
-            &session_key,
-        )?,
+        EngineArg::Uc => match daemon_mode {
+            DaemonModeArg::Off => run_build_with_uc_cache(
+                &common,
+                &manifest_path,
+                &workspace_root,
+                &profile,
+                &session_key,
+            )?,
+            DaemonModeArg::Auto => {
+                if let Some(response) = try_uc_build_via_daemon(&common, &manifest_path)? {
+                    daemon_used = true;
+                    session_key = response.session_key;
+                    (response.run, response.cache_hit, response.fingerprint)
+                } else {
+                    run_build_with_uc_cache(
+                        &common,
+                        &manifest_path,
+                        &workspace_root,
+                        &profile,
+                        &session_key,
+                    )?
+                }
+            }
+            DaemonModeArg::Require => {
+                let response = try_uc_build_via_daemon(&common, &manifest_path)?
+                    .context("daemon mode is require but daemon is unavailable")?;
+                daemon_used = true;
+                session_key = response.session_key;
+                (response.run, response.cache_hit, response.fingerprint)
+            }
+        },
     };
     replay_output(&run.stdout, &run.stderr)?;
 
@@ -418,6 +692,7 @@ fn run_build(args: BuildArgs) -> Result<()> {
         let report = BuildReport {
             generated_at_epoch_ms: epoch_ms()?,
             engine: engine.as_str().to_string(),
+            daemon_used,
             manifest_path: manifest_path.display().to_string(),
             workspace_root: workspace_root.display().to_string(),
             profile,
@@ -437,6 +712,102 @@ fn run_build(args: BuildArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn try_uc_build_via_daemon(
+    common: &BuildCommonArgs,
+    manifest_path: &Path,
+) -> Result<Option<DaemonBuildResponse>> {
+    #[cfg(not(unix))]
+    {
+        let _ = (common, manifest_path);
+        return Ok(None);
+    }
+    #[cfg(unix)]
+    {
+        let socket_path = daemon_socket_path(None)?;
+        if !socket_path.exists() {
+            return Ok(None);
+        }
+
+        let request = DaemonRequest::Build(daemon_build_request_from_common(common, manifest_path));
+        let response = match daemon_request(&socket_path, &request) {
+            Ok(response) => response,
+            Err(err) => {
+                eprintln!(
+                    "uc: daemon request failed ({}), falling back to local engine",
+                    err
+                );
+                return Ok(None);
+            }
+        };
+
+        match response {
+            DaemonResponse::Build(result) => Ok(Some(result)),
+            DaemonResponse::Error { message } => {
+                eprintln!(
+                    "uc: daemon returned error ({}), falling back to local engine",
+                    message
+                );
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+fn daemon_build_request_from_common(
+    common: &BuildCommonArgs,
+    manifest_path: &Path,
+) -> DaemonBuildRequest {
+    DaemonBuildRequest {
+        manifest_path: manifest_path.display().to_string(),
+        package: common.package.clone(),
+        workspace: common.workspace,
+        features: common.features.clone(),
+        offline: common.offline,
+        release: common.release,
+        profile: common.profile.clone(),
+    }
+}
+
+fn common_args_from_daemon_request(request: &DaemonBuildRequest) -> BuildCommonArgs {
+    BuildCommonArgs {
+        manifest_path: Some(PathBuf::from(&request.manifest_path)),
+        package: request.package.clone(),
+        workspace: request.workspace,
+        features: request.features.clone(),
+        offline: request.offline,
+        release: request.release,
+        profile: request.profile.clone(),
+    }
+}
+
+fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildResponse> {
+    let common = common_args_from_daemon_request(&request);
+    let manifest_path = resolve_manifest_path(&common.manifest_path)?;
+    let workspace_root = manifest_path
+        .parent()
+        .context("manifest path has no parent")?
+        .to_path_buf();
+    let profile = effective_profile(&common);
+    let session_input = build_session_input(&common, &manifest_path, &workspace_root, &profile)?;
+    let session_key = session_input.deterministic_key_hex();
+
+    let (run, cache_hit, fingerprint) = run_build_with_uc_cache(
+        &common,
+        &manifest_path,
+        &workspace_root,
+        &profile,
+        &session_key,
+    )?;
+
+    Ok(DaemonBuildResponse {
+        run,
+        cache_hit,
+        fingerprint,
+        session_key,
+    })
 }
 
 fn run_metadata(args: MetadataArgs) -> Result<()> {
@@ -1244,6 +1615,29 @@ fn scarb_version_line() -> Result<String> {
     Ok(first.to_string())
 }
 
+fn build_session_input(
+    common: &BuildCommonArgs,
+    manifest_path: &Path,
+    workspace_root: &Path,
+    profile: &str,
+) -> Result<SessionInput> {
+    let scarb_version = scarb_version_line()?;
+    let plugin_signature = compute_plugin_signature(manifest_path)?;
+    Ok(SessionInput {
+        workspace_root: workspace_root.display().to_string(),
+        compiler_version: scarb_version,
+        profile: profile.to_string(),
+        features: common.features.clone(),
+        cfg_set: Vec::new(),
+        plugin_signature,
+        target_family: if common.workspace {
+            "workspace".to_string()
+        } else {
+            "package".to_string()
+        },
+    })
+}
+
 fn exit_code_from_status(status: &ExitStatus) -> i32 {
     if let Some(code) = status.code() {
         return code;
@@ -1335,6 +1729,104 @@ fn acquire_cache_lock(cache_root: &Path) -> Result<CacheLockGuard> {
     }
 }
 
+fn daemon_socket_path(override_path: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = override_path {
+        return Ok(path);
+    }
+    let home = std::env::var_os("HOME").context("HOME is not set; provide --socket-path")?;
+    Ok(PathBuf::from(home).join(".uc/daemon/uc.sock"))
+}
+
+fn daemon_log_path(socket_path: &Path) -> PathBuf {
+    socket_path.with_extension("log")
+}
+
+#[cfg(unix)]
+fn daemon_request(socket_path: &Path, request: &DaemonRequest) -> Result<DaemonResponse> {
+    let mut stream = UnixStream::connect(socket_path)
+        .with_context(|| format!("failed to connect daemon socket {}", socket_path.display()))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(120)))
+        .with_context(|| format!("failed to set read timeout for {}", socket_path.display()))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .with_context(|| format!("failed to set write timeout for {}", socket_path.display()))?;
+
+    let payload = serde_json::to_vec(request).context("failed to encode daemon request")?;
+    stream
+        .write_all(&payload)
+        .context("failed to write daemon request payload")?;
+    stream
+        .write_all(b"\n")
+        .context("failed to write daemon request newline")?;
+    stream.flush().context("failed to flush daemon request")?;
+
+    let mut response_line = String::new();
+    {
+        let mut reader = BufReader::new(&mut stream);
+        reader
+            .read_line(&mut response_line)
+            .context("failed to read daemon response")?;
+    }
+    if response_line.trim().is_empty() {
+        bail!("daemon returned empty response");
+    }
+    serde_json::from_str(response_line.trim_end()).context("failed to decode daemon response")
+}
+
+#[cfg(unix)]
+fn daemon_ping(socket_path: &Path) -> Result<DaemonStatusPayload> {
+    match daemon_request(socket_path, &DaemonRequest::Ping)? {
+        DaemonResponse::Pong(status) => Ok(status),
+        DaemonResponse::Error { message } => bail!("daemon ping failed: {message}"),
+        _ => bail!("unexpected daemon response to ping"),
+    }
+}
+
+#[cfg(unix)]
+fn handle_daemon_connection(
+    mut stream: UnixStream,
+    status: &DaemonStatusPayload,
+    should_shutdown: &mut bool,
+) -> Result<()> {
+    let mut request_line = String::new();
+    {
+        let mut reader = BufReader::new(&mut stream);
+        reader
+            .read_line(&mut request_line)
+            .context("failed to read daemon request line")?;
+    }
+    if request_line.trim().is_empty() {
+        return Ok(());
+    }
+
+    let request: DaemonRequest =
+        serde_json::from_str(request_line.trim_end()).context("failed to parse daemon request")?;
+    let response = match request {
+        DaemonRequest::Ping => DaemonResponse::Pong(status.clone()),
+        DaemonRequest::Shutdown => {
+            *should_shutdown = true;
+            DaemonResponse::Ack
+        }
+        DaemonRequest::Build(request) => match execute_daemon_build(request) {
+            Ok(result) => DaemonResponse::Build(result),
+            Err(err) => DaemonResponse::Error {
+                message: format!("{err:#}"),
+            },
+        },
+    };
+
+    let payload = serde_json::to_vec(&response).context("failed to encode daemon response")?;
+    stream
+        .write_all(&payload)
+        .context("failed to write daemon response")?;
+    stream
+        .write_all(b"\n")
+        .context("failed to write daemon response newline")?;
+    stream.flush().context("failed to flush daemon response")?;
+    Ok(())
+}
+
 fn read_bytes_with_limit(path: &Path, max_bytes: u64, label: &str) -> Result<Vec<u8>> {
     let metadata =
         fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
@@ -1400,6 +1892,11 @@ fn default_compare_output_path() -> Result<PathBuf> {
 
 fn epoch_ms() -> Result<u128> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())
+}
+
+fn epoch_ms_u64() -> Result<u64> {
+    let value = epoch_ms()?;
+    u64::try_from(value).context("epoch milliseconds overflowed u64")
 }
 
 fn workspace_root() -> Result<PathBuf> {

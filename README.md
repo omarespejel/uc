@@ -37,7 +37,11 @@ make benchmark-uc
 make compare-local
 ./benchmarks/scripts/compare_benchmark_results.sh --baseline <scarb.json> --candidate <uc.json> --out <delta.md>
 cargo run -p uc-cli -- build --manifest-path /path/to/Scarb.toml
+cargo run -p uc-cli -- daemon start
+cargo run -p uc-cli -- daemon status
+cargo run -p uc-cli -- build --engine uc --daemon-mode require --manifest-path /path/to/Scarb.toml
 cargo run -p uc-cli -- compare-build --manifest-path /path/to/Scarb.toml
+cargo run -p uc-cli -- daemon stop
 cargo run -p uc-cli -- migrate --manifest-path /path/to/Scarb.toml --emit-uc-toml /path/to/Uc.toml
 ```
 
@@ -50,4 +54,4 @@ cargo run -p uc-cli -- migrate --manifest-path /path/to/Scarb.toml --emit-uc-tom
 ## Current Status
 - Program foundations are set.
 - Baseline benchmarking against Scarb is automated and committed.
-- `uc` now has executable commands for build, metadata, benchmark orchestration, and dual-run comparator reports.
+- `uc` now has executable commands for build, metadata, benchmark orchestration, daemon lifecycle, and dual-run comparator reports.

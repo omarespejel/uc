@@ -4,9 +4,10 @@
 
 1. `uc build`
 - Executes build path with selectable engines.
-- Supports: `--manifest-path`, `--package`, `--workspace`, `--features`, `--offline`, `--release`, `--profile`.
+- Supports: `--manifest-path`, `--package`, `--workspace`, `--features`, `--offline`, `--release`, `--profile`, `--daemon-mode`.
 - Engines:
   - `--engine uc` (default): deterministic fingerprint + local artifact cache restore fast-path.
+    - daemon policy via `--daemon-mode off|auto|require` (default: `off`).
   - `--engine scarb`: direct Scarb execution path.
 - Optional `--report-path` writes execution report JSON.
 
@@ -29,6 +30,11 @@
 6. `uc migrate`
 - Analyzes `Scarb.toml` and emits a migration readiness report.
 - Optional `--emit-uc-toml <path>` generates a starter `Uc.toml` scaffold.
+
+7. `uc daemon`
+- `start`: launches local background daemon (`~/.uc/daemon/uc.sock` by default).
+- `status`: checks daemon reachability and reports pid/start timestamp.
+- `stop`: requests graceful shutdown.
 
 ## Current Engine Note
 `uc` engine currently uses Scarb execution for cache misses and deterministic local cache restore for hits. This is a bootstrap native path to capture warm speedups while keeping parity gates.
