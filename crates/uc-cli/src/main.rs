@@ -45,7 +45,7 @@ const MAX_ARTIFACT_INDEX_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CAPTURE_STDOUT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CAPTURE_STDERR_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_MAX_CACHE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
-const FINGERPRINT_INDEX_SCHEMA_VERSION: u32 = 1;
+const FINGERPRINT_INDEX_SCHEMA_VERSION: u32 = 2;
 const ARTIFACT_INDEX_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_DIAGNOSTICS_SIMILARITY_THRESHOLD: f64 = 99.5;
 const DAEMON_REQUEST_SIZE_LIMIT_BYTES: usize = 1024 * 1024;
@@ -2161,6 +2161,129 @@ fn hash_file_blake3(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+fn hash_fingerprint_source_file(path: &Path) -> Result<String> {
+    let is_cairo = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("cairo"))
+        .unwrap_or(false);
+    if is_cairo {
+        return hash_cairo_source_semantic(path);
+    }
+    hash_file_blake3(path)
+}
+
+fn hash_cairo_source_semantic(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut normalized = strip_cairo_comments(&bytes);
+    while matches!(normalized.last(), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+        normalized.pop();
+    }
+    let mut hasher = Hasher::new();
+    hasher.update(b"uc-cairo-semantic-hash-v1");
+    hasher.update(&normalized);
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn strip_cairo_comments(input: &[u8]) -> Vec<u8> {
+    #[derive(Clone, Copy)]
+    enum Mode {
+        Code,
+        LineComment,
+        BlockComment { depth: u32 },
+        SingleQuote,
+        DoubleQuote,
+    }
+
+    let mut mode = Mode::Code;
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0_usize;
+
+    while i < input.len() {
+        let b = input[i];
+        let next = input.get(i + 1).copied();
+
+        match mode {
+            Mode::Code => {
+                if b == b'/' && next == Some(b'/') {
+                    mode = Mode::LineComment;
+                    i += 2;
+                    continue;
+                }
+                if b == b'/' && next == Some(b'*') {
+                    mode = Mode::BlockComment { depth: 1 };
+                    i += 2;
+                    continue;
+                }
+                out.push(b);
+                if b == b'\'' {
+                    mode = Mode::SingleQuote;
+                } else if b == b'"' {
+                    mode = Mode::DoubleQuote;
+                }
+                i += 1;
+            }
+            Mode::LineComment => {
+                if b == b'\n' {
+                    out.push(b'\n');
+                    mode = Mode::Code;
+                }
+                i += 1;
+            }
+            Mode::BlockComment { depth } => {
+                if b == b'/' && next == Some(b'*') {
+                    mode = Mode::BlockComment { depth: depth + 1 };
+                    i += 2;
+                    continue;
+                }
+                if b == b'*' && next == Some(b'/') {
+                    if depth <= 1 {
+                        mode = Mode::Code;
+                    } else {
+                        mode = Mode::BlockComment { depth: depth - 1 };
+                    }
+                    i += 2;
+                    continue;
+                }
+                if b == b'\n' {
+                    out.push(b'\n');
+                }
+                i += 1;
+            }
+            Mode::SingleQuote => {
+                out.push(b);
+                if b == b'\\' {
+                    if let Some(escaped) = next {
+                        out.push(escaped);
+                        i += 2;
+                        continue;
+                    }
+                }
+                if b == b'\'' {
+                    mode = Mode::Code;
+                }
+                i += 1;
+            }
+            Mode::DoubleQuote => {
+                out.push(b);
+                if b == b'\\' {
+                    if let Some(escaped) = next {
+                        out.push(escaped);
+                        i += 2;
+                        continue;
+                    }
+                }
+                if b == b'"' {
+                    mode = Mode::Code;
+                }
+                i += 1;
+            }
+        }
+    }
+
+    out
+}
+
 fn metadata_modified_unix_ms(metadata: &fs::Metadata) -> Result<u64> {
     let modified = metadata
         .modified()
@@ -2400,10 +2523,10 @@ fn compute_build_fingerprint_with_scarb_version(
             {
                 cached.blake3_hex.clone()
             } else {
-                hash_file_blake3(&path)?
+                hash_fingerprint_source_file(&path)?
             }
         } else {
-            hash_file_blake3(&path)?
+            hash_fingerprint_source_file(&path)?
         };
         updated_entries.insert(
             rel.clone(),
@@ -3965,6 +4088,82 @@ mod tests {
             (2, 14, 0)
         );
         assert!(parse_scarb_semver("invalid-output").is_err());
+    }
+
+    #[test]
+    fn strip_cairo_comments_preserves_literals() {
+        let source = br#"fn demo() {
+    let url = "http://localhost";
+    let marker = '//';
+    // remove this comment
+    /* and this block */
+}
+"#;
+        let stripped = strip_cairo_comments(source);
+        let text = String::from_utf8(stripped).expect("stripped output should be utf-8");
+        assert!(text.contains("http://localhost"));
+        assert!(text.contains("let marker = '//';"));
+        assert!(!text.contains("remove this comment"));
+        assert!(!text.contains("and this block"));
+    }
+
+    #[test]
+    fn fingerprint_ignores_cairo_comment_only_edits() {
+        let workspace = prepare_smoke_workspace("uc-fingerprint-comments");
+        let manifest_path = workspace.join("Scarb.toml");
+        let common = smoke_common_args(&manifest_path);
+        let profile = effective_profile(&common);
+        let lib_path = workspace.join("src/lib.cairo");
+
+        let original = compute_build_fingerprint_with_scarb_version(
+            &workspace,
+            &manifest_path,
+            &common,
+            &profile,
+            None,
+            "scarb 2.14.0 (test)",
+        )
+        .expect("failed to compute baseline fingerprint");
+
+        fs::write(
+            &lib_path,
+            format!(
+                "{}\n// comment-only change for fingerprint test\n",
+                fs::read_to_string(&lib_path).expect("failed to read lib.cairo")
+            ),
+        )
+        .expect("failed to append comment");
+
+        let with_comment = compute_build_fingerprint_with_scarb_version(
+            &workspace,
+            &manifest_path,
+            &common,
+            &profile,
+            None,
+            "scarb 2.14.0 (test)",
+        )
+        .expect("failed to compute comment fingerprint");
+        assert_eq!(original, with_comment);
+
+        let updated = fs::read_to_string(&lib_path).expect("failed to read updated lib.cairo");
+        fs::write(
+            &lib_path,
+            updated.replace("math::weighted_sum(seed)", "math::weighted_sum(seed + 1)"),
+        )
+        .expect("failed to write semantic change");
+
+        let with_semantic_change = compute_build_fingerprint_with_scarb_version(
+            &workspace,
+            &manifest_path,
+            &common,
+            &profile,
+            None,
+            "scarb 2.14.0 (test)",
+        )
+        .expect("failed to compute semantic-change fingerprint");
+        assert_ne!(original, with_semantic_change);
+
+        fs::remove_dir_all(&workspace).ok();
     }
 
     #[test]

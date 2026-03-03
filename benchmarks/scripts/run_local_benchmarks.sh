@@ -281,7 +281,7 @@ build_command_for_manifest() {
   if [[ "$TOOL" == "scarb" ]]; then
     reply=(scarb --manifest-path "$manifest" build)
   else
-    reply=("$UC_BIN" build --engine uc --daemon-mode auto --manifest-path "$manifest")
+    reply=("$UC_BIN" build --engine uc --daemon-mode require --manifest-path "$manifest")
   fi
 }
 
@@ -291,7 +291,7 @@ metadata_online_command_for_manifest() {
   if [[ "$TOOL" == "scarb" ]]; then
     reply=(scarb --manifest-path "$manifest" --global-cache-dir "$cache_dir" metadata --format-version 1)
   else
-    reply=("$UC_BIN" metadata --daemon-mode auto --manifest-path "$manifest" --global-cache-dir "$cache_dir" --format-version 1)
+    reply=("$UC_BIN" metadata --daemon-mode require --manifest-path "$manifest" --global-cache-dir "$cache_dir" --format-version 1)
   fi
 }
 
@@ -301,7 +301,7 @@ metadata_offline_command_for_manifest() {
   if [[ "$TOOL" == "scarb" ]]; then
     reply=(scarb --manifest-path "$manifest" --global-cache-dir "$cache_dir" --offline metadata --format-version 1)
   else
-    reply=("$UC_BIN" metadata --daemon-mode auto --manifest-path "$manifest" --offline --global-cache-dir "$cache_dir" --format-version 1)
+    reply=("$UC_BIN" metadata --daemon-mode require --manifest-path "$manifest" --offline --global-cache-dir "$cache_dir" --format-version 1)
   fi
 }
 
