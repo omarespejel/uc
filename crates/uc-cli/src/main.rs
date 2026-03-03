@@ -15,6 +15,7 @@ use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use toml::Value as TomlValue;
@@ -785,8 +786,7 @@ fn run_build(args: BuildArgs) -> Result<()> {
         .to_path_buf();
     let profile = effective_profile(&common);
 
-    let session_input = build_session_input(&common, &manifest_path, &profile)?;
-    let mut session_key = session_input.deterministic_key_hex();
+    let mut session_key = String::new();
     let mut daemon_used = false;
     let (run, cache_hit, fingerprint) = match engine {
         EngineArg::Scarb => {
@@ -799,41 +799,52 @@ fn run_build(args: BuildArgs) -> Result<()> {
             };
             (run, false, fingerprint)
         }
-        EngineArg::Uc => match daemon_mode {
-            DaemonModeArg::Off => run_build_with_uc_cache(
-                &common,
-                &manifest_path,
-                &workspace_root,
-                &profile,
-                &session_key,
-                false,
-            )?,
-            DaemonModeArg::Auto => {
-                if let Some(response) = try_uc_build_via_daemon(&common, &manifest_path)? {
+        EngineArg::Uc => {
+            let run_local = || -> Result<(CommandRun, bool, String, String)> {
+                let local_session_key =
+                    build_session_input(&common, &manifest_path, &profile)?.deterministic_key_hex();
+                let (run, cache_hit, fingerprint) = run_build_with_uc_cache(
+                    &common,
+                    &manifest_path,
+                    &workspace_root,
+                    &profile,
+                    &local_session_key,
+                    false,
+                )?;
+                Ok((run, cache_hit, fingerprint, local_session_key))
+            };
+
+            match daemon_mode {
+                DaemonModeArg::Off => {
+                    let (run, cache_hit, fingerprint, local_session_key) = run_local()?;
+                    session_key = local_session_key;
+                    (run, cache_hit, fingerprint)
+                }
+                DaemonModeArg::Auto => {
+                    if let Some(response) = try_uc_build_via_daemon(&common, &manifest_path)? {
+                        daemon_used = true;
+                        session_key = response.session_key;
+                        (response.run, response.cache_hit, response.fingerprint)
+                    } else {
+                        let (run, cache_hit, fingerprint, local_session_key) = run_local()?;
+                        session_key = local_session_key;
+                        (run, cache_hit, fingerprint)
+                    }
+                }
+                DaemonModeArg::Require => {
+                    let response = try_uc_build_via_daemon(&common, &manifest_path)?
+                        .context("daemon mode is require but daemon is unavailable")?;
                     daemon_used = true;
                     session_key = response.session_key;
                     (response.run, response.cache_hit, response.fingerprint)
-                } else {
-                    run_build_with_uc_cache(
-                        &common,
-                        &manifest_path,
-                        &workspace_root,
-                        &profile,
-                        &session_key,
-                        false,
-                    )?
                 }
             }
-            DaemonModeArg::Require => {
-                let response = try_uc_build_via_daemon(&common, &manifest_path)?
-                    .context("daemon mode is require but daemon is unavailable")?;
-                daemon_used = true;
-                session_key = response.session_key;
-                (response.run, response.cache_hit, response.fingerprint)
-            }
-        },
+        }
     };
     replay_output(&run.stdout, &run.stderr)?;
+    if session_key.is_empty() {
+        session_key = "n/a".to_string();
+    }
 
     if let Some(path) = report_path {
         let artifacts = collect_profile_artifacts(&workspace_root, &profile)?;
@@ -2125,13 +2136,19 @@ fn effective_profile(common: &BuildCommonArgs) -> String {
 }
 
 fn scarb_version_line() -> Result<String> {
+    static SCARB_VERSION_CACHE: OnceLock<String> = OnceLock::new();
+    if let Some(cached) = SCARB_VERSION_CACHE.get() {
+        return Ok(cached.clone());
+    }
     let output = Command::new("scarb")
         .arg("--version")
         .output()
         .context("failed to execute `scarb --version`")?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let first = stdout.lines().next().unwrap_or("scarb unknown").trim();
-    Ok(first.to_string())
+    let version = first.to_string();
+    let _ = SCARB_VERSION_CACHE.set(version.clone());
+    Ok(version)
 }
 
 fn build_session_input(
