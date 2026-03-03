@@ -35,7 +35,9 @@ const MAX_CACHEABLE_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_CACHE_ENTRY_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_FINGERPRINT_INDEX_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_ARTIFACT_INDEX_BYTES: u64 = 32 * 1024 * 1024;
 const FINGERPRINT_INDEX_SCHEMA_VERSION: u32 = 1;
+const ARTIFACT_INDEX_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_DIAGNOSTICS_SIMILARITY_THRESHOLD: f64 = 99.5;
 const DAEMON_REQUEST_SIZE_LIMIT_BYTES: usize = 1024 * 1024;
 const DAEMON_RATE_WINDOW_SECONDS: u64 = 1;
@@ -419,6 +421,19 @@ struct FingerprintIndexEntry {
     blake3_hex: String,
 }
 
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct ArtifactIndex {
+    schema_version: u32,
+    entries: BTreeMap<String, ArtifactIndexEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ArtifactIndexEntry {
+    size_bytes: u64,
+    modified_unix_ms: u64,
+    blake3_hex: String,
+}
+
 struct DaemonRateLimiter {
     events: VecDeque<Instant>,
 }
@@ -451,6 +466,15 @@ impl FingerprintIndex {
     fn empty() -> Self {
         Self {
             schema_version: FINGERPRINT_INDEX_SCHEMA_VERSION,
+            entries: BTreeMap::new(),
+        }
+    }
+}
+
+impl ArtifactIndex {
+    fn empty() -> Self {
+        Self {
+            schema_version: ARTIFACT_INDEX_SCHEMA_VERSION,
             entries: BTreeMap::new(),
         }
     }
@@ -1248,69 +1272,30 @@ fn run_build_with_uc_cache(
     let run = run_command(command, command_vec, capture_output)?;
 
     if run.exit_code == 0 {
-        let artifacts = collect_profile_artifacts_fast(&canonical_workspace_root, profile)?;
-        let _cache_lock = acquire_cache_lock(&cache_root)?;
-        persist_cache_entry(
+        let cached_artifacts = collect_cached_artifacts_for_entry(
             &canonical_workspace_root,
             profile,
-            &fingerprint,
-            &artifacts,
+            &cache_root,
             &objects_dir,
-            &entry_path,
         )?;
+        let _cache_lock = acquire_cache_lock(&cache_root)?;
+        persist_cache_entry(profile, &fingerprint, &cached_artifacts, &entry_path)?;
     }
 
     Ok((run, false, fingerprint))
 }
 
 fn persist_cache_entry(
-    workspace_root: &Path,
     profile: &str,
     fingerprint: &str,
-    artifacts: &[ArtifactDigest],
-    objects_dir: &Path,
+    cached_artifacts: &[CachedArtifact],
     entry_path: &Path,
 ) -> Result<()> {
-    let target_root = workspace_root.join("target").join(profile);
-    let mut cached_artifacts = Vec::with_capacity(artifacts.len());
-
-    for artifact in artifacts {
-        let src = target_root.join(&artifact.relative_path);
-        if !src.exists() {
-            continue;
-        }
-
-        let canonical_hash = artifact.blake3_hex.to_ascii_lowercase();
-        validate_hex_digest("artifact blake3 hash", &canonical_hash, MIN_HASH_LEN)?;
-        let object_rel_path = format!("{}/{}.bin", &canonical_hash[0..2], canonical_hash);
-        let object_path = objects_dir.join(&object_rel_path);
-        if !object_path.exists() {
-            if let Some(parent) = object_path.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("failed to create {}", parent.display()))?;
-            }
-            fs::copy(&src, &object_path).with_context(|| {
-                format!(
-                    "failed to copy artifact {} to {}",
-                    src.display(),
-                    object_path.display()
-                )
-            })?;
-        }
-
-        cached_artifacts.push(CachedArtifact {
-            relative_path: artifact.relative_path.clone(),
-            blake3_hex: canonical_hash,
-            size_bytes: artifact.size_bytes,
-            object_rel_path,
-        });
-    }
-
     let entry = BuildCacheEntry {
         schema_version: BUILD_CACHE_SCHEMA_VERSION,
         fingerprint: fingerprint.to_string(),
         profile: profile.to_string(),
-        artifacts: cached_artifacts,
+        artifacts: cached_artifacts.to_vec(),
     };
 
     if let Some(parent) = entry_path.parent() {
@@ -1506,6 +1491,44 @@ fn save_fingerprint_index(path: &Path, index: &FingerprintIndex) -> Result<()> {
     fs::rename(&temp_path, path).with_context(|| {
         format!(
             "failed to move fingerprint index {} to {}",
+            temp_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn load_artifact_index(path: &Path) -> Result<ArtifactIndex> {
+    if !path.exists() {
+        return Ok(ArtifactIndex::empty());
+    }
+    let bytes = read_bytes_with_limit(path, MAX_ARTIFACT_INDEX_BYTES, "artifact index")?;
+    match serde_json::from_slice::<ArtifactIndex>(&bytes) {
+        Ok(index) if index.schema_version == ARTIFACT_INDEX_SCHEMA_VERSION => Ok(index),
+        Ok(_) => Ok(ArtifactIndex::empty()),
+        Err(err) => {
+            eprintln!(
+                "uc: warning: ignoring unreadable artifact index {}: {}",
+                path.display(),
+                err
+            );
+            Ok(ArtifactIndex::empty())
+        }
+    }
+}
+
+fn save_artifact_index(path: &Path, index: &ArtifactIndex) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let bytes = serde_json::to_vec(index).context("failed to encode artifact index")?;
+    let temp_path = path.with_extension("tmp");
+    fs::write(&temp_path, &bytes)
+        .with_context(|| format!("failed to write {}", temp_path.display()))?;
+    fs::rename(&temp_path, path).with_context(|| {
+        format!(
+            "failed to move artifact index {} to {}",
             temp_path.display(),
             path.display()
         )
@@ -1835,12 +1858,114 @@ fn collect_profile_artifacts(workspace_root: &Path, profile: &str) -> Result<Vec
     collect_artifact_digests(&target_dir)
 }
 
-fn collect_profile_artifacts_fast(
+fn collect_cached_artifacts_for_entry(
     workspace_root: &Path,
     profile: &str,
-) -> Result<Vec<ArtifactDigest>> {
-    let target_dir = workspace_root.join("target").join(profile);
-    collect_artifact_digests_fast(&target_dir)
+    cache_root: &Path,
+    objects_dir: &Path,
+) -> Result<Vec<CachedArtifact>> {
+    let target_root = workspace_root.join("target").join(profile);
+    if !target_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let index_path = cache_root.join("artifact-index-v1.json");
+    let mut index = load_artifact_index(&index_path)?;
+    let mut updated_index_entries: BTreeMap<String, ArtifactIndexEntry> = BTreeMap::new();
+    let mut cached_artifacts = Vec::new();
+
+    for entry in WalkDir::new(&target_root).follow_links(false).into_iter() {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to traverse artifact tree under {}",
+                target_root.display()
+            )
+        })?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !CACHEABLE_ARTIFACT_SUFFIXES
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+        {
+            continue;
+        }
+
+        let metadata =
+            fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+        if metadata.len() > MAX_CACHEABLE_ARTIFACT_BYTES {
+            bail!(
+                "cacheable artifact {} exceeds size limit ({} bytes > {} bytes)",
+                path.display(),
+                metadata.len(),
+                MAX_CACHEABLE_ARTIFACT_BYTES
+            );
+        }
+        let relative_path = path
+            .strip_prefix(&target_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let modified_unix_ms = metadata_modified_unix_ms(&metadata)?;
+
+        let canonical_hash = if let Some(cached) = index.entries.get(&relative_path) {
+            if cached.size_bytes == metadata.len() && cached.modified_unix_ms == modified_unix_ms {
+                cached.blake3_hex.clone()
+            } else {
+                hash_file_blake3(path)?
+            }
+        } else {
+            hash_file_blake3(path)?
+        }
+        .to_ascii_lowercase();
+        validate_hex_digest("artifact blake3 hash", &canonical_hash, MIN_HASH_LEN)?;
+
+        let object_rel_path = format!("{}/{}.bin", &canonical_hash[0..2], canonical_hash);
+        let object_path = objects_dir.join(&object_rel_path);
+        if !object_path.exists() {
+            if let Some(parent) = object_path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            fs::copy(path, &object_path).with_context(|| {
+                format!(
+                    "failed to copy artifact {} to {}",
+                    path.display(),
+                    object_path.display()
+                )
+            })?;
+        }
+
+        cached_artifacts.push(CachedArtifact {
+            relative_path: relative_path.clone(),
+            blake3_hex: canonical_hash.clone(),
+            size_bytes: metadata.len(),
+            object_rel_path,
+        });
+        updated_index_entries.insert(
+            relative_path,
+            ArtifactIndexEntry {
+                size_bytes: metadata.len(),
+                modified_unix_ms,
+                blake3_hex: canonical_hash,
+            },
+        );
+    }
+
+    cached_artifacts.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    index.schema_version = ARTIFACT_INDEX_SCHEMA_VERSION;
+    index.entries = updated_index_entries;
+    if let Err(err) = save_artifact_index(&index_path, &index) {
+        eprintln!(
+            "uc: warning: failed to update artifact index {}: {err:#}",
+            index_path.display()
+        );
+    }
+    Ok(cached_artifacts)
 }
 
 fn collect_artifact_digests_fast(target_root: &Path) -> Result<Vec<ArtifactDigest>> {
