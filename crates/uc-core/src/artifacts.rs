@@ -229,6 +229,8 @@ fn normalize_sierra_json_ids(value: &mut Value) {
 }
 
 fn build_sierra_id_map(value: &Value) -> HashMap<i64, String> {
+    // For Sierra schema v1 (used by cairo-lang 2.14+), declaration IDs in these sections are
+    // compiler-internal and safe to normalize without changing program semantics.
     let mut ids = HashMap::new();
     collect_section_ids(value, "type_declarations", "type", &mut ids);
     collect_section_ids(value, "libfunc_declarations", "libfunc", &mut ids);
@@ -359,9 +361,11 @@ fn canonicalize_json(value: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonicalize_json, compare_artifact_sets, normalize_sierra_json_ids, ArtifactDigest,
+        canonicalize_json, compare_artifact_sets, normalize_sierra_json_ids,
+        validate_supported_sierra_schema, ArtifactDigest,
     };
     use serde_json::json;
+    use std::path::Path;
 
     fn artifact(path: &str, hash: &str) -> ArtifactDigest {
         ArtifactDigest {
@@ -487,5 +491,20 @@ mod tests {
             value["type_declarations"][0]["id"],
             json!("<type:0:felt252>")
         );
+    }
+
+    #[test]
+    fn sierra_schema_guard_accepts_major_version_one() {
+        let value = json!({ "sierra_format_version": "1.5.0" });
+        let result = validate_supported_sierra_schema(&value, Path::new("sample.sierra.json"));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn sierra_schema_guard_rejects_other_major_versions() {
+        let value = json!({ "sierra_format_version": "2.0.0" });
+        let err = validate_supported_sierra_schema(&value, Path::new("sample.sierra.json"))
+            .expect_err("major version 2 should be rejected");
+        assert!(format!("{err:#}").contains("unsupported Sierra schema version"));
     }
 }

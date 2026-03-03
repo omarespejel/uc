@@ -31,8 +31,8 @@ For repeated builds in the same workspace:
 ## Current Status (2026-03-03)
 - Comparator gate: passing on sampled workloads (0 artifact mismatches, diagnostics similarity 100%).
 - Performance signal: smoke stability gate passing with wins on warm no-op and warm-edit (including semantic edits); cold path remains near parity and is still being tuned.
-- Hardening in progress: integration coverage for cache hit/miss, corruption recovery, and concurrent access continues to expand.
-- Gate A status: passing for smoke fixture lane; research-matrix sign-off still in progress.
+- Correctness hardening: integration coverage now includes cache hit/miss invalidation and corrupted-cache recovery; broader concurrency stress remains in progress.
+- Gate A status: passing for the smoke fixture lane only; research-matrix sign-off is still in progress.
 
 ## Gate Outcome
 - Go: all criteria pass.

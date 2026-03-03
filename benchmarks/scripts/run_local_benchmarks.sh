@@ -14,6 +14,7 @@ CPU_SET="${CPU_SET:-${UC_BENCH_CPU_SET:-}}"
 NICE_LEVEL="${NICE_LEVEL:-${UC_BENCH_NICE_LEVEL:-0}}"
 STRICT_PINNING="${STRICT_PINNING:-${UC_BENCH_STRICT_PINNING:-0}}"
 WARM_SETTLE_SECONDS="${WARM_SETTLE_SECONDS:-2.2}"
+BENCH_LOCK_DIR="${BENCH_LOCK_DIR:-$ROOT_DIR/.uc/benchmarks.lock}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR="$ROOT_DIR/benchmarks/results"
 OUT_JSON=""
@@ -24,6 +25,7 @@ UC_DAEMON_SOCKET_PATH="${UC_DAEMON_SOCKET_PATH:-$TMP_DIR/uc-daemon.sock}"
 UC_DAEMON_STARTED=0
 TASKSET_ENABLED=0
 CPU_GOVERNOR="unknown"
+BENCH_LOCK_HELD=0
 
 declare -a EXEC_PREFIX=()
 declare -a CMD_REPLY=()
@@ -40,6 +42,9 @@ export RUST_BACKTRACE=0
 cleanup() {
   if [[ "$TOOL" == "uc" && "$UC_DAEMON_STARTED" == "1" && -x "$UC_BIN" ]]; then
     UC_DAEMON_SOCKET_PATH="$UC_DAEMON_SOCKET_PATH" "$UC_BIN" daemon stop >/dev/null 2>&1 || true
+  fi
+  if [[ "$BENCH_LOCK_HELD" == "1" ]]; then
+    rm -rf "$BENCH_LOCK_DIR"
   fi
   rm -rf "$TMP_DIR"
 }
@@ -61,6 +66,7 @@ Options:
   --nice-level <n>            Optional process nice level (default: 0)
   --warm-settle-seconds <n>   Wait after warm-up before warm-noop samples (default: 2.2)
   --strict-pinning            Fail if requested pinning cannot be applied
+  BENCH_LOCK_DIR=<path>       Optional env var to override benchmark lock path
   --help                      Show this help
 USAGE
 }
@@ -197,6 +203,23 @@ if [[ "$MATRIX" == "research" && -z "$WORKSPACE_ROOT" ]]; then
   exit 1
 fi
 
+acquire_benchmark_lock() {
+  mkdir -p "$(dirname "$BENCH_LOCK_DIR")"
+  if mkdir "$BENCH_LOCK_DIR" 2>/dev/null; then
+    BENCH_LOCK_HELD=1
+    printf '%s\n' "$$" > "$BENCH_LOCK_DIR/pid" 2>/dev/null || true
+    return 0
+  fi
+
+  local owner_pid="unknown"
+  if [[ -r "$BENCH_LOCK_DIR/pid" ]]; then
+    owner_pid="$(cat "$BENCH_LOCK_DIR/pid" 2>/dev/null || printf '%s' "unknown")"
+  fi
+  echo "Benchmark lock is already held at $BENCH_LOCK_DIR (pid: $owner_pid)." >&2
+  echo "Run benchmarks serially to avoid cold-cache cleanup races with concurrent builds." >&2
+  exit 1
+}
+
 configure_execution_prefix() {
   EXEC_PREFIX=()
 
@@ -265,6 +288,7 @@ fi
 
 configure_execution_prefix
 capture_cpu_governor
+acquire_benchmark_lock
 
 mkdir -p "$OUT_DIR"
 : > "$TMP_DIR/scenarios.ndjson"

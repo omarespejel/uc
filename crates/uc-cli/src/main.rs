@@ -35,6 +35,9 @@ use uc_core::compare::{compare_diagnostics, extract_diagnostic_lines, Diagnostic
 use uc_core::session::SessionInput;
 use walkdir::WalkDir;
 
+#[cfg(feature = "dev-benchmark-command")]
+mod benchmark_cmd;
+
 const BUILD_CACHE_SCHEMA_VERSION: u32 = 1;
 const MIN_HASH_LEN: usize = 2;
 const SESSION_KEY_LEN: usize = 64;
@@ -85,8 +88,9 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     Daemon(DaemonArgs),
+    #[cfg(feature = "dev-benchmark-command")]
     #[command(hide = true)]
-    Benchmark(BenchmarkArgs),
+    Benchmark(benchmark_cmd::BenchmarkArgs),
     Cache(CacheArgs),
     SessionKey(SessionKeyArgs),
     Build(BuildArgs),
@@ -135,36 +139,6 @@ struct DaemonSocketArgs {
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
-enum MatrixArg {
-    Research,
-    Smoke,
-}
-
-impl MatrixArg {
-    fn as_str(self) -> &'static str {
-        match self {
-            MatrixArg::Research => "research",
-            MatrixArg::Smoke => "smoke",
-        }
-    }
-}
-
-#[derive(Copy, Clone, Debug, ValueEnum)]
-enum BenchmarkToolArg {
-    Scarb,
-    Uc,
-}
-
-impl BenchmarkToolArg {
-    fn as_str(self) -> &'static str {
-        match self {
-            BenchmarkToolArg::Scarb => "scarb",
-            BenchmarkToolArg::Uc => "uc",
-        }
-    }
-}
-
-#[derive(Copy, Clone, Debug, ValueEnum)]
 enum EngineArg {
     Scarb,
     Uc,
@@ -184,24 +158,6 @@ enum DaemonModeArg {
     Off,
     Auto,
     Require,
-}
-
-#[derive(Args, Debug)]
-struct BenchmarkArgs {
-    #[arg(long, value_enum, default_value_t = MatrixArg::Research)]
-    matrix: MatrixArg,
-
-    #[arg(long, value_enum, default_value_t = BenchmarkToolArg::Scarb)]
-    tool: BenchmarkToolArg,
-
-    #[arg(long, default_value_t = 5)]
-    runs: u32,
-
-    #[arg(long, default_value_t = 3)]
-    cold_runs: u32,
-
-    #[arg(long)]
-    workspace_root: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -618,7 +574,8 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Daemon(args) => run_daemon(args),
-        Commands::Benchmark(args) => run_benchmark(args),
+        #[cfg(feature = "dev-benchmark-command")]
+        Commands::Benchmark(args) => benchmark_cmd::run(args),
         Commands::Cache(args) => run_cache(args),
         Commands::SessionKey(args) => run_session_key(args),
         Commands::Build(args) => run_build(args),
@@ -1143,51 +1100,6 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
         remove_socket_if_exists(&socket_path)?;
         Ok(())
     }
-}
-
-fn run_benchmark(args: BenchmarkArgs) -> Result<()> {
-    if !parse_env_bool("UC_ENABLE_BENCHMARK_COMMAND", false) {
-        bail!(
-            "`uc benchmark` is a development-only command. Set UC_ENABLE_BENCHMARK_COMMAND=1 to enable it."
-        );
-    }
-    let script = if let Some(path) = std::env::var_os("UC_BENCHMARK_SCRIPT") {
-        PathBuf::from(path)
-    } else if let Some(root) = std::env::var_os("UC_BENCHMARK_REPO_ROOT") {
-        PathBuf::from(root).join("benchmarks/scripts/run_local_benchmarks.sh")
-    } else {
-        bail!("`uc benchmark` requires UC_BENCHMARK_SCRIPT or UC_BENCHMARK_REPO_ROOT to be set");
-    };
-
-    if !script.exists() {
-        bail!(
-            "benchmark script not found at {}. Set UC_BENCHMARK_SCRIPT or UC_BENCHMARK_REPO_ROOT.",
-            script.display()
-        );
-    }
-
-    let mut command = Command::new(&script);
-    command
-        .arg("--matrix")
-        .arg(args.matrix.as_str())
-        .arg("--tool")
-        .arg(args.tool.as_str())
-        .arg("--runs")
-        .arg(args.runs.to_string())
-        .arg("--cold-runs")
-        .arg(args.cold_runs.to_string());
-    if let Some(workspace_root) = args.workspace_root {
-        command.arg("--workspace-root").arg(workspace_root);
-    }
-    let status = command
-        .status()
-        .context("failed to execute benchmark script")?;
-
-    if !status.success() {
-        bail!("benchmark script exited with status {status}");
-    }
-
-    Ok(())
 }
 
 fn run_session_key(args: SessionKeyArgs) -> Result<()> {
