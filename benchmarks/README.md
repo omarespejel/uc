@@ -2,7 +2,7 @@
 
 Benchmark harness and baseline artifacts for Scarb vs `uc` performance and parity tracking.
 
-`run_local_benchmarks.sh` requires `zsh` (used by CI and local benchmark runs).
+`run_local_benchmarks.sh` runs on `bash` and supports optional pinning flags for lower variance (`--cpu-set`, `--nice-level`, `--strict-pinning`).
 
 ## Folders
 - `scenarios.md`: scenario definitions.
@@ -28,9 +28,12 @@ WORKSPACE_ROOT=/path/to/compiler-starknet ./benchmarks/scripts/run_dual_run_comp
 ./benchmarks/scripts/run_stability_benchmarks.sh \
   --matrix research \
   --workspace-root /path/to/compiler-starknet \
-  --runs 10 \
-  --cold-runs 5 \
+  --runs 12 \
+  --cold-runs 12 \
   --cycles 5 \
+  --cpu-set 0 \
+  --nice-level 5 \
+  --warm-settle-seconds 2.2 \
   --gate-config benchmarks/gates/perf-gate-research.json
 ```
 

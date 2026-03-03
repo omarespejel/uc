@@ -4,11 +4,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(git -C "$SCRIPT_DIR/../.." rev-parse --show-toplevel 2>/dev/null || (cd "$SCRIPT_DIR/../.." && pwd -P))"
 MATRIX="${MATRIX:-research}"
-RUNS="${RUNS:-10}"
-COLD_RUNS="${COLD_RUNS:-5}"
+RUNS="${RUNS:-12}"
+COLD_RUNS="${COLD_RUNS:-12}"
 CYCLES="${CYCLES:-5}"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-}"
 GATE_CONFIG="${GATE_CONFIG:-}"
+CPU_SET="${CPU_SET:-${UC_BENCH_CPU_SET:-}}"
+NICE_LEVEL="${NICE_LEVEL:-${UC_BENCH_NICE_LEVEL:-0}}"
+STRICT_PINNING="${STRICT_PINNING:-${UC_BENCH_STRICT_PINNING:-0}}"
+WARM_SETTLE_SECONDS="${WARM_SETTLE_SECONDS:-2.2}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR="$ROOT_DIR/benchmarks/results"
 OUT_JSON="$OUT_DIR/stability-summary-$STAMP.json"
@@ -27,9 +31,13 @@ Usage: $(basename "$0") [options]
 Options:
   --matrix <research|smoke>    Benchmark matrix (default: research)
   --workspace-root <path>      Path containing local cloned repos (required for research)
-  --runs <n>                   Warm/offline iterations per run (default: 10)
-  --cold-runs <n>              Cold iterations per run (default: 5)
+  --runs <n>                   Warm/offline iterations per run (default: 12)
+  --cold-runs <n>              Cold iterations per run (default: 12)
   --cycles <n>                 Number of paired scarb/uc cycles (default: 5)
+  --cpu-set <list>             Optional CPU affinity list passed to local runner
+  --nice-level <n>             Optional process nice level passed to local runner
+  --warm-settle-seconds <n>    Wait after warm-up before warm-noop samples (default: 2.2)
+  --strict-pinning             Fail if requested pinning cannot be applied
   --gate-config <path>         Optional gate rules JSON path
   --help                       Show this help
 USAGE
@@ -72,6 +80,25 @@ while [[ $# -gt 0 ]]; do
       CYCLES="$2"
       shift 2
       ;;
+    --cpu-set)
+      require_option_value "$1" "${2-}"
+      CPU_SET="$2"
+      shift 2
+      ;;
+    --nice-level)
+      require_option_value "$1" "${2-}"
+      NICE_LEVEL="$2"
+      shift 2
+      ;;
+    --warm-settle-seconds)
+      require_option_value "$1" "${2-}"
+      WARM_SETTLE_SECONDS="$2"
+      shift 2
+      ;;
+    --strict-pinning)
+      STRICT_PINNING=1
+      shift
+      ;;
     --gate-config)
       require_option_value "$1" "${2-}"
       GATE_CONFIG="$2"
@@ -101,6 +128,14 @@ if [[ "$CYCLES" =~ [^0-9] || "$CYCLES" -le 0 ]]; then
   echo "--cycles must be a positive integer, got: $CYCLES" >&2
   exit 1
 fi
+if [[ ! "$NICE_LEVEL" =~ ^-?[0-9]+$ ]]; then
+  echo "--nice-level must be an integer, got: $NICE_LEVEL" >&2
+  exit 1
+fi
+if ! [[ "$WARM_SETTLE_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "--warm-settle-seconds must be a positive number, got: $WARM_SETTLE_SECONDS" >&2
+  exit 1
+fi
 if [[ "$MATRIX" == "research" && -z "$WORKSPACE_ROOT" ]]; then
   echo "--workspace-root is required for research matrix" >&2
   exit 1
@@ -118,13 +153,22 @@ run_benchmark() {
   local cycle="$2"
   local log="$TMP_DIR/${tool}-cycle-${cycle}.log"
   local -a cmd=(
-    zsh
     "$ROOT_DIR/benchmarks/scripts/run_local_benchmarks.sh"
     --matrix "$MATRIX"
     --tool "$tool"
     --runs "$RUNS"
     --cold-runs "$COLD_RUNS"
+    --warm-settle-seconds "$WARM_SETTLE_SECONDS"
   )
+  if [[ -n "$CPU_SET" ]]; then
+    cmd+=(--cpu-set "$CPU_SET")
+  fi
+  if [[ "$NICE_LEVEL" != "0" ]]; then
+    cmd+=(--nice-level "$NICE_LEVEL")
+  fi
+  if [[ "$STRICT_PINNING" == "1" ]]; then
+    cmd+=(--strict-pinning)
+  fi
   if [[ -n "$WORKSPACE_ROOT" ]]; then
     cmd+=(--workspace-root "$WORKSPACE_ROOT")
   fi
@@ -198,7 +242,11 @@ jq -s \
   --argjson runs "$RUNS" \
   --argjson cold_runs "$COLD_RUNS" \
   --argjson cycles "$CYCLES" \
-  --arg workspace_root "${WORKSPACE_ROOT:-}" '
+  --arg workspace_root "${WORKSPACE_ROOT:-}" \
+  --arg cpu_set "$CPU_SET" \
+  --arg nice_level "$NICE_LEVEL" \
+  --arg strict_pinning "$STRICT_PINNING" \
+  --arg warm_settle_seconds "$WARM_SETTLE_SECONDS" '
     def median(a):
       (a | sort) as $s
       | ($s | length) as $n
@@ -219,6 +267,12 @@ jq -s \
       runs: $runs,
       cold_runs: $cold_runs,
       cycles: $cycles,
+      pinned_conditions: {
+        cpu_set: (if $cpu_set == "" then null else $cpu_set end),
+        nice_level: ($nice_level | tonumber),
+        strict_pinning: ($strict_pinning == "1"),
+        warm_settle_seconds: ($warm_settle_seconds | tonumber)
+      },
       cycle_reports: map({
         cycle,
         baseline_json,
@@ -261,6 +315,10 @@ jq -s \
   echo "- Cycles: $(jq -r '.cycles' "$OUT_JSON")"
   echo "- Runs: $(jq -r '.runs' "$OUT_JSON")"
   echo "- Cold runs: $(jq -r '.cold_runs' "$OUT_JSON")"
+  echo "- CPU set: $(jq -r '.pinned_conditions.cpu_set // "<none>"' "$OUT_JSON")"
+  echo "- Nice level: $(jq -r '.pinned_conditions.nice_level' "$OUT_JSON")"
+  echo "- Strict pinning: $(jq -r '.pinned_conditions.strict_pinning' "$OUT_JSON")"
+  echo "- Warm settle seconds: $(jq -r '.pinned_conditions.warm_settle_seconds' "$OUT_JSON")"
   if [[ -n "$WORKSPACE_ROOT" ]]; then
     echo "- Workspace root: $WORKSPACE_ROOT"
   fi

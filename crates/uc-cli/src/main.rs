@@ -2,9 +2,15 @@ use anyhow::{bail, Context, Result};
 use blake3::Hasher;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+#[cfg(target_os = "macos")]
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "macos")]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
@@ -16,6 +22,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -52,9 +59,12 @@ const DAEMON_REQUEST_SIZE_LIMIT_BYTES: usize = 1024 * 1024;
 const DAEMON_RATE_WINDOW_SECONDS: u64 = 1;
 const DAEMON_MAX_REQUESTS_PER_WINDOW: usize = 32;
 const DAEMON_LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
+const DAEMON_UNHEALTHY_RECOVERY_SECONDS: u64 = 5;
 const ASYNC_PERSIST_ERROR_QUEUE_LIMIT: usize = 32;
+const ASYNC_PERSIST_QUEUE_LIMIT: usize = 128;
 const CACHE_LOCK_STALE_AFTER_SECONDS: u64 = 300;
 const DEFAULT_MIN_SCARB_VERSION: &str = "2.14.0";
+const DAEMON_PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CACHEABLE_ARTIFACT_SUFFIXES: [&str; 5] = [
     ".sierra.json",
     ".sierra",
@@ -218,6 +228,15 @@ struct SessionKeyArgs {
 
     #[arg(long)]
     target_family: String,
+
+    #[arg(long)]
+    cairo_edition: Option<String>,
+
+    #[arg(long)]
+    cairo_lang_version: Option<String>,
+
+    #[arg(long, default_value = "")]
+    build_env_fingerprint: String,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -264,7 +283,7 @@ struct MetadataArgs {
     #[arg(long)]
     manifest_path: Option<PathBuf>,
 
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 1, value_parser = parse_metadata_format_version)]
     format_version: u32,
 
     #[arg(long, value_enum, default_value_t = DaemonModeArg::Off)]
@@ -415,6 +434,7 @@ struct DaemonStatusPayload {
     pid: u32,
     started_at_epoch_ms: u64,
     socket_path: String,
+    protocol_version: String,
     healthy: bool,
     total_requests: u64,
     failed_requests: u64,
@@ -424,6 +444,8 @@ struct DaemonStatusPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DaemonBuildRequest {
+    #[serde(default)]
+    protocol_version: String,
     manifest_path: String,
     package: Option<String>,
     workspace: bool,
@@ -447,6 +469,8 @@ struct DaemonBuildResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DaemonMetadataRequest {
+    #[serde(default)]
+    protocol_version: String,
     manifest_path: String,
     format_version: u32,
     offline: bool,
@@ -482,13 +506,13 @@ struct CacheLockGuard {
     path: PathBuf,
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct FingerprintIndex {
     schema_version: u32,
     entries: BTreeMap<String, FingerprintIndexEntry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct FingerprintIndexEntry {
     size_bytes: u64,
     modified_unix_ms: u64,
@@ -519,6 +543,7 @@ struct DaemonHealth {
     rate_limited_requests: u64,
     consecutive_failures: u64,
     last_error: Option<String>,
+    last_failure_at: Option<Instant>,
 }
 
 impl DaemonRateLimiter {
@@ -620,6 +645,19 @@ fn parse_diagnostics_threshold(input: &str) -> std::result::Result<f64, String> 
         ));
     }
     Ok(parsed)
+}
+
+fn parse_metadata_format_version(input: &str) -> std::result::Result<u32, String> {
+    let parsed = input
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| format!("invalid metadata format version `{input}`"))?;
+    if matches!(parsed, 1 | 2) {
+        return Ok(parsed);
+    }
+    Err(format!(
+        "unsupported metadata format version `{parsed}` (expected 1 or 2)"
+    ))
 }
 
 fn parse_env_u64(name: &str, default: u64) -> u64 {
@@ -768,6 +806,31 @@ fn resolve_diagnostics_threshold(cli_value: Option<f64>) -> Result<f64> {
     Ok(DEFAULT_DIAGNOSTICS_SIMILARITY_THRESHOLD)
 }
 
+fn validate_metadata_format_version(version: u32) -> Result<()> {
+    if matches!(version, 1 | 2) {
+        return Ok(());
+    }
+    bail!("unsupported metadata format version `{version}` (expected 1 or 2)");
+}
+
+fn validate_daemon_protocol_version(version: &str) -> Result<()> {
+    if version == DAEMON_PROTOCOL_VERSION {
+        return Ok(());
+    }
+    bail!(
+        "daemon protocol mismatch (daemon={}, client={})",
+        version,
+        DAEMON_PROTOCOL_VERSION
+    );
+}
+
+fn daemon_response_protocol_mismatch(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("protocol mismatch")
+        || normalized.contains("daemon build request protocol mismatch")
+        || normalized.contains("daemon metadata request protocol mismatch")
+}
+
 fn run_daemon(args: DaemonArgs) -> Result<()> {
     match args.command {
         DaemonCommand::Start(socket) => run_daemon_start(socket),
@@ -888,10 +951,11 @@ fn run_daemon_status(args: DaemonSocketArgs) -> Result<()> {
         let status = daemon_ping(&socket_path)
             .with_context(|| format!("daemon not reachable on {}", socket_path.display()))?;
         println!(
-            "uc daemon running (pid={}, started_at_epoch_ms={}, socket={}, healthy={}, total_requests={}, failed_requests={}, rate_limited_requests={}, last_error={})",
+            "uc daemon running (pid={}, started_at_epoch_ms={}, socket={}, protocol={}, healthy={}, total_requests={}, failed_requests={}, rate_limited_requests={}, last_error={})",
             status.pid,
             status.started_at_epoch_ms,
             status.socket_path,
+            status.protocol_version,
             status.healthy,
             status.total_requests,
             status.failed_requests,
@@ -1006,6 +1070,7 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
             pid: std::process::id(),
             started_at_epoch_ms: epoch_ms_u64()?,
             socket_path: socket_path.display().to_string(),
+            protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
             healthy: true,
             total_requests: 0,
             failed_requests: 0,
@@ -1100,6 +1165,9 @@ fn run_session_key(args: SessionKeyArgs) -> Result<()> {
         cfg_set: args.cfg_set,
         manifest_content_hash: args.manifest_content_hash,
         target_family: args.target_family,
+        cairo_edition: args.cairo_edition,
+        cairo_lang_version: args.cairo_lang_version,
+        build_env_fingerprint: args.build_env_fingerprint,
     };
 
     println!("{}", input.deterministic_key_hex());
@@ -1267,10 +1335,16 @@ fn try_uc_build_via_daemon(
         match response {
             DaemonResponse::Build(result) => Ok(Some(result)),
             DaemonResponse::Error { message } => {
-                eprintln!(
-                    "uc: daemon returned error ({}), falling back to local engine",
-                    message
-                );
+                if daemon_response_protocol_mismatch(&message) {
+                    eprintln!(
+                        "uc: daemon protocol mismatch ({message}), falling back to local engine"
+                    );
+                } else {
+                    eprintln!(
+                        "uc: daemon returned error ({}), falling back to local engine",
+                        message
+                    );
+                }
                 Ok(None)
             }
             _ => Ok(None),
@@ -1319,12 +1393,21 @@ fn try_uc_metadata_via_daemon(
             DaemonResponse::Metadata(result) => Ok(Some(result.run)),
             DaemonResponse::Error { message } => {
                 if fallback_to_local {
-                    eprintln!(
-                        "uc: daemon returned error ({}), falling back to local metadata",
-                        message
-                    );
+                    if daemon_response_protocol_mismatch(&message) {
+                        eprintln!(
+                            "uc: daemon protocol mismatch ({message}), falling back to local metadata"
+                        );
+                    } else {
+                        eprintln!(
+                            "uc: daemon returned error ({}), falling back to local metadata",
+                            message
+                        );
+                    }
                     Ok(None)
                 } else {
+                    if daemon_response_protocol_mismatch(&message) {
+                        bail!("{message}");
+                    }
                     bail!("daemon metadata request failed: {message}");
                 }
             }
@@ -1339,6 +1422,7 @@ fn daemon_build_request_from_common(
     async_cache_persist: bool,
 ) -> DaemonBuildRequest {
     DaemonBuildRequest {
+        protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
         manifest_path: manifest_path.display().to_string(),
         package: common.package.clone(),
         workspace: common.workspace,
@@ -1368,6 +1452,7 @@ fn daemon_metadata_request_from_args(
     capture_output: bool,
 ) -> DaemonMetadataRequest {
     DaemonMetadataRequest {
+        protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
         manifest_path: manifest_path.display().to_string(),
         format_version: args.format_version,
         offline: args.offline,
@@ -1391,6 +1476,8 @@ fn metadata_args_from_daemon_request(request: &DaemonMetadataRequest) -> Metadat
 }
 
 fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildResponse> {
+    validate_daemon_protocol_version(&request.protocol_version)
+        .context("daemon build request protocol mismatch")?;
     let common = common_args_from_daemon_request(&request);
     let manifest_path = resolve_manifest_path(&common.manifest_path)?;
     let workspace_root = manifest_path
@@ -1421,6 +1508,9 @@ fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildRespon
 }
 
 fn execute_daemon_metadata(request: DaemonMetadataRequest) -> Result<DaemonMetadataResponse> {
+    validate_daemon_protocol_version(&request.protocol_version)
+        .context("daemon metadata request protocol mismatch")?;
+    validate_metadata_format_version(request.format_version)?;
     let args = metadata_args_from_daemon_request(&request);
     let manifest_path = resolve_manifest_path(&args.manifest_path)?;
     let (command, command_vec) = scarb_metadata_command(&args, &manifest_path);
@@ -1429,6 +1519,7 @@ fn execute_daemon_metadata(request: DaemonMetadataRequest) -> Result<DaemonMetad
 }
 
 fn run_metadata(args: MetadataArgs) -> Result<()> {
+    validate_metadata_format_version(args.format_version)?;
     let manifest_path = resolve_manifest_path(&args.manifest_path)?;
     let write_report = args.report_path.is_some();
 
@@ -1783,29 +1874,38 @@ fn run_build_with_uc_cache(
         if async_cache_persist {
             telemetry.cache_persist_async = true;
             let persist_scope_key = async_persist_scope_key(&canonical_workspace_root, profile);
-            let workspace_root = canonical_workspace_root.clone();
-            let profile = profile.to_string();
-            let fingerprint = fingerprint.clone();
-            let cache_root = cache_root.clone();
-            let objects_dir = objects_dir.clone();
-            let entry_path = entry_path.clone();
             if try_mark_async_persist_in_flight(&persist_scope_key) {
                 telemetry.cache_persist_scheduled = true;
-                thread::spawn(move || {
-                    let _guard = AsyncPersistGuard::new(persist_scope_key);
-                    if let Err(err) = persist_cache_entry_for_build(
-                        &workspace_root,
-                        &profile,
-                        &fingerprint,
-                        &cache_root,
-                        &objects_dir,
-                        &entry_path,
-                    ) {
-                        record_async_persist_error(err.to_string());
-                        tracing::warn!(error = %format!("{err:#}"), "async cache persistence failed");
-                        eprintln!("uc: warning: async cache persistence failed: {err:#}");
+                let task = AsyncPersistTask {
+                    scope_key: persist_scope_key.clone(),
+                    workspace_root: canonical_workspace_root.clone(),
+                    profile: profile.to_string(),
+                    fingerprint: fingerprint.clone(),
+                    cache_root: cache_root.clone(),
+                    objects_dir: objects_dir.clone(),
+                    entry_path: entry_path.clone(),
+                };
+                match async_persist_sender().try_send(task) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(task)) => {
+                        clear_async_persist_in_flight(&persist_scope_key);
+                        let error = format!(
+                            "async cache persistence queue is full (limit={ASYNC_PERSIST_QUEUE_LIMIT}); dropping task for {}",
+                            task.workspace_root.display()
+                        );
+                        record_async_persist_error(error.clone());
+                        tracing::warn!(error = %error, "failed to enqueue async cache persistence task");
+                        eprintln!("uc: warning: {error}");
                     }
-                });
+                    Err(TrySendError::Disconnected(_)) => {
+                        clear_async_persist_in_flight(&persist_scope_key);
+                        let error = "async cache persistence worker is unavailable; task dropped"
+                            .to_string();
+                        record_async_persist_error(error.clone());
+                        tracing::warn!(error = %error, "failed to enqueue async cache persistence task");
+                        eprintln!("uc: warning: {error}");
+                    }
+                }
             }
         } else {
             let persist_start = Instant::now();
@@ -1858,7 +1958,15 @@ fn record_async_persist_error(error: String) {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     slot.push_back(error);
     while slot.len() > ASYNC_PERSIST_ERROR_QUEUE_LIMIT {
-        slot.pop_front();
+        if let Some(dropped) = slot.pop_front() {
+            tracing::warn!(
+                dropped_error = %dropped,
+                "async cache persistence error queue dropped oldest entry"
+            );
+            eprintln!(
+                "uc: warning: async cache persistence error queue dropped oldest entry: {dropped}"
+            );
+        }
     }
 }
 
@@ -1882,6 +1990,44 @@ impl AsyncPersistGuard {
 impl Drop for AsyncPersistGuard {
     fn drop(&mut self) {
         clear_async_persist_in_flight(&self.scope_key);
+    }
+}
+
+struct AsyncPersistTask {
+    scope_key: String,
+    workspace_root: PathBuf,
+    profile: String,
+    fingerprint: String,
+    cache_root: PathBuf,
+    objects_dir: PathBuf,
+    entry_path: PathBuf,
+}
+
+fn async_persist_sender() -> &'static SyncSender<AsyncPersistTask> {
+    static SENDER: OnceLock<SyncSender<AsyncPersistTask>> = OnceLock::new();
+    SENDER.get_or_init(|| {
+        let (sender, receiver) = mpsc::sync_channel(ASYNC_PERSIST_QUEUE_LIMIT);
+        thread::spawn(move || run_async_persist_worker(receiver));
+        sender
+    })
+}
+
+fn run_async_persist_worker(receiver: Receiver<AsyncPersistTask>) {
+    for task in receiver {
+        let _guard = AsyncPersistGuard::new(task.scope_key.clone());
+        if let Err(err) = persist_cache_entry_for_build(
+            &task.workspace_root,
+            &task.profile,
+            &task.fingerprint,
+            &task.cache_root,
+            &task.objects_dir,
+            &task.entry_path,
+        ) {
+            let _ = fs::remove_file(&task.entry_path);
+            record_async_persist_error(err.to_string());
+            tracing::warn!(error = %format!("{err:#}"), "async cache persistence failed");
+            eprintln!("uc: warning: async cache persistence failed: {err:#}");
+        }
     }
 }
 
@@ -2110,7 +2256,7 @@ fn restore_cached_artifacts(
         }
 
         let object_path = objects_dir.join(&artifact.object_rel_path);
-        fs::copy(&object_path, &out_path).with_context(|| {
+        restore_cache_object(&object_path, &out_path).with_context(|| {
             format!(
                 "failed to restore cache object {} to {}",
                 object_path.display(),
@@ -2129,6 +2275,77 @@ fn restore_cached_artifacts(
         .collect();
     let restored = collect_artifact_digests_fast(&target_root)?;
     Ok(compare_artifact_sets(&expected, &restored).is_empty())
+}
+
+fn try_reflink_file(source: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let source_file = File::open(source)?;
+        let destination_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)?;
+        let result = unsafe {
+            libc::ioctl(
+                destination_file.as_raw_fd(),
+                libc::FICLONE as _,
+                source_file.as_raw_fd(),
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        return Err(io::Error::last_os_error());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let source_c = CString::new(source.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"))?;
+        let destination_c = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "destination path contains NUL")
+        })?;
+        let result = unsafe { libc::clonefile(source_c.as_ptr(), destination_c.as_ptr(), 0) };
+        if result == 0 {
+            return Ok(());
+        }
+        return Err(io::Error::last_os_error());
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (source, destination);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "reflink is not supported on this platform",
+        ))
+    }
+}
+
+fn restore_cache_object(source: &Path, destination: &Path) -> Result<()> {
+    if destination.exists() {
+        fs::remove_file(destination)
+            .with_context(|| format!("failed to replace {}", destination.display()))?;
+    }
+
+    if let Err(reflink_err) = try_reflink_file(source, destination) {
+        let _ = fs::remove_file(destination);
+        match fs::hard_link(source, destination) {
+            Ok(()) => return Ok(()),
+            Err(link_err) => {
+                fs::copy(source, destination).with_context(|| {
+                    format!(
+                        "failed to copy cache object after reflink ({}) and hard-link ({}) fallbacks: {} -> {}",
+                        reflink_err,
+                        link_err,
+                        source.display(),
+                        destination.display()
+                    )
+                })?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn hash_file_blake3(path: &Path) -> Result<String> {
@@ -2358,6 +2575,42 @@ fn save_fingerprint_index(path: &Path, index: &FingerprintIndex) -> Result<()> {
     Ok(())
 }
 
+fn fingerprint_index_cache() -> &'static Mutex<HashMap<String, FingerprintIndex>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, FingerprintIndex>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn fingerprint_index_cache_key(path: &Path) -> String {
+    normalize_fingerprint_path(path)
+}
+
+fn load_fingerprint_index_cached(path: &Path) -> Result<FingerprintIndex> {
+    let key = fingerprint_index_cache_key(path);
+    {
+        let cache = fingerprint_index_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(index) = cache.get(&key) {
+            return Ok(index.clone());
+        }
+    }
+
+    let loaded = load_fingerprint_index(path)?;
+    let mut cache = fingerprint_index_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.insert(key, loaded.clone());
+    Ok(loaded)
+}
+
+fn store_fingerprint_index_cached(path: &Path, index: &FingerprintIndex) {
+    let key = fingerprint_index_cache_key(path);
+    let mut cache = fingerprint_index_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.insert(key, index.clone());
+}
+
 fn load_artifact_index(path: &Path) -> Result<ArtifactIndex> {
     if !path.exists() {
         return Ok(ArtifactIndex::empty());
@@ -2412,6 +2665,7 @@ fn compute_build_fingerprint_with_scarb_version(
     let mut hasher = Hasher::new();
     hasher.update(b"uc-build-fingerprint-v1");
     hasher.update(scarb_version.as_bytes());
+    hasher.update(compute_build_env_fingerprint().as_bytes());
     let canonical_manifest = manifest_path
         .canonicalize()
         .with_context(|| format!("failed to canonicalize {}", manifest_path.display()))?;
@@ -2439,7 +2693,7 @@ fn compute_build_fingerprint_with_scarb_version(
 
     let (index_path, mut index) = if let Some(root) = cache_root {
         let path = root.join("fingerprint/index-v1.json");
-        (Some(path.clone()), load_fingerprint_index(&path)?)
+        (Some(path.clone()), load_fingerprint_index_cached(&path)?)
     } else {
         (None, FingerprintIndex::empty())
     };
@@ -2542,13 +2796,17 @@ fn compute_build_fingerprint_with_scarb_version(
         hasher.update(b"\n");
     }
     if let Some(path) = index_path {
+        let changed = index.entries != updated_entries;
         index.schema_version = FINGERPRINT_INDEX_SCHEMA_VERSION;
         index.entries = updated_entries;
-        if let Err(err) = save_fingerprint_index(&path, &index) {
-            eprintln!(
-                "uc: warning: failed to update fingerprint index {}: {err:#}",
-                path.display()
-            );
+        store_fingerprint_index_cached(&path, &index);
+        if changed {
+            if let Err(err) = save_fingerprint_index(&path, &index) {
+                eprintln!(
+                    "uc: warning: failed to update fingerprint index {}: {err:#}",
+                    path.display()
+                );
+            }
         }
     }
 
@@ -2906,22 +3164,33 @@ fn collect_cached_artifacts_for_entry(
 }
 
 fn persist_artifact_object(source: &Path, destination: &Path) -> Result<()> {
-    match fs::hard_link(source, destination) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            if err.kind() == io::ErrorKind::AlreadyExists {
-                return Ok(());
+    if destination.exists() {
+        return Ok(());
+    }
+    if let Err(reflink_err) = try_reflink_file(source, destination) {
+        if reflink_err.kind() == io::ErrorKind::AlreadyExists {
+            return Ok(());
+        }
+        let _ = fs::remove_file(destination);
+        match fs::hard_link(source, destination) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                if err.kind() == io::ErrorKind::AlreadyExists {
+                    return Ok(());
+                }
+                fs::copy(source, destination).with_context(|| {
+                    format!(
+                        "failed to copy artifact {} to {} after reflink ({}) and hard-link ({}) fallbacks",
+                        source.display(),
+                        destination.display(),
+                        reflink_err,
+                        err
+                    )
+                })?;
             }
-            fs::copy(source, destination).with_context(|| {
-                format!(
-                    "failed to copy artifact {} to {}",
-                    source.display(),
-                    destination.display()
-                )
-            })?;
-            Ok(())
         }
     }
+    Ok(())
 }
 
 fn collect_artifact_digests_fast(target_root: &Path) -> Result<Vec<ArtifactDigest>> {
@@ -3072,6 +3341,48 @@ fn resolve_manifest_path(manifest_path: &Option<PathBuf>) -> Result<PathBuf> {
     Ok(resolved)
 }
 
+#[cfg(test)]
+fn validate_manifest_dependency_sanity(manifest_path: &Path) -> Result<()> {
+    let manifest_text = read_text_file_with_limit(manifest_path, MAX_MANIFEST_BYTES, "manifest")?;
+    let manifest = parse_manifest_toml(
+        &manifest_text,
+        manifest_path,
+        "failed to parse manifest dependency tables",
+    )?;
+    validate_manifest_dependency_sanity_from_manifest(manifest_path, &manifest)
+}
+
+fn validate_manifest_dependency_sanity_from_manifest(
+    manifest_path: &Path,
+    manifest: &TomlValue,
+) -> Result<()> {
+    let package_name = manifest
+        .get("package")
+        .and_then(TomlValue::as_table)
+        .and_then(|tbl| tbl.get("name"))
+        .and_then(TomlValue::as_str)
+        .map(str::to_string);
+
+    let Some(package_name) = package_name else {
+        return Ok(());
+    };
+
+    for section_name in ["dependencies", "dev-dependencies"] {
+        let Some(table) = manifest.get(section_name).and_then(TomlValue::as_table) else {
+            continue;
+        };
+        if table.contains_key(&package_name) {
+            bail!(
+                "manifest {} contains self-dependency `{}` in [{}]",
+                manifest_path.display(),
+                package_name,
+                section_name
+            );
+        }
+    }
+    Ok(())
+}
+
 fn effective_profile(common: &BuildCommonArgs) -> String {
     if common.release {
         return "release".to_string();
@@ -3113,8 +3424,18 @@ fn build_session_input(
     profile: &str,
 ) -> Result<SessionInput> {
     let scarb_version = scarb_version_line()?;
-    let manifest_content_hash = compute_manifest_content_hash(manifest_path)?;
-    let mut cfg_set = build_session_cfg_set(manifest_path)?;
+    let manifest_text = read_text_file_with_limit(manifest_path, MAX_MANIFEST_BYTES, "manifest")?;
+    let manifest = parse_manifest_toml(
+        &manifest_text,
+        manifest_path,
+        "failed to parse manifest for session key",
+    )?;
+    validate_manifest_dependency_sanity_from_manifest(manifest_path, &manifest)?;
+    let manifest_content_hash = compute_manifest_content_hash_bytes(manifest_text.as_bytes());
+    let (cairo_edition, cairo_lang_version) =
+        resolve_manifest_cairo_settings_from_manifest(&manifest);
+    let build_env_fingerprint = compute_build_env_fingerprint();
+    let mut cfg_set = build_session_cfg_set_from_manifest(&manifest)?;
     cfg_set.push(format!("workspace:{}", common.workspace));
     cfg_set.push(format!("release:{}", common.release));
     Ok(SessionInput {
@@ -3130,17 +3451,78 @@ fn build_session_input(
         } else {
             "package".to_string()
         },
+        cairo_edition,
+        cairo_lang_version,
+        build_env_fingerprint,
     })
 }
 
+fn resolve_manifest_cairo_settings_from_manifest(
+    manifest: &TomlValue,
+) -> (Option<String>, Option<String>) {
+    let edition_from_manifest = manifest
+        .get("package")
+        .and_then(TomlValue::as_table)
+        .and_then(|tbl| tbl.get("edition"))
+        .and_then(TomlValue::as_str)
+        .map(str::to_string);
+
+    let cairo_lang_from_manifest = manifest
+        .get("cairo")
+        .and_then(TomlValue::as_table)
+        .and_then(|tbl| tbl.get("language-version").or_else(|| tbl.get("version")))
+        .and_then(TomlValue::as_str)
+        .map(str::to_string);
+
+    let edition = std::env::var("CAIRO_EDITION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or(edition_from_manifest);
+
+    let cairo_lang_version = std::env::var("CAIRO_LANG_VERSION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or(cairo_lang_from_manifest);
+
+    (edition, cairo_lang_version)
+}
+
+fn compute_build_env_fingerprint() -> String {
+    const BUILD_ENV_PREFIXES: [&str; 3] = ["CAIRO_", "SCARB_", "STARKNET_"];
+    let mut entries: Vec<(String, String)> = std::env::vars()
+        .filter(|(key, _)| {
+            BUILD_ENV_PREFIXES
+                .iter()
+                .any(|prefix| key.starts_with(prefix))
+        })
+        .collect();
+    entries.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+    let mut hasher = Hasher::new();
+    hasher.update(b"uc-build-env-v1");
+    for (key, value) in entries {
+        hasher.update(key.as_bytes());
+        hasher.update(b"=");
+        hasher.update(value.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+#[cfg(test)]
 fn build_session_cfg_set(manifest_path: &Path) -> Result<Vec<String>> {
     let manifest_text = read_text_file_with_limit(manifest_path, MAX_MANIFEST_BYTES, "manifest")?;
-    let manifest = manifest_text.parse::<TomlValue>().with_context(|| {
-        format!(
-            "failed to parse manifest for session key {}",
-            manifest_path.display()
-        )
-    })?;
+    let manifest = parse_manifest_toml(
+        &manifest_text,
+        manifest_path,
+        "failed to parse manifest for session key",
+    )?;
+    build_session_cfg_set_from_manifest(&manifest)
+}
+
+fn build_session_cfg_set_from_manifest(manifest: &TomlValue) -> Result<Vec<String>> {
     let mut cfg_set = Vec::new();
     if let Some(cairo) = manifest.get("cairo") {
         cfg_set.push(format!(
@@ -3161,6 +3543,16 @@ fn build_session_cfg_set(manifest_path: &Path) -> Result<Vec<String>> {
         ));
     }
     Ok(cfg_set)
+}
+
+fn parse_manifest_toml(
+    manifest_text: &str,
+    manifest_path: &Path,
+    context: &str,
+) -> Result<TomlValue> {
+    manifest_text
+        .parse::<TomlValue>()
+        .with_context(|| format!("{context} {}", manifest_path.display()))
 }
 
 fn stable_toml_fragment_hash(value: &TomlValue) -> Result<String> {
@@ -3205,11 +3597,10 @@ fn exit_code_from_status(status: &ExitStatus) -> i32 {
     -1
 }
 
-fn compute_manifest_content_hash(manifest_path: &Path) -> Result<String> {
-    let bytes = read_bytes_with_limit(manifest_path, MAX_MANIFEST_BYTES, "manifest")?;
+fn compute_manifest_content_hash_bytes(bytes: &[u8]) -> String {
     let mut hasher = Hasher::new();
-    hasher.update(&bytes);
-    Ok(format!("manifest-blake3:{}", hasher.finalize().to_hex()))
+    hasher.update(bytes);
+    format!("manifest-blake3:{}", hasher.finalize().to_hex())
 }
 
 fn validate_hex_digest(label: &str, digest: &str, min_len: usize) -> Result<()> {
@@ -3502,6 +3893,7 @@ fn daemon_status_snapshot(
         pid: base.pid,
         started_at_epoch_ms: base.started_at_epoch_ms,
         socket_path: base.socket_path.clone(),
+        protocol_version: base.protocol_version.clone(),
         healthy: snapshot.consecutive_failures < 3,
         total_requests: snapshot.total_requests,
         failed_requests: snapshot.failed_requests,
@@ -3518,6 +3910,7 @@ fn record_daemon_success(health: &Arc<Mutex<DaemonHealth>>) {
     state.total_requests = state.total_requests.saturating_add(1);
     state.consecutive_failures = 0;
     state.last_error = None;
+    state.last_failure_at = None;
 }
 
 #[cfg(unix)]
@@ -3529,6 +3922,7 @@ fn record_daemon_failure(health: &Arc<Mutex<DaemonHealth>>, error: String) {
     state.failed_requests = state.failed_requests.saturating_add(1);
     state.consecutive_failures = state.consecutive_failures.saturating_add(1);
     state.last_error = Some(error);
+    state.last_failure_at = Some(Instant::now());
 }
 
 #[cfg(unix)]
@@ -3541,6 +3935,25 @@ fn record_daemon_rate_limit(health: &Arc<Mutex<DaemonHealth>>) {
     state.rate_limited_requests = state.rate_limited_requests.saturating_add(1);
     state.consecutive_failures = state.consecutive_failures.saturating_add(1);
     state.last_error = Some("daemon rate limit exceeded; retry shortly".to_string());
+    state.last_failure_at = Some(Instant::now());
+}
+
+#[cfg(unix)]
+fn maybe_auto_recover_daemon_health(health: &Arc<Mutex<DaemonHealth>>) {
+    let mut state = health
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state.consecutive_failures < 3 {
+        return;
+    }
+    let Some(last_failure_at) = state.last_failure_at else {
+        return;
+    };
+    if last_failure_at.elapsed() >= Duration::from_secs(DAEMON_UNHEALTHY_RECOVERY_SECONDS) {
+        state.consecutive_failures = 0;
+        state.last_error = None;
+        state.last_failure_at = None;
+    }
 }
 
 #[cfg(unix)]
@@ -3569,6 +3982,7 @@ fn handle_daemon_connection(
     if request_line.trim().is_empty() {
         return Ok(());
     }
+    maybe_auto_recover_daemon_health(health);
 
     if !rate_limiter.allow() {
         record_daemon_rate_limit(health);
@@ -3927,7 +4341,7 @@ mod tests {
     fn daemon_metadata_request_roundtrip_preserves_fields() {
         let args = MetadataArgs {
             manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
-            format_version: 3,
+            format_version: 2,
             daemon_mode: DaemonModeArg::Auto,
             offline: true,
             global_cache_dir: Some(PathBuf::from("/tmp/scarb-cache")),
@@ -3944,7 +4358,8 @@ mod tests {
                 .expect("manifest path missing"),
             Path::new("/tmp/workspace/Scarb.toml")
         );
-        assert_eq!(restored.format_version, 3);
+        assert_eq!(restored.format_version, 2);
+        assert_eq!(request.protocol_version, DAEMON_PROTOCOL_VERSION);
         assert!(restored.offline);
         assert_eq!(
             restored.global_cache_dir,
@@ -3970,6 +4385,7 @@ mod tests {
         let restored = common_args_from_daemon_request(&request);
 
         assert!(request.async_cache_persist);
+        assert_eq!(request.protocol_version, DAEMON_PROTOCOL_VERSION);
         assert_eq!(restored.package, common.package);
         assert_eq!(restored.workspace, common.workspace);
         assert_eq!(restored.features, common.features);
@@ -3981,6 +4397,7 @@ mod tests {
     #[test]
     fn daemon_build_request_serialization_supports_async_cache_persist_wire_field() {
         let request = DaemonRequest::Build(DaemonBuildRequest {
+            protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
             manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
             package: None,
             workspace: false,
@@ -3999,6 +4416,7 @@ mod tests {
         match decoded {
             DaemonRequest::Build(payload) => {
                 assert!(payload.async_cache_persist);
+                assert_eq!(payload.protocol_version, DAEMON_PROTOCOL_VERSION);
                 assert_eq!(payload.manifest_path, "/tmp/workspace/Scarb.toml");
                 assert_eq!(payload.features, vec!["feature_a".to_string()]);
             }
@@ -4009,6 +4427,7 @@ mod tests {
     #[test]
     fn daemon_metadata_request_serialization_supports_wire_format() {
         let request = DaemonRequest::Metadata(DaemonMetadataRequest {
+            protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
             manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
             format_version: 1,
             offline: false,
@@ -4022,6 +4441,7 @@ mod tests {
             serde_json::from_str(&json).expect("failed to decode daemon request");
         match decoded {
             DaemonRequest::Metadata(payload) => {
+                assert_eq!(payload.protocol_version, DAEMON_PROTOCOL_VERSION);
                 assert_eq!(payload.manifest_path, "/tmp/workspace/Scarb.toml");
                 assert_eq!(payload.format_version, 1);
                 assert!(!payload.offline);
@@ -4091,6 +4511,95 @@ mod tests {
     }
 
     #[test]
+    fn parse_metadata_format_version_accepts_supported_values() {
+        assert_eq!(parse_metadata_format_version("1").unwrap(), 1);
+        assert_eq!(parse_metadata_format_version("2").unwrap(), 2);
+        assert!(parse_metadata_format_version("3").is_err());
+    }
+
+    #[test]
+    fn validate_daemon_protocol_version_rejects_mismatch() {
+        let err = validate_daemon_protocol_version("0.0.0")
+            .err()
+            .expect("expected mismatch");
+        assert!(
+            format!("{err:#}").contains("daemon protocol mismatch"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn persist_artifact_object_materializes_destination() {
+        let dir = unique_test_dir("uc-persist-object");
+        let source = dir.join("source.bin");
+        let destination = dir.join("objects/aa/object.bin");
+        fs::create_dir_all(
+            destination
+                .parent()
+                .expect("destination should have parent directory"),
+        )
+        .expect("failed to create object directory");
+        fs::write(&source, b"artifact-bytes").expect("failed to write source object");
+
+        persist_artifact_object(&source, &destination).expect("persist should succeed");
+
+        let restored = fs::read(&destination).expect("failed to read destination");
+        assert_eq!(restored, b"artifact-bytes");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn restore_cache_object_overwrites_existing_file() {
+        let dir = unique_test_dir("uc-restore-object");
+        let source = dir.join("source.bin");
+        let destination = dir.join("target/output.bin");
+        fs::create_dir_all(
+            destination
+                .parent()
+                .expect("destination should have parent directory"),
+        )
+        .expect("failed to create destination directory");
+        fs::write(&source, b"fresh-object").expect("failed to write source object");
+        fs::write(&destination, b"stale-object").expect("failed to write stale destination");
+
+        restore_cache_object(&source, &destination).expect("restore should succeed");
+
+        let restored = fs::read(&destination).expect("failed to read restored object");
+        assert_eq!(restored, b"fresh-object");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn validate_manifest_dependency_sanity_rejects_self_dependency() {
+        let dir = unique_test_dir("uc-self-dependency");
+        let manifest_path = dir.join("Scarb.toml");
+        fs::write(
+            &manifest_path,
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+
+[dependencies]
+demo = "1.0.0"
+"#,
+        )
+        .expect("failed to write manifest");
+
+        let result = validate_manifest_dependency_sanity(&manifest_path);
+        assert!(result.is_err());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn normalize_fingerprint_path_normalizes_windows_prefix() {
+        assert_eq!(
+            normalize_fingerprint_path(Path::new(r"\\?\C:\tmp\demo\Scarb.toml")),
+            "C:/tmp/demo/Scarb.toml"
+        );
+    }
+
+    #[test]
     fn strip_cairo_comments_preserves_literals() {
         let source = br#"fn demo() {
     let url = "http://localhost";
@@ -4148,7 +4657,10 @@ mod tests {
         let updated = fs::read_to_string(&lib_path).expect("failed to read updated lib.cairo");
         fs::write(
             &lib_path,
-            updated.replace("BENCH_EDIT_SEED_BIAS: felt252 = 0", "BENCH_EDIT_SEED_BIAS: felt252 = 1"),
+            updated.replace(
+                "BENCH_EDIT_SEED_BIAS: felt252 = 0",
+                "BENCH_EDIT_SEED_BIAS: felt252 = 1",
+            ),
         )
         .expect("failed to write semantic change");
 

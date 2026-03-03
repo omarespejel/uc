@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -30,13 +30,7 @@ const DEFAULT_SUFFIXES: [&str; 5] = [
     ".executable.json",
 ];
 const MAX_ARTIFACT_SIZE_BYTES: u64 = 64 * 1024 * 1024;
-const SIERRA_ID_NORMALIZATION_SECTIONS: [&str; 4] = [
-    "type_declarations",
-    "libfunc_declarations",
-    "funcs",
-    "statements",
-];
-const SIERRA_NORMALIZATION_SCHEMA_TAG: &str = "sierra-normalization-v2";
+const SIERRA_NORMALIZATION_SCHEMA_TAG: &str = "sierra-normalization-v3";
 
 pub fn collect_artifact_digests(target_root: &Path) -> Result<Vec<ArtifactDigest>> {
     if !target_root.exists() {
@@ -230,27 +224,89 @@ fn validate_supported_sierra_schema(value: &Value, path: &Path) -> Result<()> {
 }
 
 fn normalize_sierra_json_ids(value: &mut Value) {
-    normalize_sierra_json_ids_scoped(value, false);
+    let id_map = build_sierra_id_map(value);
+    normalize_sierra_json_ids_with_map(value, &id_map);
 }
 
-fn normalize_sierra_json_ids_scoped(value: &mut Value, in_section: bool) {
+fn build_sierra_id_map(value: &Value) -> HashMap<i64, String> {
+    let mut ids = HashMap::new();
+    collect_section_ids(value, "type_declarations", "type", &mut ids);
+    collect_section_ids(value, "libfunc_declarations", "libfunc", &mut ids);
+    collect_section_ids(value, "funcs", "func", &mut ids);
+    ids
+}
+
+fn collect_section_ids(value: &Value, section: &str, kind: &str, out: &mut HashMap<i64, String>) {
+    let Some(items) = value.get(section).and_then(Value::as_array) else {
+        return;
+    };
+
+    for (index, item) in items.iter().enumerate() {
+        let Some(raw_id) = extract_numeric_id(item.get("id")) else {
+            continue;
+        };
+        let debug_name = extract_debug_name(item)
+            .unwrap_or_else(|| format!("{kind}-{index}"))
+            .replace('\"', "");
+        let token = format!("<{kind}:{index}:{debug_name}>");
+        out.entry(raw_id).or_insert(token);
+    }
+}
+
+fn extract_numeric_id(value: Option<&Value>) -> Option<i64> {
+    match value? {
+        Value::Number(num) => num
+            .as_i64()
+            .or_else(|| num.as_u64().and_then(|v| i64::try_from(v).ok())),
+        Value::Object(map) => map
+            .get("id")
+            .and_then(|nested| extract_numeric_id(Some(nested))),
+        _ => None,
+    }
+}
+
+fn extract_debug_name(item: &Value) -> Option<String> {
+    if let Some(name) = item
+        .get("id")
+        .and_then(Value::as_object)
+        .and_then(|id| id.get("debug_name"))
+        .and_then(Value::as_str)
+    {
+        return Some(name.to_string());
+    }
+
+    if let Some(name) = item
+        .get("long_id")
+        .and_then(Value::as_object)
+        .and_then(|long| long.get("debug_name"))
+        .and_then(Value::as_str)
+    {
+        return Some(name.to_string());
+    }
+
+    item.get("debug_name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn normalize_sierra_json_ids_with_map(value: &mut Value, id_map: &HashMap<i64, String>) {
     match value {
         Value::Object(map) => {
             for (key, item) in map.iter_mut() {
-                let child_in_section = in_section
-                    || SIERRA_ID_NORMALIZATION_SECTIONS
-                        .iter()
-                        .any(|section| *section == key);
-                if key == "id" && in_section && item.is_number() {
-                    *item = Value::String("<normalized-id>".to_string());
-                } else {
-                    normalize_sierra_json_ids_scoped(item, child_in_section);
+                if key == "id" {
+                    if let Some(raw_id) = extract_numeric_id(Some(item)) {
+                        if let Some(mapped) = id_map.get(&raw_id) {
+                            *item = Value::String(mapped.clone());
+                            continue;
+                        }
+                    }
                 }
+                normalize_sierra_json_ids_with_map(item, id_map);
             }
         }
         Value::Array(items) => {
             for item in items {
-                normalize_sierra_json_ids_scoped(item, in_section);
+                normalize_sierra_json_ids_with_map(item, id_map);
             }
         }
         _ => {}
@@ -333,21 +389,23 @@ mod tests {
     #[test]
     fn sierra_normalization_ignores_function_and_statement_ids() {
         let mut a = json!({
+            "type_declarations": [{"id": {"id": 5, "debug_name": "felt252"}}],
             "funcs": [{
                 "id": {"id": 10, "debug_name": "foo"},
                 "signature": {"ret_types": [{"id": 5}]}
             }],
             "statements": [{
-                "Invocation": {"libfunc_id": {"id": 20}}
+                "Invocation": {"libfunc_id": {"id": 10}}
             }]
         });
         let mut b = json!({
+            "type_declarations": [{"id": {"id": 42, "debug_name": "felt252"}}],
             "funcs": [{
                 "id": {"id": 99, "debug_name": "foo"},
                 "signature": {"ret_types": [{"id": 42}]}
             }],
             "statements": [{
-                "Invocation": {"libfunc_id": {"id": 1234}}
+                "Invocation": {"libfunc_id": {"id": 99}}
             }]
         });
 
@@ -355,6 +413,24 @@ mod tests {
         normalize_sierra_json_ids(&mut b);
 
         assert_eq!(
+            serde_json::to_string(&canonicalize_json(&a)).unwrap(),
+            serde_json::to_string(&canonicalize_json(&b)).unwrap()
+        );
+    }
+
+    #[test]
+    fn sierra_normalization_preserves_unknown_ids() {
+        let mut a = json!({
+            "metadata": {"id": 12},
+            "statements": [{"Invocation": {"branch": {"id": 7}}}]
+        });
+        let mut b = json!({
+            "metadata": {"id": 12},
+            "statements": [{"Invocation": {"branch": {"id": 9}}}]
+        });
+        normalize_sierra_json_ids(&mut a);
+        normalize_sierra_json_ids(&mut b);
+        assert_ne!(
             serde_json::to_string(&canonicalize_json(&a)).unwrap(),
             serde_json::to_string(&canonicalize_json(&b)).unwrap()
         );
@@ -370,7 +446,7 @@ mod tests {
         assert_eq!(value["metadata"]["id"], json!(123));
         assert_eq!(
             value["type_declarations"][0]["id"],
-            json!("<normalized-id>")
+            json!("<type:0:felt252>")
         );
     }
 }

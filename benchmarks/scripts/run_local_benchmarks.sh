@@ -1,17 +1,17 @@
-#!/usr/bin/env zsh
-# Requires zsh (arrays, extended globs, and zsh/datetime module).
+#!/usr/bin/env bash
 set -euo pipefail
-zmodload zsh/datetime
-typeset -gi MONO_LAST_US=0
-typeset -gi MONO_OFFSET_US=0
 
-SCRIPT_DIR="$(cd "$(dirname "${(%):-%N}")" && pwd -P)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 ROOT_DIR="$(git -C "$SCRIPT_DIR/../.." rev-parse --show-toplevel 2>/dev/null || (cd "$SCRIPT_DIR/../.." && pwd -P))"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-}"
 MATRIX="${MATRIX:-research}"
 TOOL="${TOOL:-scarb}"
-RUNS="${RUNS:-5}"
-COLD_RUNS="${COLD_RUNS:-3}"
+RUNS="${RUNS:-12}"
+COLD_RUNS="${COLD_RUNS:-12}"
+CPU_SET="${CPU_SET:-${UC_BENCH_CPU_SET:-}}"
+NICE_LEVEL="${NICE_LEVEL:-${UC_BENCH_NICE_LEVEL:-0}}"
+STRICT_PINNING="${STRICT_PINNING:-${UC_BENCH_STRICT_PINNING:-0}}"
+WARM_SETTLE_SECONDS="${WARM_SETTLE_SECONDS:-2.2}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR="$ROOT_DIR/benchmarks/results"
 OUT_JSON=""
@@ -19,7 +19,18 @@ OUT_MD=""
 TMP_DIR="$(mktemp -d)"
 UC_BIN="$ROOT_DIR/target/debug/uc"
 UC_DAEMON_SOCKET_PATH="${UC_DAEMON_SOCKET_PATH:-$TMP_DIR/uc-daemon.sock}"
+TASKSET_ENABLED=0
+CPU_GOVERNOR="unknown"
+
+declare -a EXEC_PREFIX=()
+declare -a CMD_REPLY=()
+
 export UC_DAEMON_SOCKET_PATH
+# Keep language/runtime behavior stable across cycles.
+export LC_ALL=C
+export TZ=UTC
+export CARGO_INCREMENTAL=0
+export RUST_BACKTRACE=0
 
 cleanup() {
   if [[ "$TOOL" == "uc" && -x "$UC_BIN" ]]; then
@@ -37,8 +48,12 @@ Options:
   --matrix <research|smoke>   Scenario matrix to run (default: research)
   --tool <scarb|uc>           Tool under test (default: scarb)
   --workspace-root <path>     Path containing local cloned repos
-  --runs <n>                  Runs for warm/offline scenarios (default: 5)
-  --cold-runs <n>             Runs for cold scenarios (default: 3)
+  --runs <n>                  Runs for warm/offline scenarios (default: 12)
+  --cold-runs <n>             Runs for cold scenarios (default: 12)
+  --cpu-set <list>            Optional CPU affinity list (e.g. 0 or 0-1)
+  --nice-level <n>            Optional process nice level (default: 0)
+  --warm-settle-seconds <n>   Wait after warm-up before warm-noop samples (default: 2.2)
+  --strict-pinning            Fail if requested pinning cannot be applied
   --help                      Show this help
 USAGE
 }
@@ -80,6 +95,25 @@ while [[ $# -gt 0 ]]; do
       COLD_RUNS="$2"
       shift 2
       ;;
+    --cpu-set)
+      require_option_value "$1" "${2-}"
+      CPU_SET="$2"
+      shift 2
+      ;;
+    --nice-level)
+      require_option_value "$1" "${2-}"
+      NICE_LEVEL="$2"
+      shift 2
+      ;;
+    --warm-settle-seconds)
+      require_option_value "$1" "${2-}"
+      WARM_SETTLE_SECONDS="$2"
+      shift 2
+      ;;
+    --strict-pinning)
+      STRICT_PINNING=1
+      shift
+      ;;
     --help)
       usage
       exit 0
@@ -92,12 +126,20 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "$RUNS" != <-> || "$RUNS" -le 0 ]]; then
+if [[ ! "$RUNS" =~ ^[0-9]+$ || "$RUNS" -le 0 ]]; then
   echo "--runs must be a positive integer, got: $RUNS" >&2
   exit 1
 fi
-if [[ "$COLD_RUNS" != <-> || "$COLD_RUNS" -le 0 ]]; then
+if [[ ! "$COLD_RUNS" =~ ^[0-9]+$ || "$COLD_RUNS" -le 0 ]]; then
   echo "--cold-runs must be a positive integer, got: $COLD_RUNS" >&2
+  exit 1
+fi
+if [[ ! "$NICE_LEVEL" =~ ^-?[0-9]+$ ]]; then
+  echo "--nice-level must be an integer, got: $NICE_LEVEL" >&2
+  exit 1
+fi
+if ! [[ "$WARM_SETTLE_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "--warm-settle-seconds must be a positive number, got: $WARM_SETTLE_SECONDS" >&2
   exit 1
 fi
 
@@ -116,17 +158,72 @@ require_cmd scarb
 require_cmd jq
 require_cmd awk
 require_cmd sort
+require_cmd python3
 
 if [[ "$TOOL" != "scarb" && "$TOOL" != "uc" ]]; then
   echo "Unsupported tool: $TOOL" >&2
   exit 1
 fi
 
+if [[ "$MATRIX" == "research" && -z "$WORKSPACE_ROOT" ]]; then
+  echo "WORKSPACE_ROOT is required for research matrix runs." >&2
+  echo "Set WORKSPACE_ROOT to a path where scarb/examples exists." >&2
+  exit 1
+fi
+
+configure_execution_prefix() {
+  EXEC_PREFIX=()
+
+  if [[ -n "$CPU_SET" ]]; then
+    if command -v taskset >/dev/null 2>&1; then
+      EXEC_PREFIX+=(taskset -c "$CPU_SET")
+      TASKSET_ENABLED=1
+    elif [[ "$STRICT_PINNING" == "1" ]]; then
+      echo "Requested --cpu-set but taskset is unavailable." >&2
+      exit 1
+    else
+      echo "Benchmark warning: taskset unavailable; CPU pinning skipped." >&2
+    fi
+  fi
+
+  if [[ "$NICE_LEVEL" != "0" ]]; then
+    if command -v nice >/dev/null 2>&1; then
+      EXEC_PREFIX+=(nice -n "$NICE_LEVEL")
+    elif [[ "$STRICT_PINNING" == "1" ]]; then
+      echo "Requested --nice-level but nice is unavailable." >&2
+      exit 1
+    else
+      echo "Benchmark warning: nice unavailable; priority pinning skipped." >&2
+    fi
+  fi
+}
+
+capture_cpu_governor() {
+  if [[ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]]; then
+    CPU_GOVERNOR="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)"
+    if [[ "$CPU_GOVERNOR" != "performance" ]]; then
+      if [[ "$STRICT_PINNING" == "1" ]]; then
+        echo "CPU governor is '$CPU_GOVERNOR'; expected 'performance' in strict mode." >&2
+        exit 1
+      fi
+      echo "Benchmark warning: CPU governor is '$CPU_GOVERNOR' (not 'performance')." >&2
+    fi
+  fi
+}
+
+with_exec_prefix() {
+  local -a base=("$@")
+  CMD_REPLY=("${EXEC_PREFIX[@]}" "${base[@]}")
+}
+
 if [[ "$TOOL" == "uc" ]]; then
   require_cmd cargo
   (cd "$ROOT_DIR" && cargo build -p uc-cli >/dev/null)
   UC_DAEMON_SOCKET_PATH="$UC_DAEMON_SOCKET_PATH" "$UC_BIN" daemon start >/dev/null
 fi
+
+configure_execution_prefix
+capture_cpu_governor
 
 mkdir -p "$OUT_DIR"
 : > "$TMP_DIR/scenarios.ndjson"
@@ -150,33 +247,14 @@ workspace_root_for_report() {
 }
 
 command_to_string() {
-  local -a argv=("$@")
   local -a escaped=()
-  local arg
-  for arg in "${argv[@]}"; do
-    escaped+=("${(q)arg}")
+  local arg quoted
+  for arg in "$@"; do
+    printf -v quoted '%q' "$arg"
+    escaped+=("$quoted")
   done
-  printf "%s" "${(j: :)escaped}"
-}
-
-monotonic_now_us() {
-  # Use zsh's high-resolution clock to avoid per-sample subprocess overhead.
-  local now="$EPOCHREALTIME"
-  local sec="${now%%.*}"
-  local frac="${now#*.}"
-  frac="${frac}000000"
-  frac="${frac[1,6]}"
-  local raw_us=$((10#$sec * 1000000 + 10#$frac))
-  local adjusted_us=$((raw_us + MONO_OFFSET_US))
-  if (( adjusted_us < MONO_LAST_US )); then
-    MONO_OFFSET_US=$((MONO_OFFSET_US + MONO_LAST_US - adjusted_us))
-    adjusted_us=$((raw_us + MONO_OFFSET_US))
-  fi
-  if (( adjusted_us < MONO_LAST_US )); then
-    adjusted_us=$MONO_LAST_US
-  fi
-  MONO_LAST_US=$adjusted_us
-  printf "%s" "$adjusted_us"
+  local joined="${escaped[*]}"
+  printf "%s" "$joined"
 }
 
 measure_command_ms() {
@@ -193,38 +271,51 @@ measure_command_ms() {
 
   display="$(command_to_string "${argv[@]}")"
 
-  local start_us
-  local end_us
-  local original_dir
-  original_dir="$(pwd -P)"
-  start_us="$(monotonic_now_us)"
-  if ! cd "$cwd"; then
-    echo "Failed to enter benchmark directory: $cwd" >&2
-    return 1
-  fi
-  if ! "${argv[@]}" >/dev/null 2>"$stderr_file"; then
-    cd "$original_dir" >/dev/null 2>&1 || true
+  if ! python3 - "$cwd" "$stderr_file" "${argv[@]}" <<'PY'; then
+import os
+import subprocess
+import sys
+import time
+
+cwd = sys.argv[1]
+stderr_path = sys.argv[2]
+command = sys.argv[3:]
+
+start_ns = time.monotonic_ns()
+with open(os.devnull, "wb") as devnull, open(stderr_path, "wb") as stderr:
+    proc = subprocess.run(command, cwd=cwd, stdout=devnull, stderr=stderr)
+elapsed_ms = (time.monotonic_ns() - start_ns) / 1_000_000
+if proc.returncode != 0:
+    raise SystemExit(proc.returncode)
+print(f"{elapsed_ms:.3f}")
+PY
     echo "Command failed in $cwd: $display" >&2
     cat "$stderr_file" >&2
     return 1
   fi
-  cd "$original_dir" >/dev/null 2>&1 || true
-  end_us="$(monotonic_now_us)"
-
-  awk -v s="$start_us" -v e="$end_us" 'BEGIN { printf "%.3f\n", (e - s) / 1000 }'
 }
 
 stats_json_from_samples() {
   local samples_file="$1"
   jq -s '
     sort as $s
-    | def pidx($p): (((length * $p) | ceil) - 1);
+    | def quantile($p):
+        if length == 0 then null
+        else
+          (length - 1) as $n
+          | ($n * $p) as $i
+          | ($i | floor) as $lo
+          | ($i | ceil) as $hi
+          | if $lo == $hi then .[$lo]
+            else (.[$lo] + ((.[$hi] - .[$lo]) * ($i - $lo)))
+            end
+        end;
     {
       min_ms: ($s | min),
       max_ms: ($s | max),
       mean_ms: (add / length),
-      p50_ms: $s[pidx(0.50)],
-      p95_ms: $s[pidx(0.95)]
+      p50_ms: ($s | quantile(0.50)),
+      p95_ms: ($s | quantile(0.95))
     }
   ' "$samples_file"
 }
@@ -262,31 +353,37 @@ append_result() {
 
 build_command_for_manifest() {
   local manifest="$1"
+  local -a base=()
   if [[ "$TOOL" == "scarb" ]]; then
-    reply=(scarb --manifest-path "$manifest" build)
+    base=(scarb --manifest-path "$manifest" build)
   else
-    reply=("$UC_BIN" build --engine uc --daemon-mode require --manifest-path "$manifest")
+    base=("$UC_BIN" build --engine uc --daemon-mode require --manifest-path "$manifest")
   fi
+  with_exec_prefix "${base[@]}"
 }
 
 metadata_online_command_for_manifest() {
   local manifest="$1"
   local cache_dir="$2"
+  local -a base=()
   if [[ "$TOOL" == "scarb" ]]; then
-    reply=(scarb --manifest-path "$manifest" --global-cache-dir "$cache_dir" metadata --format-version 1)
+    base=(scarb --manifest-path "$manifest" --global-cache-dir "$cache_dir" metadata --format-version 1)
   else
-    reply=("$UC_BIN" metadata --daemon-mode require --manifest-path "$manifest" --global-cache-dir "$cache_dir" --format-version 1)
+    base=("$UC_BIN" metadata --daemon-mode require --manifest-path "$manifest" --global-cache-dir "$cache_dir" --format-version 1)
   fi
+  with_exec_prefix "${base[@]}"
 }
 
 metadata_offline_command_for_manifest() {
   local manifest="$1"
   local cache_dir="$2"
+  local -a base=()
   if [[ "$TOOL" == "scarb" ]]; then
-    reply=(scarb --manifest-path "$manifest" --global-cache-dir "$cache_dir" --offline metadata --format-version 1)
+    base=(scarb --manifest-path "$manifest" --global-cache-dir "$cache_dir" --offline metadata --format-version 1)
   else
-    reply=("$UC_BIN" metadata --daemon-mode require --manifest-path "$manifest" --offline --global-cache-dir "$cache_dir" --format-version 1)
+    base=("$UC_BIN" metadata --daemon-mode require --manifest-path "$manifest" --offline --global-cache-dir "$cache_dir" --format-version 1)
   fi
+  with_exec_prefix "${base[@]}"
 }
 
 prepare_workload_copy() {
@@ -326,7 +423,7 @@ run_build_cold() {
   rm -rf "$baseline_dir"
   cp -PR "$cwd" "$baseline_dir"
 
-  for i in $(seq 1 "$runs"); do
+  for _ in $(seq 1 "$runs"); do
     rm -rf "$cwd"
     cp -PR "$baseline_dir" "$cwd"
     measure_command_ms "$cwd" "${command[@]}" >> "$samples_file"
@@ -345,8 +442,9 @@ run_build_warm_noop() {
   local samples_file="$TMP_DIR/${TOOL}-${workload//\//_}-build-warm-noop.samples"
   : > "$samples_file"
 
-  measure_command_ms "$cwd" "${command[@]}" > /dev/null
-  for i in $(seq 1 "$runs"); do
+  measure_command_ms "$cwd" "${command[@]}" >/dev/null
+  sleep "$WARM_SETTLE_SECONDS"
+  for _ in $(seq 1 "$runs"); do
     measure_command_ms "$cwd" "${command[@]}" >> "$samples_file"
   done
 
@@ -363,20 +461,29 @@ run_build_warm_edit() {
   local command_string="$(command_to_string "${command[@]}")"
   local samples_file="$TMP_DIR/${TOOL}-${workload//\//_}-build-warm-edit.samples"
   local backup_file="$TMP_DIR/${TOOL}-${workload//\//_}-edit.backup"
+  local failed=0
   : > "$samples_file"
 
   cp "$edit_file" "$backup_file"
-  {
-    measure_command_ms "$cwd" "${command[@]}" > /dev/null
+  if ! measure_command_ms "$cwd" "${command[@]}" >/dev/null; then
+    failed=1
+  fi
 
+  if [[ "$failed" -eq 0 ]]; then
     for i in $(seq 1 "$runs"); do
       cp "$backup_file" "$edit_file"
       printf "\n// uc benchmark edit %s %s\n" "$i" "$STAMP" >> "$edit_file"
-      measure_command_ms "$cwd" "${command[@]}" >> "$samples_file"
+      if ! measure_command_ms "$cwd" "${command[@]}" >> "$samples_file"; then
+        failed=1
+        break
+      fi
     done
-  } always {
-    cp "$backup_file" "$edit_file" >/dev/null 2>&1 || true
-  }
+  fi
+
+  cp "$backup_file" "$edit_file" >/dev/null 2>&1 || true
+  if [[ "$failed" -ne 0 ]]; then
+    return 1
+  fi
 
   append_result "build.warm_edit" "$workload" "$command_string" "$samples_file" "$runs"
 }
@@ -404,20 +511,29 @@ run_build_warm_edit_semantic() {
   local command_string="$(command_to_string "${command[@]}")"
   local samples_file="$TMP_DIR/${TOOL}-${workload//\//_}-build-warm-edit-semantic.samples"
   local backup_file="$TMP_DIR/${TOOL}-${workload//\//_}-semantic-edit.backup"
+  local failed=0
   : > "$samples_file"
 
   cp "$edit_file" "$backup_file"
-  {
-    measure_command_ms "$cwd" "${command[@]}" > /dev/null
+  if ! measure_command_ms "$cwd" "${command[@]}" >/dev/null; then
+    failed=1
+  fi
 
+  if [[ "$failed" -eq 0 ]]; then
     for i in $(seq 1 "$runs"); do
       cp "$backup_file" "$edit_file"
       rewrite_smoke_semantic_edit "$edit_file" "$i"
-      measure_command_ms "$cwd" "${command[@]}" >> "$samples_file"
+      if ! measure_command_ms "$cwd" "${command[@]}" >> "$samples_file"; then
+        failed=1
+        break
+      fi
     done
-  } always {
-    cp "$backup_file" "$edit_file" >/dev/null 2>&1 || true
-  }
+  fi
+
+  cp "$backup_file" "$edit_file" >/dev/null 2>&1 || true
+  if [[ "$failed" -ne 0 ]]; then
+    return 1
+  fi
 
   append_result "build.warm_edit_semantic" "$workload" "$command_string" "$samples_file" "$runs"
 }
@@ -433,7 +549,7 @@ run_metadata_online_cold() {
   local samples_file="$TMP_DIR/${TOOL}-${workload//\//_}-metadata-online-cold.samples"
   : > "$samples_file"
 
-  for i in $(seq 1 "$runs"); do
+  for _ in $(seq 1 "$runs"); do
     rm -rf "$cache_dir"
     measure_command_ms "$cwd" "${command[@]}" >> "$samples_file"
   done
@@ -462,9 +578,9 @@ run_metadata_offline_warm() {
   : > "$samples_file"
 
   rm -rf "$cache_dir"
-  measure_command_ms "$cwd" "${warm_command[@]}" > /dev/null
+  measure_command_ms "$cwd" "${warm_command[@]}" >/dev/null
 
-  for i in $(seq 1 "$runs"); do
+  for _ in $(seq 1 "$runs"); do
     measure_command_ms "$cwd" "${command[@]}" >> "$samples_file"
   done
 
@@ -472,11 +588,6 @@ run_metadata_offline_warm() {
 }
 
 if [[ "$MATRIX" == "research" ]]; then
-  if [[ -z "$WORKSPACE_ROOT" ]]; then
-    echo "WORKSPACE_ROOT is required for research matrix runs." >&2
-    echo "Set WORKSPACE_ROOT to a path where scarb/examples exists." >&2
-    exit 1
-  fi
   WORKSPACE_ROOT="$(cd "$WORKSPACE_ROOT" && pwd -P)"
 
   HELLO_SRC="$WORKSPACE_ROOT/scarb/examples/hello_world"
@@ -499,9 +610,9 @@ if [[ "$MATRIX" == "research" ]]; then
   DEPS_MANIFEST="$DEPS_DIR/Scarb.toml"
 
   build_command_for_manifest "$HELLO_MANIFEST"
-  HELLO_BUILD_CMD=("${reply[@]}")
+  HELLO_BUILD_CMD=("${CMD_REPLY[@]}")
   build_command_for_manifest "$WS_MANIFEST"
-  WS_BUILD_CMD=("${reply[@]}")
+  WS_BUILD_CMD=("${CMD_REPLY[@]}")
 
   run_build_cold "hello_world" "$HELLO_DIR" "$COLD_RUNS" "${HELLO_BUILD_CMD[@]}"
   run_build_warm_noop "hello_world" "$HELLO_DIR" "$RUNS" "${HELLO_BUILD_CMD[@]}"
@@ -513,9 +624,9 @@ if [[ "$MATRIX" == "research" ]]; then
 
   DEPS_CACHE_DIR="$TMP_DIR/deps-cache"
   metadata_online_command_for_manifest "$DEPS_MANIFEST" "$DEPS_CACHE_DIR"
-  DEPS_META_WARM_CMD=("${reply[@]}")
+  DEPS_META_WARM_CMD=("${CMD_REPLY[@]}")
   metadata_offline_command_for_manifest "$DEPS_MANIFEST" "$DEPS_CACHE_DIR"
-  DEPS_META_OFFLINE_CMD=("${reply[@]}")
+  DEPS_META_OFFLINE_CMD=("${CMD_REPLY[@]}")
 
   run_metadata_online_cold "dependencies" "$DEPS_DIR" "$DEPS_CACHE_DIR" "$COLD_RUNS" "${DEPS_META_WARM_CMD[@]}"
   run_metadata_offline_warm "dependencies" "$DEPS_DIR" "$DEPS_CACHE_DIR" "$RUNS" "${DEPS_META_WARM_CMD[@]}" -- "${DEPS_META_OFFLINE_CMD[@]}"
@@ -525,7 +636,7 @@ elif [[ "$MATRIX" == "smoke" ]]; then
   SMOKE_MANIFEST="$SMOKE_DIR/Scarb.toml"
 
   build_command_for_manifest "$SMOKE_MANIFEST"
-  SMOKE_BUILD_CMD=("${reply[@]}")
+  SMOKE_BUILD_CMD=("${CMD_REPLY[@]}")
 
   run_build_cold "scarb_smoke" "$SMOKE_DIR" "$COLD_RUNS" "${SMOKE_BUILD_CMD[@]}"
   run_build_warm_noop "scarb_smoke" "$SMOKE_DIR" "$RUNS" "${SMOKE_BUILD_CMD[@]}"
@@ -554,6 +665,12 @@ jq -s \
   --arg tool_version "$TOOL_VERSION" \
   --arg scarb_version "$SCARB_VERSION" \
   --arg workspace_root "$WORKSPACE_ROOT_REPORT" \
+  --arg cpu_set "$CPU_SET" \
+  --arg nice_level "$NICE_LEVEL" \
+  --arg strict_pinning "$STRICT_PINNING" \
+  --arg taskset_enabled "$TASKSET_ENABLED" \
+  --arg cpu_governor "$CPU_GOVERNOR" \
+  --arg warm_settle_seconds "$WARM_SETTLE_SECONDS" \
   --argjson runs "$RUNS" \
   --argjson cold_runs "$COLD_RUNS" \
   '{
@@ -567,11 +684,24 @@ jq -s \
     workspace_root: $workspace_root,
     runs: $runs,
     cold_runs: $cold_runs,
+    pinned_conditions: {
+      cpu_set: (if $cpu_set == "" then null else $cpu_set end),
+      nice_level: ($nice_level | tonumber),
+      strict_pinning: ($strict_pinning == "1"),
+      taskset_enabled: ($taskset_enabled == "1"),
+      cpu_governor: $cpu_governor,
+      warm_settle_seconds: ($warm_settle_seconds | tonumber),
+      env: {
+        lc_all: "C",
+        tz: "UTC",
+        cargo_incremental: "0"
+      }
+    },
     scenarios: .
   }' "$TMP_DIR/scenarios.ndjson" > "$OUT_JSON"
 
 {
-  echo "# ${TOOL:u} Benchmark ($STAMP)"
+  echo "# ${TOOL^^} Benchmark ($STAMP)"
   echo
   echo "## Environment"
   echo "- Generated at: $GENERATED_AT"
@@ -579,6 +709,10 @@ jq -s \
   echo "- Host: <redacted>"
   echo "- Tool: $TOOL_VERSION"
   echo "- Workspace root: $WORKSPACE_ROOT_REPORT"
+  echo "- CPU set: ${CPU_SET:-<none>}"
+  echo "- Nice level: $NICE_LEVEL"
+  echo "- CPU governor: $CPU_GOVERNOR"
+  echo "- Warm settle seconds: $WARM_SETTLE_SECONDS"
   echo
   echo "## Summary"
   echo "| Scenario | Workload | Runs | p50 (ms) | p95 (ms) | mean (ms) | min (ms) | max (ms) |"

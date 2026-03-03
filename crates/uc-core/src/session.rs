@@ -11,6 +11,9 @@ pub struct SessionInput {
     pub cfg_set: Vec<String>,
     pub manifest_content_hash: String,
     pub target_family: String,
+    pub cairo_edition: Option<String>,
+    pub cairo_lang_version: Option<String>,
+    pub build_env_fingerprint: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -23,6 +26,9 @@ struct NormalizedSessionInput<'a> {
     cfg_set: Vec<String>,
     manifest_content_hash: &'a str,
     target_family: &'a str,
+    cairo_edition: Option<String>,
+    cairo_lang_version: Option<String>,
+    build_env_fingerprint: &'a str,
 }
 
 impl SessionInput {
@@ -43,6 +49,9 @@ impl SessionInput {
             cfg_set,
             manifest_content_hash: &self.manifest_content_hash,
             target_family: &self.target_family,
+            cairo_edition: self.cairo_edition.clone(),
+            cairo_lang_version: self.cairo_lang_version.clone(),
+            build_env_fingerprint: &self.build_env_fingerprint,
         })
         .expect("session key normalization serialization must not fail");
 
@@ -66,6 +75,9 @@ mod tests {
             cfg_set: cfg_set.into_iter().map(ToString::to_string).collect(),
             manifest_content_hash: "manifest-blake3:abc".to_string(),
             target_family: "lib".to_string(),
+            cairo_edition: Some("2024_07".to_string()),
+            cairo_lang_version: Some("1.0".to_string()),
+            build_env_fingerprint: "env-blake3:abc".to_string(),
         }
     }
 
@@ -95,6 +107,18 @@ mod tests {
 
         let mut c = a.clone();
         c.package = Some("other".to_string());
+        assert_ne!(a.deterministic_key_hex(), c.deterministic_key_hex());
+    }
+
+    #[test]
+    fn session_key_changes_when_cairo_or_env_changes() {
+        let a = sample_input(vec!["a"], vec!["cfg1"]);
+        let mut b = a.clone();
+        b.cairo_edition = Some("2023_11".to_string());
+        assert_ne!(a.deterministic_key_hex(), b.deterministic_key_hex());
+
+        let mut c = a.clone();
+        c.build_env_fingerprint = "env-blake3:def".to_string();
         assert_ne!(a.deterministic_key_hex(), c.deterministic_key_hex());
     }
 }
