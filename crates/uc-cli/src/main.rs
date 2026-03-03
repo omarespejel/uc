@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use blake3::Hasher;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 #[cfg(unix)]
@@ -31,14 +31,24 @@ const SESSION_KEY_LEN: usize = 64;
 const MAX_FINGERPRINT_FILES: usize = 50_000;
 const MAX_FINGERPRINT_DEPTH: usize = 32;
 const MAX_FINGERPRINT_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_CACHEABLE_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_CACHE_ENTRY_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_FINGERPRINT_INDEX_BYTES: u64 = 32 * 1024 * 1024;
+const FINGERPRINT_INDEX_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_DIAGNOSTICS_SIMILARITY_THRESHOLD: f64 = 99.5;
 const DAEMON_REQUEST_SIZE_LIMIT_BYTES: usize = 1024 * 1024;
 const DAEMON_RATE_WINDOW_SECONDS: u64 = 1;
 const DAEMON_MAX_REQUESTS_PER_WINDOW: usize = 32;
 const DAEMON_LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 const CACHE_LOCK_STALE_AFTER_SECONDS: u64 = 300;
+const CACHEABLE_ARTIFACT_SUFFIXES: [&str; 5] = [
+    ".sierra.json",
+    ".sierra",
+    ".casm",
+    ".contract_class.json",
+    ".executable.json",
+];
 
 #[derive(Parser, Debug)]
 #[command(name = "uc")]
@@ -396,6 +406,19 @@ struct CacheLockGuard {
     path: PathBuf,
 }
 
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct FingerprintIndex {
+    schema_version: u32,
+    entries: BTreeMap<String, FingerprintIndexEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FingerprintIndexEntry {
+    size_bytes: u64,
+    modified_unix_ms: u64,
+    blake3_hex: String,
+}
+
 struct DaemonRateLimiter {
     events: VecDeque<Instant>,
 }
@@ -421,6 +444,15 @@ impl DaemonRateLimiter {
         }
         self.events.push_back(now);
         true
+    }
+}
+
+impl FingerprintIndex {
+    fn empty() -> Self {
+        Self {
+            schema_version: FINGERPRINT_INDEX_SCHEMA_VERSION,
+            entries: BTreeMap::new(),
+        }
     }
 }
 
@@ -722,6 +754,8 @@ fn run_session_key(args: SessionKeyArgs) -> Result<()> {
 
 fn run_build(args: BuildArgs) -> Result<()> {
     let common = args.common;
+    let report_path = args.report_path;
+    let write_report = report_path.is_some();
     let engine = args.engine;
     let daemon_mode = args.daemon_mode;
     let manifest_path = resolve_manifest_path(&common.manifest_path)?;
@@ -737,9 +771,12 @@ fn run_build(args: BuildArgs) -> Result<()> {
     let (run, cache_hit, fingerprint) = match engine {
         EngineArg::Scarb => {
             let (command, command_vec) = scarb_build_command(&common, &manifest_path);
-            let run = run_command_capture(command, command_vec)?;
-            let fingerprint =
-                compute_build_fingerprint(&workspace_root, &manifest_path, &common, &profile)?;
+            let run = run_command(command, command_vec, write_report)?;
+            let fingerprint = if write_report {
+                compute_build_fingerprint(&workspace_root, &manifest_path, &common, &profile, None)?
+            } else {
+                String::new()
+            };
             (run, false, fingerprint)
         }
         EngineArg::Uc => match daemon_mode {
@@ -749,6 +786,7 @@ fn run_build(args: BuildArgs) -> Result<()> {
                 &workspace_root,
                 &profile,
                 &session_key,
+                false,
             )?,
             DaemonModeArg::Auto => {
                 if let Some(response) = try_uc_build_via_daemon(&common, &manifest_path)? {
@@ -762,6 +800,7 @@ fn run_build(args: BuildArgs) -> Result<()> {
                         &workspace_root,
                         &profile,
                         &session_key,
+                        false,
                     )?
                 }
             }
@@ -776,9 +815,8 @@ fn run_build(args: BuildArgs) -> Result<()> {
     };
     replay_output(&run.stdout, &run.stderr)?;
 
-    let artifacts = collect_profile_artifacts(&workspace_root, &profile)?;
-
-    if let Some(path) = args.report_path {
+    if let Some(path) = report_path {
+        let artifacts = collect_profile_artifacts(&workspace_root, &profile)?;
         let report = BuildReport {
             generated_at_epoch_ms: epoch_ms()?,
             engine: engine.as_str().to_string(),
@@ -900,6 +938,7 @@ fn execute_daemon_build(
         &workspace_root,
         &profile,
         &session_key,
+        true,
     )?;
 
     Ok(DaemonBuildResponse {
@@ -913,9 +952,12 @@ fn execute_daemon_build(
 fn run_metadata(args: MetadataArgs) -> Result<()> {
     let manifest_path = resolve_manifest_path(&args.manifest_path)?;
     let (command, command_vec) = scarb_metadata_command(&args, &manifest_path);
+    let write_report = args.report_path.is_some();
 
-    let run = run_command_capture(command, command_vec)?;
-    replay_output(&run.stdout, &run.stderr)?;
+    let run = run_command(command, command_vec, write_report)?;
+    if write_report {
+        replay_output(&run.stdout, &run.stderr)?;
+    }
 
     if let Some(path) = args.report_path {
         let report = MetadataReport {
@@ -1140,6 +1182,7 @@ fn run_build_with_uc_cache(
     workspace_root: &Path,
     profile: &str,
     session_key: &str,
+    capture_output: bool,
 ) -> Result<(CommandRun, bool, String)> {
     let canonical_workspace_root = workspace_root.canonicalize().with_context(|| {
         format!(
@@ -1147,8 +1190,6 @@ fn run_build_with_uc_cache(
             workspace_root.display()
         )
     })?;
-    let fingerprint =
-        compute_build_fingerprint(&canonical_workspace_root, manifest_path, common, profile)?;
     validate_hex_digest("session key", session_key, SESSION_KEY_LEN)?;
     let cache_root = canonical_workspace_root.join(".uc/cache");
     ensure_path_within_root(&canonical_workspace_root, &cache_root, "cache root")?;
@@ -1161,6 +1202,13 @@ fn run_build_with_uc_cache(
     )?;
     ensure_path_within_root(&canonical_workspace_root, &entry_path, "cache entry path")?;
     let _cache_lock = acquire_cache_lock(&cache_root)?;
+    let fingerprint = compute_build_fingerprint(
+        &canonical_workspace_root,
+        manifest_path,
+        common,
+        profile,
+        Some(&cache_root),
+    )?;
 
     let restore_start = Instant::now();
     if let Some(entry) = load_cache_entry(&entry_path)? {
@@ -1195,10 +1243,10 @@ fn run_build_with_uc_cache(
     }
 
     let (command, command_vec) = scarb_build_command(common, manifest_path);
-    let run = run_command_capture(command, command_vec)?;
+    let run = run_command(command, command_vec, capture_output)?;
 
     if run.exit_code == 0 {
-        let artifacts = collect_profile_artifacts(&canonical_workspace_root, profile)?;
+        let artifacts = collect_profile_artifacts_fast(&canonical_workspace_root, profile)?;
         persist_cache_entry(
             &canonical_workspace_root,
             profile,
@@ -1376,7 +1424,7 @@ fn restore_cached_artifacts(
             size_bytes: item.size_bytes,
         })
         .collect();
-    let restored = collect_artifact_digests(&target_root)?;
+    let restored = collect_artifact_digests_fast(&target_root)?;
     Ok(compare_artifact_sets(&expected, &restored).is_empty())
 }
 
@@ -1400,11 +1448,58 @@ fn hash_file_blake3(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+fn metadata_modified_unix_ms(metadata: &fs::Metadata) -> Result<u64> {
+    let modified = metadata
+        .modified()
+        .context("failed to read file modification time")?;
+    let since_epoch = modified.duration_since(UNIX_EPOCH).unwrap_or_default();
+    u64::try_from(since_epoch.as_millis()).context("file modified time overflowed u64")
+}
+
+fn load_fingerprint_index(path: &Path) -> Result<FingerprintIndex> {
+    if !path.exists() {
+        return Ok(FingerprintIndex::empty());
+    }
+    let bytes = read_bytes_with_limit(path, MAX_FINGERPRINT_INDEX_BYTES, "fingerprint index")?;
+    match serde_json::from_slice::<FingerprintIndex>(&bytes) {
+        Ok(index) if index.schema_version == FINGERPRINT_INDEX_SCHEMA_VERSION => Ok(index),
+        Ok(_) => Ok(FingerprintIndex::empty()),
+        Err(err) => {
+            eprintln!(
+                "uc: warning: ignoring unreadable fingerprint index {}: {}",
+                path.display(),
+                err
+            );
+            Ok(FingerprintIndex::empty())
+        }
+    }
+}
+
+fn save_fingerprint_index(path: &Path, index: &FingerprintIndex) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let bytes = serde_json::to_vec(index).context("failed to encode fingerprint index")?;
+    let temp_path = path.with_extension("tmp");
+    fs::write(&temp_path, &bytes)
+        .with_context(|| format!("failed to write {}", temp_path.display()))?;
+    fs::rename(&temp_path, path).with_context(|| {
+        format!(
+            "failed to move fingerprint index {} to {}",
+            temp_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
 fn compute_build_fingerprint(
     workspace_root: &Path,
     manifest_path: &Path,
     common: &BuildCommonArgs,
     profile: &str,
+    cache_root: Option<&Path>,
 ) -> Result<String> {
     let mut hasher = Hasher::new();
     hasher.update(b"uc-build-fingerprint-v1");
@@ -1432,6 +1527,14 @@ fn compute_build_fingerprint(
         hasher.update(feature.as_bytes());
         hasher.update(b",");
     }
+
+    let (index_path, mut index) = if let Some(root) = cache_root {
+        let path = root.join("fingerprint/index-v1.json");
+        (Some(path.clone()), load_fingerprint_index(&path)?)
+    } else {
+        (None, FingerprintIndex::empty())
+    };
+    let mut updated_entries: BTreeMap<String, FingerprintIndexEntry> = BTreeMap::new();
 
     let mut files = Vec::new();
     let walker = WalkDir::new(workspace_root)
@@ -1461,9 +1564,9 @@ fn compute_build_fingerprint(
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
-        let file_size = fs::metadata(&path)
-            .with_context(|| format!("failed to stat {}", path.display()))?
-            .len();
+        let metadata =
+            fs::metadata(&path).with_context(|| format!("failed to stat {}", path.display()))?;
+        let file_size = metadata.len();
         if file_size > MAX_FINGERPRINT_FILE_BYTES {
             bail!(
                 "fingerprint file {} exceeds size limit ({} bytes > {} bytes)",
@@ -1472,11 +1575,38 @@ fn compute_build_fingerprint(
                 MAX_FINGERPRINT_FILE_BYTES
             );
         }
-        let file_hash = hash_file_blake3(&path)?;
+        let modified_unix_ms = metadata_modified_unix_ms(&metadata)?;
+        let file_hash = if let Some(cached) = index.entries.get(&rel) {
+            if cached.size_bytes == file_size && cached.modified_unix_ms == modified_unix_ms {
+                cached.blake3_hex.clone()
+            } else {
+                hash_file_blake3(&path)?
+            }
+        } else {
+            hash_file_blake3(&path)?
+        };
+        updated_entries.insert(
+            rel.clone(),
+            FingerprintIndexEntry {
+                size_bytes: file_size,
+                modified_unix_ms,
+                blake3_hex: file_hash.clone(),
+            },
+        );
         hasher.update(rel.as_bytes());
         hasher.update(b":");
         hasher.update(file_hash.as_bytes());
         hasher.update(b"\n");
+    }
+    if let Some(path) = index_path {
+        index.schema_version = FINGERPRINT_INDEX_SCHEMA_VERSION;
+        index.entries = updated_entries;
+        if let Err(err) = save_fingerprint_index(&path, &index) {
+            eprintln!(
+                "uc: warning: failed to update fingerprint index {}: {err:#}",
+                path.display()
+            );
+        }
     }
 
     Ok(hasher.finalize().to_hex().to_string())
@@ -1656,9 +1786,93 @@ fn run_command_capture(mut command: Command, command_vec: Vec<String>) -> Result
     })
 }
 
+fn run_command_status(mut command: Command, command_vec: Vec<String>) -> Result<CommandRun> {
+    let start = Instant::now();
+    command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    let status = command.status().context("failed to run command")?;
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    Ok(CommandRun {
+        command: command_vec,
+        exit_code: exit_code_from_status(&status),
+        elapsed_ms,
+        stdout: String::new(),
+        stderr: String::new(),
+    })
+}
+
+fn run_command(
+    command: Command,
+    command_vec: Vec<String>,
+    capture_output: bool,
+) -> Result<CommandRun> {
+    if capture_output {
+        return run_command_capture(command, command_vec);
+    }
+    run_command_status(command, command_vec)
+}
+
 fn collect_profile_artifacts(workspace_root: &Path, profile: &str) -> Result<Vec<ArtifactDigest>> {
     let target_dir = workspace_root.join("target").join(profile);
     collect_artifact_digests(&target_dir)
+}
+
+fn collect_profile_artifacts_fast(
+    workspace_root: &Path,
+    profile: &str,
+) -> Result<Vec<ArtifactDigest>> {
+    let target_dir = workspace_root.join("target").join(profile);
+    collect_artifact_digests_fast(&target_dir)
+}
+
+fn collect_artifact_digests_fast(target_root: &Path) -> Result<Vec<ArtifactDigest>> {
+    if !target_root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut digests = Vec::new();
+    for entry in WalkDir::new(target_root).follow_links(false).into_iter() {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to traverse artifact tree under {}",
+                target_root.display()
+            )
+        })?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !CACHEABLE_ARTIFACT_SUFFIXES
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+        {
+            continue;
+        }
+        let metadata =
+            fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+        if metadata.len() > MAX_CACHEABLE_ARTIFACT_BYTES {
+            bail!(
+                "cacheable artifact {} exceeds size limit ({} bytes > {} bytes)",
+                path.display(),
+                metadata.len(),
+                MAX_CACHEABLE_ARTIFACT_BYTES
+            );
+        }
+        let hash = hash_file_blake3(path)?;
+        let relative_path = path
+            .strip_prefix(target_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        digests.push(ArtifactDigest {
+            relative_path,
+            blake3_hex: hash,
+            size_bytes: metadata.len(),
+        });
+    }
+    digests.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    Ok(digests)
 }
 
 fn replay_output(stdout: &str, stderr: &str) -> Result<()> {
