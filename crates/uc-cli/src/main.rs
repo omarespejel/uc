@@ -264,6 +264,9 @@ struct MetadataArgs {
     #[arg(long, default_value_t = 1)]
     format_version: u32,
 
+    #[arg(long, value_enum, default_value_t = DaemonModeArg::Off)]
+    daemon_mode: DaemonModeArg,
+
     #[arg(long)]
     offline: bool,
 
@@ -438,11 +441,26 @@ struct DaemonBuildResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct DaemonMetadataRequest {
+    manifest_path: String,
+    format_version: u32,
+    offline: bool,
+    global_cache_dir: Option<String>,
+    capture_output: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DaemonMetadataResponse {
+    run: CommandRun,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum DaemonRequest {
     Ping,
     Shutdown,
     Build(DaemonBuildRequest),
+    Metadata(DaemonMetadataRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -451,6 +469,7 @@ enum DaemonResponse {
     Pong(DaemonStatusPayload),
     Ack,
     Build(DaemonBuildResponse),
+    Metadata(DaemonMetadataResponse),
     Error { message: String },
 }
 
@@ -1223,6 +1242,61 @@ fn try_uc_build_via_daemon(
     }
 }
 
+fn try_uc_metadata_via_daemon(
+    args: &MetadataArgs,
+    manifest_path: &Path,
+    capture_output: bool,
+    fallback_to_local: bool,
+) -> Result<Option<CommandRun>> {
+    #[cfg(not(unix))]
+    {
+        let _ = (args, manifest_path, capture_output, fallback_to_local);
+        return Ok(None);
+    }
+    #[cfg(unix)]
+    {
+        let socket_path = daemon_socket_path(None)?;
+        if !socket_path.exists() {
+            return Ok(None);
+        }
+
+        let request = DaemonRequest::Metadata(daemon_metadata_request_from_args(
+            args,
+            manifest_path,
+            capture_output,
+        ));
+        let response = match daemon_request(&socket_path, &request) {
+            Ok(response) => response,
+            Err(err) => {
+                if fallback_to_local {
+                    eprintln!(
+                        "uc: daemon request failed ({}), falling back to local metadata",
+                        err
+                    );
+                    return Ok(None);
+                }
+                return Err(err).context("daemon metadata request failed");
+            }
+        };
+
+        match response {
+            DaemonResponse::Metadata(result) => Ok(Some(result.run)),
+            DaemonResponse::Error { message } => {
+                if fallback_to_local {
+                    eprintln!(
+                        "uc: daemon returned error ({}), falling back to local metadata",
+                        message
+                    );
+                    Ok(None)
+                } else {
+                    bail!("daemon metadata request failed: {message}");
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
 fn daemon_build_request_from_common(
     common: &BuildCommonArgs,
     manifest_path: &Path,
@@ -1247,6 +1321,34 @@ fn common_args_from_daemon_request(request: &DaemonBuildRequest) -> BuildCommonA
         offline: request.offline,
         release: request.release,
         profile: request.profile.clone(),
+    }
+}
+
+fn daemon_metadata_request_from_args(
+    args: &MetadataArgs,
+    manifest_path: &Path,
+    capture_output: bool,
+) -> DaemonMetadataRequest {
+    DaemonMetadataRequest {
+        manifest_path: manifest_path.display().to_string(),
+        format_version: args.format_version,
+        offline: args.offline,
+        global_cache_dir: args
+            .global_cache_dir
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        capture_output,
+    }
+}
+
+fn metadata_args_from_daemon_request(request: &DaemonMetadataRequest) -> MetadataArgs {
+    MetadataArgs {
+        manifest_path: Some(PathBuf::from(&request.manifest_path)),
+        format_version: request.format_version,
+        daemon_mode: DaemonModeArg::Off,
+        offline: request.offline,
+        global_cache_dir: request.global_cache_dir.as_ref().map(PathBuf::from),
+        report_path: None,
     }
 }
 
@@ -1280,13 +1382,39 @@ fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildRespon
     })
 }
 
-fn run_metadata(args: MetadataArgs) -> Result<()> {
-    validate_scarb_toolchain()?;
+fn execute_daemon_metadata(request: DaemonMetadataRequest) -> Result<DaemonMetadataResponse> {
+    let args = metadata_args_from_daemon_request(&request);
     let manifest_path = resolve_manifest_path(&args.manifest_path)?;
     let (command, command_vec) = scarb_metadata_command(&args, &manifest_path);
+    let run = run_command(command, command_vec, request.capture_output)?;
+    Ok(DaemonMetadataResponse { run })
+}
+
+fn run_metadata(args: MetadataArgs) -> Result<()> {
+    let manifest_path = resolve_manifest_path(&args.manifest_path)?;
     let write_report = args.report_path.is_some();
 
-    let run = run_command(command, command_vec, write_report)?;
+    let run = match args.daemon_mode {
+        DaemonModeArg::Off => {
+            let (command, command_vec) = scarb_metadata_command(&args, &manifest_path);
+            run_command(command, command_vec, write_report)?
+        }
+        DaemonModeArg::Auto => {
+            if let Some(run) =
+                try_uc_metadata_via_daemon(&args, &manifest_path, write_report, true)?
+            {
+                run
+            } else {
+                let (command, command_vec) = scarb_metadata_command(&args, &manifest_path);
+                run_command(command, command_vec, write_report)?
+            }
+        }
+        DaemonModeArg::Require => {
+            try_uc_metadata_via_daemon(&args, &manifest_path, write_report, false)?
+                .context("daemon mode is require but daemon is unavailable")?
+        }
+    };
+
     if write_report {
         replay_output(&run.stdout, &run.stderr)?;
     }
@@ -3307,6 +3435,17 @@ fn handle_daemon_connection(
                 DaemonResponse::Error { message }
             }
         },
+        DaemonRequest::Metadata(request) => match execute_daemon_metadata(request) {
+            Ok(result) => {
+                record_daemon_success(health);
+                DaemonResponse::Metadata(result)
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                record_daemon_failure(health, message.clone());
+                DaemonResponse::Error { message }
+            }
+        },
     };
 
     let payload = serde_json::to_vec(&response).context("failed to encode daemon response")?;
@@ -3467,4 +3606,126 @@ fn validate_scarb_toolchain() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn unique_test_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before UNIX_EPOCH")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&dir).expect("failed to create test directory");
+        dir
+    }
+
+    #[test]
+    fn daemon_metadata_request_roundtrip_preserves_fields() {
+        let args = MetadataArgs {
+            manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
+            format_version: 3,
+            daemon_mode: DaemonModeArg::Auto,
+            offline: true,
+            global_cache_dir: Some(PathBuf::from("/tmp/scarb-cache")),
+            report_path: None,
+        };
+        let request =
+            daemon_metadata_request_from_args(&args, Path::new("/tmp/workspace/Scarb.toml"), true);
+        let restored = metadata_args_from_daemon_request(&request);
+
+        assert_eq!(
+            restored
+                .manifest_path
+                .as_ref()
+                .expect("manifest path missing"),
+            Path::new("/tmp/workspace/Scarb.toml")
+        );
+        assert_eq!(restored.format_version, 3);
+        assert!(restored.offline);
+        assert_eq!(
+            restored.global_cache_dir,
+            Some(PathBuf::from("/tmp/scarb-cache"))
+        );
+        assert_eq!(restored.daemon_mode as u8, DaemonModeArg::Off as u8);
+        assert!(request.capture_output);
+    }
+
+    #[test]
+    fn daemon_metadata_request_serialization_supports_wire_format() {
+        let request = DaemonRequest::Metadata(DaemonMetadataRequest {
+            manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
+            format_version: 1,
+            offline: false,
+            global_cache_dir: None,
+            capture_output: false,
+        });
+        let json = serde_json::to_string(&request).expect("failed to encode request");
+        assert!(json.contains("\"type\":\"metadata\""));
+
+        let decoded: DaemonRequest =
+            serde_json::from_str(&json).expect("failed to decode daemon request");
+        match decoded {
+            DaemonRequest::Metadata(payload) => {
+                assert_eq!(payload.manifest_path, "/tmp/workspace/Scarb.toml");
+                assert_eq!(payload.format_version, 1);
+                assert!(!payload.offline);
+                assert!(!payload.capture_output);
+                assert!(payload.global_cache_dir.is_none());
+            }
+            _ => panic!("expected metadata request"),
+        }
+    }
+
+    #[test]
+    fn write_uc_toml_normalizes_windows_manifest_path() {
+        let dir = unique_test_dir("uc-write-uc-toml");
+        let output = dir.join("Uc.toml");
+
+        write_uc_toml(
+            &output,
+            Path::new(r"C:\Users\foo\project\Scarb.toml"),
+            Some("demo"),
+            Some("0.1.0"),
+            Some("2024_07"),
+        )
+        .expect("failed to write Uc.toml");
+
+        let body = fs::read_to_string(&output).expect("failed to read Uc.toml");
+        assert!(body.contains(r#"scarb_manifest = "C:/Users/foo/project/Scarb.toml""#));
+        assert!(!body.contains(r#"C:\Users\foo\project\Scarb.toml"#));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scarb_metadata_command_includes_daemon_independent_flags() {
+        let args = MetadataArgs {
+            manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
+            format_version: 2,
+            daemon_mode: DaemonModeArg::Require,
+            offline: true,
+            global_cache_dir: Some(PathBuf::from("/tmp/scarb-cache")),
+            report_path: None,
+        };
+        let (_, command_vec) =
+            scarb_metadata_command(&args, Path::new("/tmp/workspace/Scarb.toml"));
+        assert_eq!(
+            command_vec,
+            vec![
+                "scarb",
+                "--manifest-path",
+                "/tmp/workspace/Scarb.toml",
+                "--offline",
+                "--global-cache-dir",
+                "/tmp/scarb-cache",
+                "metadata",
+                "--format-version",
+                "2",
+            ]
+        );
+    }
 }
