@@ -1,5 +1,5 @@
 {
-  "generated_at_epoch_ms": 1772530616348,
+  "generated_at_epoch_ms": 1772533533326,
   "manifest_path": "/Users/espejelomar/StarkNet/compiler-starknet/scarb/examples/workspaces/Scarb.toml",
   "workspace_root": "/Users/espejelomar/StarkNet/compiler-starknet/scarb/examples/workspaces",
   "clean_before_each": true,
@@ -12,22 +12,22 @@
       "build"
     ],
     "exit_code": 0,
-    "elapsed_ms": 1031.531459,
+    "elapsed_ms": 1539.9764999999998,
     "artifact_count": 1,
     "diagnostics": []
   },
   "candidate": {
-    "label": "uc-build-wrapper",
+    "label": "uc-engine",
     "command": [
       "/Users/espejelomar/StarkNet/compiler-starknet/uc/target/debug/uc",
       "build",
       "--manifest-path",
       "/Users/espejelomar/StarkNet/compiler-starknet/scarb/examples/workspaces/Scarb.toml",
       "--engine",
-      "scarb"
+      "uc"
     ],
     "exit_code": 0,
-    "elapsed_ms": 968.6476250000001,
+    "elapsed_ms": 1006.258375,
     "artifact_count": 1,
     "diagnostics": []
   },

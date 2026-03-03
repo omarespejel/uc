@@ -373,11 +373,13 @@ name = "uc-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "clap",
  "serde",
  "serde_json",
  "toml",
  "uc-core",
+ "walkdir",
 ]
 
 [[package]]

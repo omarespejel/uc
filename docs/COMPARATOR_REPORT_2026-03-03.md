@@ -3,7 +3,7 @@
 ## Scope
 Dual-run comparison between:
 - baseline: direct `scarb build`
-- candidate: `uc build` wrapper path
+- candidate: `uc build --engine uc`
 
 ## Command
 ```bash
@@ -22,8 +22,8 @@ Dual-run comparison between:
 
 ## Notes
 - This establishes comparator infrastructure and correctness gating.
-- Current candidate engine is Scarb-backed by design for initial rollout.
-- Next step is swapping candidate execution path from Scarb-backed wrapper to native `uc` engine and enforcing the same gate.
+- Candidate engine now runs through `uc` cache path and falls back to Scarb on cache miss.
+- Comparator gate remains mandatory while native engine behavior is tuned.
 
 ## Artifacts
 - `benchmarks/baselines/2026-03-03-compare-summary.md`

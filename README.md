@@ -19,6 +19,7 @@ See:
 - `docs/BENCHMARK_PLAN.md`
 - `docs/ARCHITECTURE_BLUEPRINT.md`
 - `docs/COMMAND_SURFACE.md`
+- `docs/SPEED_SIGNAL_2026-03-03.md`
 
 ## Repository Structure
 - `docs/`: product, architecture, roadmap, KPIs, operating model, cutover.
@@ -32,7 +33,9 @@ See:
 ```bash
 make bootstrap
 make benchmark-local
+make benchmark-uc
 make compare-local
+./benchmarks/scripts/compare_benchmark_results.sh --baseline <scarb.json> --candidate <uc.json> --out <delta.md>
 cargo run -p uc-cli -- build --manifest-path /path/to/Scarb.toml
 cargo run -p uc-cli -- compare-build --manifest-path /path/to/Scarb.toml
 cargo run -p uc-cli -- migrate --manifest-path /path/to/Scarb.toml --emit-uc-toml /path/to/Uc.toml

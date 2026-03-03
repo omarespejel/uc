@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
+use blake3::Hasher;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -12,6 +13,7 @@ use uc_core::artifacts::{
 };
 use uc_core::compare::{compare_diagnostics, extract_diagnostic_lines, DiagnosticsComparison};
 use uc_core::session::SessionInput;
+use walkdir::WalkDir;
 
 #[derive(Parser, Debug)]
 #[command(name = "uc")]
@@ -47,14 +49,31 @@ impl MatrixArg {
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
+enum BenchmarkToolArg {
+    Scarb,
+    Uc,
+}
+
+impl BenchmarkToolArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            BenchmarkToolArg::Scarb => "scarb",
+            BenchmarkToolArg::Uc => "uc",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
 enum EngineArg {
     Scarb,
+    Uc,
 }
 
 impl EngineArg {
     fn as_str(self) -> &'static str {
         match self {
             EngineArg::Scarb => "scarb",
+            EngineArg::Uc => "uc",
         }
     }
 }
@@ -63,6 +82,9 @@ impl EngineArg {
 struct BenchmarkArgs {
     #[arg(long, value_enum, default_value_t = MatrixArg::Research)]
     matrix: MatrixArg,
+
+    #[arg(long, value_enum, default_value_t = BenchmarkToolArg::Scarb)]
+    tool: BenchmarkToolArg,
 
     #[arg(long, default_value_t = 5)]
     runs: u32,
@@ -127,7 +149,7 @@ struct BuildArgs {
     #[command(flatten)]
     common: BuildCommonArgs,
 
-    #[arg(long, value_enum, default_value_t = EngineArg::Scarb)]
+    #[arg(long, value_enum, default_value_t = EngineArg::Uc)]
     engine: EngineArg,
 
     #[arg(long)]
@@ -196,6 +218,8 @@ struct BuildReport {
     command: Vec<String>,
     exit_code: i32,
     elapsed_ms: f64,
+    cache_hit: bool,
+    fingerprint: String,
     artifact_count: usize,
 }
 
@@ -247,6 +271,22 @@ struct MigrationReport {
     suggested_next_steps: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedArtifact {
+    relative_path: String,
+    blake3_hex: String,
+    size_bytes: u64,
+    object_rel_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BuildCacheEntry {
+    schema_version: u32,
+    fingerprint: String,
+    profile: String,
+    artifacts: Vec<CachedArtifact>,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -271,6 +311,8 @@ fn run_benchmark(args: BenchmarkArgs) -> Result<()> {
     let status = Command::new(&script)
         .arg("--matrix")
         .arg(args.matrix.as_str())
+        .arg("--tool")
+        .arg(args.tool.as_str())
         .arg("--runs")
         .arg(args.runs.to_string())
         .arg("--cold-runs")
@@ -304,6 +346,7 @@ fn run_session_key(args: SessionKeyArgs) -> Result<()> {
 
 fn run_build(args: BuildArgs) -> Result<()> {
     let common = args.common;
+    let engine = args.engine;
     let manifest_path = resolve_manifest_path(&common.manifest_path)?;
     let workspace_root = manifest_path
         .parent()
@@ -326,8 +369,23 @@ fn run_build(args: BuildArgs) -> Result<()> {
         },
     };
 
-    let (command, command_vec) = scarb_build_command(&common, &manifest_path);
-    let run = run_command_capture(command, command_vec)?;
+    let session_key = session_input.deterministic_key_hex();
+    let (run, cache_hit, fingerprint) = match engine {
+        EngineArg::Scarb => {
+            let (command, command_vec) = scarb_build_command(&common, &manifest_path);
+            let run = run_command_capture(command, command_vec)?;
+            let fingerprint =
+                compute_build_fingerprint(&workspace_root, &manifest_path, &common, &profile)?;
+            (run, false, fingerprint)
+        }
+        EngineArg::Uc => run_build_with_uc_cache(
+            &common,
+            &manifest_path,
+            &workspace_root,
+            &profile,
+            &session_key,
+        )?,
+    };
     replay_output(&run.stdout, &run.stderr)?;
 
     let artifacts = collect_profile_artifacts(&workspace_root, &profile)?;
@@ -335,14 +393,16 @@ fn run_build(args: BuildArgs) -> Result<()> {
     if let Some(path) = args.report_path {
         let report = BuildReport {
             generated_at_epoch_ms: epoch_ms()?,
-            engine: args.engine.as_str().to_string(),
+            engine: engine.as_str().to_string(),
             manifest_path: manifest_path.display().to_string(),
             workspace_root: workspace_root.display().to_string(),
             profile,
-            session_key: session_input.deterministic_key_hex(),
+            session_key,
             command: run.command.clone(),
             exit_code: run.exit_code,
             elapsed_ms: run.elapsed_ms,
+            cache_hit,
+            fingerprint,
             artifact_count: artifacts.len(),
         };
         write_json_report(&path, &report)?;
@@ -518,7 +578,7 @@ fn run_compare_build(args: CompareBuildArgs) -> Result<()> {
         remove_build_outputs(&workspace_root)?;
     }
 
-    let candidate_run = run_uc_build_subprocess(&common, &manifest_path)?;
+    let candidate_run = run_uc_build_subprocess(&common, &manifest_path, EngineArg::Uc)?;
     let candidate_artifacts = collect_profile_artifacts(&workspace_root, &profile)?;
     let candidate_diag = extract_diagnostic_lines(&candidate_run.stderr);
 
@@ -539,7 +599,7 @@ fn run_compare_build(args: CompareBuildArgs) -> Result<()> {
             diagnostics: baseline_diag,
         },
         candidate: CompareRunSnapshot {
-            label: "uc-build-wrapper".to_string(),
+            label: "uc-engine".to_string(),
             command: candidate_run.command.clone(),
             exit_code: candidate_run.exit_code,
             elapsed_ms: candidate_run.elapsed_ms,
@@ -571,6 +631,286 @@ fn run_compare_build(args: CompareBuildArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn run_build_with_uc_cache(
+    common: &BuildCommonArgs,
+    manifest_path: &Path,
+    workspace_root: &Path,
+    profile: &str,
+    session_key: &str,
+) -> Result<(CommandRun, bool, String)> {
+    let fingerprint = compute_build_fingerprint(workspace_root, manifest_path, common, profile)?;
+    let cache_root = workspace_root.join(".uc/cache");
+    let objects_dir = cache_root.join("objects");
+    let entry_path = cache_root.join("build").join(format!("{session_key}.json"));
+
+    let restore_start = Instant::now();
+    if let Some(entry) = load_cache_entry(&entry_path)? {
+        if entry.schema_version == 1
+            && entry.profile == profile
+            && entry.fingerprint == fingerprint
+            && restore_cached_artifacts(workspace_root, profile, &objects_dir, &entry.artifacts)?
+        {
+            let run = CommandRun {
+                command: vec![
+                    "uc".to_string(),
+                    "build".to_string(),
+                    "--engine".to_string(),
+                    "uc".to_string(),
+                    "--cache-hit".to_string(),
+                ],
+                exit_code: 0,
+                elapsed_ms: restore_start.elapsed().as_secs_f64() * 1000.0,
+                stdout: format!(
+                    "uc: cache hit, restored {} artifacts\n",
+                    entry.artifacts.len()
+                ),
+                stderr: String::new(),
+            };
+            return Ok((run, true, fingerprint));
+        }
+    }
+
+    let (command, command_vec) = scarb_build_command(common, manifest_path);
+    let run = run_command_capture(command, command_vec)?;
+
+    if run.exit_code == 0 {
+        let artifacts = collect_profile_artifacts(workspace_root, profile)?;
+        persist_cache_entry(
+            workspace_root,
+            profile,
+            &fingerprint,
+            &artifacts,
+            &objects_dir,
+            &entry_path,
+        )?;
+    }
+
+    Ok((run, false, fingerprint))
+}
+
+fn persist_cache_entry(
+    workspace_root: &Path,
+    profile: &str,
+    fingerprint: &str,
+    artifacts: &[ArtifactDigest],
+    objects_dir: &Path,
+    entry_path: &Path,
+) -> Result<()> {
+    let target_root = workspace_root.join("target").join(profile);
+    let mut cached_artifacts = Vec::with_capacity(artifacts.len());
+
+    for artifact in artifacts {
+        let src = target_root.join(&artifact.relative_path);
+        if !src.exists() {
+            continue;
+        }
+
+        let object_rel_path = format!(
+            "{}/{}.bin",
+            &artifact.blake3_hex[0..2.min(artifact.blake3_hex.len())],
+            artifact.blake3_hex
+        );
+        let object_path = objects_dir.join(&object_rel_path);
+        if !object_path.exists() {
+            if let Some(parent) = object_path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            fs::copy(&src, &object_path).with_context(|| {
+                format!(
+                    "failed to copy artifact {} to {}",
+                    src.display(),
+                    object_path.display()
+                )
+            })?;
+        }
+
+        cached_artifacts.push(CachedArtifact {
+            relative_path: artifact.relative_path.clone(),
+            blake3_hex: artifact.blake3_hex.clone(),
+            size_bytes: artifact.size_bytes,
+            object_rel_path,
+        });
+    }
+
+    let entry = BuildCacheEntry {
+        schema_version: 1,
+        fingerprint: fingerprint.to_string(),
+        profile: profile.to_string(),
+        artifacts: cached_artifacts,
+    };
+
+    if let Some(parent) = entry_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let bytes = serde_json::to_vec_pretty(&entry)?;
+    fs::write(entry_path, bytes)
+        .with_context(|| format!("failed to write cache entry {}", entry_path.display()))?;
+
+    Ok(())
+}
+
+fn load_cache_entry(path: &Path) -> Result<Option<BuildCacheEntry>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let parsed: BuildCacheEntry = match serde_json::from_slice(&bytes) {
+        Ok(entry) => entry,
+        Err(_) => return Ok(None),
+    };
+    Ok(Some(parsed))
+}
+
+fn restore_cached_artifacts(
+    workspace_root: &Path,
+    profile: &str,
+    objects_dir: &Path,
+    artifacts: &[CachedArtifact],
+) -> Result<bool> {
+    if artifacts.is_empty() {
+        return Ok(false);
+    }
+
+    for artifact in artifacts {
+        let object_path = objects_dir.join(&artifact.object_rel_path);
+        if !object_path.exists() {
+            return Ok(false);
+        }
+    }
+
+    let target_root = workspace_root.join("target").join(profile);
+    for artifact in artifacts {
+        let expected_hash = &artifact.blake3_hex;
+        let out_path = target_root.join(&artifact.relative_path);
+
+        if out_path.exists() && hash_file_blake3(&out_path)? == *expected_hash {
+            continue;
+        }
+
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+
+        let object_path = objects_dir.join(&artifact.object_rel_path);
+        fs::copy(&object_path, &out_path).with_context(|| {
+            format!(
+                "failed to restore cache object {} to {}",
+                object_path.display(),
+                out_path.display()
+            )
+        })?;
+    }
+
+    let expected: Vec<ArtifactDigest> = artifacts
+        .iter()
+        .map(|item| ArtifactDigest {
+            relative_path: item.relative_path.clone(),
+            blake3_hex: item.blake3_hex.clone(),
+            size_bytes: item.size_bytes,
+        })
+        .collect();
+    let restored = collect_artifact_digests(&target_root)?;
+    Ok(compare_artifact_sets(&expected, &restored).is_empty())
+}
+
+fn hash_file_blake3(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut hasher = Hasher::new();
+    hasher.update(&bytes);
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn compute_build_fingerprint(
+    workspace_root: &Path,
+    manifest_path: &Path,
+    common: &BuildCommonArgs,
+    profile: &str,
+) -> Result<String> {
+    let mut hasher = Hasher::new();
+    hasher.update(b"uc-build-fingerprint-v1");
+    hasher.update(manifest_path.display().to_string().as_bytes());
+    hasher.update(profile.as_bytes());
+    hasher.update(common.package.as_deref().unwrap_or("*").as_bytes());
+    hasher.update(if common.workspace {
+        b"workspace"
+    } else {
+        b"package"
+    });
+    hasher.update(if common.offline {
+        b"offline"
+    } else {
+        b"online"
+    });
+
+    let mut features = common.features.clone();
+    features.sort();
+    for feature in features {
+        hasher.update(feature.as_bytes());
+        hasher.update(b",");
+    }
+
+    let mut files = Vec::new();
+    let walker = WalkDir::new(workspace_root)
+        .into_iter()
+        .filter_entry(|entry| !is_ignored_entry(workspace_root, entry.path()));
+
+    for entry in walker.filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if should_include_fingerprint_file(path) {
+            files.push(path.to_path_buf());
+        }
+    }
+    files.sort();
+
+    for path in files {
+        let rel = path
+            .strip_prefix(workspace_root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let file_hash = hash_file_blake3(&path)?;
+        hasher.update(rel.as_bytes());
+        hasher.update(b":");
+        hasher.update(file_hash.as_bytes());
+        hasher.update(b"\n");
+    }
+
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn is_ignored_entry(root: &Path, path: &Path) -> bool {
+    if path == root {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    matches!(name, ".git" | "target" | ".scarb" | ".uc")
+}
+
+fn should_include_fingerprint_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+
+    if matches!(name, "Scarb.toml" | "Scarb.lock" | "Uc.toml") {
+        return true;
+    }
+
+    path.extension()
+        .and_then(|s| s.to_str())
+        .map(|ext| ext == "cairo")
+        .unwrap_or(false)
 }
 
 fn scarb_build_command(common: &BuildCommonArgs, manifest_path: &Path) -> (Command, Vec<String>) {
@@ -652,7 +992,11 @@ fn scarb_metadata_command(args: &MetadataArgs, manifest_path: &Path) -> (Command
     (command, command_vec)
 }
 
-fn run_uc_build_subprocess(common: &BuildCommonArgs, manifest_path: &Path) -> Result<CommandRun> {
+fn run_uc_build_subprocess(
+    common: &BuildCommonArgs,
+    manifest_path: &Path,
+    engine: EngineArg,
+) -> Result<CommandRun> {
     let exe = std::env::current_exe().context("failed to resolve current uc binary path")?;
     let mut command = Command::new(&exe);
     let mut command_vec = vec![exe.display().to_string(), "build".to_string()];
@@ -663,9 +1007,9 @@ fn run_uc_build_subprocess(common: &BuildCommonArgs, manifest_path: &Path) -> Re
     command_vec.push("--manifest-path".to_string());
     command_vec.push(manifest_path.display().to_string());
 
-    command.arg("--engine").arg("scarb");
+    command.arg("--engine").arg(engine.as_str());
     command_vec.push("--engine".to_string());
-    command_vec.push("scarb".to_string());
+    command_vec.push(engine.as_str().to_string());
 
     if common.offline {
         command.arg("--offline");

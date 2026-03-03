@@ -25,6 +25,11 @@ For repeated builds in the same workspace:
 - Dual-run comparator harness: `benchmarks/scripts/run_dual_run_comparator.sh`
 - CLI compare command: `uc compare-build --manifest-path <Scarb.toml>`
 
+## Current Status (2026-03-03)
+- Comparator gate: passing on sampled workloads (0 artifact mismatches, diagnostics similarity 100%).
+- Performance signal: strong gains on warm no-op, mixed on warm-edit p95 across workloads.
+- Gate A is not passed yet; optimization work continues.
+
 ## Gate Outcome
 - Go: all criteria pass.
 - No-Go: criteria miss after one stabilization cycle.

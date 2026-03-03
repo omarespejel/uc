@@ -36,6 +36,7 @@ Every build-path engine change must run dual-run comparison (`scarb-direct` vs `
 
 ## Execution
 ```bash
-./benchmarks/scripts/run_local_benchmarks.sh --matrix research
+./benchmarks/scripts/run_local_benchmarks.sh --matrix research --tool scarb
+./benchmarks/scripts/run_local_benchmarks.sh --matrix research --tool uc
 ./benchmarks/scripts/run_dual_run_comparator.sh
 ```

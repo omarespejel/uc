@@ -3,8 +3,11 @@
 ## Implemented Commands
 
 1. `uc build`
-- Executes build path with Scarb-backed engine.
+- Executes build path with selectable engines.
 - Supports: `--manifest-path`, `--package`, `--workspace`, `--features`, `--offline`, `--release`, `--profile`.
+- Engines:
+  - `--engine uc` (default): deterministic fingerprint + local artifact cache restore fast-path.
+  - `--engine scarb`: direct Scarb execution path.
 - Optional `--report-path` writes execution report JSON.
 
 2. `uc metadata`
@@ -28,7 +31,7 @@
 - Optional `--emit-uc-toml <path>` generates a starter `Uc.toml` scaffold.
 
 ## Current Engine Note
-`uc build` currently uses `engine=scarb` as the bootstrap execution backend. This is intentional for phased correctness gating before native engine swap.
+`uc` engine currently uses Scarb execution for cache misses and deterministic local cache restore for hits. This is a bootstrap native path to capture warm speedups while keeping parity gates.
 
 ## Next Expansion
 - Add native `uc` compile engine implementation behind the existing command interface.

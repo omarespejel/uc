@@ -11,12 +11,18 @@ Benchmark harness and baseline artifacts for Scarb vs `uc` performance and parit
 
 ## Run Baseline Matrix
 ```bash
-./benchmarks/scripts/run_local_benchmarks.sh --matrix research
+./benchmarks/scripts/run_local_benchmarks.sh --matrix research --tool scarb
+./benchmarks/scripts/run_local_benchmarks.sh --matrix research --tool uc
 ```
 
 ## Run Dual-Run Comparator
 ```bash
 ./benchmarks/scripts/run_dual_run_comparator.sh
+```
+
+## Compare Two Benchmark Runs
+```bash
+./benchmarks/scripts/compare_benchmark_results.sh --baseline <scarb.json> --candidate <uc.json> --out <delta.md>
 ```
 
 ## Modes

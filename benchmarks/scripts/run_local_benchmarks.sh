@@ -6,13 +6,15 @@ ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 DEFAULT_WORKSPACE_ROOT="/Users/espejelomar/StarkNet/compiler-starknet"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-$DEFAULT_WORKSPACE_ROOT}"
 MATRIX="${MATRIX:-research}"
+TOOL="${TOOL:-scarb}"
 RUNS="${RUNS:-5}"
 COLD_RUNS="${COLD_RUNS:-3}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR="$ROOT_DIR/benchmarks/results"
-OUT_JSON="$OUT_DIR/scarb-baseline-$STAMP.json"
-OUT_MD="$OUT_DIR/scarb-baseline-$STAMP.md"
+OUT_JSON=""
+OUT_MD=""
 TMP_DIR="$(mktemp -d)"
+UC_BIN="$ROOT_DIR/target/debug/uc"
 
 cleanup() {
   rm -rf "$TMP_DIR"
@@ -25,6 +27,7 @@ Usage: $(basename "$0") [options]
 
 Options:
   --matrix <research|smoke>   Scenario matrix to run (default: research)
+  --tool <scarb|uc>           Tool under test (default: scarb)
   --workspace-root <path>     Path containing local cloned repos
   --runs <n>                  Runs for warm/offline scenarios (default: 5)
   --cold-runs <n>             Runs for cold scenarios (default: 3)
@@ -36,6 +39,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --matrix)
       MATRIX="$2"
+      shift 2
+      ;;
+    --tool)
+      TOOL="$2"
       shift 2
       ;;
     --workspace-root)
@@ -62,6 +69,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+OUT_JSON="$OUT_DIR/${TOOL}-baseline-$STAMP.json"
+OUT_MD="$OUT_DIR/${TOOL}-baseline-$STAMP.md"
+
 require_cmd() {
   local cmd="$1"
   if ! command -v "$cmd" >/dev/null 2>&1; then
@@ -74,6 +84,16 @@ require_cmd scarb
 require_cmd jq
 require_cmd awk
 require_cmd sort
+
+if [[ "$TOOL" != "scarb" && "$TOOL" != "uc" ]]; then
+  echo "Unsupported tool: $TOOL" >&2
+  exit 1
+fi
+
+if [[ "$TOOL" == "uc" ]]; then
+  require_cmd cargo
+  (cd "$ROOT_DIR" && cargo build -p uc-cli >/dev/null)
+fi
 
 mkdir -p "$OUT_DIR"
 : > "$TMP_DIR/scenarios.ndjson"
@@ -138,16 +158,45 @@ append_result() {
     }' >> "$TMP_DIR/scenarios.ndjson"
 }
 
+build_command_for_manifest() {
+  local manifest="$1"
+  if [[ "$TOOL" == "scarb" ]]; then
+    echo "scarb --manifest-path '$manifest' build"
+  else
+    echo "$UC_BIN build --engine uc --manifest-path '$manifest'"
+  fi
+}
+
+metadata_online_command_for_manifest() {
+  local manifest="$1"
+  local cache_dir="$2"
+  if [[ "$TOOL" == "scarb" ]]; then
+    echo "scarb --manifest-path '$manifest' --global-cache-dir '$cache_dir' metadata --format-version 1"
+  else
+    echo "$UC_BIN metadata --manifest-path '$manifest' --global-cache-dir '$cache_dir' --format-version 1"
+  fi
+}
+
+metadata_offline_command_for_manifest() {
+  local manifest="$1"
+  local cache_dir="$2"
+  if [[ "$TOOL" == "scarb" ]]; then
+    echo "scarb --manifest-path '$manifest' --global-cache-dir '$cache_dir' --offline metadata --format-version 1"
+  else
+    echo "$UC_BIN metadata --manifest-path '$manifest' --offline --global-cache-dir '$cache_dir' --format-version 1"
+  fi
+}
+
 run_build_cold() {
   local workload="$1"
   local cwd="$2"
   local command="$3"
   local runs="$4"
-  local samples_file="$TMP_DIR/${workload//\//_}-build-cold.samples"
+  local samples_file="$TMP_DIR/${TOOL}-${workload//\//_}-build-cold.samples"
   : > "$samples_file"
 
   for i in $(seq 1 "$runs"); do
-    rm -rf "$cwd/target" "$cwd/.scarb"
+    rm -rf "$cwd/target" "$cwd/.scarb" "$cwd/.uc"
     measure_command_ms "$cwd" "$command" >> "$samples_file"
   done
 
@@ -159,7 +208,7 @@ run_build_warm_noop() {
   local cwd="$2"
   local command="$3"
   local runs="$4"
-  local samples_file="$TMP_DIR/${workload//\//_}-build-warm-noop.samples"
+  local samples_file="$TMP_DIR/${TOOL}-${workload//\//_}-build-warm-noop.samples"
   : > "$samples_file"
 
   measure_command_ms "$cwd" "$command" > /dev/null
@@ -176,8 +225,8 @@ run_build_warm_edit() {
   local command="$3"
   local edit_file="$4"
   local runs="$5"
-  local samples_file="$TMP_DIR/${workload//\//_}-build-warm-edit.samples"
-  local backup_file="$TMP_DIR/${workload//\//_}-edit.backup"
+  local samples_file="$TMP_DIR/${TOOL}-${workload//\//_}-build-warm-edit.samples"
+  local backup_file="$TMP_DIR/${TOOL}-${workload//\//_}-edit.backup"
   : > "$samples_file"
 
   cp "$edit_file" "$backup_file"
@@ -196,12 +245,11 @@ run_build_warm_edit() {
 run_metadata_online_cold() {
   local workload="$1"
   local cwd="$2"
-  local cache_dir="$3"
-  local runs="$4"
-  local samples_file="$TMP_DIR/${workload//\//_}-metadata-online-cold.samples"
+  local command="$3"
+  local cache_dir="$4"
+  local runs="$5"
+  local samples_file="$TMP_DIR/${TOOL}-${workload//\//_}-metadata-online-cold.samples"
   : > "$samples_file"
-
-  local command="scarb --global-cache-dir '$cache_dir' metadata --format-version 1"
 
   for i in $(seq 1 "$runs"); do
     rm -rf "$cache_dir"
@@ -214,13 +262,12 @@ run_metadata_online_cold() {
 run_metadata_offline_warm() {
   local workload="$1"
   local cwd="$2"
-  local cache_dir="$3"
-  local runs="$4"
-  local samples_file="$TMP_DIR/${workload//\//_}-metadata-offline-warm.samples"
+  local warm_command="$3"
+  local command="$4"
+  local cache_dir="$5"
+  local runs="$6"
+  local samples_file="$TMP_DIR/${TOOL}-${workload//\//_}-metadata-offline-warm.samples"
   : > "$samples_file"
-
-  local warm_command="scarb --global-cache-dir '$cache_dir' metadata --format-version 1"
-  local command="scarb --global-cache-dir '$cache_dir' --offline metadata --format-version 1"
 
   rm -rf "$cache_dir"
   measure_command_ms "$cwd" "$warm_command" > /dev/null
@@ -243,27 +290,45 @@ if [[ "$MATRIX" == "research" ]]; then
     exit 1
   fi
 
-  run_build_cold "hello_world" "$HELLO_DIR" "scarb build" "$COLD_RUNS"
-  run_build_warm_noop "hello_world" "$HELLO_DIR" "scarb build" "$RUNS"
-  run_build_warm_edit "hello_world" "$HELLO_DIR" "scarb build" "$HELLO_DIR/src/lib.cairo" "$RUNS"
+  HELLO_MANIFEST="$HELLO_DIR/Scarb.toml"
+  WS_MANIFEST="$WS_DIR/Scarb.toml"
+  DEPS_MANIFEST="$DEPS_DIR/Scarb.toml"
 
-  run_build_cold "workspaces" "$WS_DIR" "scarb build" "$COLD_RUNS"
-  run_build_warm_noop "workspaces" "$WS_DIR" "scarb build" "$RUNS"
-  run_build_warm_edit "workspaces" "$WS_DIR" "scarb build" "$WS_DIR/crates/fibonacci/src/lib.cairo" "$RUNS"
+  HELLO_BUILD_CMD="$(build_command_for_manifest "$HELLO_MANIFEST")"
+  WS_BUILD_CMD="$(build_command_for_manifest "$WS_MANIFEST")"
 
-  run_metadata_online_cold "dependencies" "$DEPS_DIR" "$TMP_DIR/deps-cache" "$COLD_RUNS"
-  run_metadata_offline_warm "dependencies" "$DEPS_DIR" "$TMP_DIR/deps-cache" "$RUNS"
+  run_build_cold "hello_world" "$HELLO_DIR" "$HELLO_BUILD_CMD" "$COLD_RUNS"
+  run_build_warm_noop "hello_world" "$HELLO_DIR" "$HELLO_BUILD_CMD" "$RUNS"
+  run_build_warm_edit "hello_world" "$HELLO_DIR" "$HELLO_BUILD_CMD" "$HELLO_DIR/src/lib.cairo" "$RUNS"
+
+  run_build_cold "workspaces" "$WS_DIR" "$WS_BUILD_CMD" "$COLD_RUNS"
+  run_build_warm_noop "workspaces" "$WS_DIR" "$WS_BUILD_CMD" "$RUNS"
+  run_build_warm_edit "workspaces" "$WS_DIR" "$WS_BUILD_CMD" "$WS_DIR/crates/fibonacci/src/lib.cairo" "$RUNS"
+
+  DEPS_META_WARM_CMD="$(metadata_online_command_for_manifest "$DEPS_MANIFEST" "$TMP_DIR/deps-cache")"
+  DEPS_META_OFFLINE_CMD="$(metadata_offline_command_for_manifest "$DEPS_MANIFEST" "$TMP_DIR/deps-cache")"
+
+  run_metadata_online_cold "dependencies" "$DEPS_DIR" "$DEPS_META_WARM_CMD" "$TMP_DIR/deps-cache" "$COLD_RUNS"
+  run_metadata_offline_warm "dependencies" "$DEPS_DIR" "$DEPS_META_WARM_CMD" "$DEPS_META_OFFLINE_CMD" "$TMP_DIR/deps-cache" "$RUNS"
 elif [[ "$MATRIX" == "smoke" ]]; then
   SMOKE_DIR="$ROOT_DIR/benchmarks/fixtures/scarb_smoke"
-  run_build_cold "scarb_smoke" "$SMOKE_DIR" "scarb build" 1
-  run_build_warm_noop "scarb_smoke" "$SMOKE_DIR" "scarb build" 2
-  run_build_warm_edit "scarb_smoke" "$SMOKE_DIR" "scarb build" "$SMOKE_DIR/src/lib.cairo" 2
+  SMOKE_MANIFEST="$SMOKE_DIR/Scarb.toml"
+  SMOKE_BUILD_CMD="$(build_command_for_manifest "$SMOKE_MANIFEST")"
+
+  run_build_cold "scarb_smoke" "$SMOKE_DIR" "$SMOKE_BUILD_CMD" 1
+  run_build_warm_noop "scarb_smoke" "$SMOKE_DIR" "$SMOKE_BUILD_CMD" 2
+  run_build_warm_edit "scarb_smoke" "$SMOKE_DIR" "$SMOKE_BUILD_CMD" "$SMOKE_DIR/src/lib.cairo" 2
 else
   echo "Unsupported matrix: $MATRIX" >&2
   exit 1
 fi
 
 SCARB_VERSION="$(scarb --version | head -n1)"
+if [[ "$TOOL" == "uc" ]]; then
+  TOOL_VERSION="uc (local build; scarb backend version: $SCARB_VERSION)"
+else
+  TOOL_VERSION="$SCARB_VERSION"
+fi
 GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 HOST_NAME="$(hostname)"
 UNAME_STR="$(uname -a)"
@@ -273,6 +338,8 @@ jq -s \
   --arg matrix "$MATRIX" \
   --arg host "$HOST_NAME" \
   --arg uname "$UNAME_STR" \
+  --arg tool "$TOOL" \
+  --arg tool_version "$TOOL_VERSION" \
   --arg scarb_version "$SCARB_VERSION" \
   --arg workspace_root "$WORKSPACE_ROOT" \
   --argjson runs "$RUNS" \
@@ -282,7 +349,8 @@ jq -s \
     matrix: $matrix,
     host: $host,
     uname: $uname,
-    tool: "scarb",
+    tool: $tool,
+    tool_version: $tool_version,
     scarb_version: $scarb_version,
     workspace_root: $workspace_root,
     runs: $runs,
@@ -291,13 +359,13 @@ jq -s \
   }' "$TMP_DIR/scenarios.ndjson" > "$OUT_JSON"
 
 {
-  echo "# Scarb Baseline Benchmark ($STAMP)"
+  echo "# ${TOOL:u} Benchmark ($STAMP)"
   echo
   echo "## Environment"
   echo "- Generated at: $GENERATED_AT"
   echo "- Matrix: $MATRIX"
   echo "- Host: $HOST_NAME"
-  echo "- Tool: $SCARB_VERSION"
+  echo "- Tool: $TOOL_VERSION"
   echo "- Workspace root: $WORKSPACE_ROOT"
   echo
   echo "## Summary"

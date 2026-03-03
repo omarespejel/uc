@@ -1,9 +1,10 @@
 {
-  "generated_at": "2026-03-03T09:23:03Z",
+  "generated_at": "2026-03-03T10:25:10Z",
   "matrix": "research",
   "host": "TMWM-G5FXKKXLXY",
   "uname": "Darwin TMWM-G5FXKKXLXY 23.6.0 Darwin Kernel Version 23.6.0: Thu Apr 24 20:29:27 PDT 2025; root:xnu-10063.141.1.705.2~1/RELEASE_ARM64_T6030 arm64",
   "tool": "scarb",
+  "tool_version": "scarb 2.14.0 (682b29e13 2025-11-25)",
   "scarb_version": "scarb 2.14.0 (682b29e13 2025-11-25)",
   "workspace_root": "/Users/espejelomar/StarkNet/compiler-starknet",
   "runs": 5,
@@ -12,155 +13,155 @@
     {
       "scenario": "build.cold",
       "workload": "hello_world",
-      "command": "scarb build",
+      "command": "scarb --manifest-path '/Users/espejelomar/StarkNet/compiler-starknet/scarb/examples/hello_world/Scarb.toml' build",
       "runs": 3,
       "samples_ms": [
-        3115.231,
-        2510.427,
-        4511.191
+        3363.971,
+        2140.786,
+        1227.342
       ],
       "stats": {
-        "min_ms": 2510.427,
-        "max_ms": 4511.191,
-        "mean_ms": 3378.949666666667,
-        "p50_ms": 3115.231,
-        "p95_ms": 4511.191
+        "min_ms": 1227.342,
+        "max_ms": 3363.971,
+        "mean_ms": 2244.033,
+        "p50_ms": 2140.786,
+        "p95_ms": 3363.971
       }
     },
     {
       "scenario": "build.warm_noop",
       "workload": "hello_world",
-      "command": "scarb build",
+      "command": "scarb --manifest-path '/Users/espejelomar/StarkNet/compiler-starknet/scarb/examples/hello_world/Scarb.toml' build",
       "runs": 5,
       "samples_ms": [
-        38.252,
-        39.342,
-        47.721,
-        32.565,
-        44.375
+        25.610,
+        22.468,
+        23.249,
+        51.707,
+        36.271
       ],
       "stats": {
-        "min_ms": 32.565,
-        "max_ms": 47.721,
-        "mean_ms": 40.451,
-        "p50_ms": 39.342,
-        "p95_ms": 47.721
+        "min_ms": 22.468,
+        "max_ms": 51.707,
+        "mean_ms": 31.861,
+        "p50_ms": 25.610,
+        "p95_ms": 51.707
       }
     },
     {
       "scenario": "build.warm_edit",
       "workload": "hello_world",
-      "command": "scarb build",
+      "command": "scarb --manifest-path '/Users/espejelomar/StarkNet/compiler-starknet/scarb/examples/hello_world/Scarb.toml' build",
       "runs": 5,
       "samples_ms": [
-        1290.758,
-        1130.938,
-        960.974,
-        1445.466,
-        1430.065
+        2547.850,
+        527.639,
+        575.733,
+        462.139,
+        516.453
       ],
       "stats": {
-        "min_ms": 960.974,
-        "max_ms": 1445.466,
-        "mean_ms": 1251.6402000000003,
-        "p50_ms": 1290.758,
-        "p95_ms": 1445.466
+        "min_ms": 462.139,
+        "max_ms": 2547.850,
+        "mean_ms": 925.9628,
+        "p50_ms": 527.639,
+        "p95_ms": 2547.850
       }
     },
     {
       "scenario": "build.cold",
       "workload": "workspaces",
-      "command": "scarb build",
+      "command": "scarb --manifest-path '/Users/espejelomar/StarkNet/compiler-starknet/scarb/examples/workspaces/Scarb.toml' build",
       "runs": 3,
       "samples_ms": [
-        4573.176,
-        5644.983,
-        3313.896
+        960.396,
+        866.872,
+        889.514
       ],
       "stats": {
-        "min_ms": 3313.896,
-        "max_ms": 5644.983,
-        "mean_ms": 4510.685,
-        "p50_ms": 4573.176,
-        "p95_ms": 5644.983
+        "min_ms": 866.872,
+        "max_ms": 960.396,
+        "mean_ms": 905.594,
+        "p50_ms": 889.514,
+        "p95_ms": 960.396
       }
     },
     {
       "scenario": "build.warm_noop",
       "workload": "workspaces",
-      "command": "scarb build",
+      "command": "scarb --manifest-path '/Users/espejelomar/StarkNet/compiler-starknet/scarb/examples/workspaces/Scarb.toml' build",
       "runs": 5,
       "samples_ms": [
-        50.684,
-        46.485,
-        42.055,
-        66.484,
-        60.783
+        28.650,
+        27.934,
+        29.370,
+        29.115,
+        26.545
       ],
       "stats": {
-        "min_ms": 42.055,
-        "max_ms": 66.484,
-        "mean_ms": 53.298199999999994,
-        "p50_ms": 50.684,
-        "p95_ms": 66.484
+        "min_ms": 26.545,
+        "max_ms": 29.370,
+        "mean_ms": 28.3228,
+        "p50_ms": 28.650,
+        "p95_ms": 29.370
       }
     },
     {
       "scenario": "build.warm_edit",
       "workload": "workspaces",
-      "command": "scarb build",
+      "command": "scarb --manifest-path '/Users/espejelomar/StarkNet/compiler-starknet/scarb/examples/workspaces/Scarb.toml' build",
       "runs": 5,
       "samples_ms": [
-        3762.847,
-        1765.468,
-        2009.133,
-        988.306,
-        1969.981
+        362.695,
+        334.174,
+        316.571,
+        317.624,
+        337.213
       ],
       "stats": {
-        "min_ms": 988.306,
-        "max_ms": 3762.847,
-        "mean_ms": 2099.147,
-        "p50_ms": 1969.981,
-        "p95_ms": 3762.847
+        "min_ms": 316.571,
+        "max_ms": 362.695,
+        "mean_ms": 333.6554,
+        "p50_ms": 334.174,
+        "p95_ms": 362.695
       }
     },
     {
       "scenario": "metadata.online_cold",
       "workload": "dependencies",
-      "command": "scarb --global-cache-dir '/var/folders/qz/nsyksys54bx4x8c_688j6sx80000gn/T/tmp.ZsGw5a3FDF/deps-cache' metadata --format-version 1",
+      "command": "scarb --manifest-path '/Users/espejelomar/StarkNet/compiler-starknet/scarb/examples/dependencies/Scarb.toml' --global-cache-dir '/var/folders/qz/nsyksys54bx4x8c_688j6sx80000gn/T/tmp.SnUrgBp9HP/deps-cache' metadata --format-version 1",
       "runs": 3,
       "samples_ms": [
-        3698.907,
-        2666.493,
-        2240.888
+        1567.474,
+        1591.516,
+        1497.380
       ],
       "stats": {
-        "min_ms": 2240.888,
-        "max_ms": 3698.907,
-        "mean_ms": 2868.762666666667,
-        "p50_ms": 2666.493,
-        "p95_ms": 3698.907
+        "min_ms": 1497.380,
+        "max_ms": 1591.516,
+        "mean_ms": 1552.1233333333332,
+        "p50_ms": 1567.474,
+        "p95_ms": 1591.516
       }
     },
     {
       "scenario": "metadata.offline_warm",
       "workload": "dependencies",
-      "command": "scarb --global-cache-dir '/var/folders/qz/nsyksys54bx4x8c_688j6sx80000gn/T/tmp.ZsGw5a3FDF/deps-cache' --offline metadata --format-version 1",
+      "command": "scarb --manifest-path '/Users/espejelomar/StarkNet/compiler-starknet/scarb/examples/dependencies/Scarb.toml' --global-cache-dir '/var/folders/qz/nsyksys54bx4x8c_688j6sx80000gn/T/tmp.SnUrgBp9HP/deps-cache' --offline metadata --format-version 1",
       "runs": 5,
       "samples_ms": [
-        27.528,
-        31.008,
-        41.200,
-        145.476,
-        54.530
+        21.856,
+        17.674,
+        17.775,
+        22.075,
+        20.268
       ],
       "stats": {
-        "min_ms": 27.528,
-        "max_ms": 145.476,
-        "mean_ms": 59.94839999999999,
-        "p50_ms": 41.200,
-        "p95_ms": 145.476
+        "min_ms": 17.674,
+        "max_ms": 22.075,
+        "mean_ms": 19.9296,
+        "p50_ms": 20.268,
+        "p95_ms": 22.075
       }
     }
   ]
