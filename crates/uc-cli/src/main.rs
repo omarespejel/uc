@@ -4148,7 +4148,7 @@ mod tests {
         let updated = fs::read_to_string(&lib_path).expect("failed to read updated lib.cairo");
         fs::write(
             &lib_path,
-            updated.replace("math::weighted_sum(seed)", "math::weighted_sum(seed + 1)"),
+            updated.replace("BENCH_EDIT_SEED_BIAS: felt252 = 0", "BENCH_EDIT_SEED_BIAS: felt252 = 1"),
         )
         .expect("failed to write semantic change");
 

@@ -10,11 +10,14 @@
 3. `build.warm_edit`
 - Build once, modify one source file, rebuild.
 
+4. `build.warm_edit_semantic`
+- Build once, apply a semantic source edit, rebuild.
+
 ## Metadata Scenarios
-4. `metadata.online_cold`
+5. `metadata.online_cold`
 - Run metadata with empty global cache.
 
-5. `metadata.offline_warm`
+6. `metadata.offline_warm`
 - Warm cache once, then run metadata with `--offline`.
 
 ## Outputs

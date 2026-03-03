@@ -381,6 +381,47 @@ run_build_warm_edit() {
   append_result "build.warm_edit" "$workload" "$command_string" "$samples_file" "$runs"
 }
 
+rewrite_smoke_semantic_edit() {
+  local file="$1"
+  local value="$2"
+  local tmp_file="$TMP_DIR/semantic-edit-$$.tmp"
+  sed -E "s/(const BENCH_EDIT_SEED_BIAS: felt252 = )[0-9]+;/\\1${value};/" "$file" > "$tmp_file"
+  if cmp -s "$file" "$tmp_file"; then
+    echo "Failed to apply semantic benchmark edit marker in $file" >&2
+    rm -f "$tmp_file"
+    exit 1
+  fi
+  mv "$tmp_file" "$file"
+}
+
+run_build_warm_edit_semantic() {
+  local workload="$1"
+  local cwd="$2"
+  local edit_file="$3"
+  local runs="$4"
+  shift 4
+  local -a command=("$@")
+  local command_string="$(command_to_string "${command[@]}")"
+  local samples_file="$TMP_DIR/${TOOL}-${workload//\//_}-build-warm-edit-semantic.samples"
+  local backup_file="$TMP_DIR/${TOOL}-${workload//\//_}-semantic-edit.backup"
+  : > "$samples_file"
+
+  cp "$edit_file" "$backup_file"
+  {
+    measure_command_ms "$cwd" "${command[@]}" > /dev/null
+
+    for i in $(seq 1 "$runs"); do
+      cp "$backup_file" "$edit_file"
+      rewrite_smoke_semantic_edit "$edit_file" "$i"
+      measure_command_ms "$cwd" "${command[@]}" >> "$samples_file"
+    done
+  } always {
+    cp "$backup_file" "$edit_file" >/dev/null 2>&1 || true
+  }
+
+  append_result "build.warm_edit_semantic" "$workload" "$command_string" "$samples_file" "$runs"
+}
+
 run_metadata_online_cold() {
   local workload="$1"
   local cwd="$2"
@@ -486,9 +527,10 @@ elif [[ "$MATRIX" == "smoke" ]]; then
   build_command_for_manifest "$SMOKE_MANIFEST"
   SMOKE_BUILD_CMD=("${reply[@]}")
 
-  run_build_cold "scarb_smoke" "$SMOKE_DIR" 1 "${SMOKE_BUILD_CMD[@]}"
-  run_build_warm_noop "scarb_smoke" "$SMOKE_DIR" 2 "${SMOKE_BUILD_CMD[@]}"
-  run_build_warm_edit "scarb_smoke" "$SMOKE_DIR" "$SMOKE_DIR/src/lib.cairo" 2 "${SMOKE_BUILD_CMD[@]}"
+  run_build_cold "scarb_smoke" "$SMOKE_DIR" "$COLD_RUNS" "${SMOKE_BUILD_CMD[@]}"
+  run_build_warm_noop "scarb_smoke" "$SMOKE_DIR" "$RUNS" "${SMOKE_BUILD_CMD[@]}"
+  run_build_warm_edit "scarb_smoke" "$SMOKE_DIR" "$SMOKE_DIR/src/lib.cairo" "$RUNS" "${SMOKE_BUILD_CMD[@]}"
+  run_build_warm_edit_semantic "scarb_smoke" "$SMOKE_DIR" "$SMOKE_DIR/src/lib.cairo" "$RUNS" "${SMOKE_BUILD_CMD[@]}"
 else
   echo "Unsupported matrix: $MATRIX" >&2
   exit 1
