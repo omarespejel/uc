@@ -55,6 +55,7 @@ const MAX_ARTIFACT_INDEX_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CAPTURE_STDOUT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CAPTURE_STDERR_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_MAX_CACHE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+const DEFAULT_CACHE_BUDGET_MIN_INTERVAL_MS: u64 = 5 * 60 * 1000;
 const FINGERPRINT_INDEX_SCHEMA_VERSION: u32 = 2;
 const ARTIFACT_INDEX_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_DIAGNOSTICS_SIMILARITY_THRESHOLD: f64 = 99.5;
@@ -412,6 +413,8 @@ struct DaemonBuildRequest {
     profile: Option<String>,
     #[serde(default)]
     async_cache_persist: bool,
+    #[serde(default = "default_daemon_capture_output")]
+    capture_output: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -750,6 +753,13 @@ fn cache_budget_enforce_every() -> u64 {
     .max(1)
 }
 
+fn cache_budget_min_interval_ms() -> u64 {
+    parse_env_u64(
+        "UC_CACHE_BUDGET_MIN_INTERVAL_MS",
+        DEFAULT_CACHE_BUDGET_MIN_INTERVAL_MS,
+    )
+}
+
 fn should_enforce_cache_size_budget_for_persist_index(
     persist_index: u64,
     enforce_every: u64,
@@ -760,10 +770,63 @@ fn should_enforce_cache_size_budget_for_persist_index(
     persist_index % enforce_every == 0
 }
 
+fn should_enforce_cache_size_budget_for_state(
+    persist_index: u64,
+    enforce_every: u64,
+    now_ms: u64,
+    last_enforced_ms: u64,
+    min_interval_ms: u64,
+) -> bool {
+    if !should_enforce_cache_size_budget_for_persist_index(persist_index, enforce_every) {
+        return false;
+    }
+    if min_interval_ms == 0 {
+        return true;
+    }
+    if last_enforced_ms == 0 {
+        return false;
+    }
+    now_ms.saturating_sub(last_enforced_ms) >= min_interval_ms
+}
+
 fn should_enforce_cache_size_budget_now() -> bool {
     static PERSIST_COUNT: AtomicU64 = AtomicU64::new(0);
+    static LAST_ENFORCED_MS: AtomicU64 = AtomicU64::new(0);
     let persist_index = PERSIST_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    should_enforce_cache_size_budget_for_persist_index(persist_index, cache_budget_enforce_every())
+    let enforce_every = cache_budget_enforce_every();
+    let min_interval_ms = cache_budget_min_interval_ms();
+    if !should_enforce_cache_size_budget_for_persist_index(persist_index, enforce_every) {
+        return false;
+    }
+    if min_interval_ms == 0 {
+        return true;
+    }
+    let now_ms = epoch_ms_u64().unwrap_or_default();
+    loop {
+        let last = LAST_ENFORCED_MS.load(Ordering::Relaxed);
+        if !should_enforce_cache_size_budget_for_state(
+            persist_index,
+            enforce_every,
+            now_ms,
+            last,
+            min_interval_ms,
+        ) {
+            if last == 0 {
+                let _ = LAST_ENFORCED_MS.compare_exchange(
+                    0,
+                    now_ms,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            }
+            return false;
+        }
+        match LAST_ENFORCED_MS.compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => return true,
+            Err(_) => continue,
+        }
+    }
 }
 
 fn fail_on_async_cache_error() -> bool {
@@ -774,6 +837,15 @@ fn fail_on_async_cache_error() -> bool {
 fn daemon_async_cache_persist_enabled() -> bool {
     static VALUE: OnceLock<bool> = OnceLock::new();
     *VALUE.get_or_init(|| parse_env_bool("UC_DAEMON_ASYNC_CACHE_PERSIST", false))
+}
+
+fn daemon_capture_output_enabled() -> bool {
+    static VALUE: OnceLock<bool> = OnceLock::new();
+    *VALUE.get_or_init(|| parse_env_bool("UC_DAEMON_CAPTURE_OUTPUT", true))
+}
+
+fn default_daemon_capture_output() -> bool {
+    true
 }
 
 fn should_log_phase_telemetry() -> bool {
@@ -1267,6 +1339,7 @@ fn try_uc_build_via_daemon(
             common,
             manifest_path,
             daemon_async_cache_persist_enabled(),
+            daemon_capture_output_enabled(),
         ));
         let response = match daemon_request(&socket_path, &request) {
             Ok(response) => response,
@@ -1367,6 +1440,7 @@ fn daemon_build_request_from_common(
     common: &BuildCommonArgs,
     manifest_path: &Path,
     async_cache_persist: bool,
+    capture_output: bool,
 ) -> DaemonBuildRequest {
     DaemonBuildRequest {
         protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
@@ -1378,6 +1452,7 @@ fn daemon_build_request_from_common(
         release: common.release,
         profile: common.profile.clone(),
         async_cache_persist,
+        capture_output,
     }
 }
 
@@ -1441,7 +1516,7 @@ fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildRespon
         &workspace_root,
         &profile,
         &session_key,
-        true,
+        request.capture_output,
         request.async_cache_persist,
     )?;
 
@@ -4504,11 +4579,16 @@ mod tests {
             release: false,
             profile: Some("dev".to_string()),
         };
-        let request =
-            daemon_build_request_from_common(&common, Path::new("/tmp/workspace/Scarb.toml"), true);
+        let request = daemon_build_request_from_common(
+            &common,
+            Path::new("/tmp/workspace/Scarb.toml"),
+            true,
+            false,
+        );
         let restored = common_args_from_daemon_request(&request);
 
         assert!(request.async_cache_persist);
+        assert!(!request.capture_output);
         assert_eq!(request.protocol_version, DAEMON_PROTOCOL_VERSION);
         assert_eq!(restored.package, common.package);
         assert_eq!(restored.workspace, common.workspace);
@@ -4530,19 +4610,39 @@ mod tests {
             release: false,
             profile: None,
             async_cache_persist: true,
+            capture_output: true,
         });
         let json = serde_json::to_string(&request).expect("failed to encode request");
         assert!(json.contains("\"type\":\"build\""));
         assert!(json.contains("\"async_cache_persist\":true"));
+        assert!(json.contains("\"capture_output\":true"));
 
         let decoded: DaemonRequest =
             serde_json::from_str(&json).expect("failed to decode daemon request");
         match decoded {
             DaemonRequest::Build(payload) => {
                 assert!(payload.async_cache_persist);
+                assert!(payload.capture_output);
                 assert_eq!(payload.protocol_version, DAEMON_PROTOCOL_VERSION);
                 assert_eq!(payload.manifest_path, "/tmp/workspace/Scarb.toml");
                 assert_eq!(payload.features, vec!["feature_a".to_string()]);
+            }
+            _ => panic!("expected build request"),
+        }
+    }
+
+    #[test]
+    fn daemon_build_request_defaults_capture_output_when_missing_from_wire() {
+        let json = format!(
+            "{{\"type\":\"build\",\"protocol_version\":\"{}\",\"manifest_path\":\"/tmp/workspace/Scarb.toml\",\"package\":null,\"workspace\":false,\"features\":[],\"offline\":false,\"release\":false,\"profile\":null,\"async_cache_persist\":false}}",
+            DAEMON_PROTOCOL_VERSION
+        );
+        let decoded: DaemonRequest =
+            serde_json::from_str(&json).expect("failed to decode daemon request");
+        match decoded {
+            DaemonRequest::Build(payload) => {
+                assert!(payload.capture_output);
+                assert_eq!(payload.protocol_version, DAEMON_PROTOCOL_VERSION);
             }
             _ => panic!("expected build request"),
         }
@@ -4705,6 +4805,29 @@ mod tests {
                 1
             ));
         }
+    }
+
+    #[test]
+    fn cache_budget_enforcement_state_respects_interval_and_first_arm() {
+        assert!(!should_enforce_cache_size_budget_for_state(
+            8, 8, 10_000, 0, 60_000
+        ));
+        assert!(!should_enforce_cache_size_budget_for_state(
+            8, 8, 20_000, 10_000, 60_000
+        ));
+        assert!(should_enforce_cache_size_budget_for_state(
+            16, 8, 80_000, 10_000, 60_000
+        ));
+    }
+
+    #[test]
+    fn cache_budget_enforcement_state_interval_zero_uses_stride_only() {
+        assert!(!should_enforce_cache_size_budget_for_state(
+            7, 8, 1_000, 0, 0
+        ));
+        assert!(should_enforce_cache_size_budget_for_state(
+            8, 8, 1_000, 0, 0
+        ));
     }
 
     #[test]

@@ -10,6 +10,7 @@ RUNS="${RUNS:-12}"
 COLD_RUNS="${COLD_RUNS:-12}"
 BUILD_OFFLINE="${BUILD_OFFLINE:-1}"
 UC_DAEMON_MODE="${UC_DAEMON_MODE:-off}"
+UC_DAEMON_CAPTURE_OUTPUT="${UC_DAEMON_CAPTURE_OUTPUT:-}"
 CPU_SET="${CPU_SET:-${UC_BENCH_CPU_SET:-}}"
 NICE_LEVEL="${NICE_LEVEL:-${UC_BENCH_NICE_LEVEL:-0}}"
 STRICT_PINNING="${STRICT_PINNING:-${UC_BENCH_STRICT_PINNING:-0}}"
@@ -62,6 +63,7 @@ Options:
   --cold-runs <n>             Runs for cold scenarios (default: 12)
   --build-online              Measure build scenarios in online mode (default: offline)
   --uc-daemon-mode <mode>     UC daemon mode for uc tool (off|require, default: off)
+  UC_DAEMON_CAPTURE_OUTPUT    Optional env override (0/1) for daemon build output capture
   --cpu-set <list>            Optional CPU affinity list (e.g. 0 or 0-1)
   --nice-level <n>            Optional process nice level (default: 0)
   --warm-settle-seconds <n>   Wait after warm-up before warm-noop samples (default: 2.2)
@@ -280,6 +282,13 @@ if [[ "$TOOL" == "uc" ]]; then
   require_cmd cargo
   (cd "$ROOT_DIR" && cargo build -p uc-cli >/dev/null)
   export UC_PHASE_TIMING=1
+  if [[ "$UC_DAEMON_MODE" != "off" && -z "$UC_DAEMON_CAPTURE_OUTPUT" ]]; then
+    # For benchmark daemon runs, suppress output capture to avoid IPC copy overhead.
+    UC_DAEMON_CAPTURE_OUTPUT=0
+  fi
+  if [[ -n "$UC_DAEMON_CAPTURE_OUTPUT" ]]; then
+    export UC_DAEMON_CAPTURE_OUTPUT
+  fi
   if [[ "$UC_DAEMON_MODE" != "off" ]]; then
     UC_DAEMON_SOCKET_PATH="$UC_DAEMON_SOCKET_PATH" "$UC_BIN" daemon start >/dev/null
     UC_DAEMON_STARTED=1
@@ -698,6 +707,7 @@ run_build_warm_edit() {
   fi
 
   if [[ "$failed" -eq 0 ]]; then
+    sleep "$WARM_SETTLE_SECONDS"
     for i in $(seq 1 "$runs"); do
       cp "$backup_file" "$edit_file"
       printf "\n// uc benchmark edit %s %s\n" "$i" "$STAMP" >> "$edit_file"
@@ -751,6 +761,7 @@ run_build_warm_edit_semantic() {
   fi
 
   if [[ "$failed" -eq 0 ]]; then
+    sleep "$WARM_SETTLE_SECONDS"
     for i in $(seq 1 "$runs"); do
       cp "$backup_file" "$edit_file"
       rewrite_smoke_semantic_edit "$edit_file" "$i"
