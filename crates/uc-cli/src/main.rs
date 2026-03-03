@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use blake3::Hasher;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 #[cfg(unix)]
@@ -15,6 +15,7 @@ use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1283,24 +1284,28 @@ fn run_build_with_uc_cache(
 
     if run.exit_code == 0 {
         if async_cache_persist {
+            let persist_scope_key = async_persist_scope_key(&canonical_workspace_root, profile);
             let workspace_root = canonical_workspace_root.clone();
             let profile = profile.to_string();
             let fingerprint = fingerprint.clone();
             let cache_root = cache_root.clone();
             let objects_dir = objects_dir.clone();
             let entry_path = entry_path.clone();
-            thread::spawn(move || {
-                if let Err(err) = persist_cache_entry_for_build(
-                    &workspace_root,
-                    &profile,
-                    &fingerprint,
-                    &cache_root,
-                    &objects_dir,
-                    &entry_path,
-                ) {
-                    eprintln!("uc: warning: async cache persistence failed: {err:#}");
-                }
-            });
+            if try_mark_async_persist_in_flight(&persist_scope_key) {
+                thread::spawn(move || {
+                    let _guard = AsyncPersistGuard::new(persist_scope_key);
+                    if let Err(err) = persist_cache_entry_for_build(
+                        &workspace_root,
+                        &profile,
+                        &fingerprint,
+                        &cache_root,
+                        &objects_dir,
+                        &entry_path,
+                    ) {
+                        eprintln!("uc: warning: async cache persistence failed: {err:#}");
+                    }
+                });
+            }
         } else {
             persist_cache_entry_for_build(
                 &canonical_workspace_root,
@@ -1314,6 +1319,45 @@ fn run_build_with_uc_cache(
     }
 
     Ok((run, false, fingerprint))
+}
+
+fn async_persist_scope_key(workspace_root: &Path, profile: &str) -> String {
+    format!("{}::{profile}", workspace_root.display())
+}
+
+fn async_persist_in_flight_set() -> &'static Mutex<HashSet<String>> {
+    static IN_FLIGHT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    IN_FLIGHT.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn try_mark_async_persist_in_flight(scope_key: &str) -> bool {
+    let mut in_flight = async_persist_in_flight_set()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    in_flight.insert(scope_key.to_string())
+}
+
+fn clear_async_persist_in_flight(scope_key: &str) {
+    let mut in_flight = async_persist_in_flight_set()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    in_flight.remove(scope_key);
+}
+
+struct AsyncPersistGuard {
+    scope_key: String,
+}
+
+impl AsyncPersistGuard {
+    fn new(scope_key: String) -> Self {
+        Self { scope_key }
+    }
+}
+
+impl Drop for AsyncPersistGuard {
+    fn drop(&mut self) {
+        clear_async_persist_in_flight(&self.scope_key);
+    }
 }
 
 fn persist_cache_entry(
@@ -1334,7 +1378,7 @@ fn persist_cache_entry(
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let bytes = serde_json::to_vec_pretty(&entry)?;
+    let bytes = serde_json::to_vec(&entry)?;
     fs::write(entry_path, bytes)
         .with_context(|| format!("failed to write cache entry {}", entry_path.display()))?;
 
@@ -1976,13 +2020,7 @@ fn collect_cached_artifacts_for_entry(
                 fs::create_dir_all(parent)
                     .with_context(|| format!("failed to create {}", parent.display()))?;
             }
-            fs::copy(path, &object_path).with_context(|| {
-                format!(
-                    "failed to copy artifact {} to {}",
-                    path.display(),
-                    object_path.display()
-                )
-            })?;
+            persist_artifact_object(path, &object_path)?;
         }
 
         cached_artifacts.push(CachedArtifact {
@@ -2011,6 +2049,25 @@ fn collect_cached_artifacts_for_entry(
         );
     }
     Ok(cached_artifacts)
+}
+
+fn persist_artifact_object(source: &Path, destination: &Path) -> Result<()> {
+    match fs::hard_link(source, destination) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if err.kind() == io::ErrorKind::AlreadyExists {
+                return Ok(());
+            }
+            fs::copy(source, destination).with_context(|| {
+                format!(
+                    "failed to copy artifact {} to {}",
+                    source.display(),
+                    destination.display()
+                )
+            })?;
+            Ok(())
+        }
+    }
 }
 
 fn collect_artifact_digests_fast(target_root: &Path) -> Result<Vec<ArtifactDigest>> {
