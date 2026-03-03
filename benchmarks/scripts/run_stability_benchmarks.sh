@@ -235,16 +235,19 @@ jq -s \
           | .[$k].candidate_p95 = ((.[$k].candidate_p95 // []) + [$item.candidate_p95_ms])
         ))
         | to_entries
-        | map(.value + {
-            median_p50_delta_percent: median(.value.p50_deltas),
-            median_p95_delta_percent: median(.value.p95_deltas),
-            mean_p95_delta_percent: mean(.value.p95_deltas),
-            stdev_p95_delta_percent: stdev(.value.p95_deltas),
-            min_p95_delta_percent: (.value.p95_deltas | min),
-            max_p95_delta_percent: (.value.p95_deltas | max),
-            median_baseline_p95_ms: median(.value.baseline_p95),
-            median_candidate_p95_ms: median(.value.candidate_p95)
-          })
+        | map(
+            . as $entry
+            | $entry.value + {
+                median_p50_delta_percent: median($entry.value.p50_deltas),
+                median_p95_delta_percent: median($entry.value.p95_deltas),
+                mean_p95_delta_percent: mean($entry.value.p95_deltas),
+                stdev_p95_delta_percent: stdev($entry.value.p95_deltas),
+                min_p95_delta_percent: ($entry.value.p95_deltas | min),
+                max_p95_delta_percent: ($entry.value.p95_deltas | max),
+                median_baseline_p95_ms: median($entry.value.baseline_p95),
+                median_candidate_p95_ms: median($entry.value.candidate_p95)
+              }
+          )
         | sort_by(.scenario, .workload)
       )
     }
