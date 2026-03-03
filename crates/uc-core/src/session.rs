@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionInput {
-    pub workspace_root: String,
     pub compiler_version: String,
     pub profile: String,
     pub features: Vec<String>,
@@ -53,7 +52,6 @@ mod tests {
 
     fn sample_input(features: Vec<&str>, cfg_set: Vec<&str>) -> SessionInput {
         SessionInput {
-            workspace_root: "/tmp/ws".to_string(),
             compiler_version: "2.14.0".to_string(),
             profile: "dev".to_string(),
             features: features.into_iter().map(ToString::to_string).collect(),

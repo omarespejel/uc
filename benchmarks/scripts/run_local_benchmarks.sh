@@ -259,6 +259,17 @@ prepare_workload_copy() {
   printf "%s" "$isolated_dir"
 }
 
+ensure_isolated_workload_dir() {
+  local path="$1"
+  case "$path" in
+    "$TMP_DIR"/workloads/*) ;;
+    *)
+      echo "Refusing destructive benchmark cleanup outside isolated workspace: $path" >&2
+      exit 1
+      ;;
+  esac
+}
+
 run_build_cold() {
   local workload="$1"
   local cwd="$2"
@@ -270,6 +281,7 @@ run_build_cold() {
   : > "$samples_file"
 
   for i in $(seq 1 "$runs"); do
+    ensure_isolated_workload_dir "$cwd"
     rm -rf "$cwd/target" "$cwd/.scarb" "$cwd/.uc"
     measure_command_ms "$cwd" "${command[@]}" >> "$samples_file"
   done

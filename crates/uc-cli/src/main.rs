@@ -165,9 +165,6 @@ struct BenchmarkArgs {
 #[derive(Args, Debug)]
 struct SessionKeyArgs {
     #[arg(long)]
-    workspace_root: String,
-
-    #[arg(long)]
     compiler_version: String,
 
     #[arg(long)]
@@ -763,7 +760,6 @@ fn run_benchmark(args: BenchmarkArgs) -> Result<()> {
 
 fn run_session_key(args: SessionKeyArgs) -> Result<()> {
     let input = SessionInput {
-        workspace_root: args.workspace_root,
         compiler_version: args.compiler_version,
         profile: args.profile,
         features: args.features,
@@ -789,7 +785,7 @@ fn run_build(args: BuildArgs) -> Result<()> {
         .to_path_buf();
     let profile = effective_profile(&common);
 
-    let session_input = build_session_input(&common, &manifest_path, &workspace_root, &profile)?;
+    let session_input = build_session_input(&common, &manifest_path, &profile)?;
     let mut session_key = session_input.deterministic_key_hex();
     let mut daemon_used = false;
     let (run, cache_hit, fingerprint) = match engine {
@@ -953,7 +949,7 @@ fn execute_daemon_build(
         .context("manifest path has no parent")?
         .to_path_buf();
     let profile = effective_profile(&common);
-    let session_input = build_session_input(&common, &manifest_path, &workspace_root, &profile)?;
+    let session_input = build_session_input(&common, &manifest_path, &profile)?;
     let session_key = session_input.deterministic_key_hex();
 
     let (run, cache_hit, fingerprint) = run_build_with_uc_cache(
@@ -2026,6 +2022,14 @@ fn replay_output(stdout: &str, stderr: &str) -> Result<()> {
 }
 
 fn remove_build_outputs(workspace_root: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(workspace_root)
+        .with_context(|| format!("failed to stat workspace root {}", workspace_root.display()))?;
+    if meta.file_type().is_symlink() {
+        bail!(
+            "workspace root {} must not be a symlink",
+            workspace_root.display()
+        );
+    }
     let canonical_root = workspace_root.canonicalize().with_context(|| {
         format!(
             "failed to resolve workspace root {}",
@@ -2041,6 +2045,15 @@ fn remove_build_outputs(workspace_root: &Path) -> Result<()> {
     if !canonical_root.join("Scarb.toml").is_file() {
         bail!(
             "workspace root {} has no Scarb.toml marker; refusing cleanup",
+            canonical_root.display()
+        );
+    }
+    if !canonical_root.join("Scarb.lock").exists()
+        && !canonical_root.join("src").is_dir()
+        && !canonical_root.join("crates").is_dir()
+    {
+        bail!(
+            "workspace root {} is missing expected project markers; refusing cleanup",
             canonical_root.display()
         );
     }
@@ -2124,13 +2137,11 @@ fn scarb_version_line() -> Result<String> {
 fn build_session_input(
     common: &BuildCommonArgs,
     manifest_path: &Path,
-    workspace_root: &Path,
     profile: &str,
 ) -> Result<SessionInput> {
     let scarb_version = scarb_version_line()?;
     let manifest_content_hash = compute_manifest_content_hash(manifest_path)?;
     Ok(SessionInput {
-        workspace_root: workspace_root.display().to_string(),
         compiler_version: scarb_version,
         profile: profile.to_string(),
         features: common.features.clone(),
@@ -2574,6 +2585,17 @@ fn epoch_ms_u64() -> Result<u64> {
 }
 
 fn workspace_root() -> Result<PathBuf> {
-    let dir = std::env::current_dir()?;
-    Ok(dir)
+    let cwd = std::env::current_dir()?.canonicalize()?;
+    for candidate in cwd.ancestors() {
+        let root = candidate.to_path_buf();
+        let benchmarks_script = root.join("benchmarks/scripts/run_local_benchmarks.sh");
+        let cargo_manifest = root.join("Cargo.toml");
+        if benchmarks_script.is_file() && cargo_manifest.is_file() {
+            return Ok(root);
+        }
+    }
+    bail!(
+        "failed to locate uc workspace root from {}; expected Cargo.toml and benchmarks/scripts/run_local_benchmarks.sh in an ancestor directory",
+        cwd.display()
+    )
 }
