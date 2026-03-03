@@ -1,0 +1,6 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Program Questions
+    url: https://github.com/omarespejel/uc/discussions
+    about: Use discussions for open product and roadmap questions.
+
