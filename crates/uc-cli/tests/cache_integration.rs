@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Mutex, OnceLock};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
@@ -96,33 +97,71 @@ fn scarb_available() -> bool {
         .unwrap_or(false)
 }
 
-fn run_uc_build(workspace: &TestWorkspace, report_tag: &str) -> (Output, BuildReport) {
-    let manifest = workspace.root.join("Scarb.toml");
-    let report_path = workspace
-        .root
-        .join(".uc")
-        .join(format!("report-{report_tag}.json"));
+fn run_uc_build_for_root(
+    root: &Path,
+    report_tag: &str,
+    daemon_mode: &str,
+    daemon_socket_path: Option<&Path>,
+) -> (Output, BuildReport) {
+    let manifest = root.join("Scarb.toml");
+    let report_path = root.join(".uc").join(format!("report-{report_tag}.json"));
     if let Some(parent) = report_path.parent() {
         fs::create_dir_all(parent).expect("failed to create report directory");
     }
-    let output = Command::new(uc_bin())
-        .current_dir(&workspace.root)
+    let mut command = Command::new(uc_bin());
+    command
+        .current_dir(root)
         .arg("build")
         .arg("--engine")
         .arg("uc")
         .arg("--daemon-mode")
-        .arg("off")
+        .arg(daemon_mode)
         .arg("--offline")
         .arg("--manifest-path")
         .arg(&manifest)
         .arg("--report-path")
-        .arg(&report_path)
-        .output()
-        .expect("failed to execute uc build");
-    let report_bytes = fs::read(&report_path).expect("missing build report");
+        .arg(&report_path);
+    if let Some(socket_path) = daemon_socket_path {
+        command.env("UC_DAEMON_SOCKET_PATH", socket_path);
+    } else {
+        command.env_remove("UC_DAEMON_SOCKET_PATH");
+    }
+    let output = command.output().expect("failed to execute uc build");
+    let report_bytes = fs::read(&report_path).unwrap_or_else(|err| {
+        panic!(
+            "missing build report at {}: {}\n{}",
+            report_path.display(),
+            err,
+            output_to_utf8(&output)
+        )
+    });
     let report: BuildReport =
         serde_json::from_slice(&report_bytes).expect("failed to decode build report JSON");
     (output, report)
+}
+
+fn run_uc_build(workspace: &TestWorkspace, report_tag: &str) -> (Output, BuildReport) {
+    run_uc_build_for_root(&workspace.root, report_tag, "off", None)
+}
+
+fn run_uc_daemon_stop(socket_path: &Path) -> Output {
+    Command::new(uc_bin())
+        .arg("daemon")
+        .arg("stop")
+        .arg("--socket-path")
+        .arg(socket_path)
+        .output()
+        .expect("failed to execute uc daemon stop")
+}
+
+fn run_uc_daemon_start(socket_path: &Path) -> Output {
+    Command::new(uc_bin())
+        .arg("daemon")
+        .arg("start")
+        .arg("--socket-path")
+        .arg(socket_path)
+        .output()
+        .expect("failed to execute uc daemon start")
 }
 
 fn output_to_utf8(output: &Output) -> String {
@@ -261,4 +300,126 @@ fn integration_corrupted_cache_entry_recovers_without_crash() {
         stabilize_report.cache_hit,
         "subsequent build should hit cache again after recovery"
     );
+}
+
+#[test]
+fn integration_concurrent_builds_complete_and_cache_recovers_to_hit() {
+    let _guard = serial_guard();
+    if !scarb_available() {
+        eprintln!(
+            "skipping integration_concurrent_builds_complete_and_cache_recovers_to_hit: scarb not available"
+        );
+        return;
+    }
+    let workspace = make_test_workspace("concurrent-builds");
+
+    let root_a = workspace.root.clone();
+    let root_b = workspace.root.clone();
+
+    let worker_a =
+        thread::spawn(move || run_uc_build_for_root(&root_a, "concurrent-a", "off", None));
+    let worker_b =
+        thread::spawn(move || run_uc_build_for_root(&root_b, "concurrent-b", "off", None));
+
+    let (output_a, report_a) = worker_a
+        .join()
+        .expect("worker A thread panicked during concurrent build");
+    let (output_b, report_b) = worker_b
+        .join()
+        .expect("worker B thread panicked during concurrent build");
+
+    assert_success(&output_a, "concurrent build A");
+    assert_success(&output_b, "concurrent build B");
+    assert_eq!(report_a.exit_code, 0);
+    assert_eq!(report_b.exit_code, 0);
+
+    let (stabilize_output, stabilize_report) = run_uc_build(&workspace, "concurrent-stabilize");
+    assert_success(
+        &stabilize_output,
+        "stabilization build after concurrent runs",
+    );
+    assert!(
+        stabilize_report.cache_hit,
+        "cache should converge to a hit after concurrent runs complete"
+    );
+}
+
+#[test]
+fn integration_daemon_restart_preserves_cache_hit_correctness() {
+    let _guard = serial_guard();
+    if !scarb_available() {
+        eprintln!(
+            "skipping integration_daemon_restart_preserves_cache_hit_correctness: scarb not available"
+        );
+        return;
+    }
+    let workspace = make_test_workspace("daemon-restart");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be after unix epoch")
+        .as_nanos();
+    let socket_path =
+        std::env::temp_dir().join(format!("uc-it-daemon-{}-{nonce}.sock", std::process::id()));
+    let _ = fs::remove_file(&socket_path);
+
+    let start_output = run_uc_daemon_start(&socket_path);
+    assert!(
+        start_output.status.success(),
+        "daemon start should succeed: {}",
+        output_to_utf8(&start_output)
+    );
+
+    let (first_output, first_report) = run_uc_build_for_root(
+        &workspace.root,
+        "daemon-first",
+        "require",
+        Some(&socket_path),
+    );
+    assert_success(&first_output, "first daemon build");
+    assert_eq!(first_report.exit_code, 0);
+    assert!(
+        !first_report.cache_hit,
+        "first daemon build should compile and populate cache"
+    );
+
+    let (second_output, second_report) = run_uc_build_for_root(
+        &workspace.root,
+        "daemon-second",
+        "require",
+        Some(&socket_path),
+    );
+    assert_success(&second_output, "second daemon build");
+    assert!(
+        second_report.cache_hit,
+        "second daemon build should reuse cache"
+    );
+
+    let stop_output = run_uc_daemon_stop(&socket_path);
+    assert!(
+        stop_output.status.success(),
+        "daemon stop should succeed before restart: {}",
+        output_to_utf8(&stop_output)
+    );
+
+    let restart_output = run_uc_daemon_start(&socket_path);
+    assert!(
+        restart_output.status.success(),
+        "daemon restart should succeed: {}",
+        output_to_utf8(&restart_output)
+    );
+
+    let (after_restart_output, after_restart_report) = run_uc_build_for_root(
+        &workspace.root,
+        "daemon-after-restart",
+        "require",
+        Some(&socket_path),
+    );
+    assert_success(&after_restart_output, "daemon build after restart");
+    assert!(
+        after_restart_report.cache_hit,
+        "cache hit should persist across daemon restart"
+    );
+
+    let _ = run_uc_daemon_stop(&socket_path);
+    let _ = fs::remove_file(&socket_path);
 }

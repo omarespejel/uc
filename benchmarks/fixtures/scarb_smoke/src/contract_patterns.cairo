@@ -12,9 +12,15 @@ pub trait IToken<TContractState> {
     ) -> bool;
 }
 
+#[starknet::interface]
+pub trait IRegistry<TContractState> {
+    fn last_seed(self: @TContractState) -> felt252;
+    fn bump(ref self: TContractState, seed: felt252);
+}
+
 #[starknet::contract]
 mod token {
-    use super::IToken;
+    use super::{IRegistryDispatcher, IRegistryDispatcherTrait, IToken};
     use core::num::traits::Zero;
     use core::num::traits::CheckedAdd;
     use core::option::OptionTrait;
@@ -30,10 +36,12 @@ mod token {
     #[storage]
     struct Storage {
         owner: ContractAddress,
+        registry: ContractAddress,
         total_supply: u128,
         balances: Map<ContractAddress, u128>,
         allowances: Map<(ContractAddress, ContractAddress), u128>,
         allowance_nonce: Map<(ContractAddress, ContractAddress), u64>,
+        permissions: Map<(ContractAddress, felt252), bool>,
     }
 
     #[event]
@@ -42,6 +50,7 @@ mod token {
         Transfer: Transfer,
         Approval: Approval,
         Minted: Minted,
+        RegistrySynced: RegistrySynced,
     }
 
     #[derive(Drop, starknet::Event)]
@@ -65,10 +74,23 @@ mod token {
         value: u128,
     }
 
+    #[derive(Drop, starknet::Event)]
+    struct RegistrySynced {
+        registry: ContractAddress,
+        caller: ContractAddress,
+        seed: felt252,
+    }
+
     #[constructor]
-    fn constructor(ref self: ContractState, owner: ContractAddress, initial_supply: u128) {
+    fn constructor(
+        ref self: ContractState,
+        owner: ContractAddress,
+        registry: ContractAddress,
+        initial_supply: u128,
+    ) {
         assert(!owner.is_zero(), 'owner=0');
         self.owner.write(owner);
+        self.registry.write(registry);
         self.total_supply.write(initial_supply);
         self.balances.write(owner, initial_supply);
     }
@@ -171,5 +193,64 @@ mod token {
             recipient,
             value: amount,
         }));
+    }
+
+    #[external(v0)]
+    fn sync_permission_seed(ref self: ContractState) {
+        let registry = self.registry.read();
+        assert(!registry.is_zero(), 'registry=0');
+        let caller = get_caller_address();
+        let seed = IRegistryDispatcher { contract_address: registry }.last_seed();
+        self.permissions.write((caller, seed), true);
+        self.emit(Event::RegistrySynced(RegistrySynced {
+            registry,
+            caller,
+            seed,
+        }));
+    }
+}
+
+#[starknet::contract]
+mod registry {
+    use super::IRegistry;
+    use starknet::storage::{
+        Map,
+        StorageMapReadAccess,
+        StorageMapWriteAccess,
+        StoragePointerReadAccess,
+        StoragePointerWriteAccess,
+    };
+    use starknet::{ContractAddress, get_caller_address};
+    use core::num::traits::Zero;
+
+    #[storage]
+    struct Storage {
+        admin: ContractAddress,
+        last_seed: felt252,
+        latest_by_caller: Map<ContractAddress, felt252>,
+        history: Map<(ContractAddress, felt252), felt252>,
+    }
+
+    #[constructor]
+    fn constructor(ref self: ContractState, admin: ContractAddress, initial_seed: felt252) {
+        assert(!admin.is_zero(), 'admin=0');
+        self.admin.write(admin);
+        self.last_seed.write(initial_seed);
+    }
+
+    #[abi(embed_v0)]
+    impl RegistryImpl of IRegistry<ContractState> {
+        fn last_seed(self: @ContractState) -> felt252 {
+            self.last_seed.read()
+        }
+
+        fn bump(ref self: ContractState, seed: felt252) {
+            assert(self.admin.read() == get_caller_address(), 'not admin');
+            let caller = get_caller_address();
+            let previous = self.latest_by_caller.read(caller);
+            self.last_seed.write(seed);
+            self.latest_by_caller.write(caller, seed);
+            self.history.write((caller, seed), previous);
+        }
     }
 }

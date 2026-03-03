@@ -29,10 +29,10 @@ For repeated builds in the same workspace:
 - CLI compare command: `uc compare-build --manifest-path <Scarb.toml>`
 
 ## Current Status (2026-03-03)
-- Comparator gate: passing on sampled workloads (0 artifact mismatches, diagnostics similarity 100%).
-- Performance signal: smoke stability gate passing with wins on warm no-op and warm-edit (including semantic edits); cold path remains near parity and is still being tuned.
-- Correctness hardening: integration coverage now includes cache hit/miss invalidation and corrupted-cache recovery; broader concurrency stress remains in progress.
-- Gate A status: passing for the smoke fixture lane only; research-matrix sign-off is still in progress.
+- Comparator gate (smoke lane): passing on sampled workloads (0 artifact mismatches, diagnostics similarity 100%).
+- Performance gate (smoke stability): passing with wins on warm no-op and warm-edit (including semantic edits); cold path remains near parity and is still being tuned.
+- Correctness hardening: integration coverage includes cache hit/miss invalidation and corrupted-cache recovery; broader concurrency/daemon hardening is still in progress.
+- Gate A (full research matrix): not signed off yet. Current pass claim is smoke-lane only.
 
 ## Gate Outcome
 - Go: all criteria pass.

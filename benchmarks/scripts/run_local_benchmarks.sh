@@ -69,6 +69,7 @@ Options:
   --warm-settle-seconds <n>   Wait after warm-up before warm-noop samples (default: 2.2)
   --strict-pinning            Fail if requested pinning cannot be applied
   BENCH_LOCK_DIR=<path>       Optional env var to override benchmark lock path
+  NOTE                        Do not run concurrent `uc build` jobs in benchmark workspaces.
   --help                      Show this help
 USAGE
 }
@@ -218,8 +219,37 @@ acquire_benchmark_lock() {
     owner_pid="$(cat "$BENCH_LOCK_DIR/pid" 2>/dev/null || printf '%s' "unknown")"
   fi
   echo "Benchmark lock is already held at $BENCH_LOCK_DIR (pid: $owner_pid)." >&2
-  echo "Run benchmarks serially to avoid cold-cache cleanup races with concurrent builds." >&2
+  echo "Run benchmarks serially and avoid concurrent 'uc build' jobs in benchmark workspaces." >&2
   exit 1
+}
+
+lock_file_pid() {
+  local lock_file="$1"
+  [[ -f "$lock_file" ]] || return 1
+  local owner_pid
+  owner_pid="$(head -n1 "$lock_file" 2>/dev/null | tr -d '[:space:]')"
+  [[ "$owner_pid" =~ ^[0-9]+$ ]] || return 1
+  printf "%s" "$owner_pid"
+}
+
+process_alive() {
+  local pid="$1"
+  if [[ -z "$pid" || ! "$pid" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  kill -0 "$pid" 2>/dev/null
+}
+
+assert_no_active_uc_cache_lock() {
+  local cwd="$1"
+  local lock_file="$cwd/.uc/cache/cache.lock"
+  local owner_pid
+  owner_pid="$(lock_file_pid "$lock_file" || true)"
+  if [[ -n "$owner_pid" ]] && process_alive "$owner_pid"; then
+    echo "Refusing benchmark cleanup while active uc cache lock exists: $lock_file (pid: $owner_pid)." >&2
+    echo "Stop concurrent uc build operations in benchmark workspaces, then retry." >&2
+    exit 1
+  fi
 }
 
 configure_execution_prefix() {
@@ -618,6 +648,7 @@ ensure_isolated_workload_dir() {
 reset_workload_outputs() {
   local cwd="$1"
   ensure_isolated_workload_dir "$cwd"
+  assert_no_active_uc_cache_lock "$cwd"
   rm -rf "$cwd/target" "$cwd/.uc" "$cwd/.scarb"
 }
 
@@ -655,6 +686,7 @@ run_build_cold() {
   cp -PR "$cwd" "$baseline_dir"
 
   for _ in $(seq 1 "$runs"); do
+    assert_no_active_uc_cache_lock "$cwd"
     rm -rf "$cwd"
     cp -PR "$baseline_dir" "$cwd"
     measure_command_ms "$cwd" "${command[@]}" >> "$samples_file"

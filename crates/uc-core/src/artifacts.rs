@@ -220,6 +220,35 @@ fn validate_supported_sierra_schema(value: &Value, path: &Path) -> Result<()> {
             path.display()
         );
     }
+    // Sierra v1 declaration IDs are compiler-internal numeric references. If this shape changes,
+    // fail fast so we do not accidentally normalize semantically meaningful identifiers.
+    validate_declaration_section_ids(value, "type_declarations", path)?;
+    validate_declaration_section_ids(value, "libfunc_declarations", path)?;
+    Ok(())
+}
+
+fn validate_declaration_section_ids(value: &Value, section: &str, path: &Path) -> Result<()> {
+    let Some(items) = value.get(section).and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (index, item) in items.iter().enumerate() {
+        let id_value = item.get("id").with_context(|| {
+            format!(
+                "unsupported Sierra schema in {}: {}[{}] is missing `id`",
+                path.display(),
+                section,
+                index
+            )
+        })?;
+        if extract_numeric_id(Some(id_value)).is_none() {
+            bail!(
+                "unsupported Sierra schema in {}: {}[{}].id must be numeric",
+                path.display(),
+                section,
+                index
+            );
+        }
+    }
     Ok(())
 }
 
@@ -506,5 +535,42 @@ mod tests {
         let err = validate_supported_sierra_schema(&value, Path::new("sample.sierra.json"))
             .expect_err("major version 2 should be rejected");
         assert!(format!("{err:#}").contains("unsupported Sierra schema version"));
+    }
+
+    #[test]
+    fn sierra_schema_guard_rejects_non_numeric_declaration_ids() {
+        let value = json!({
+            "sierra_format_version": "1.0.0",
+            "type_declarations": [{ "id": "felt252" }],
+        });
+        let err = validate_supported_sierra_schema(&value, Path::new("sample.sierra.json"))
+            .expect_err("non-numeric declaration IDs should be rejected");
+        assert!(format!("{err:#}").contains("unsupported Sierra schema"));
+    }
+
+    #[test]
+    fn sierra_normalization_preserves_function_signature_semantics() {
+        let mut a = json!({
+            "type_declarations": [{"id": {"id": 5, "debug_name": "felt252"}}],
+            "funcs": [{
+                "id": {"id": 10, "debug_name": "foo"},
+                "signature": {"ret_types": [{"id": 5}]}
+            }]
+        });
+        let mut b = json!({
+            "type_declarations": [{"id": {"id": 5, "debug_name": "u128"}}],
+            "funcs": [{
+                "id": {"id": 10, "debug_name": "foo"},
+                "signature": {"ret_types": [{"id": 5}]}
+            }]
+        });
+
+        normalize_sierra_json_ids(&mut a);
+        normalize_sierra_json_ids(&mut b);
+
+        assert_ne!(
+            serde_json::to_string(&canonicalize_json(&a)).unwrap(),
+            serde_json::to_string(&canonicalize_json(&b)).unwrap()
+        );
     }
 }
