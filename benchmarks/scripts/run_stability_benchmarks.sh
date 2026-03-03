@@ -9,6 +9,8 @@ COLD_RUNS="${COLD_RUNS:-12}"
 CYCLES="${CYCLES:-5}"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-}"
 GATE_CONFIG="${GATE_CONFIG:-}"
+BUILD_OFFLINE="${BUILD_OFFLINE:-1}"
+UC_DAEMON_MODE="${UC_DAEMON_MODE:-off}"
 CPU_SET="${CPU_SET:-${UC_BENCH_CPU_SET:-}}"
 NICE_LEVEL="${NICE_LEVEL:-${UC_BENCH_NICE_LEVEL:-0}}"
 STRICT_PINNING="${STRICT_PINNING:-${UC_BENCH_STRICT_PINNING:-0}}"
@@ -33,6 +35,8 @@ Options:
   --workspace-root <path>      Path containing local cloned repos (required for research)
   --runs <n>                   Warm/offline iterations per run (default: 12)
   --cold-runs <n>              Cold iterations per run (default: 12)
+  --build-online               Measure build scenarios in online mode (default: offline)
+  --uc-daemon-mode <mode>      UC daemon mode for uc tool (off|require, default: off)
   --cycles <n>                 Number of paired scarb/uc cycles (default: 5)
   --cpu-set <list>             Optional CPU affinity list passed to local runner
   --nice-level <n>             Optional process nice level passed to local runner
@@ -73,6 +77,15 @@ while [[ $# -gt 0 ]]; do
     --cold-runs)
       require_option_value "$1" "${2-}"
       COLD_RUNS="$2"
+      shift 2
+      ;;
+    --build-online)
+      BUILD_OFFLINE=0
+      shift
+      ;;
+    --uc-daemon-mode)
+      require_option_value "$1" "${2-}"
+      UC_DAEMON_MODE="$2"
       shift 2
       ;;
     --cycles)
@@ -128,6 +141,14 @@ if [[ "$CYCLES" =~ [^0-9] || "$CYCLES" -le 0 ]]; then
   echo "--cycles must be a positive integer, got: $CYCLES" >&2
   exit 1
 fi
+if [[ "$BUILD_OFFLINE" != "0" && "$BUILD_OFFLINE" != "1" ]]; then
+  echo "BUILD_OFFLINE must be 0 or 1, got: $BUILD_OFFLINE" >&2
+  exit 1
+fi
+if [[ "$UC_DAEMON_MODE" != "off" && "$UC_DAEMON_MODE" != "require" ]]; then
+  echo "--uc-daemon-mode must be one of: off, require (got: $UC_DAEMON_MODE)" >&2
+  exit 1
+fi
 if [[ ! "$NICE_LEVEL" =~ ^-?[0-9]+$ ]]; then
   echo "--nice-level must be an integer, got: $NICE_LEVEL" >&2
   exit 1
@@ -159,7 +180,11 @@ run_benchmark() {
     --runs "$RUNS"
     --cold-runs "$COLD_RUNS"
     --warm-settle-seconds "$WARM_SETTLE_SECONDS"
+    --uc-daemon-mode "$UC_DAEMON_MODE"
   )
+  if [[ "$BUILD_OFFLINE" == "0" ]]; then
+    cmd+=(--build-online)
+  fi
   if [[ -n "$CPU_SET" ]]; then
     cmd+=(--cpu-set "$CPU_SET")
   fi
@@ -184,8 +209,21 @@ run_benchmark() {
 
 for cycle in $(seq 1 "$CYCLES"); do
   echo "== Paired cycle $cycle/$CYCLES ==" >&2
-  scarb_json="$(run_benchmark scarb "$cycle")"
-  uc_json="$(run_benchmark uc "$cycle")"
+  scarb_json=""
+  uc_json=""
+  if (( cycle % 2 == 1 )); then
+    order=("scarb" "uc")
+  else
+    order=("uc" "scarb")
+  fi
+  for tool in "${order[@]}"; do
+    result_json="$(run_benchmark "$tool" "$cycle")"
+    if [[ "$tool" == "scarb" ]]; then
+      scarb_json="$result_json"
+    else
+      uc_json="$result_json"
+    fi
+  done
 
   if [[ -z "$scarb_json" || -z "$uc_json" ]]; then
     echo "Failed to discover benchmark JSON output for cycle $cycle" >&2
@@ -209,6 +247,7 @@ for cycle in $(seq 1 "$CYCLES"); do
         else
           {
             cycle: $cycle,
+            run_order: (if ($cycle % 2) == 1 then "scarb-first" else "uc-first" end),
             baseline_json: $baseline,
             candidate_json: $candidate,
             scenarios: [
@@ -245,6 +284,8 @@ jq -s \
   --arg workspace_root "${WORKSPACE_ROOT:-}" \
   --arg cpu_set "$CPU_SET" \
   --arg nice_level "$NICE_LEVEL" \
+  --arg build_offline "$BUILD_OFFLINE" \
+  --arg uc_daemon_mode "$UC_DAEMON_MODE" \
   --arg strict_pinning "$STRICT_PINNING" \
   --arg warm_settle_seconds "$WARM_SETTLE_SECONDS" '
     def median(a):
@@ -270,11 +311,14 @@ jq -s \
       pinned_conditions: {
         cpu_set: (if $cpu_set == "" then null else $cpu_set end),
         nice_level: ($nice_level | tonumber),
+        build_offline: ($build_offline == "1"),
+        uc_daemon_mode: $uc_daemon_mode,
         strict_pinning: ($strict_pinning == "1"),
         warm_settle_seconds: ($warm_settle_seconds | tonumber)
       },
       cycle_reports: map({
         cycle,
+        run_order,
         baseline_json,
         candidate_json
       }),
@@ -317,6 +361,9 @@ jq -s \
   echo "- Cold runs: $(jq -r '.cold_runs' "$OUT_JSON")"
   echo "- CPU set: $(jq -r '.pinned_conditions.cpu_set // "<none>"' "$OUT_JSON")"
   echo "- Nice level: $(jq -r '.pinned_conditions.nice_level' "$OUT_JSON")"
+  echo "- Build mode: $(jq -r 'if .pinned_conditions.build_offline then "offline" else "online" end' "$OUT_JSON")"
+  echo "- UC daemon mode: $(jq -r '.pinned_conditions.uc_daemon_mode' "$OUT_JSON")"
+  echo "- Run order: alternates per cycle (scarb-first, uc-first)"
   echo "- Strict pinning: $(jq -r '.pinned_conditions.strict_pinning' "$OUT_JSON")"
   echo "- Warm settle seconds: $(jq -r '.pinned_conditions.warm_settle_seconds' "$OUT_JSON")"
   if [[ -n "$WORKSPACE_ROOT" ]]; then

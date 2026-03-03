@@ -3397,6 +3397,12 @@ fn effective_profile(common: &BuildCommonArgs) -> String {
 
 fn scarb_version_line() -> Result<String> {
     static SCARB_VERSION_CACHE: OnceLock<String> = OnceLock::new();
+    if let Ok(override_version) = std::env::var("UC_SCARB_VERSION_LINE") {
+        let trimmed = override_version.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
     if let Some(cached) = SCARB_VERSION_CACHE.get() {
         return Ok(cached.clone());
     }
@@ -4508,6 +4514,17 @@ mod tests {
             (2, 14, 0)
         );
         assert!(parse_scarb_semver("invalid-output").is_err());
+    }
+
+    #[test]
+    fn scarb_version_line_uses_env_override() {
+        let _guard = integration_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var("UC_SCARB_VERSION_LINE", "scarb 9.9.9 (override)");
+        let version = scarb_version_line().expect("override version should be accepted");
+        assert_eq!(version, "scarb 9.9.9 (override)");
+        std::env::remove_var("UC_SCARB_VERSION_LINE");
     }
 
     #[test]

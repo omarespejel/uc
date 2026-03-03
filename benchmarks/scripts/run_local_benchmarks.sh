@@ -8,6 +8,8 @@ MATRIX="${MATRIX:-research}"
 TOOL="${TOOL:-scarb}"
 RUNS="${RUNS:-12}"
 COLD_RUNS="${COLD_RUNS:-12}"
+BUILD_OFFLINE="${BUILD_OFFLINE:-1}"
+UC_DAEMON_MODE="${UC_DAEMON_MODE:-off}"
 CPU_SET="${CPU_SET:-${UC_BENCH_CPU_SET:-}}"
 NICE_LEVEL="${NICE_LEVEL:-${UC_BENCH_NICE_LEVEL:-0}}"
 STRICT_PINNING="${STRICT_PINNING:-${UC_BENCH_STRICT_PINNING:-0}}"
@@ -19,11 +21,14 @@ OUT_MD=""
 TMP_DIR="$(mktemp -d)"
 UC_BIN="$ROOT_DIR/target/debug/uc"
 UC_DAEMON_SOCKET_PATH="${UC_DAEMON_SOCKET_PATH:-$TMP_DIR/uc-daemon.sock}"
+UC_DAEMON_STARTED=0
 TASKSET_ENABLED=0
 CPU_GOVERNOR="unknown"
 
 declare -a EXEC_PREFIX=()
 declare -a CMD_REPLY=()
+LAST_MEASURE_STDERR_FILE=""
+LAST_MEASURE_ELAPSED_MS=""
 
 export UC_DAEMON_SOCKET_PATH
 # Keep language/runtime behavior stable across cycles.
@@ -33,7 +38,7 @@ export CARGO_INCREMENTAL=0
 export RUST_BACKTRACE=0
 
 cleanup() {
-  if [[ "$TOOL" == "uc" && -x "$UC_BIN" ]]; then
+  if [[ "$TOOL" == "uc" && "$UC_DAEMON_STARTED" == "1" && -x "$UC_BIN" ]]; then
     UC_DAEMON_SOCKET_PATH="$UC_DAEMON_SOCKET_PATH" "$UC_BIN" daemon stop >/dev/null 2>&1 || true
   fi
   rm -rf "$TMP_DIR"
@@ -50,6 +55,8 @@ Options:
   --workspace-root <path>     Path containing local cloned repos
   --runs <n>                  Runs for warm/offline scenarios (default: 12)
   --cold-runs <n>             Runs for cold scenarios (default: 12)
+  --build-online              Measure build scenarios in online mode (default: offline)
+  --uc-daemon-mode <mode>     UC daemon mode for uc tool (off|require, default: off)
   --cpu-set <list>            Optional CPU affinity list (e.g. 0 or 0-1)
   --nice-level <n>            Optional process nice level (default: 0)
   --warm-settle-seconds <n>   Wait after warm-up before warm-noop samples (default: 2.2)
@@ -95,6 +102,15 @@ while [[ $# -gt 0 ]]; do
       COLD_RUNS="$2"
       shift 2
       ;;
+    --build-online)
+      BUILD_OFFLINE=0
+      shift
+      ;;
+    --uc-daemon-mode)
+      require_option_value "$1" "${2-}"
+      UC_DAEMON_MODE="$2"
+      shift 2
+      ;;
     --cpu-set)
       require_option_value "$1" "${2-}"
       CPU_SET="$2"
@@ -134,6 +150,14 @@ if [[ ! "$COLD_RUNS" =~ ^[0-9]+$ || "$COLD_RUNS" -le 0 ]]; then
   echo "--cold-runs must be a positive integer, got: $COLD_RUNS" >&2
   exit 1
 fi
+if [[ "$BUILD_OFFLINE" != "0" && "$BUILD_OFFLINE" != "1" ]]; then
+  echo "BUILD_OFFLINE must be 0 or 1, got: $BUILD_OFFLINE" >&2
+  exit 1
+fi
+if [[ "$UC_DAEMON_MODE" != "off" && "$UC_DAEMON_MODE" != "require" ]]; then
+  echo "--uc-daemon-mode must be one of: off, require (got: $UC_DAEMON_MODE)" >&2
+  exit 1
+fi
 if [[ ! "$NICE_LEVEL" =~ ^-?[0-9]+$ ]]; then
   echo "--nice-level must be an integer, got: $NICE_LEVEL" >&2
   exit 1
@@ -159,6 +183,8 @@ require_cmd jq
 require_cmd awk
 require_cmd sort
 require_cmd python3
+SCARB_VERSION="$(scarb --version | head -n1)"
+export UC_SCARB_VERSION_LINE="$SCARB_VERSION"
 
 if [[ "$TOOL" != "scarb" && "$TOOL" != "uc" ]]; then
   echo "Unsupported tool: $TOOL" >&2
@@ -219,7 +245,11 @@ with_exec_prefix() {
 if [[ "$TOOL" == "uc" ]]; then
   require_cmd cargo
   (cd "$ROOT_DIR" && cargo build -p uc-cli >/dev/null)
-  UC_DAEMON_SOCKET_PATH="$UC_DAEMON_SOCKET_PATH" "$UC_BIN" daemon start >/dev/null
+  export UC_PHASE_TIMING=1
+  if [[ "$UC_DAEMON_MODE" != "off" ]]; then
+    UC_DAEMON_SOCKET_PATH="$UC_DAEMON_SOCKET_PATH" "$UC_BIN" daemon start >/dev/null
+    UC_DAEMON_STARTED=1
+  fi
 fi
 
 configure_execution_prefix
@@ -261,8 +291,9 @@ measure_command_ms() {
   local cwd="$1"
   shift
   local -a argv=("$@")
-  local stderr_file="$TMP_DIR/stderr.log"
+  local stderr_file="$TMP_DIR/stderr-$$-$RANDOM.log"
   local display
+  local elapsed_ms
 
   if [[ ${#argv[@]} -eq 0 ]]; then
     echo "Command parse failed: empty argv" >&2
@@ -271,7 +302,7 @@ measure_command_ms() {
 
   display="$(command_to_string "${argv[@]}")"
 
-  if ! python3 - "$cwd" "$stderr_file" "${argv[@]}" <<'PY'; then
+  if ! elapsed_ms="$(python3 - "$cwd" "$stderr_file" "${argv[@]}" <<'PY'
 import os
 import subprocess
 import sys
@@ -289,10 +320,14 @@ if proc.returncode != 0:
     raise SystemExit(proc.returncode)
 print(f"{elapsed_ms:.3f}")
 PY
+  )"; then
     echo "Command failed in $cwd: $display" >&2
     cat "$stderr_file" >&2
     return 1
   fi
+  LAST_MEASURE_STDERR_FILE="$stderr_file"
+  LAST_MEASURE_ELAPSED_MS="$elapsed_ms"
+  printf "%s\n" "$elapsed_ms"
 }
 
 stats_json_from_samples() {
@@ -320,18 +355,130 @@ stats_json_from_samples() {
   ' "$samples_file"
 }
 
+record_uc_phase_sample() {
+  local phase_file="$1"
+  if [[ "$TOOL" != "uc" ]]; then
+    return 0
+  fi
+  if [[ -z "$LAST_MEASURE_STDERR_FILE" || ! -f "$LAST_MEASURE_STDERR_FILE" ]]; then
+    return 0
+  fi
+  local phase_line
+  phase_line="$(grep -F "uc: phase timings (ms)" "$LAST_MEASURE_STDERR_FILE" | tail -n1 || true)"
+  if [[ -z "$phase_line" ]]; then
+    return 0
+  fi
+  python3 - "$phase_file" "$LAST_MEASURE_ELAPSED_MS" "$phase_line" <<'PY'
+import json
+import re
+import sys
+
+phase_file = sys.argv[1]
+elapsed_ms = float(sys.argv[2])
+line = sys.argv[3]
+pattern = re.compile(
+    r"fingerprint=(?P<fingerprint>[0-9.]+)\s+"
+    r"cache_lookup=(?P<cache_lookup>[0-9.]+)\s+"
+    r"cache_restore=(?P<cache_restore>[0-9.]+)\s+"
+    r"compile=(?P<compile>[0-9.]+)\s+"
+    r"cache_persist=(?P<cache_persist>[0-9.]+)\s+"
+    r"async=(?P<async>\w+)\s+"
+    r"scheduled=(?P<scheduled>\w+)\s+"
+    r"daemon_used=(?P<daemon_used>\w+)\s+"
+    r"cache_hit=(?P<cache_hit>\w+)"
+)
+match = pattern.search(line)
+if not match:
+    raise SystemExit(0)
+
+def as_bool(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+payload = {
+    "elapsed_ms": elapsed_ms,
+    "fingerprint_ms": float(match.group("fingerprint")),
+    "cache_lookup_ms": float(match.group("cache_lookup")),
+    "cache_restore_ms": float(match.group("cache_restore")),
+    "compile_ms": float(match.group("compile")),
+    "cache_persist_ms": float(match.group("cache_persist")),
+    "async_persist": as_bool(match.group("async")),
+    "persist_scheduled": as_bool(match.group("scheduled")),
+    "daemon_used": as_bool(match.group("daemon_used")),
+    "cache_hit": as_bool(match.group("cache_hit")),
+}
+with open(phase_file, "a", encoding="utf-8") as f:
+    f.write(json.dumps(payload))
+    f.write("\n")
+PY
+}
+
+phase_stats_json_from_samples() {
+  local phase_file="$1"
+  if [[ ! -s "$phase_file" ]]; then
+    printf "null"
+    return 0
+  fi
+  jq -s '
+    def quantile($arr; $p):
+      ($arr | sort) as $s
+      | ($s | length) as $n
+      | if $n == 0 then null
+        else
+          ($n - 1) as $k
+          | ($k * $p) as $i
+          | ($i | floor) as $lo
+          | ($i | ceil) as $hi
+          | if $lo == $hi then $s[$lo]
+            else ($s[$lo] + (($s[$hi] - $s[$lo]) * ($i - $lo)))
+            end
+        end;
+    def metric($key):
+      [.[].[$key]] as $values
+      | if ($values | length) == 0 then null
+        else {
+          min_ms: ($values | min),
+          max_ms: ($values | max),
+          mean_ms: (($values | add) / ($values | length)),
+          p50_ms: quantile($values; 0.50),
+          p95_ms: quantile($values; 0.95)
+        }
+        end;
+    if length == 0 then null else {
+      sample_count: length,
+      cache_hit_count: ([.[] | select(.cache_hit)] | length),
+      cache_miss_count: ([.[] | select(.cache_hit | not)] | length),
+      daemon_used_count: ([.[] | select(.daemon_used)] | length),
+      async_persist_count: ([.[] | select(.async_persist)] | length),
+      persist_scheduled_count: ([.[] | select(.persist_scheduled)] | length),
+      elapsed_ms: metric("elapsed_ms"),
+      fingerprint_ms: metric("fingerprint_ms"),
+      cache_lookup_ms: metric("cache_lookup_ms"),
+      cache_restore_ms: metric("cache_restore_ms"),
+      compile_ms: metric("compile_ms"),
+      cache_persist_ms: metric("cache_persist_ms")
+    } end
+  ' "$phase_file"
+}
+
 append_result() {
   local scenario="$1"
   local workload="$2"
   local command="$3"
   local samples_file="$4"
   local runs="$5"
+  local phase_file="${6:-}"
   local stats_json
   local samples_json
+  local phase_samples_json="null"
+  local phase_stats_json="null"
   local report_command
 
   stats_json="$(stats_json_from_samples "$samples_file")"
   samples_json="$(jq -s '.' "$samples_file")"
+  if [[ -n "$phase_file" && -s "$phase_file" ]]; then
+    phase_samples_json="$(jq -s '.' "$phase_file")"
+    phase_stats_json="$(phase_stats_json_from_samples "$phase_file")"
+  fi
   report_command="$(sanitize_for_report "$command")"
 
   jq -n \
@@ -341,25 +488,42 @@ append_result() {
     --argjson runs "$runs" \
     --argjson samples_ms "$samples_json" \
     --argjson stats "$stats_json" \
+    --argjson phase_samples "$phase_samples_json" \
+    --argjson phase_stats "$phase_stats_json" \
     '{
       scenario: $scenario,
       workload: $workload,
       command: $command,
       runs: $runs,
       samples_ms: $samples_ms,
-      stats: $stats
+      stats: $stats,
+      phase_samples: $phase_samples,
+      phase_stats: $phase_stats
     }' >> "$TMP_DIR/scenarios.ndjson"
+}
+
+build_command_for_manifest_with_mode() {
+  local manifest="$1"
+  local offline_mode="$2"
+  local -a base=()
+  if [[ "$TOOL" == "scarb" ]]; then
+    base=(scarb --manifest-path "$manifest")
+    if [[ "$offline_mode" == "1" ]]; then
+      base+=(--offline)
+    fi
+    base+=(build)
+  else
+    base=("$UC_BIN" build --engine uc --daemon-mode "$UC_DAEMON_MODE" --manifest-path "$manifest")
+    if [[ "$offline_mode" == "1" ]]; then
+      base+=(--offline)
+    fi
+  fi
+  with_exec_prefix "${base[@]}"
 }
 
 build_command_for_manifest() {
   local manifest="$1"
-  local -a base=()
-  if [[ "$TOOL" == "scarb" ]]; then
-    base=(scarb --manifest-path "$manifest" build)
-  else
-    base=("$UC_BIN" build --engine uc --daemon-mode require --manifest-path "$manifest")
-  fi
-  with_exec_prefix "${base[@]}"
+  build_command_for_manifest_with_mode "$manifest" "$BUILD_OFFLINE"
 }
 
 metadata_online_command_for_manifest() {
@@ -369,7 +533,7 @@ metadata_online_command_for_manifest() {
   if [[ "$TOOL" == "scarb" ]]; then
     base=(scarb --manifest-path "$manifest" --global-cache-dir "$cache_dir" metadata --format-version 1)
   else
-    base=("$UC_BIN" metadata --daemon-mode require --manifest-path "$manifest" --global-cache-dir "$cache_dir" --format-version 1)
+    base=("$UC_BIN" metadata --daemon-mode "$UC_DAEMON_MODE" --manifest-path "$manifest" --global-cache-dir "$cache_dir" --format-version 1)
   fi
   with_exec_prefix "${base[@]}"
 }
@@ -381,7 +545,7 @@ metadata_offline_command_for_manifest() {
   if [[ "$TOOL" == "scarb" ]]; then
     base=(scarb --manifest-path "$manifest" --global-cache-dir "$cache_dir" --offline metadata --format-version 1)
   else
-    base=("$UC_BIN" metadata --daemon-mode require --manifest-path "$manifest" --offline --global-cache-dir "$cache_dir" --format-version 1)
+    base=("$UC_BIN" metadata --daemon-mode "$UC_DAEMON_MODE" --manifest-path "$manifest" --offline --global-cache-dir "$cache_dir" --format-version 1)
   fi
   with_exec_prefix "${base[@]}"
 }
@@ -407,6 +571,27 @@ ensure_isolated_workload_dir() {
   esac
 }
 
+reset_workload_outputs() {
+  local cwd="$1"
+  ensure_isolated_workload_dir "$cwd"
+  rm -rf "$cwd/target" "$cwd/.uc" "$cwd/.scarb"
+}
+
+prime_build_dependencies_if_needed() {
+  local workload="$1"
+  local manifest="$2"
+  if [[ "$BUILD_OFFLINE" != "1" ]]; then
+    return 0
+  fi
+  local cwd
+  cwd="$(dirname "$manifest")"
+  build_command_for_manifest_with_mode "$manifest" "0"
+  local -a warm_online_command=("${CMD_REPLY[@]}")
+  echo "Priming online build cache for $workload before offline measurements..." >&2
+  measure_command_ms "$cwd" "${warm_online_command[@]}" >/dev/null
+  reset_workload_outputs "$cwd"
+}
+
 run_build_cold() {
   local workload="$1"
   local cwd="$2"
@@ -415,8 +600,10 @@ run_build_cold() {
   local -a command=("$@")
   local command_string="$(command_to_string "${command[@]}")"
   local samples_file="$TMP_DIR/${TOOL}-${workload//\//_}-build-cold.samples"
+  local phase_file="$TMP_DIR/${TOOL}-${workload//\//_}-build-cold.phases.ndjson"
   local baseline_dir="$TMP_DIR/cold-baselines/${workload//\//_}"
   : > "$samples_file"
+  : > "$phase_file"
 
   ensure_isolated_workload_dir "$cwd"
   mkdir -p "$(dirname "$baseline_dir")"
@@ -427,9 +614,10 @@ run_build_cold() {
     rm -rf "$cwd"
     cp -PR "$baseline_dir" "$cwd"
     measure_command_ms "$cwd" "${command[@]}" >> "$samples_file"
+    record_uc_phase_sample "$phase_file"
   done
 
-  append_result "build.cold" "$workload" "$command_string" "$samples_file" "$runs"
+  append_result "build.cold" "$workload" "$command_string" "$samples_file" "$runs" "$phase_file"
 }
 
 run_build_warm_noop() {
@@ -440,15 +628,18 @@ run_build_warm_noop() {
   local -a command=("$@")
   local command_string="$(command_to_string "${command[@]}")"
   local samples_file="$TMP_DIR/${TOOL}-${workload//\//_}-build-warm-noop.samples"
+  local phase_file="$TMP_DIR/${TOOL}-${workload//\//_}-build-warm-noop.phases.ndjson"
   : > "$samples_file"
+  : > "$phase_file"
 
   measure_command_ms "$cwd" "${command[@]}" >/dev/null
   sleep "$WARM_SETTLE_SECONDS"
   for _ in $(seq 1 "$runs"); do
     measure_command_ms "$cwd" "${command[@]}" >> "$samples_file"
+    record_uc_phase_sample "$phase_file"
   done
 
-  append_result "build.warm_noop" "$workload" "$command_string" "$samples_file" "$runs"
+  append_result "build.warm_noop" "$workload" "$command_string" "$samples_file" "$runs" "$phase_file"
 }
 
 run_build_warm_edit() {
@@ -460,9 +651,11 @@ run_build_warm_edit() {
   local -a command=("$@")
   local command_string="$(command_to_string "${command[@]}")"
   local samples_file="$TMP_DIR/${TOOL}-${workload//\//_}-build-warm-edit.samples"
+  local phase_file="$TMP_DIR/${TOOL}-${workload//\//_}-build-warm-edit.phases.ndjson"
   local backup_file="$TMP_DIR/${TOOL}-${workload//\//_}-edit.backup"
   local failed=0
   : > "$samples_file"
+  : > "$phase_file"
 
   cp "$edit_file" "$backup_file"
   if ! measure_command_ms "$cwd" "${command[@]}" >/dev/null; then
@@ -477,6 +670,7 @@ run_build_warm_edit() {
         failed=1
         break
       fi
+      record_uc_phase_sample "$phase_file"
     done
   fi
 
@@ -485,7 +679,7 @@ run_build_warm_edit() {
     return 1
   fi
 
-  append_result "build.warm_edit" "$workload" "$command_string" "$samples_file" "$runs"
+  append_result "build.warm_edit" "$workload" "$command_string" "$samples_file" "$runs" "$phase_file"
 }
 
 rewrite_smoke_semantic_edit() {
@@ -510,9 +704,11 @@ run_build_warm_edit_semantic() {
   local -a command=("$@")
   local command_string="$(command_to_string "${command[@]}")"
   local samples_file="$TMP_DIR/${TOOL}-${workload//\//_}-build-warm-edit-semantic.samples"
+  local phase_file="$TMP_DIR/${TOOL}-${workload//\//_}-build-warm-edit-semantic.phases.ndjson"
   local backup_file="$TMP_DIR/${TOOL}-${workload//\//_}-semantic-edit.backup"
   local failed=0
   : > "$samples_file"
+  : > "$phase_file"
 
   cp "$edit_file" "$backup_file"
   if ! measure_command_ms "$cwd" "${command[@]}" >/dev/null; then
@@ -527,6 +723,7 @@ run_build_warm_edit_semantic() {
         failed=1
         break
       fi
+      record_uc_phase_sample "$phase_file"
     done
   fi
 
@@ -535,7 +732,7 @@ run_build_warm_edit_semantic() {
     return 1
   fi
 
-  append_result "build.warm_edit_semantic" "$workload" "$command_string" "$samples_file" "$runs"
+  append_result "build.warm_edit_semantic" "$workload" "$command_string" "$samples_file" "$runs" "$phase_file"
 }
 
 run_metadata_online_cold() {
@@ -547,14 +744,17 @@ run_metadata_online_cold() {
   local -a command=("$@")
   local command_string="$(command_to_string "${command[@]}")"
   local samples_file="$TMP_DIR/${TOOL}-${workload//\//_}-metadata-online-cold.samples"
+  local phase_file="$TMP_DIR/${TOOL}-${workload//\//_}-metadata-online-cold.phases.ndjson"
   : > "$samples_file"
+  : > "$phase_file"
 
   for _ in $(seq 1 "$runs"); do
     rm -rf "$cache_dir"
     measure_command_ms "$cwd" "${command[@]}" >> "$samples_file"
+    record_uc_phase_sample "$phase_file"
   done
 
-  append_result "metadata.online_cold" "$workload" "$command_string" "$samples_file" "$runs"
+  append_result "metadata.online_cold" "$workload" "$command_string" "$samples_file" "$runs" "$phase_file"
 }
 
 run_metadata_offline_warm() {
@@ -575,16 +775,19 @@ run_metadata_offline_warm() {
   local -a command=("$@")
   local command_string="$(command_to_string "${command[@]}")"
   local samples_file="$TMP_DIR/${TOOL}-${workload//\//_}-metadata-offline-warm.samples"
+  local phase_file="$TMP_DIR/${TOOL}-${workload//\//_}-metadata-offline-warm.phases.ndjson"
   : > "$samples_file"
+  : > "$phase_file"
 
   rm -rf "$cache_dir"
   measure_command_ms "$cwd" "${warm_command[@]}" >/dev/null
 
   for _ in $(seq 1 "$runs"); do
     measure_command_ms "$cwd" "${command[@]}" >> "$samples_file"
+    record_uc_phase_sample "$phase_file"
   done
 
-  append_result "metadata.offline_warm" "$workload" "$command_string" "$samples_file" "$runs"
+  append_result "metadata.offline_warm" "$workload" "$command_string" "$samples_file" "$runs" "$phase_file"
 }
 
 if [[ "$MATRIX" == "research" ]]; then
@@ -614,6 +817,9 @@ if [[ "$MATRIX" == "research" ]]; then
   build_command_for_manifest "$WS_MANIFEST"
   WS_BUILD_CMD=("${CMD_REPLY[@]}")
 
+  prime_build_dependencies_if_needed "hello_world" "$HELLO_MANIFEST"
+  prime_build_dependencies_if_needed "workspaces" "$WS_MANIFEST"
+
   run_build_cold "hello_world" "$HELLO_DIR" "$COLD_RUNS" "${HELLO_BUILD_CMD[@]}"
   run_build_warm_noop "hello_world" "$HELLO_DIR" "$RUNS" "${HELLO_BUILD_CMD[@]}"
   run_build_warm_edit "hello_world" "$HELLO_DIR" "$HELLO_DIR/src/lib.cairo" "$RUNS" "${HELLO_BUILD_CMD[@]}"
@@ -638,6 +844,8 @@ elif [[ "$MATRIX" == "smoke" ]]; then
   build_command_for_manifest "$SMOKE_MANIFEST"
   SMOKE_BUILD_CMD=("${CMD_REPLY[@]}")
 
+  prime_build_dependencies_if_needed "scarb_smoke" "$SMOKE_MANIFEST"
+
   run_build_cold "scarb_smoke" "$SMOKE_DIR" "$COLD_RUNS" "${SMOKE_BUILD_CMD[@]}"
   run_build_warm_noop "scarb_smoke" "$SMOKE_DIR" "$RUNS" "${SMOKE_BUILD_CMD[@]}"
   run_build_warm_edit "scarb_smoke" "$SMOKE_DIR" "$SMOKE_DIR/src/lib.cairo" "$RUNS" "${SMOKE_BUILD_CMD[@]}"
@@ -647,7 +855,6 @@ else
   exit 1
 fi
 
-SCARB_VERSION="$(scarb --version | head -n1)"
 if [[ "$TOOL" == "uc" ]]; then
   TOOL_VERSION="uc (local build; scarb backend version: $SCARB_VERSION)"
 else
@@ -667,6 +874,8 @@ jq -s \
   --arg workspace_root "$WORKSPACE_ROOT_REPORT" \
   --arg cpu_set "$CPU_SET" \
   --arg nice_level "$NICE_LEVEL" \
+  --arg build_offline "$BUILD_OFFLINE" \
+  --arg uc_daemon_mode "$UC_DAEMON_MODE" \
   --arg strict_pinning "$STRICT_PINNING" \
   --arg taskset_enabled "$TASKSET_ENABLED" \
   --arg cpu_governor "$CPU_GOVERNOR" \
@@ -687,6 +896,8 @@ jq -s \
     pinned_conditions: {
       cpu_set: (if $cpu_set == "" then null else $cpu_set end),
       nice_level: ($nice_level | tonumber),
+      build_offline: ($build_offline == "1"),
+      uc_daemon_mode: $uc_daemon_mode,
       strict_pinning: ($strict_pinning == "1"),
       taskset_enabled: ($taskset_enabled == "1"),
       cpu_governor: $cpu_governor,
@@ -711,6 +922,8 @@ jq -s \
   echo "- Workspace root: $WORKSPACE_ROOT_REPORT"
   echo "- CPU set: ${CPU_SET:-<none>}"
   echo "- Nice level: $NICE_LEVEL"
+  echo "- Build mode: $(if [[ "$BUILD_OFFLINE" == "1" ]]; then echo "offline"; else echo "online"; fi)"
+  echo "- UC daemon mode: $UC_DAEMON_MODE"
   echo "- CPU governor: $CPU_GOVERNOR"
   echo "- Warm settle seconds: $WARM_SETTLE_SECONDS"
   echo

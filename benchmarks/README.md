@@ -3,6 +3,7 @@
 Benchmark harness and baseline artifacts for Scarb vs `uc` performance and parity tracking.
 
 `run_local_benchmarks.sh` runs on `bash` and supports optional pinning flags for lower variance (`--cpu-set`, `--nice-level`, `--strict-pinning`).
+Build scenarios are measured in offline mode by default for stability (`--build-online` to opt out). The default UC benchmark mode is `--uc-daemon-mode off` for lower run-to-run jitter (`require` is still supported). `uc` runs emit per-sample phase telemetry (`phase_samples` + `phase_stats`) in benchmark JSON.
 
 ## Folders
 - `scenarios.md`: scenario definitions.
@@ -30,6 +31,7 @@ WORKSPACE_ROOT=/path/to/compiler-starknet ./benchmarks/scripts/run_dual_run_comp
   --workspace-root /path/to/compiler-starknet \
   --runs 12 \
   --cold-runs 12 \
+  --uc-daemon-mode off \
   --cycles 5 \
   --cpu-set 0 \
   --nice-level 5 \
