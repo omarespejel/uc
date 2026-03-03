@@ -278,11 +278,17 @@ run_build_cold() {
   local -a command=("$@")
   local command_string="$(command_to_string "${command[@]}")"
   local samples_file="$TMP_DIR/${TOOL}-${workload//\//_}-build-cold.samples"
+  local baseline_dir="$TMP_DIR/cold-baselines/${workload//\//_}"
   : > "$samples_file"
 
+  ensure_isolated_workload_dir "$cwd"
+  mkdir -p "$(dirname "$baseline_dir")"
+  rm -rf "$baseline_dir"
+  cp -R "$cwd" "$baseline_dir"
+
   for i in $(seq 1 "$runs"); do
-    ensure_isolated_workload_dir "$cwd"
-    rm -rf "$cwd/target" "$cwd/.scarb" "$cwd/.uc"
+    rm -rf "$cwd"
+    cp -R "$baseline_dir" "$cwd"
     measure_command_ms "$cwd" "${command[@]}" >> "$samples_file"
   done
 
