@@ -232,7 +232,6 @@ fn build_sierra_id_map(value: &Value) -> HashMap<i64, String> {
     let mut ids = HashMap::new();
     collect_section_ids(value, "type_declarations", "type", &mut ids);
     collect_section_ids(value, "libfunc_declarations", "libfunc", &mut ids);
-    collect_section_ids(value, "funcs", "func", &mut ids);
     ids
 }
 
@@ -289,11 +288,29 @@ fn extract_debug_name(item: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+#[derive(Copy, Clone)]
+enum NormalizeContext {
+    Default,
+    FuncArray,
+    FuncRoot,
+}
+
 fn normalize_sierra_json_ids_with_map(value: &mut Value, id_map: &HashMap<i64, String>) {
+    normalize_sierra_json_ids_with_context(value, id_map, NormalizeContext::Default);
+}
+
+fn normalize_sierra_json_ids_with_context(
+    value: &mut Value,
+    id_map: &HashMap<i64, String>,
+    context: NormalizeContext,
+) {
     match value {
         Value::Object(map) => {
             for (key, item) in map.iter_mut() {
-                if key == "id" {
+                if key == "id" && matches!(context, NormalizeContext::FuncRoot) {
+                    continue;
+                }
+                if key == "id" && !matches!(context, NormalizeContext::FuncRoot) {
                     if let Some(raw_id) = extract_numeric_id(Some(item)) {
                         if let Some(mapped) = id_map.get(&raw_id) {
                             *item = Value::String(mapped.clone());
@@ -301,12 +318,22 @@ fn normalize_sierra_json_ids_with_map(value: &mut Value, id_map: &HashMap<i64, S
                         }
                     }
                 }
-                normalize_sierra_json_ids_with_map(item, id_map);
+                let next_context = if key == "funcs" {
+                    NormalizeContext::FuncArray
+                } else {
+                    NormalizeContext::Default
+                };
+                normalize_sierra_json_ids_with_context(item, id_map, next_context);
             }
         }
         Value::Array(items) => {
+            let item_context = if matches!(context, NormalizeContext::FuncArray) {
+                NormalizeContext::FuncRoot
+            } else {
+                NormalizeContext::Default
+            };
             for item in items {
-                normalize_sierra_json_ids_with_map(item, id_map);
+                normalize_sierra_json_ids_with_context(item, id_map, item_context);
             }
         }
         _ => {}
@@ -387,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn sierra_normalization_ignores_function_and_statement_ids() {
+    fn sierra_normalization_preserves_function_ids_but_normalizes_type_ids() {
         let mut a = json!({
             "type_declarations": [{"id": {"id": 5, "debug_name": "felt252"}}],
             "funcs": [{
@@ -395,7 +422,7 @@ mod tests {
                 "signature": {"ret_types": [{"id": 5}]}
             }],
             "statements": [{
-                "Invocation": {"libfunc_id": {"id": 10}}
+                "Invocation": {"libfunc_id": {"id": 7}}
             }]
         });
         let mut b = json!({
@@ -405,14 +432,26 @@ mod tests {
                 "signature": {"ret_types": [{"id": 42}]}
             }],
             "statements": [{
-                "Invocation": {"libfunc_id": {"id": 99}}
+                "Invocation": {"libfunc_id": {"id": 7}}
             }]
         });
 
         normalize_sierra_json_ids(&mut a);
         normalize_sierra_json_ids(&mut b);
 
+        assert_eq!(a["type_declarations"][0]["id"], json!("<type:0:felt252>"));
+        assert_eq!(b["type_declarations"][0]["id"], json!("<type:0:felt252>"));
+        assert_eq!(a["funcs"][0]["id"]["id"], json!(10));
+        assert_eq!(b["funcs"][0]["id"]["id"], json!(99));
         assert_eq!(
+            a["funcs"][0]["signature"]["ret_types"][0]["id"],
+            json!("<type:0:felt252>")
+        );
+        assert_eq!(
+            b["funcs"][0]["signature"]["ret_types"][0]["id"],
+            json!("<type:0:felt252>")
+        );
+        assert_ne!(
             serde_json::to_string(&canonicalize_json(&a)).unwrap(),
             serde_json::to_string(&canonicalize_json(&b)).unwrap()
         );

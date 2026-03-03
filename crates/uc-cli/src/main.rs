@@ -63,6 +63,7 @@ const DAEMON_UNHEALTHY_RECOVERY_SECONDS: u64 = 5;
 const ASYNC_PERSIST_ERROR_QUEUE_LIMIT: usize = 32;
 const ASYNC_PERSIST_QUEUE_LIMIT: usize = 128;
 const CACHE_LOCK_STALE_AFTER_SECONDS: u64 = 300;
+const DEFAULT_CACHE_BUDGET_ENFORCE_EVERY: u64 = 8;
 const DEFAULT_MIN_SCARB_VERSION: &str = "2.14.0";
 const DAEMON_PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CACHEABLE_ARTIFACT_SUFFIXES: [&str; 5] = [
@@ -772,6 +773,30 @@ fn max_capture_stderr_bytes() -> u64 {
 fn max_cache_bytes() -> u64 {
     static VALUE: OnceLock<u64> = OnceLock::new();
     *VALUE.get_or_init(|| parse_env_u64("UC_MAX_CACHE_BYTES", DEFAULT_MAX_CACHE_BYTES))
+}
+
+fn cache_budget_enforce_every() -> u64 {
+    parse_env_u64(
+        "UC_CACHE_BUDGET_ENFORCE_EVERY",
+        DEFAULT_CACHE_BUDGET_ENFORCE_EVERY,
+    )
+    .max(1)
+}
+
+fn should_enforce_cache_size_budget_for_persist_index(
+    persist_index: u64,
+    enforce_every: u64,
+) -> bool {
+    if enforce_every <= 1 {
+        return true;
+    }
+    persist_index % enforce_every == 0
+}
+
+fn should_enforce_cache_size_budget_now() -> bool {
+    static PERSIST_COUNT: AtomicU64 = AtomicU64::new(0);
+    let persist_index = PERSIST_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    should_enforce_cache_size_budget_for_persist_index(persist_index, cache_budget_enforce_every())
 }
 
 fn fail_on_async_cache_error() -> bool {
@@ -2062,7 +2087,10 @@ fn persist_cache_entry_for_build(
         collect_cached_artifacts_for_entry(workspace_root, profile, cache_root, objects_dir)?;
     let _cache_lock = acquire_cache_lock(cache_root)?;
     persist_cache_entry(profile, fingerprint, &cached_artifacts, entry_path)?;
-    enforce_cache_size_budget(cache_root)
+    if should_enforce_cache_size_budget_now() {
+        enforce_cache_size_budget(cache_root)?;
+    }
+    Ok(())
 }
 
 fn enforce_cache_size_budget(cache_root: &Path) -> Result<()> {
@@ -3495,14 +3523,30 @@ fn resolve_manifest_cairo_settings_from_manifest(
     (edition, cairo_lang_version)
 }
 
-fn compute_build_env_fingerprint() -> String {
+fn build_env_prefixes() -> Vec<String> {
     const BUILD_ENV_PREFIXES: [&str; 3] = ["CAIRO_", "SCARB_", "STARKNET_"];
+    let mut prefixes: Vec<String> = BUILD_ENV_PREFIXES
+        .iter()
+        .map(|prefix| (*prefix).to_string())
+        .collect();
+    if let Ok(extra_prefixes) = std::env::var("UC_BUILD_ENV_PREFIXES_EXTRA") {
+        for prefix in extra_prefixes
+            .split(',')
+            .map(str::trim)
+            .filter(|prefix| !prefix.is_empty())
+        {
+            if !prefixes.iter().any(|existing| existing == prefix) {
+                prefixes.push(prefix.to_string());
+            }
+        }
+    }
+    prefixes
+}
+
+fn compute_build_env_fingerprint() -> String {
+    let prefixes = build_env_prefixes();
     let mut entries: Vec<(String, String)> = std::env::vars()
-        .filter(|(key, _)| {
-            BUILD_ENV_PREFIXES
-                .iter()
-                .any(|prefix| key.starts_with(prefix))
-        })
+        .filter(|(key, _)| prefixes.iter().any(|prefix| key.starts_with(prefix)))
         .collect();
     entries.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
 
@@ -4525,6 +4569,68 @@ mod tests {
         let version = scarb_version_line().expect("override version should be accepted");
         assert_eq!(version, "scarb 9.9.9 (override)");
         std::env::remove_var("UC_SCARB_VERSION_LINE");
+    }
+
+    #[test]
+    fn build_env_fingerprint_tracks_prefixed_vars_only() {
+        let _guard = integration_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::remove_var("UC_BUILD_ENV_PREFIXES_EXTRA");
+        std::env::remove_var("SCARB_TEST_UC_FINGERPRINT");
+        std::env::remove_var("UC_TEST_UNRELATED_FINGERPRINT");
+
+        let baseline = compute_build_env_fingerprint();
+        std::env::set_var("SCARB_TEST_UC_FINGERPRINT", "v1");
+        let with_prefixed = compute_build_env_fingerprint();
+        assert_ne!(baseline, with_prefixed);
+
+        std::env::set_var("UC_TEST_UNRELATED_FINGERPRINT", "noise");
+        let with_unrelated = compute_build_env_fingerprint();
+        assert_eq!(with_prefixed, with_unrelated);
+
+        std::env::set_var("SCARB_TEST_UC_FINGERPRINT", "v2");
+        let with_prefixed_change = compute_build_env_fingerprint();
+        assert_ne!(with_prefixed, with_prefixed_change);
+
+        std::env::remove_var("SCARB_TEST_UC_FINGERPRINT");
+        std::env::remove_var("UC_TEST_UNRELATED_FINGERPRINT");
+    }
+
+    #[test]
+    fn build_env_fingerprint_supports_extra_prefixes() {
+        let _guard = integration_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::remove_var("UC_BUILD_ENV_PREFIXES_EXTRA");
+        std::env::set_var("XBUILD_TEST_FINGERPRINT", "v1");
+        let without_extra = compute_build_env_fingerprint();
+
+        std::env::set_var("UC_BUILD_ENV_PREFIXES_EXTRA", "XBUILD_");
+        let with_extra = compute_build_env_fingerprint();
+        assert_ne!(without_extra, with_extra);
+
+        std::env::remove_var("XBUILD_TEST_FINGERPRINT");
+        std::env::remove_var("UC_BUILD_ENV_PREFIXES_EXTRA");
+    }
+
+    #[test]
+    fn cache_budget_enforcement_stride_triggers_every_nth_persist() {
+        assert!(!should_enforce_cache_size_budget_for_persist_index(1, 8));
+        assert!(!should_enforce_cache_size_budget_for_persist_index(7, 8));
+        assert!(should_enforce_cache_size_budget_for_persist_index(8, 8));
+        assert!(!should_enforce_cache_size_budget_for_persist_index(9, 8));
+        assert!(should_enforce_cache_size_budget_for_persist_index(16, 8));
+    }
+
+    #[test]
+    fn cache_budget_enforcement_stride_one_triggers_every_persist() {
+        for persist_index in 1..=8 {
+            assert!(should_enforce_cache_size_budget_for_persist_index(
+                persist_index,
+                1
+            ));
+        }
     }
 
     #[test]
