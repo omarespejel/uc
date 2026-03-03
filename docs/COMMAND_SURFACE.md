@@ -18,7 +18,7 @@
 3. `uc compare-build`
 - Runs direct Scarb build vs `uc build` wrapper on same manifest.
 - Compares artifact hashes and diagnostics lines.
-- Writes JSON report and enforces pass/fail gate.
+- Writes JSON report to `--output-path <file>` (or `benchmarks/results/compare-build-<epoch>.json` by default) and enforces pass/fail gate.
 
 4. `uc benchmark`
 - Runs benchmark matrix harness script.

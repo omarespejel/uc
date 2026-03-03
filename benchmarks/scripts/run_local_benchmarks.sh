@@ -3,8 +3,8 @@ set -euo pipefail
 zmodload zsh/datetime
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-DEFAULT_WORKSPACE_ROOT="/Users/espejelomar/StarkNet/compiler-starknet"
-WORKSPACE_ROOT="${WORKSPACE_ROOT:-$DEFAULT_WORKSPACE_ROOT}"
+DEFAULT_WORKSPACE_ROOT="$(cd "$ROOT_DIR/.." && pwd)"
+WORKSPACE_ROOT="${WORKSPACE_ROOT:-}"
 MATRIX="${MATRIX:-research}"
 TOOL="${TOOL:-scarb}"
 RUNS="${RUNS:-5}"
@@ -98,16 +98,41 @@ fi
 mkdir -p "$OUT_DIR"
 : > "$TMP_DIR/scenarios.ndjson"
 
+sanitize_for_report() {
+  local value="$1"
+  value="${value//$TMP_DIR/<tmp-dir>}"
+  value="${value//$ROOT_DIR/<repo-root>}"
+  if [[ -n "$WORKSPACE_ROOT" ]]; then
+    value="${value//$WORKSPACE_ROOT/<workspace-root>}"
+  fi
+  printf "%s" "$value"
+}
+
+workspace_root_for_report() {
+  if [[ -n "$WORKSPACE_ROOT" ]]; then
+    sanitize_for_report "$WORKSPACE_ROOT"
+  else
+    printf "%s" "<workspace-root-unset>"
+  fi
+}
+
 measure_command_ms() {
   local cwd="$1"
   local command="$2"
   local stderr_file="$TMP_DIR/stderr.log"
+  local -a argv
+
+  argv=("${(@Q)${(z)command}}")
+  if [[ ${#argv[@]} -eq 0 ]]; then
+    echo "Command parse failed: $command" >&2
+    return 1
+  fi
 
   local start="$EPOCHREALTIME"
-  if ! (cd "$cwd" && eval "$command" >/dev/null 2>"$stderr_file"); then
+  if ! (cd "$cwd" && "${argv[@]}" >/dev/null 2>"$stderr_file"); then
     echo "Command failed in $cwd: $command" >&2
     cat "$stderr_file" >&2
-    exit 1
+    return 1
   fi
   local end="$EPOCHREALTIME"
 
@@ -137,14 +162,16 @@ append_result() {
   local runs="$5"
   local stats_json
   local samples_json
+  local report_command
 
   stats_json="$(stats_json_from_samples "$samples_file")"
   samples_json="$(jq -s '.' "$samples_file")"
+  report_command="$(sanitize_for_report "$command")"
 
   jq -n \
     --arg scenario "$scenario" \
     --arg workload "$workload" \
-    --arg command "$command" \
+    --arg command "$report_command" \
     --argjson runs "$runs" \
     --argjson samples_ms "$samples_json" \
     --argjson stats "$stats_json" \
@@ -196,7 +223,7 @@ run_build_cold() {
   : > "$samples_file"
 
   for i in $(seq 1 "$runs"); do
-    rm -rf "$cwd/target" "$cwd/.scarb" "$cwd/.uc"
+    rm -rf "$cwd/target" "$cwd/.scarb"
     measure_command_ms "$cwd" "$command" >> "$samples_file"
   done
 
@@ -230,15 +257,18 @@ run_build_warm_edit() {
   : > "$samples_file"
 
   cp "$edit_file" "$backup_file"
-  measure_command_ms "$cwd" "$command" > /dev/null
+  {
+    measure_command_ms "$cwd" "$command" > /dev/null
 
-  for i in $(seq 1 "$runs"); do
-    cp "$backup_file" "$edit_file"
-    printf "\n// uc benchmark edit %s %s\n" "$i" "$STAMP" >> "$edit_file"
-    measure_command_ms "$cwd" "$command" >> "$samples_file"
-  done
+    for i in $(seq 1 "$runs"); do
+      cp "$backup_file" "$edit_file"
+      printf "\n// uc benchmark edit %s %s\n" "$i" "$STAMP" >> "$edit_file"
+      measure_command_ms "$cwd" "$command" >> "$samples_file"
+    done
+  } always {
+    cp "$backup_file" "$edit_file" >/dev/null 2>&1 || true
+  }
 
-  cp "$backup_file" "$edit_file"
   append_result "build.warm_edit" "$workload" "$command" "$samples_file" "$runs"
 }
 
@@ -280,12 +310,17 @@ run_metadata_offline_warm() {
 }
 
 if [[ "$MATRIX" == "research" ]]; then
+  if [[ -z "$WORKSPACE_ROOT" ]]; then
+    WORKSPACE_ROOT="$DEFAULT_WORKSPACE_ROOT"
+  fi
+
   HELLO_DIR="$WORKSPACE_ROOT/scarb/examples/hello_world"
   WS_DIR="$WORKSPACE_ROOT/scarb/examples/workspaces"
   DEPS_DIR="$WORKSPACE_ROOT/scarb/examples/dependencies"
 
   if [[ ! -d "$HELLO_DIR" || ! -d "$WS_DIR" || ! -d "$DEPS_DIR" ]]; then
     echo "Research matrix directories not found under: $WORKSPACE_ROOT" >&2
+    echo "Hint: pass --workspace-root <path> (or WORKSPACE_ROOT=<path>) where scarb/examples exists." >&2
     echo "Expected: scarb/examples/hello_world, scarb/examples/workspaces, scarb/examples/dependencies" >&2
     exit 1
   fi
@@ -330,18 +365,17 @@ else
   TOOL_VERSION="$SCARB_VERSION"
 fi
 GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-HOST_NAME="$(hostname)"
-UNAME_STR="$(uname -a)"
+WORKSPACE_ROOT_REPORT="$(workspace_root_for_report)"
 
 jq -s \
   --arg generated_at "$GENERATED_AT" \
   --arg matrix "$MATRIX" \
-  --arg host "$HOST_NAME" \
-  --arg uname "$UNAME_STR" \
+  --arg host "<redacted>" \
+  --arg uname "<redacted>" \
   --arg tool "$TOOL" \
   --arg tool_version "$TOOL_VERSION" \
   --arg scarb_version "$SCARB_VERSION" \
-  --arg workspace_root "$WORKSPACE_ROOT" \
+  --arg workspace_root "$WORKSPACE_ROOT_REPORT" \
   --argjson runs "$RUNS" \
   --argjson cold_runs "$COLD_RUNS" \
   '{
@@ -364,9 +398,9 @@ jq -s \
   echo "## Environment"
   echo "- Generated at: $GENERATED_AT"
   echo "- Matrix: $MATRIX"
-  echo "- Host: $HOST_NAME"
+  echo "- Host: <redacted>"
   echo "- Tool: $TOOL_VERSION"
-  echo "- Workspace root: $WORKSPACE_ROOT"
+  echo "- Workspace root: $WORKSPACE_ROOT_REPORT"
   echo
   echo "## Summary"
   echo "| Scenario | Workload | Runs | p50 (ms) | p95 (ms) | mean (ms) | min (ms) | max (ms) |"

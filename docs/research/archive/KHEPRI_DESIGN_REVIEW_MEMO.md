@@ -1,5 +1,7 @@
 # Khepri Build Acceleration: Design Review Memo
 
+> Historical archive note: this memo is retained for context and has been superseded by the `uc` planning docs in `docs/`.
+
 **Date:** 2026-03-03  
 **Owner:** Compiler Acceleration Initiative  
 **Decision Type:** Architecture + Delivery Scope
@@ -97,4 +99,3 @@ Evaluation matrix:
 2. Compile daemon MVP + Scarb bridge + fallback.
 3. Gate review with benchmark and parity evidence.
 4. Stabilization and opt-in CI rollout.
-

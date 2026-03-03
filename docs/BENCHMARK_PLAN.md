@@ -31,8 +31,8 @@ Every build-path engine change must run dual-run comparison (`scarb-direct` vs `
 - candidate vs baseline elapsed time.
 
 ## Gate Thresholds
-- Gate A: warm rebuild p95 >= 40% faster than Scarb baseline.
-- Gate A: zero artifact hash mismatches and diagnostics parity >= 99.5%.
+- Gate A (Performance): warm rebuild p95 >= 40% faster than Scarb baseline.
+- Gate B (Correctness): zero artifact hash mismatches and diagnostics parity >= 99.5%.
 
 ## Execution
 ```bash

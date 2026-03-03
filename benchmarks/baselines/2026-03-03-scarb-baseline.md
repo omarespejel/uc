@@ -3,11 +3,12 @@
 ## Environment
 - Generated at: 2026-03-03T10:25:10Z
 - Matrix: research
-- Host: TMWM-G5FXKKXLXY
+- Host: <redacted>
 - Tool: scarb 2.14.0 (682b29e13 2025-11-25)
-- Workspace root: /Users/espejelomar/StarkNet/compiler-starknet
+- Workspace root: <workspace-root>
 
 ## Summary
+
 | Scenario | Workload | Runs | p50 (ms) | p95 (ms) | mean (ms) | min (ms) | max (ms) |
 |---|---|---:|---:|---:|---:|---:|---:|
 | build.cold | hello_world | 3 | 2140.786 | 3363.971 | 2244.033 | 1227.342 | 3363.971 |

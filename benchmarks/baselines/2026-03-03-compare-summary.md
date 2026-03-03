@@ -6,5 +6,5 @@
 | workspaces | true | 0 | 100 | 1539.98 | 1006.26 |
 
 ## Reports
-- /Users/espejelomar/StarkNet/compiler-starknet/uc/benchmarks/results/compare-hello_world-20260303-042525.json
-- /Users/espejelomar/StarkNet/compiler-starknet/uc/benchmarks/results/compare-workspaces-20260303-042525.json
+- benchmarks/baselines/2026-03-03-compare-hello_world.json
+- benchmarks/baselines/2026-03-03-compare-workspaces.json

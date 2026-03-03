@@ -1,14 +1,14 @@
 {
   "generated_at_epoch_ms": 1772533530750,
-  "manifest_path": "/Users/espejelomar/StarkNet/compiler-starknet/scarb/examples/hello_world/Scarb.toml",
-  "workspace_root": "/Users/espejelomar/StarkNet/compiler-starknet/scarb/examples/hello_world",
+  "manifest_path": "<workspace-root>/scarb/examples/hello_world/Scarb.toml",
+  "workspace_root": "<workspace-root>/scarb/examples/hello_world",
   "clean_before_each": true,
   "baseline": {
     "label": "scarb-direct",
     "command": [
       "scarb",
       "--manifest-path",
-      "/Users/espejelomar/StarkNet/compiler-starknet/scarb/examples/hello_world/Scarb.toml",
+      "<workspace-root>/scarb/examples/hello_world/Scarb.toml",
       "build"
     ],
     "exit_code": 0,
@@ -19,10 +19,10 @@
   "candidate": {
     "label": "uc-engine",
     "command": [
-      "/Users/espejelomar/StarkNet/compiler-starknet/uc/target/debug/uc",
+      "<workspace-root>/uc/target/debug/uc",
       "build",
       "--manifest-path",
-      "/Users/espejelomar/StarkNet/compiler-starknet/scarb/examples/hello_world/Scarb.toml",
+      "<workspace-root>/scarb/examples/hello_world/Scarb.toml",
       "--engine",
       "uc"
     ],

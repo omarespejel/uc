@@ -39,6 +39,7 @@ jobs:
             --output-path benchmarks/results/compare-smoke.json
 
       - name: Upload benchmark artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results

@@ -1,7 +1,7 @@
 # Research Synthesis (2026-03-03)
 
 ## Context
-This synthesis consolidates all prior deep research completed in `/Users/espejelomar/StarkNet/compiler-starknet` and converts it into `uc` project guidance.
+This synthesis consolidates all prior deep research completed in this repository (`<repo-root>`) and converts it into `uc` project guidance.
 
 ## Verified Technical Findings
 1. Scarb currently rebuilds compiler database state on each invocation.

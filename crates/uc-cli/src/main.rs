@@ -3,7 +3,7 @@ use blake3::Hasher;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -14,6 +14,12 @@ use uc_core::artifacts::{
 use uc_core::compare::{compare_diagnostics, extract_diagnostic_lines, DiagnosticsComparison};
 use uc_core::session::SessionInput;
 use walkdir::WalkDir;
+
+const BUILD_CACHE_SCHEMA_VERSION: u32 = 1;
+const MIN_HASH_LEN: usize = 2;
+const SESSION_KEY_LEN: usize = 64;
+const MAX_FINGERPRINT_FILES: usize = 50_000;
+const MAX_FINGERPRINT_DEPTH: usize = 32;
 
 #[derive(Parser, Debug)]
 #[command(name = "uc")]
@@ -92,7 +98,7 @@ struct BenchmarkArgs {
     #[arg(long, default_value_t = 3)]
     cold_runs: u32,
 
-    #[arg(long, default_value = "/Users/espejelomar/StarkNet/compiler-starknet")]
+    #[arg(long, default_value = ".")]
     workspace_root: String,
 }
 
@@ -355,13 +361,14 @@ fn run_build(args: BuildArgs) -> Result<()> {
     let profile = effective_profile(&common);
 
     let scarb_version = scarb_version_line()?;
+    let plugin_signature = compute_plugin_signature(&manifest_path)?;
     let session_input = SessionInput {
         workspace_root: workspace_root.display().to_string(),
         compiler_version: scarb_version,
         profile: profile.clone(),
         features: common.features.clone(),
         cfg_set: Vec::new(),
-        plugin_signature: "unknown".to_string(),
+        plugin_signature,
         target_family: if common.workspace {
             "workspace".to_string()
         } else {
@@ -584,6 +591,8 @@ fn run_compare_build(args: CompareBuildArgs) -> Result<()> {
 
     let mismatches = compare_artifact_sets(&baseline_artifacts, &candidate_artifacts);
     let diagnostics = compare_diagnostics(&baseline_diag, &candidate_diag);
+    let artifacts_match = mismatches.is_empty();
+    let diagnostics_ok = diagnostics.similarity_percent >= 99.5;
 
     let report = CompareBuildReport {
         generated_at_epoch_ms: epoch_ms()?,
@@ -611,7 +620,8 @@ fn run_compare_build(args: CompareBuildArgs) -> Result<()> {
         artifact_mismatches: mismatches,
         passed: baseline_run.exit_code == 0
             && candidate_run.exit_code == 0
-            && compare_artifact_sets(&baseline_artifacts, &candidate_artifacts).is_empty(),
+            && artifacts_match
+            && diagnostics_ok,
     };
 
     let output_path = args.output_path.unwrap_or_else(|| {
@@ -641,13 +651,14 @@ fn run_build_with_uc_cache(
     session_key: &str,
 ) -> Result<(CommandRun, bool, String)> {
     let fingerprint = compute_build_fingerprint(workspace_root, manifest_path, common, profile)?;
+    validate_hex_digest("session key", session_key, SESSION_KEY_LEN)?;
     let cache_root = workspace_root.join(".uc/cache");
     let objects_dir = cache_root.join("objects");
     let entry_path = cache_root.join("build").join(format!("{session_key}.json"));
 
     let restore_start = Instant::now();
     if let Some(entry) = load_cache_entry(&entry_path)? {
-        if entry.schema_version == 1
+        if entry.schema_version == BUILD_CACHE_SCHEMA_VERSION
             && entry.profile == profile
             && entry.fingerprint == fingerprint
             && restore_cached_artifacts(workspace_root, profile, &objects_dir, &entry.artifacts)?
@@ -707,11 +718,9 @@ fn persist_cache_entry(
             continue;
         }
 
-        let object_rel_path = format!(
-            "{}/{}.bin",
-            &artifact.blake3_hex[0..2.min(artifact.blake3_hex.len())],
-            artifact.blake3_hex
-        );
+        let canonical_hash = artifact.blake3_hex.to_ascii_lowercase();
+        validate_hex_digest("artifact blake3 hash", &canonical_hash, MIN_HASH_LEN)?;
+        let object_rel_path = format!("{}/{}.bin", &canonical_hash[0..2], canonical_hash);
         let object_path = objects_dir.join(&object_rel_path);
         if !object_path.exists() {
             if let Some(parent) = object_path.parent() {
@@ -729,14 +738,14 @@ fn persist_cache_entry(
 
         cached_artifacts.push(CachedArtifact {
             relative_path: artifact.relative_path.clone(),
-            blake3_hex: artifact.blake3_hex.clone(),
+            blake3_hex: canonical_hash,
             size_bytes: artifact.size_bytes,
             object_rel_path,
         });
     }
 
     let entry = BuildCacheEntry {
-        schema_version: 1,
+        schema_version: BUILD_CACHE_SCHEMA_VERSION,
         fingerprint: fingerprint.to_string(),
         profile: profile.to_string(),
         artifacts: cached_artifacts,
@@ -762,7 +771,14 @@ fn load_cache_entry(path: &Path) -> Result<Option<BuildCacheEntry>> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let parsed: BuildCacheEntry = match serde_json::from_slice(&bytes) {
         Ok(entry) => entry,
-        Err(_) => return Ok(None),
+        Err(err) => {
+            eprintln!(
+                "uc: warning: ignoring unreadable cache entry {}: {}",
+                path.display(),
+                err
+            );
+            return Ok(None);
+        }
     };
     Ok(Some(parsed))
 }
@@ -778,6 +794,12 @@ fn restore_cached_artifacts(
     }
 
     for artifact in artifacts {
+        validate_hex_digest(
+            "cached artifact blake3 hash",
+            &artifact.blake3_hex,
+            MIN_HASH_LEN,
+        )?;
+        validate_cache_object_rel_path(&artifact.object_rel_path)?;
         let object_path = objects_dir.join(&artifact.object_rel_path);
         if !object_path.exists() {
             return Ok(false);
@@ -821,9 +843,22 @@ fn restore_cached_artifacts(
 }
 
 fn hash_file_blake3(path: &Path) -> Result<String> {
-    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let file =
+        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut buf = [0_u8; 8192];
     let mut hasher = Hasher::new();
-    hasher.update(&bytes);
+
+    loop {
+        let read = reader
+            .read(&mut buf)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+
     Ok(hasher.finalize().to_hex().to_string())
 }
 
@@ -858,6 +893,7 @@ fn compute_build_fingerprint(
 
     let mut files = Vec::new();
     let walker = WalkDir::new(workspace_root)
+        .max_depth(MAX_FINGERPRINT_DEPTH)
         .into_iter()
         .filter_entry(|entry| !is_ignored_entry(workspace_root, entry.path()));
 
@@ -867,6 +903,11 @@ fn compute_build_fingerprint(
         }
         let path = entry.path();
         if should_include_fingerprint_file(path) {
+            if files.len() >= MAX_FINGERPRINT_FILES {
+                bail!(
+                    "workspace has too many fingerprintable files (>{MAX_FINGERPRINT_FILES}); refusing to hash more"
+                );
+            }
             files.push(path.to_path_buf());
         }
     }
@@ -1074,8 +1115,22 @@ fn replay_output(stdout: &str, stderr: &str) -> Result<()> {
 }
 
 fn remove_build_outputs(workspace_root: &Path) -> Result<()> {
-    let target = workspace_root.join("target");
-    let scarb_dir = workspace_root.join(".scarb");
+    let canonical_root = workspace_root.canonicalize().with_context(|| {
+        format!(
+            "failed to resolve workspace root {}",
+            workspace_root.display()
+        )
+    })?;
+    if canonical_root == Path::new("/") || canonical_root.ancestors().count() < 3 {
+        bail!(
+            "workspace root {} is too close to filesystem root; refusing cleanup",
+            canonical_root.display()
+        );
+    }
+
+    let target = canonical_root.join("target");
+    let scarb_dir = canonical_root.join(".scarb");
+    let uc_dir = canonical_root.join(".uc");
 
     if target.exists() {
         fs::remove_dir_all(&target)
@@ -1087,20 +1142,44 @@ fn remove_build_outputs(workspace_root: &Path) -> Result<()> {
             .with_context(|| format!("failed to remove {}", scarb_dir.display()))?;
     }
 
+    if uc_dir.exists() {
+        fs::remove_dir_all(&uc_dir)
+            .with_context(|| format!("failed to remove {}", uc_dir.display()))?;
+    }
+
     Ok(())
 }
 
 fn resolve_manifest_path(manifest_path: &Option<PathBuf>) -> Result<PathBuf> {
-    let path = manifest_path
+    let cwd = std::env::current_dir()?.canonicalize()?;
+    let requested = manifest_path
         .as_ref()
         .cloned()
         .unwrap_or_else(|| PathBuf::from("Scarb.toml"));
+    let candidate = if requested.is_absolute() {
+        requested.clone()
+    } else {
+        cwd.join(&requested)
+    };
+    let resolved = candidate
+        .canonicalize()
+        .with_context(|| format!("failed to resolve manifest path {}", candidate.display()))?;
 
-    if path.is_absolute() {
-        return Ok(path);
+    if !requested.is_absolute() && !resolved.starts_with(&cwd) {
+        bail!(
+            "manifest path escapes current working directory: {}",
+            requested.display()
+        );
     }
 
-    Ok(std::env::current_dir()?.join(path))
+    if resolved.file_name().and_then(|s| s.to_str()) != Some("Scarb.toml") {
+        bail!(
+            "manifest path must reference Scarb.toml, got {}",
+            resolved.display()
+        );
+    }
+
+    Ok(resolved)
 }
 
 fn effective_profile(common: &BuildCommonArgs) -> String {
@@ -1123,6 +1202,41 @@ fn scarb_version_line() -> Result<String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let first = stdout.lines().next().unwrap_or("scarb unknown").trim();
     Ok(first.to_string())
+}
+
+fn compute_plugin_signature(manifest_path: &Path) -> Result<String> {
+    let bytes = fs::read(manifest_path)
+        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+    let mut hasher = Hasher::new();
+    hasher.update(&bytes);
+    Ok(format!("manifest-blake3:{}", hasher.finalize().to_hex()))
+}
+
+fn validate_hex_digest(label: &str, digest: &str, min_len: usize) -> Result<()> {
+    if digest.len() < min_len {
+        bail!(
+            "{label} must be at least {min_len} hex chars, got {}",
+            digest.len()
+        );
+    }
+    if !digest.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("{label} must contain only hex characters");
+    }
+    Ok(())
+}
+
+fn validate_cache_object_rel_path(path: &str) -> Result<()> {
+    let rel = Path::new(path);
+    if rel.is_absolute() {
+        bail!("cache object path must be relative");
+    }
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(_) => {}
+            _ => bail!("cache object path contains invalid component"),
+        }
+    }
+    Ok(())
 }
 
 fn write_uc_toml(

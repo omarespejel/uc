@@ -1,19 +1,19 @@
 {
   "generated_at": "2026-03-03T10:24:23Z",
   "matrix": "research",
-  "host": "TMWM-G5FXKKXLXY",
-  "uname": "Darwin TMWM-G5FXKKXLXY 23.6.0 Darwin Kernel Version 23.6.0: Thu Apr 24 20:29:27 PDT 2025; root:xnu-10063.141.1.705.2~1/RELEASE_ARM64_T6030 arm64",
+  "host": "<redacted>",
+  "uname": "<redacted>",
   "tool": "uc",
   "tool_version": "uc (local build; scarb backend version: scarb 2.14.0 (682b29e13 2025-11-25))",
   "scarb_version": "scarb 2.14.0 (682b29e13 2025-11-25)",
-  "workspace_root": "/Users/espejelomar/StarkNet/compiler-starknet",
+  "workspace_root": "<workspace-root>",
   "runs": 5,
   "cold_runs": 3,
   "scenarios": [
     {
       "scenario": "build.cold",
       "workload": "hello_world",
-      "command": "/Users/espejelomar/StarkNet/compiler-starknet/uc/target/debug/uc build --engine uc --manifest-path '/Users/espejelomar/StarkNet/compiler-starknet/scarb/examples/hello_world/Scarb.toml'",
+      "command": "<workspace-root>/uc/target/debug/uc build --engine uc --manifest-path '<workspace-root>/scarb/examples/hello_world/Scarb.toml'",
       "runs": 3,
       "samples_ms": [
         1997.631,
@@ -31,7 +31,7 @@
     {
       "scenario": "build.warm_noop",
       "workload": "hello_world",
-      "command": "/Users/espejelomar/StarkNet/compiler-starknet/uc/target/debug/uc build --engine uc --manifest-path '/Users/espejelomar/StarkNet/compiler-starknet/scarb/examples/hello_world/Scarb.toml'",
+      "command": "<workspace-root>/uc/target/debug/uc build --engine uc --manifest-path '<workspace-root>/scarb/examples/hello_world/Scarb.toml'",
       "runs": 5,
       "samples_ms": [
         11.509,
@@ -51,7 +51,7 @@
     {
       "scenario": "build.warm_edit",
       "workload": "hello_world",
-      "command": "/Users/espejelomar/StarkNet/compiler-starknet/uc/target/debug/uc build --engine uc --manifest-path '/Users/espejelomar/StarkNet/compiler-starknet/scarb/examples/hello_world/Scarb.toml'",
+      "command": "<workspace-root>/uc/target/debug/uc build --engine uc --manifest-path '<workspace-root>/scarb/examples/hello_world/Scarb.toml'",
       "runs": 5,
       "samples_ms": [
         389.501,
@@ -71,7 +71,7 @@
     {
       "scenario": "build.cold",
       "workload": "workspaces",
-      "command": "/Users/espejelomar/StarkNet/compiler-starknet/uc/target/debug/uc build --engine uc --manifest-path '/Users/espejelomar/StarkNet/compiler-starknet/scarb/examples/workspaces/Scarb.toml'",
+      "command": "<workspace-root>/uc/target/debug/uc build --engine uc --manifest-path '<workspace-root>/scarb/examples/workspaces/Scarb.toml'",
       "runs": 3,
       "samples_ms": [
         835.775,
@@ -89,7 +89,7 @@
     {
       "scenario": "build.warm_noop",
       "workload": "workspaces",
-      "command": "/Users/espejelomar/StarkNet/compiler-starknet/uc/target/debug/uc build --engine uc --manifest-path '/Users/espejelomar/StarkNet/compiler-starknet/scarb/examples/workspaces/Scarb.toml'",
+      "command": "<workspace-root>/uc/target/debug/uc build --engine uc --manifest-path '<workspace-root>/scarb/examples/workspaces/Scarb.toml'",
       "runs": 5,
       "samples_ms": [
         14.478,
@@ -109,7 +109,7 @@
     {
       "scenario": "build.warm_edit",
       "workload": "workspaces",
-      "command": "/Users/espejelomar/StarkNet/compiler-starknet/uc/target/debug/uc build --engine uc --manifest-path '/Users/espejelomar/StarkNet/compiler-starknet/scarb/examples/workspaces/Scarb.toml'",
+      "command": "<workspace-root>/uc/target/debug/uc build --engine uc --manifest-path '<workspace-root>/scarb/examples/workspaces/Scarb.toml'",
       "runs": 5,
       "samples_ms": [
         354.613,
@@ -129,7 +129,7 @@
     {
       "scenario": "metadata.online_cold",
       "workload": "dependencies",
-      "command": "/Users/espejelomar/StarkNet/compiler-starknet/uc/target/debug/uc metadata --manifest-path '/Users/espejelomar/StarkNet/compiler-starknet/scarb/examples/dependencies/Scarb.toml' --global-cache-dir '/var/folders/qz/nsyksys54bx4x8c_688j6sx80000gn/T/tmp.jzs1VPXFwS/deps-cache' --format-version 1",
+      "command": "<workspace-root>/uc/target/debug/uc metadata --manifest-path '<workspace-root>/scarb/examples/dependencies/Scarb.toml' --global-cache-dir '<tmp-dir>/deps-cache' --format-version 1",
       "runs": 3,
       "samples_ms": [
         1828.481,
@@ -147,7 +147,7 @@
     {
       "scenario": "metadata.offline_warm",
       "workload": "dependencies",
-      "command": "/Users/espejelomar/StarkNet/compiler-starknet/uc/target/debug/uc metadata --manifest-path '/Users/espejelomar/StarkNet/compiler-starknet/scarb/examples/dependencies/Scarb.toml' --offline --global-cache-dir '/var/folders/qz/nsyksys54bx4x8c_688j6sx80000gn/T/tmp.jzs1VPXFwS/deps-cache' --format-version 1",
+      "command": "<workspace-root>/uc/target/debug/uc metadata --manifest-path '<workspace-root>/scarb/examples/dependencies/Scarb.toml' --offline --global-cache-dir '<tmp-dir>/deps-cache' --format-version 1",
       "runs": 5,
       "samples_ms": [
         19.512,

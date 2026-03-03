@@ -13,11 +13,13 @@ pub struct ArtifactKeyInput {
 impl ArtifactKeyInput {
     pub fn digest_hex(&self) -> String {
         let mut features = self.features.clone();
-        features.sort();
+        features.sort_unstable();
+        features.dedup();
+        let source_hash_hex = self.source_hash_hex.trim().to_ascii_lowercase();
 
         let normalized = format!(
             "source_hash_hex={}\ncompiler_version={}\nprofile={}\nfeatures={}\ntarget_kind={}",
-            self.source_hash_hex,
+            source_hash_hex,
             self.compiler_version,
             self.profile,
             features.join(","),
@@ -46,6 +48,26 @@ mod tests {
         let b = ArtifactKeyInput {
             features: vec!["a".to_string(), "b".to_string()],
             ..a.clone()
+        };
+
+        assert_eq!(a.digest_hex(), b.digest_hex());
+    }
+
+    #[test]
+    fn digest_is_stable_when_features_repeat_or_hash_case_differs() {
+        let a = ArtifactKeyInput {
+            source_hash_hex: "AbC123".to_string(),
+            compiler_version: "2.14.0".to_string(),
+            profile: "dev".to_string(),
+            features: vec!["b".to_string(), "a".to_string(), "a".to_string()],
+            target_kind: "lib".to_string(),
+        };
+        let b = ArtifactKeyInput {
+            source_hash_hex: "abc123".to_string(),
+            compiler_version: "2.14.0".to_string(),
+            profile: "dev".to_string(),
+            features: vec!["a".to_string(), "b".to_string()],
+            target_kind: "lib".to_string(),
         };
 
         assert_eq!(a.digest_hex(), b.digest_hex());

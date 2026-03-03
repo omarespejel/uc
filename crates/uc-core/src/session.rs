@@ -12,26 +12,39 @@ pub struct SessionInput {
     pub target_family: String,
 }
 
+#[derive(Debug, Serialize)]
+struct NormalizedSessionInput<'a> {
+    workspace_root: &'a str,
+    compiler_version: &'a str,
+    profile: &'a str,
+    features: Vec<String>,
+    cfg_set: Vec<String>,
+    plugin_signature: &'a str,
+    target_family: &'a str,
+}
+
 impl SessionInput {
     pub fn deterministic_key_hex(&self) -> String {
         let mut features = self.features.clone();
         let mut cfg_set = self.cfg_set.clone();
-        features.sort();
-        cfg_set.sort();
+        features.sort_unstable();
+        features.dedup();
+        cfg_set.sort_unstable();
+        cfg_set.dedup();
 
-        let normalized = format!(
-            "workspace_root={}\ncompiler_version={}\nprofile={}\nfeatures={}\ncfg_set={}\nplugin_signature={}\ntarget_family={}",
-            self.workspace_root,
-            self.compiler_version,
-            self.profile,
-            features.join(","),
-            cfg_set.join(","),
-            self.plugin_signature,
-            self.target_family
-        );
+        let normalized = serde_json::to_vec(&NormalizedSessionInput {
+            workspace_root: &self.workspace_root,
+            compiler_version: &self.compiler_version,
+            profile: &self.profile,
+            features,
+            cfg_set,
+            plugin_signature: &self.plugin_signature,
+            target_family: &self.target_family,
+        })
+        .expect("session key normalization serialization must not fail");
 
         let mut hasher = Hasher::new();
-        hasher.update(normalized.as_bytes());
+        hasher.update(&normalized);
         hasher.finalize().to_hex().to_string()
     }
 }

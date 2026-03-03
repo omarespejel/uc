@@ -1,8 +1,9 @@
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -27,6 +28,7 @@ const DEFAULT_SUFFIXES: [&str; 5] = [
     ".contract_class.json",
     ".executable.json",
 ];
+const MAX_ARTIFACT_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 
 pub fn collect_artifact_digests(target_root: &Path) -> Result<Vec<ArtifactDigest>> {
     if !target_root.exists() {
@@ -53,15 +55,13 @@ pub fn collect_artifact_digests(target_root: &Path) -> Result<Vec<ArtifactDigest
             continue;
         }
 
-        let bytes = fs::read(path)?;
-        let mut hasher = Hasher::new();
-        hasher.update(&bytes);
+        let (blake3_hex, size_bytes) = hash_file_with_limit(path)?;
 
         let relative = relative_path(target_root, path);
         digests.push(ArtifactDigest {
             relative_path: relative,
-            blake3_hex: hasher.finalize().to_hex().to_string(),
-            size_bytes: bytes.len() as u64,
+            blake3_hex,
+            size_bytes,
         });
     }
 
@@ -119,6 +119,46 @@ fn relative_path(root: &Path, path: &Path) -> String {
 fn strip_prefix_safe(path: &Path, root: &Path) -> Option<String> {
     let rel: PathBuf = path.strip_prefix(root).ok()?.to_path_buf();
     Some(rel.to_string_lossy().to_string())
+}
+
+fn hash_file_with_limit(path: &Path) -> Result<(String, u64)> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    if metadata.len() > MAX_ARTIFACT_SIZE_BYTES {
+        bail!(
+            "artifact {} exceeds size limit ({} bytes > {} bytes)",
+            path.display(),
+            metadata.len(),
+            MAX_ARTIFACT_SIZE_BYTES
+        );
+    }
+
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Hasher::new();
+    let mut total = 0_u64;
+    let mut buf = [0_u8; 8192];
+
+    loop {
+        let read = reader
+            .read(&mut buf)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        total += read as u64;
+        if total > MAX_ARTIFACT_SIZE_BYTES {
+            bail!(
+                "artifact {} exceeds size limit while streaming ({} bytes > {} bytes)",
+                path.display(),
+                total,
+                MAX_ARTIFACT_SIZE_BYTES
+            );
+        }
+        hasher.update(&buf[..read]);
+    }
+
+    Ok((hasher.finalize().to_hex().to_string(), total))
 }
 
 #[cfg(test)]

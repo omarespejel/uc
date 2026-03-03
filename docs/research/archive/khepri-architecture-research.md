@@ -24,7 +24,7 @@ After deep exploration of five codebases (Scarb, Cairo compiler, Salsa, STWO-Cai
 
 ### 2.1 Scarb's Compilation Pipeline (Verified)
 
-```
+```text
 scarb build
   → ops::compile()                              [scarb/src/ops/compile.rs:119]
   → ops::resolve_workspace()                    [PubGrub resolver]
@@ -75,7 +75,7 @@ pub struct RootDatabase {
 
 **Six query groups, layered by dependency:**
 
-```
+```text
 FilesGroup          [INPUT: crate_configs, file_overrides, flags, cfg_set]
     ↓
 ParserGroup         [TRACKED: file_syntax, file_module_syntax, diagnostics]
@@ -147,7 +147,7 @@ UnitArtifactsFingerprint {
 ### 2.6 STWO Proving Pipeline (Verified)
 
 **Pipeline:**
-```
+```text
 Cairo source → Sierra → CASM → Cairo VM execution → Memory + Trace snapshot
   → Adapter (ProverInput) → STWO Prover → STARK Proof → Verifier
 ```
@@ -199,7 +199,7 @@ Result: **double the memory, double the parsing, zero shared work.**
 
 ### 3.2 The Solution: Shared Salsa Database Daemon
 
-```
+```text
                         ┌─────────────────────┐
                         │     KHEPRI DAEMON    │
                         │                      │
@@ -246,7 +246,7 @@ Result: **double the memory, double the parsing, zero shared work.**
 - Fast on localhost (Unix socket, no TCP overhead)
 
 **Lifecycle:**
-```
+```text
 khepri start     → starts daemon, creates RootDatabase, loads corelib
                    listens on ~/.khepri/sock (Unix) or localhost:17420 (TCP)
                    starts file watcher on workspace roots
@@ -366,7 +366,7 @@ impl CacheKey {
 
 **Three-tier lookup:**
 
-```
+```text
 1. In-memory (Salsa query cache)     → ~0ms    [Salsa handles this automatically]
 2. Local disk cache                   → ~5-50ms [content-addressed, ~/.khepri/cache/]
 3. Remote cache (S3/R2/GCS)          → ~50-500ms [shared across team/CI]
@@ -374,7 +374,7 @@ impl CacheKey {
 
 **Cache storage format:**
 
-```
+```text
 ~/.khepri/cache/
   objects/
     ab/cdef1234...  → Sierra JSON (zstd compressed)
@@ -419,13 +419,13 @@ fn start_watcher(state: Arc<KhepriState>, roots: Vec<PathBuf>) {
 Two integration paths (Phase 3, choose one):
 
 **Option A: Proxy mode (simpler)**
-```
+```text
 Editor → cairo-language-server → Khepri daemon (gRPC) → Salsa Database
 ```
 The existing `cairo-language-server` is modified to delegate queries to Khepri instead of maintaining its own database. Minimal changes to the LSP codebase.
 
 **Option B: Native mode (better performance)**
-```
+```text
 Editor → Khepri daemon (LSP protocol directly) → Salsa Database
 ```
 Khepri implements the LSP protocol itself, serving both build and IDE queries from the same database. More work but eliminates one process and all serialization overhead.
@@ -472,7 +472,7 @@ daemon-timeout = "30m"                       # auto-stop after idle
 
 **Modified compilation flow:**
 
-```
+```text
 scarb build
   → ops::compile()
   → [NEW] check if Khepri daemon is running
@@ -572,7 +572,7 @@ khepri build --verify-reproducible
 - zstd compression for artifacts
 
 **Files:**
-```
+```text
 khepri/
   Cargo.toml
   src/
@@ -600,7 +600,7 @@ khepri/
 - Graceful fallback if daemon crashes
 
 **Files (additions):**
-```
+```text
 khepri/src/
     daemon/
       mod.rs             # Daemon lifecycle (start, stop, status)
@@ -719,8 +719,8 @@ Khepri follows the same proven pattern: **persistent process + shared state + co
 
 ## Appendix A: Repository Structure Reference
 
-```
-/Users/espejelomar/StarkNet/compiler-starknet/
+```text
+<repo-root>/
 ├── scarb/                          # Build tool (Software Mansion)
 │   ├── scarb/src/
 │   │   ├── compiler/

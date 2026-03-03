@@ -18,7 +18,10 @@ For repeated builds in the same workspace:
 1. Benchmark report across matrix workloads.
 2. Artifact hash comparator report.
 3. Diagnostics comparator report.
-4. Reliability report for fallback and daemon restart behavior.
+4. Reliability report proving:
+   - 100/100 consecutive `uc build` runs complete without crash.
+   - on forced cache read failure, build falls back to fresh build with correct artifacts.
+   - process restart preserves correctness gate outcomes (no artifact mismatches, diagnostics >= 99.5%).
 
 ## Current Execution Hooks
 - Baseline benchmark harness: `benchmarks/scripts/run_local_benchmarks.sh`

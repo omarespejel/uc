@@ -2,7 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-WORKSPACE_ROOT="${WORKSPACE_ROOT:-/Users/espejelomar/StarkNet/compiler-starknet}"
+DEFAULT_WORKSPACE_ROOT="$(cd "$ROOT_DIR/.." && pwd)"
+WORKSPACE_ROOT="${WORKSPACE_ROOT:-$DEFAULT_WORKSPACE_ROOT}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR="$ROOT_DIR/benchmarks/results"
 SUMMARY_MD="$OUT_DIR/compare-summary-$STAMP.md"
@@ -16,7 +17,8 @@ UC_BIN="$ROOT_DIR/target/debug/uc"
 run_case() {
   local name="$1"
   local manifest="$2"
-  local output="$OUT_DIR/compare-${name}-$STAMP.json"
+  local output_rel="benchmarks/results/compare-${name}-$STAMP.json"
+  local output="$ROOT_DIR/$output_rel"
 
   "$UC_BIN" compare-build \
     --manifest-path "$manifest" \
@@ -31,6 +33,7 @@ WORKSPACES_MANIFEST="$WORKSPACE_ROOT/scarb/examples/workspaces/Scarb.toml"
 
 if [[ ! -f "$HELLO_MANIFEST" || ! -f "$WORKSPACES_MANIFEST" ]]; then
   echo "Expected benchmark manifests not found under $WORKSPACE_ROOT" >&2
+  echo "Hint: set WORKSPACE_ROOT or pass WORKSPACE_ROOT=<path> where scarb/examples exists." >&2
   exit 1
 fi
 
@@ -53,8 +56,8 @@ WS_JSON="$(run_case "workspaces" "$WORKSPACES_MANIFEST")"
   done
   echo
   echo "## Reports"
-  echo "- $HELLO_JSON"
-  echo "- $WS_JSON"
+  echo "- benchmarks/results/$(basename "$HELLO_JSON")"
+  echo "- benchmarks/results/$(basename "$WS_JSON")"
 } > "$SUMMARY_MD"
 
 echo "Comparator summary: $SUMMARY_MD"
