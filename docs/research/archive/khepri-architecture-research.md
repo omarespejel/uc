@@ -522,7 +522,7 @@ match &scarb_db {
 
 ### 5.3 What Does NOT Change in Scarb
 
-- CLI interface (`scarb build`, `scarb test`, etc.)
+- CLI (`scarb build`, `scarb test`, etc.)
 - Manifest format (`Scarb.toml`)
 - PubGrub dependency resolution
 - Plugin system (snforge, sncast)

@@ -102,8 +102,8 @@ struct BenchmarkArgs {
     #[arg(long, default_value_t = 3)]
     cold_runs: u32,
 
-    #[arg(long, default_value = ".")]
-    workspace_root: String,
+    #[arg(long)]
+    workspace_root: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -328,7 +328,8 @@ fn run_benchmark(args: BenchmarkArgs) -> Result<()> {
         bail!("benchmark script not found at {}", script.display());
     }
 
-    let status = Command::new(&script)
+    let mut command = Command::new(&script);
+    command
         .arg("--matrix")
         .arg(args.matrix.as_str())
         .arg("--tool")
@@ -336,9 +337,11 @@ fn run_benchmark(args: BenchmarkArgs) -> Result<()> {
         .arg("--runs")
         .arg(args.runs.to_string())
         .arg("--cold-runs")
-        .arg(args.cold_runs.to_string())
-        .arg("--workspace-root")
-        .arg(args.workspace_root)
+        .arg(args.cold_runs.to_string());
+    if let Some(workspace_root) = args.workspace_root {
+        command.arg("--workspace-root").arg(workspace_root);
+    }
+    let status = command
         .status()
         .context("failed to execute benchmark script")?;
 

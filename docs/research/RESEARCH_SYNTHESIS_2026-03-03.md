@@ -8,7 +8,7 @@ This synthesis consolidates all prior deep research completed in this repository
 2. Cairo compiler already uses Salsa incremental query groups and supports snapshotting.
 3. Existing Scarb incremental caching is artifact/fingerprint-oriented but not process-persistent.
 4. Warm-path latency opportunity is primarily from session/state reuse, not resolver rewrite alone.
-5. Proving workloads have high ROI for cache reuse, but should follow after core build proof.
+5. Proving workloads have high ROI for cache reuse, but should follow core build proof.
 
 ## Measured Signals From Prior Runs
 - Large warm-vs-cold gaps on heavy test flows.

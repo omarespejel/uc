@@ -24,12 +24,12 @@ jobs:
           chmod +x benchmarks/scripts/run_local_benchmarks.sh
           ./benchmarks/scripts/run_local_benchmarks.sh --matrix smoke --tool scarb
 
+      - name: Build uc CLI
+        run: cargo build -p uc-cli
+
       - name: Run smoke benchmark matrix (uc engine)
         run: |
           ./benchmarks/scripts/run_local_benchmarks.sh --matrix smoke --tool uc
-
-      - name: Build uc CLI
-        run: cargo build -p uc-cli
 
       - name: Run smoke compare-build gate
         run: |
