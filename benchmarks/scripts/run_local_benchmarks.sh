@@ -19,6 +19,7 @@ OUT_MD=""
 TMP_DIR="$(mktemp -d)"
 UC_BIN="$ROOT_DIR/target/debug/uc"
 UC_DAEMON_SOCKET_PATH="${UC_DAEMON_SOCKET_PATH:-$TMP_DIR/uc-daemon.sock}"
+export UC_DAEMON_SOCKET_PATH
 
 cleanup() {
   if [[ "$TOOL" == "uc" && -x "$UC_BIN" ]]; then
