@@ -428,6 +428,8 @@ struct DaemonBuildRequest {
     offline: bool,
     release: bool,
     profile: Option<String>,
+    #[serde(default)]
+    async_cache_persist: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -715,6 +717,11 @@ fn max_cache_bytes() -> u64 {
 fn fail_on_async_cache_error() -> bool {
     static VALUE: OnceLock<bool> = OnceLock::new();
     *VALUE.get_or_init(|| parse_env_bool("UC_FAIL_ON_ASYNC_CACHE_ERROR", false))
+}
+
+fn daemon_async_cache_persist_enabled() -> bool {
+    static VALUE: OnceLock<bool> = OnceLock::new();
+    *VALUE.get_or_init(|| parse_env_bool("UC_DAEMON_ASYNC_CACHE_PERSIST", false))
 }
 
 fn should_log_phase_telemetry() -> bool {
@@ -1216,7 +1223,11 @@ fn try_uc_build_via_daemon(
             return Ok(None);
         }
 
-        let request = DaemonRequest::Build(daemon_build_request_from_common(common, manifest_path));
+        let request = DaemonRequest::Build(daemon_build_request_from_common(
+            common,
+            manifest_path,
+            daemon_async_cache_persist_enabled(),
+        ));
         let response = match daemon_request(&socket_path, &request) {
             Ok(response) => response,
             Err(err) => {
@@ -1300,6 +1311,7 @@ fn try_uc_metadata_via_daemon(
 fn daemon_build_request_from_common(
     common: &BuildCommonArgs,
     manifest_path: &Path,
+    async_cache_persist: bool,
 ) -> DaemonBuildRequest {
     DaemonBuildRequest {
         manifest_path: manifest_path.display().to_string(),
@@ -1309,6 +1321,7 @@ fn daemon_build_request_from_common(
         offline: common.offline,
         release: common.release,
         profile: common.profile.clone(),
+        async_cache_persist,
     }
 }
 
@@ -1370,7 +1383,7 @@ fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildRespon
         &profile,
         &session_key,
         true,
-        true,
+        request.async_cache_persist,
     )?;
 
     Ok(DaemonBuildResponse {
@@ -3652,6 +3665,58 @@ mod tests {
         );
         assert_eq!(restored.daemon_mode as u8, DaemonModeArg::Off as u8);
         assert!(request.capture_output);
+    }
+
+    #[test]
+    fn daemon_build_request_roundtrip_preserves_async_cache_persist() {
+        let common = BuildCommonArgs {
+            manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
+            package: Some("demo".to_string()),
+            workspace: true,
+            features: vec!["feature_a".to_string(), "feature_b".to_string()],
+            offline: true,
+            release: false,
+            profile: Some("dev".to_string()),
+        };
+        let request =
+            daemon_build_request_from_common(&common, Path::new("/tmp/workspace/Scarb.toml"), true);
+        let restored = common_args_from_daemon_request(&request);
+
+        assert!(request.async_cache_persist);
+        assert_eq!(restored.package, common.package);
+        assert_eq!(restored.workspace, common.workspace);
+        assert_eq!(restored.features, common.features);
+        assert_eq!(restored.offline, common.offline);
+        assert_eq!(restored.release, common.release);
+        assert_eq!(restored.profile, common.profile);
+    }
+
+    #[test]
+    fn daemon_build_request_serialization_supports_async_cache_persist_wire_field() {
+        let request = DaemonRequest::Build(DaemonBuildRequest {
+            manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
+            package: None,
+            workspace: false,
+            features: vec!["feature_a".to_string()],
+            offline: false,
+            release: false,
+            profile: None,
+            async_cache_persist: true,
+        });
+        let json = serde_json::to_string(&request).expect("failed to encode request");
+        assert!(json.contains("\"type\":\"build\""));
+        assert!(json.contains("\"async_cache_persist\":true"));
+
+        let decoded: DaemonRequest =
+            serde_json::from_str(&json).expect("failed to decode daemon request");
+        match decoded {
+            DaemonRequest::Build(payload) => {
+                assert!(payload.async_cache_persist);
+                assert_eq!(payload.manifest_path, "/tmp/workspace/Scarb.toml");
+                assert_eq!(payload.features, vec!["feature_a".to_string()]);
+            }
+            _ => panic!("expected build request"),
+        }
     }
 
     #[test]
