@@ -23,6 +23,10 @@
 5. `uc session-key`
 - Generates deterministic session key from normalized input fields.
 
+6. `uc migrate`
+- Analyzes `Scarb.toml` and emits a migration readiness report.
+- Optional `--emit-uc-toml <path>` generates a starter `Uc.toml` scaffold.
+
 ## Current Engine Note
 `uc build` currently uses `engine=scarb` as the bootstrap execution backend. This is intentional for phased correctness gating before native engine swap.
 

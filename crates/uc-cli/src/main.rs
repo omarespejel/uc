@@ -6,6 +6,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use toml::Value as TomlValue;
 use uc_core::artifacts::{
     collect_artifact_digests, compare_artifact_sets, ArtifactDigest, ArtifactMismatch,
 };
@@ -27,6 +28,7 @@ enum Commands {
     Build(BuildArgs),
     Metadata(MetadataArgs),
     CompareBuild(CompareBuildArgs),
+    Migrate(MigrateArgs),
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -162,6 +164,18 @@ struct CompareBuildArgs {
     clean_before_each: bool,
 }
 
+#[derive(Args, Debug)]
+struct MigrateArgs {
+    #[arg(long)]
+    manifest_path: Option<PathBuf>,
+
+    #[arg(long)]
+    report_path: Option<PathBuf>,
+
+    #[arg(long)]
+    emit_uc_toml: Option<PathBuf>,
+}
+
 #[derive(Debug)]
 struct CommandRun {
     command: Vec<String>,
@@ -218,6 +232,21 @@ struct CompareBuildReport {
     passed: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct MigrationReport {
+    generated_at_epoch_ms: u128,
+    manifest_path: String,
+    workspace_root: String,
+    package_name: Option<String>,
+    package_version: Option<String>,
+    edition: Option<String>,
+    dependency_count: usize,
+    dev_dependency_count: usize,
+    unknown_sections: Vec<String>,
+    warnings: Vec<String>,
+    suggested_next_steps: Vec<String>,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -227,6 +256,7 @@ fn main() -> Result<()> {
         Commands::Build(args) => run_build(args),
         Commands::Metadata(args) => run_metadata(args),
         Commands::CompareBuild(args) => run_compare_build(args),
+        Commands::Migrate(args) => run_migrate(args),
     }
 }
 
@@ -345,6 +375,122 @@ fn run_metadata(args: MetadataArgs) -> Result<()> {
 
     if run.exit_code != 0 {
         bail!("metadata failed with exit code {}", run.exit_code);
+    }
+
+    Ok(())
+}
+
+fn run_migrate(args: MigrateArgs) -> Result<()> {
+    let manifest_path = resolve_manifest_path(&args.manifest_path)?;
+    let workspace_root = manifest_path
+        .parent()
+        .context("manifest path has no parent")?
+        .to_path_buf();
+    let raw = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+    let parsed: TomlValue = raw
+        .parse()
+        .with_context(|| format!("failed to parse TOML in {}", manifest_path.display()))?;
+
+    let package = parsed.get("package").and_then(TomlValue::as_table);
+    let package_name = package
+        .and_then(|tbl| tbl.get("name"))
+        .and_then(TomlValue::as_str)
+        .map(str::to_string);
+    let package_version = package
+        .and_then(|tbl| tbl.get("version"))
+        .and_then(TomlValue::as_str)
+        .map(str::to_string);
+    let edition = package
+        .and_then(|tbl| tbl.get("edition"))
+        .and_then(TomlValue::as_str)
+        .map(str::to_string);
+
+    let dependency_count = parsed
+        .get("dependencies")
+        .and_then(TomlValue::as_table)
+        .map_or(0, |tbl| tbl.len());
+    let dev_dependency_count = parsed
+        .get("dev-dependencies")
+        .and_then(TomlValue::as_table)
+        .map_or(0, |tbl| tbl.len());
+
+    let known_sections = [
+        "package",
+        "dependencies",
+        "dev-dependencies",
+        "workspace",
+        "target",
+        "scripts",
+        "tool",
+        "features",
+        "patch",
+        "cairo",
+        "lib",
+        "executable",
+        "test",
+    ];
+
+    let unknown_sections = parsed
+        .as_table()
+        .map(|tbl| {
+            let mut keys: Vec<String> = tbl
+                .keys()
+                .filter(|k| !known_sections.contains(&k.as_str()))
+                .cloned()
+                .collect();
+            keys.sort();
+            keys
+        })
+        .unwrap_or_default();
+
+    let mut warnings = Vec::new();
+    if package_name.is_none() {
+        warnings.push("missing [package].name".to_string());
+    }
+    if edition.is_none() {
+        warnings.push("missing [package].edition".to_string());
+    }
+    if !unknown_sections.is_empty() {
+        warnings.push(format!(
+            "unknown top-level sections detected: {}",
+            unknown_sections.join(", ")
+        ));
+    }
+
+    let report = MigrationReport {
+        generated_at_epoch_ms: epoch_ms()?,
+        manifest_path: manifest_path.display().to_string(),
+        workspace_root: workspace_root.display().to_string(),
+        package_name: package_name.clone(),
+        package_version: package_version.clone(),
+        edition: edition.clone(),
+        dependency_count,
+        dev_dependency_count,
+        unknown_sections,
+        warnings,
+        suggested_next_steps: vec![
+            "Run `uc compare-build` to establish artifact parity before migration.".to_string(),
+            "Define migration owner and target milestone for this workspace.".to_string(),
+            "Prepare `Uc.toml` and validate in CI shadow lane.".to_string(),
+        ],
+    };
+
+    let report_path = args
+        .report_path
+        .unwrap_or_else(|| workspace_root.join("uc-migration-report.json"));
+    write_json_report(&report_path, &report)?;
+    println!("Migration report: {}", report_path.display());
+
+    if let Some(uc_toml_path) = args.emit_uc_toml {
+        write_uc_toml(
+            &uc_toml_path,
+            &manifest_path,
+            package_name.as_deref(),
+            package_version.as_deref(),
+            edition.as_deref(),
+        )?;
+        println!("Generated Uc.toml scaffold: {}", uc_toml_path.display());
     }
 
     Ok(())
@@ -633,6 +779,31 @@ fn scarb_version_line() -> Result<String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let first = stdout.lines().next().unwrap_or("scarb unknown").trim();
     Ok(first.to_string())
+}
+
+fn write_uc_toml(
+    path: &Path,
+    source_manifest: &Path,
+    package_name: Option<&str>,
+    package_version: Option<&str>,
+    edition: Option<&str>,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+
+    let name = package_name.unwrap_or("unknown-package");
+    let version = package_version.unwrap_or("0.1.0");
+    let edition = edition.unwrap_or("2024_07");
+
+    let body = format!(
+        "[project]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"{edition}\"\n\n[source]\nscarb_manifest = \"{}\"\n",
+        source_manifest.display()
+    );
+
+    fs::write(path, body).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
 }
 
 fn write_json_report<T: Serialize>(path: &Path, value: &T) -> Result<()> {

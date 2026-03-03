@@ -35,6 +35,7 @@ make benchmark-local
 make compare-local
 cargo run -p uc-cli -- build --manifest-path /path/to/Scarb.toml
 cargo run -p uc-cli -- compare-build --manifest-path /path/to/Scarb.toml
+cargo run -p uc-cli -- migrate --manifest-path /path/to/Scarb.toml --emit-uc-toml /path/to/Uc.toml
 ```
 
 ## Tooling
