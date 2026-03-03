@@ -219,7 +219,7 @@ Dual-run mode in CI:
 
 ## 7. Integration Guidance for Scarb
 
-- Treat Khepri as acceleration backend, not replacement.
+- Treat Khepri as acceleration backend, not platform.
 - Keep current CLI and manifest semantics unchanged.
 - Gate activation behind explicit opt-in:
   - `[tool.khepri].enabled = true` or `SCARB_KHEPRI=1`.

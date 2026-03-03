@@ -460,7 +460,7 @@ Since proving is 100-1000x slower than compilation, even a remote cache lookup a
 
 ### 5.1 Zero-Migration Path
 
-Khepri integrates as a **Scarb plugin/wrapper**, not a replacement:
+Khepri integrates as a **Scarb plugin/wrapper**, not a standalone rewrite:
 
 ```toml
 # Scarb.toml — opt-in to Khepri acceleration

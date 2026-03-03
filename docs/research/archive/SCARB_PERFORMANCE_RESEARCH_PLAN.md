@@ -1,7 +1,7 @@
 # Scarb Replacement Research Plan (Performance-First)
 
 ## 1. Goal
-Build a Scarb-compatible replacement focused on lower latency, lower network overhead, and better cache reuse for large Cairo workspaces.
+Build a Scarb-compatible next-generation compiler plan focused on lower latency, lower network overhead, and better cache reuse for large Cairo workspaces.
 
 Primary success criteria:
 - Keep existing `Scarb.toml` / `Scarb.lock` compatibility.
@@ -31,7 +31,7 @@ Primary success criteria:
 ### Compatibility risk already observed
 - Installed binary: `scarb 2.14.0`
 - `cairo/corelib/Scarb.toml` uses `edition = "2025_12"`, which fails on Scarb 2.14.0.
-- Meaning: replacement must support newer manifest/edition schema or it will block current Cairo repos.
+- Meaning: platform must support newer manifest/edition schema or it will block current Cairo repos.
 
 ### Baseline timings captured on this machine
 - `stwo_cairo_verifier`:
@@ -58,9 +58,9 @@ From Scarb upstream:
 ## 4. Replacement Strategy Choice
 
 ## Recommendation
-Do **not** do a hard from-scratch CLI replacement first.
+Do **not** do a hard from-scratch CLI rewrite first.
 
-Use a **hybrid replacement**:
+Use a **hybrid rollout**:
 1. Build a new high-performance core engine (resolver + cache + fetch scheduler + build planning).
 2. Keep a Scarb-compatible CLI/front-end surface during migration.
 3. Replace subsystems behind compatibility boundaries in phases.
@@ -158,7 +158,7 @@ Deliverable:
 
 ## Phase 4 (Week 9-12): Hardening + Rollout
 - Dual-run mode in CI:
-  - run both Scarb and replacement on same commits
+  - run both Scarb and platform on same commits
   - compare graph, artifacts, output metadata, exit status
 - Progressive rollout:
   - developer opt-in
@@ -181,7 +181,7 @@ Targets should be validated against Phase 0 baselines:
 - Control: implement versioned manifest parser + compatibility tests against latest Cairo repos.
 
 ### Risk: Lockfile semantic mismatch
-- Control: lockfile differential tests (Scarb vs replacement) on real projects.
+- Control: lockfile differential tests (Scarb vs uc) on real projects.
 
 ### Risk: Plugin/proc-macro edge cases
 - Control: keep Scarb fallback for unsupported macro/plugin scenarios until parity suite is green.

@@ -32,7 +32,7 @@ What this is not:
 
 ## Alternatives Considered
 
-1. **Rewrite/replace Scarb fully**
+1. **Rewrite/modernize Scarb fully**
 - Pros: maximum architectural freedom.
 - Cons: high parity risk, long timeline, ecosystem migration burden.
 - Decision: rejected for initial delivery.
