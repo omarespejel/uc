@@ -4,7 +4,6 @@ zmodload zsh/datetime
 
 SCRIPT_DIR="$(cd "$(dirname "${(%):-%N}")" && pwd -P)"
 ROOT_DIR="$(git -C "$SCRIPT_DIR/../.." rev-parse --show-toplevel 2>/dev/null || (cd "$SCRIPT_DIR/../.." && pwd -P))"
-DEFAULT_WORKSPACE_ROOT="$(cd "$ROOT_DIR/.." && pwd -P)"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-}"
 MATRIX="${MATRIX:-research}"
 TOOL="${TOOL:-scarb}"
@@ -375,7 +374,9 @@ run_metadata_offline_warm() {
 
 if [[ "$MATRIX" == "research" ]]; then
   if [[ -z "$WORKSPACE_ROOT" ]]; then
-    WORKSPACE_ROOT="$DEFAULT_WORKSPACE_ROOT"
+    echo "WORKSPACE_ROOT is required for research matrix runs." >&2
+    echo "Set WORKSPACE_ROOT to a path where scarb/examples exists." >&2
+    exit 1
   fi
   WORKSPACE_ROOT="$(cd "$WORKSPACE_ROOT" && pwd -P)"
 

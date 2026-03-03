@@ -1201,7 +1201,6 @@ fn run_build_with_uc_cache(
         "cache objects directory",
     )?;
     ensure_path_within_root(&canonical_workspace_root, &entry_path, "cache entry path")?;
-    let _cache_lock = acquire_cache_lock(&cache_root)?;
     let fingerprint = compute_build_fingerprint(
         &canonical_workspace_root,
         manifest_path,
@@ -1211,34 +1210,37 @@ fn run_build_with_uc_cache(
     )?;
 
     let restore_start = Instant::now();
-    if let Some(entry) = load_cache_entry(&entry_path)? {
-        if entry.schema_version == BUILD_CACHE_SCHEMA_VERSION
-            && entry.profile == profile
-            && entry.fingerprint == fingerprint
-            && restore_cached_artifacts(
-                &canonical_workspace_root,
-                profile,
-                &objects_dir,
-                &entry.artifacts,
-            )?
-        {
-            let run = CommandRun {
-                command: vec![
-                    "uc".to_string(),
-                    "build".to_string(),
-                    "--engine".to_string(),
-                    "uc".to_string(),
-                    "--cache-hit".to_string(),
-                ],
-                exit_code: 0,
-                elapsed_ms: restore_start.elapsed().as_secs_f64() * 1000.0,
-                stdout: format!(
-                    "uc: cache hit, restored {} artifacts\n",
-                    entry.artifacts.len()
-                ),
-                stderr: String::new(),
-            };
-            return Ok((run, true, fingerprint));
+    {
+        let _cache_lock = acquire_cache_lock(&cache_root)?;
+        if let Some(entry) = load_cache_entry(&entry_path)? {
+            if entry.schema_version == BUILD_CACHE_SCHEMA_VERSION
+                && entry.profile == profile
+                && entry.fingerprint == fingerprint
+                && restore_cached_artifacts(
+                    &canonical_workspace_root,
+                    profile,
+                    &objects_dir,
+                    &entry.artifacts,
+                )?
+            {
+                let run = CommandRun {
+                    command: vec![
+                        "uc".to_string(),
+                        "build".to_string(),
+                        "--engine".to_string(),
+                        "uc".to_string(),
+                        "--cache-hit".to_string(),
+                    ],
+                    exit_code: 0,
+                    elapsed_ms: restore_start.elapsed().as_secs_f64() * 1000.0,
+                    stdout: format!(
+                        "uc: cache hit, restored {} artifacts\n",
+                        entry.artifacts.len()
+                    ),
+                    stderr: String::new(),
+                };
+                return Ok((run, true, fingerprint));
+            }
         }
     }
 
@@ -1247,6 +1249,7 @@ fn run_build_with_uc_cache(
 
     if run.exit_code == 0 {
         let artifacts = collect_profile_artifacts_fast(&canonical_workspace_root, profile)?;
+        let _cache_lock = acquire_cache_lock(&cache_root)?;
         persist_cache_entry(
             &canonical_workspace_root,
             profile,
@@ -1429,6 +1432,16 @@ fn restore_cached_artifacts(
 }
 
 fn hash_file_blake3(path: &Path) -> Result<String> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    if metadata.len() > MAX_CACHEABLE_ARTIFACT_BYTES {
+        bail!(
+            "file {} exceeds hashing size limit ({} bytes > {} bytes)",
+            path.display(),
+            metadata.len(),
+            MAX_CACHEABLE_ARTIFACT_BYTES
+        );
+    }
     let file =
         fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let mut reader = BufReader::new(file);
@@ -1454,6 +1467,12 @@ fn metadata_modified_unix_ms(metadata: &fs::Metadata) -> Result<u64> {
         .context("failed to read file modification time")?;
     let since_epoch = modified.duration_since(UNIX_EPOCH).unwrap_or_default();
     u64::try_from(since_epoch.as_millis()).context("file modified time overflowed u64")
+}
+
+fn normalize_fingerprint_path(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let without_windows_prefix = raw.strip_prefix("\\\\?\\").unwrap_or(&raw);
+    without_windows_prefix.replace('\\', "/")
 }
 
 fn load_fingerprint_index(path: &Path) -> Result<FingerprintIndex> {
@@ -1506,7 +1525,7 @@ fn compute_build_fingerprint(
     let canonical_manifest = manifest_path
         .canonicalize()
         .with_context(|| format!("failed to canonicalize {}", manifest_path.display()))?;
-    hasher.update(canonical_manifest.display().to_string().as_bytes());
+    hasher.update(normalize_fingerprint_path(&canonical_manifest).as_bytes());
     hasher.update(profile.as_bytes());
     hasher.update(common.package.as_deref().unwrap_or("*").as_bytes());
     hasher.update(if common.workspace {
