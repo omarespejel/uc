@@ -99,11 +99,11 @@ fn scarb_available() -> bool {
 
 fn run_uc_build_for_root(
     root: &Path,
+    manifest_path: &Path,
     report_tag: &str,
     daemon_mode: &str,
     daemon_socket_path: Option<&Path>,
 ) -> (Output, BuildReport) {
-    let manifest = root.join("Scarb.toml");
     let report_path = root.join(".uc").join(format!("report-{report_tag}.json"));
     if let Some(parent) = report_path.parent() {
         fs::create_dir_all(parent).expect("failed to create report directory");
@@ -118,7 +118,7 @@ fn run_uc_build_for_root(
         .arg(daemon_mode)
         .arg("--offline")
         .arg("--manifest-path")
-        .arg(&manifest)
+        .arg(manifest_path)
         .arg("--report-path")
         .arg(&report_path);
     if let Some(socket_path) = daemon_socket_path {
@@ -141,7 +141,8 @@ fn run_uc_build_for_root(
 }
 
 fn run_uc_build(workspace: &TestWorkspace, report_tag: &str) -> (Output, BuildReport) {
-    run_uc_build_for_root(&workspace.root, report_tag, "off", None)
+    let manifest = workspace.root.join("Scarb.toml");
+    run_uc_build_for_root(&workspace.root, &manifest, report_tag, "off", None)
 }
 
 fn run_uc_daemon_stop(socket_path: &Path) -> Output {
@@ -316,10 +317,24 @@ fn integration_concurrent_builds_complete_and_cache_recovers_to_hit() {
     let root_a = workspace.root.clone();
     let root_b = workspace.root.clone();
 
-    let worker_a =
-        thread::spawn(move || run_uc_build_for_root(&root_a, "concurrent-a", "off", None));
-    let worker_b =
-        thread::spawn(move || run_uc_build_for_root(&root_b, "concurrent-b", "off", None));
+    let worker_a = thread::spawn(move || {
+        run_uc_build_for_root(
+            &root_a,
+            &root_a.join("Scarb.toml"),
+            "concurrent-a",
+            "off",
+            None,
+        )
+    });
+    let worker_b = thread::spawn(move || {
+        run_uc_build_for_root(
+            &root_b,
+            &root_b.join("Scarb.toml"),
+            "concurrent-b",
+            "off",
+            None,
+        )
+    });
 
     let (output_a, report_a) = worker_a
         .join()
@@ -369,8 +384,10 @@ fn integration_daemon_restart_preserves_cache_hit_correctness() {
         output_to_utf8(&start_output)
     );
 
+    let manifest = workspace.root.join("Scarb.toml");
     let (first_output, first_report) = run_uc_build_for_root(
         &workspace.root,
+        &manifest,
         "daemon-first",
         "require",
         Some(&socket_path),
@@ -384,6 +401,7 @@ fn integration_daemon_restart_preserves_cache_hit_correctness() {
 
     let (second_output, second_report) = run_uc_build_for_root(
         &workspace.root,
+        &manifest,
         "daemon-second",
         "require",
         Some(&socket_path),
@@ -410,6 +428,7 @@ fn integration_daemon_restart_preserves_cache_hit_correctness() {
 
     let (after_restart_output, after_restart_report) = run_uc_build_for_root(
         &workspace.root,
+        &manifest,
         "daemon-after-restart",
         "require",
         Some(&socket_path),
@@ -422,4 +441,34 @@ fn integration_daemon_restart_preserves_cache_hit_correctness() {
 
     let _ = run_uc_daemon_stop(&socket_path);
     let _ = fs::remove_file(&socket_path);
+}
+
+#[test]
+fn integration_manifest_path_variants_preserve_fingerprint_determinism() {
+    let _guard = serial_guard();
+    if !scarb_available() {
+        eprintln!(
+            "skipping integration_manifest_path_variants_preserve_fingerprint_determinism: scarb not available"
+        );
+        return;
+    }
+    let workspace = make_test_workspace("manifest-path-determinism");
+    let abs_manifest = workspace.root.join("Scarb.toml");
+    let rel_manifest = PathBuf::from("./Scarb.toml");
+
+    let (abs_output, abs_report) =
+        run_uc_build_for_root(&workspace.root, &abs_manifest, "manifest-abs", "off", None);
+    assert_success(&abs_output, "absolute manifest build");
+
+    let (rel_output, rel_report) =
+        run_uc_build_for_root(&workspace.root, &rel_manifest, "manifest-rel", "off", None);
+    assert_success(&rel_output, "relative manifest build");
+    assert!(
+        rel_report.cache_hit,
+        "relative path build should hit existing cache"
+    );
+    assert_eq!(
+        abs_report.fingerprint, rel_report.fingerprint,
+        "fingerprint must be stable across equivalent manifest path spellings"
+    );
 }
