@@ -1705,6 +1705,95 @@ fn execute_daemon_metadata(request: DaemonMetadataRequest) -> Result<DaemonMetad
     Ok(DaemonMetadataResponse { run })
 }
 
+fn try_local_uc_cache_hit(
+    common: &BuildCommonArgs,
+    manifest_path: &Path,
+    workspace_root: &Path,
+    profile: &str,
+    session_key: &str,
+) -> Result<Option<(CommandRun, String, BuildPhaseTelemetry)>> {
+    let mut telemetry = BuildPhaseTelemetry::default();
+    let canonical_workspace_root = workspace_root.to_path_buf();
+    validate_hex_digest("session key", session_key, SESSION_KEY_LEN)?;
+    let cache_root = canonical_workspace_root.join(".uc/cache");
+    ensure_path_within_root(&canonical_workspace_root, &cache_root, "cache root")?;
+    let objects_dir = cache_root.join("objects");
+    let entry_path = cache_root.join("build").join(format!("{session_key}.json"));
+    ensure_path_within_root(
+        &canonical_workspace_root,
+        &objects_dir,
+        "cache objects directory",
+    )?;
+    ensure_path_within_root(&canonical_workspace_root, &entry_path, "cache entry path")?;
+
+    let fingerprint_start = Instant::now();
+    let fingerprint = compute_build_fingerprint(
+        &canonical_workspace_root,
+        manifest_path,
+        common,
+        profile,
+        Some(&cache_root),
+    )?;
+    telemetry.fingerprint_ms = fingerprint_start.elapsed().as_secs_f64() * 1000.0;
+
+    let cache_lookup_start = Instant::now();
+    let cached_entry = if let Some(entry) = load_cache_entry_cached(&entry_path)? {
+        if entry.schema_version == BUILD_CACHE_SCHEMA_VERSION
+            && entry.profile == profile
+            && entry.fingerprint == fingerprint
+        {
+            Some(entry)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    telemetry.cache_lookup_ms = cache_lookup_start.elapsed().as_secs_f64() * 1000.0;
+
+    let Some(entry) = cached_entry else {
+        return Ok(None);
+    };
+
+    let restore_start = Instant::now();
+    let restored = cached_artifacts_already_materialized(
+        &canonical_workspace_root,
+        profile,
+        &cache_root,
+        &entry.artifacts,
+    )? || restore_cached_artifacts(
+        &canonical_workspace_root,
+        profile,
+        &cache_root,
+        &objects_dir,
+        &entry.artifacts,
+    )?;
+    telemetry.cache_restore_ms = restore_start.elapsed().as_secs_f64() * 1000.0;
+    if !restored {
+        return Ok(None);
+    }
+    let total_elapsed_ms =
+        telemetry.fingerprint_ms + telemetry.cache_lookup_ms + telemetry.cache_restore_ms;
+    let run = CommandRun {
+        command: vec![
+            "uc".to_string(),
+            "build".to_string(),
+            "--engine".to_string(),
+            "uc".to_string(),
+            "--cache-hit".to_string(),
+            "--local-probe".to_string(),
+        ],
+        exit_code: 0,
+        elapsed_ms: total_elapsed_ms,
+        stdout: format!(
+            "uc: cache hit, restored {} artifacts\n",
+            entry.artifacts.len()
+        ),
+        stderr: String::new(),
+    };
+    Ok(Some((run, fingerprint, telemetry)))
+}
+
 fn run_build_with_uc_cache(
     common: &BuildCommonArgs,
     manifest_path: &Path,

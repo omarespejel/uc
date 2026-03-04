@@ -29,18 +29,18 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             (run, false, fingerprint)
         }
         EngineArg::Uc => {
+            let local_session_key =
+                build_session_input(&common, &manifest_path, &profile)?.deterministic_key_hex();
             let run_local =
-                || -> Result<(CommandRun, bool, String, String, BuildPhaseTelemetry)> {
+                |session_key: &str| -> Result<(CommandRun, bool, String, BuildPhaseTelemetry)> {
                     // Local UC builds execute Scarb directly in-process and must enforce the toolchain gate.
                     validate_scarb_toolchain()?;
-                    let local_session_key = build_session_input(&common, &manifest_path, &profile)?
-                        .deterministic_key_hex();
                     let (run, cache_hit, fingerprint, telemetry) = run_build_with_uc_cache(
                         &common,
                         &manifest_path,
                         &workspace_root,
                         &profile,
-                        &local_session_key,
+                        session_key,
                         BuildRunOptions {
                             capture_output: false,
                             inherit_output_when_uncaptured: true,
@@ -48,38 +48,61 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             use_daemon_shared_cache: false,
                         },
                     )?;
-                    Ok((run, cache_hit, fingerprint, local_session_key, telemetry))
+                    Ok((run, cache_hit, fingerprint, telemetry))
                 };
 
             match daemon_mode {
                 DaemonModeArg::Off => {
-                    let (run, cache_hit, fingerprint, local_session_key, telemetry) = run_local()?;
-                    session_key = local_session_key;
+                    let (run, cache_hit, fingerprint, telemetry) = run_local(&local_session_key)?;
+                    session_key = local_session_key.clone();
                     phase_telemetry = Some(telemetry);
                     (run, cache_hit, fingerprint)
                 }
                 DaemonModeArg::Auto => {
-                    if let Some(response) = try_uc_build_via_daemon(&common, &manifest_path, true)?
+                    if let Some((run, fingerprint, telemetry)) = try_local_uc_cache_hit(
+                        &common,
+                        &manifest_path,
+                        &workspace_root,
+                        &profile,
+                        &local_session_key,
+                    )? {
+                        session_key = local_session_key.clone();
+                        phase_telemetry = Some(telemetry);
+                        (run, true, fingerprint)
+                    } else if let Some(response) =
+                        try_uc_build_via_daemon(&common, &manifest_path, true)?
                     {
                         daemon_used = true;
                         session_key = response.session_key;
                         phase_telemetry = Some(response.telemetry);
                         (response.run, response.cache_hit, response.fingerprint)
                     } else {
-                        let (run, cache_hit, fingerprint, local_session_key, telemetry) =
-                            run_local()?;
-                        session_key = local_session_key;
+                        let (run, cache_hit, fingerprint, telemetry) =
+                            run_local(&local_session_key)?;
+                        session_key = local_session_key.clone();
                         phase_telemetry = Some(telemetry);
                         (run, cache_hit, fingerprint)
                     }
                 }
                 DaemonModeArg::Require => {
-                    let response = try_uc_build_via_daemon(&common, &manifest_path, false)?
-                        .context("daemon mode is require but daemon is unavailable")?;
-                    daemon_used = true;
-                    session_key = response.session_key;
-                    phase_telemetry = Some(response.telemetry);
-                    (response.run, response.cache_hit, response.fingerprint)
+                    if let Some((run, fingerprint, telemetry)) = try_local_uc_cache_hit(
+                        &common,
+                        &manifest_path,
+                        &workspace_root,
+                        &profile,
+                        &local_session_key,
+                    )? {
+                        session_key = local_session_key.clone();
+                        phase_telemetry = Some(telemetry);
+                        (run, true, fingerprint)
+                    } else {
+                        let response = try_uc_build_via_daemon(&common, &manifest_path, false)?
+                            .context("daemon mode is require but daemon is unavailable")?;
+                        daemon_used = true;
+                        session_key = response.session_key;
+                        phase_telemetry = Some(response.telemetry);
+                        (response.run, response.cache_hit, response.fingerprint)
+                    }
                 }
             }
         }

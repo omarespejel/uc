@@ -98,12 +98,67 @@ fn scarb_available() -> bool {
         .unwrap_or(false)
 }
 
+fn scarb_version_line() -> String {
+    let output = Command::new("scarb")
+        .arg("--version")
+        .output()
+        .expect("failed to execute `scarb --version` in test");
+    assert!(
+        output.status.success(),
+        "`scarb --version` should succeed in test setup"
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or("scarb unknown")
+        .trim()
+        .to_string()
+}
+
 fn run_uc_build_for_root(
     root: &Path,
     manifest_path: &Path,
     report_tag: &str,
     daemon_mode: &str,
     daemon_socket_path: Option<&Path>,
+) -> (Output, BuildReport) {
+    run_uc_build_for_root_with_path_override(
+        root,
+        manifest_path,
+        report_tag,
+        daemon_mode,
+        daemon_socket_path,
+        None,
+    )
+}
+
+fn run_uc_build_for_root_with_path_override(
+    root: &Path,
+    manifest_path: &Path,
+    report_tag: &str,
+    daemon_mode: &str,
+    daemon_socket_path: Option<&Path>,
+    path_override: Option<&Path>,
+) -> (Output, BuildReport) {
+    run_uc_build_for_root_with_env_overrides(
+        root,
+        manifest_path,
+        report_tag,
+        daemon_mode,
+        daemon_socket_path,
+        path_override,
+        None,
+    )
+}
+
+fn run_uc_build_for_root_with_env_overrides(
+    root: &Path,
+    manifest_path: &Path,
+    report_tag: &str,
+    daemon_mode: &str,
+    daemon_socket_path: Option<&Path>,
+    path_override: Option<&Path>,
+    scarb_version_override: Option<&str>,
 ) -> (Output, BuildReport) {
     let report_path = root.join(".uc").join(format!("report-{report_tag}.json"));
     if let Some(parent) = report_path.parent() {
@@ -126,6 +181,14 @@ fn run_uc_build_for_root(
         command.env("UC_DAEMON_SOCKET_PATH", socket_path);
     } else {
         command.env_remove("UC_DAEMON_SOCKET_PATH");
+    }
+    if let Some(path) = path_override {
+        command.env("PATH", path);
+    }
+    if let Some(version) = scarb_version_override {
+        command.env("UC_SCARB_VERSION_LINE", version);
+    } else {
+        command.env_remove("UC_SCARB_VERSION_LINE");
     }
     let output = command.output().expect("failed to execute uc build");
     let report_bytes = fs::read(&report_path).unwrap_or_else(|err| {
@@ -619,5 +682,117 @@ fn integration_daemon_require_mode_fails_when_daemon_unavailable() {
         combined.contains("daemon mode is require but daemon is unavailable")
             || combined.contains("daemon build request failed"),
         "unexpected daemon require failure output: {combined}"
+    );
+}
+
+#[test]
+fn integration_daemon_auto_mode_local_hit_skips_daemon_and_missing_scarb() {
+    let _guard = serial_guard();
+    if !scarb_available() {
+        eprintln!(
+            "skipping integration_daemon_auto_mode_local_hit_skips_daemon_and_missing_scarb: scarb not available"
+        );
+        return;
+    }
+    let workspace = make_test_workspace("daemon-auto-local-hit");
+    let manifest = workspace.root.join("Scarb.toml");
+    let scarb_version = scarb_version_line();
+
+    let (seed_output, seed_report) =
+        run_uc_build_for_root(&workspace.root, &manifest, "auto-seed", "off", None);
+    assert_success(&seed_output, "seed build for daemon auto local-hit");
+    assert!(
+        !seed_report.cache_hit,
+        "seed build should miss before local-hit probe can be exercised"
+    );
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be after unix epoch")
+        .as_nanos();
+    let missing_socket = std::env::temp_dir().join(format!(
+        "uc-it-auto-local-hit-missing-daemon-{}-{nonce}.sock",
+        std::process::id()
+    ));
+    let no_scarb_path = std::env::temp_dir().join(format!(
+        "uc-it-no-scarb-path-{}-{nonce}",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&missing_socket);
+
+    let (probe_output, probe_report) = run_uc_build_for_root_with_env_overrides(
+        &workspace.root,
+        &manifest,
+        "auto-local-hit",
+        "auto",
+        Some(&missing_socket),
+        Some(&no_scarb_path),
+        Some(&scarb_version),
+    );
+    assert_success(&probe_output, "daemon auto local-hit probe");
+    assert!(
+        probe_report.cache_hit,
+        "daemon auto mode should hit local cache before daemon/local compile fallback"
+    );
+    let combined = output_to_utf8(&probe_output);
+    assert!(
+        !combined.contains("daemon request failed"),
+        "local probe hit should avoid daemon request path: {combined}"
+    );
+}
+
+#[test]
+fn integration_daemon_require_mode_local_hit_skips_missing_daemon_and_scarb() {
+    let _guard = serial_guard();
+    if !scarb_available() {
+        eprintln!(
+            "skipping integration_daemon_require_mode_local_hit_skips_missing_daemon_and_scarb: scarb not available"
+        );
+        return;
+    }
+    let workspace = make_test_workspace("daemon-require-local-hit");
+    let manifest = workspace.root.join("Scarb.toml");
+    let scarb_version = scarb_version_line();
+
+    let (seed_output, seed_report) =
+        run_uc_build_for_root(&workspace.root, &manifest, "require-seed", "off", None);
+    assert_success(&seed_output, "seed build for daemon require local-hit");
+    assert!(
+        !seed_report.cache_hit,
+        "seed build should miss before local-hit probe can be exercised"
+    );
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be after unix epoch")
+        .as_nanos();
+    let missing_socket = std::env::temp_dir().join(format!(
+        "uc-it-require-local-hit-missing-daemon-{}-{nonce}.sock",
+        std::process::id()
+    ));
+    let no_scarb_path = std::env::temp_dir().join(format!(
+        "uc-it-no-scarb-path-require-{}-{nonce}",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&missing_socket);
+
+    let (probe_output, probe_report) = run_uc_build_for_root_with_env_overrides(
+        &workspace.root,
+        &manifest,
+        "require-local-hit",
+        "require",
+        Some(&missing_socket),
+        Some(&no_scarb_path),
+        Some(&scarb_version),
+    );
+    assert_success(&probe_output, "daemon require local-hit probe");
+    assert!(
+        probe_report.cache_hit,
+        "daemon require mode should use local hit when artifacts are already cached"
+    );
+    let combined = output_to_utf8(&probe_output);
+    assert!(
+        !combined.contains("daemon mode is require but daemon is unavailable"),
+        "local probe hit should bypass daemon unavailability failure: {combined}"
     );
 }
