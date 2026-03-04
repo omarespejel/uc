@@ -2522,6 +2522,28 @@ edition = "2024_07"
 }
 
 #[test]
+fn compile_native_casm_contract_rejects_tiny_bytecode_limit() {
+    let fixture_contract = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "../../benchmarks/fixtures/scarb_smoke/target/dev/uc_smoke_token.contract_class.json",
+    );
+    let fixture_bytes = fs::read(&fixture_contract).unwrap_or_else(|err| {
+        panic!(
+            "failed to read starknet contract fixture {}: {err}",
+            fixture_contract.display()
+        )
+    });
+    let contract_class: ContractClass =
+        serde_json::from_slice(&fixture_bytes).expect("failed to decode contract class fixture");
+    let err = compile_native_casm_contract(contract_class, 1)
+        .expect_err("tiny CASM bytecode limit should fail for fixture contract");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("failed to compile native CASM contract class"),
+        "expected CASM compile failure context, got: {message}"
+    );
+}
+
+#[test]
 fn normalize_package_name_for_cairo_crate_sanitizes_toml_bare_key_shape() {
     assert_eq!(
         normalize_package_name_for_cairo_crate("cairo.contracts-2"),

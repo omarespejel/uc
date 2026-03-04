@@ -12,6 +12,7 @@ use cairo_lang_starknet::compile::compile_prepared_db as compile_starknet_prepar
 use cairo_lang_starknet::contract::find_contracts;
 use cairo_lang_starknet::starknet_plugin_suite;
 use cairo_lang_starknet_classes::casm_contract_class::CasmContractClass;
+use cairo_lang_starknet_classes::contract_class::ContractClass;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -108,6 +109,9 @@ const DEFAULT_UC_NATIVE_BUILD_MODE: &str = "off";
 const TOOLCHAIN_CHECK_CACHE_SCHEMA_VERSION: u32 = 1;
 const MAX_TOOLCHAIN_CHECK_CACHE_BYTES: u64 = 64 * 1024;
 const NATIVE_ARTIFACT_ID_TRUNC_HEX_LEN: usize = 13;
+/// Default Starknet CASM bytecode limit used by native compile.
+/// Matches the current Scarb/Cairo default and can be overridden with
+/// `UC_NATIVE_MAX_CASM_BYTECODE_SIZE` for network-specific tuning.
 const DEFAULT_NATIVE_MAX_CASM_BYTECODE_SIZE: usize = 81_290;
 const DEFAULT_SCARB_TOOLCHAIN_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
 const DAEMON_PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -2465,6 +2469,7 @@ fn build_native_compile_context(
     for section_name in ["dependencies", "dev-dependencies"] {
         if let Some(table) = manifest.get(section_name).and_then(TomlValue::as_table) {
             for dependency_name in table.keys() {
+                // Native compile currently supports only the Starknet plugin dependency surface.
                 if dependency_name != "starknet" {
                     bail!(
                         "native compile does not support [{}].{} yet",
@@ -2527,7 +2532,11 @@ fn build_native_compile_context(
     })
 }
 
-fn prune_native_target_outputs(target_dir: &Path, package_name: &str) -> Result<()> {
+fn prune_native_target_outputs(
+    target_dir: &Path,
+    package_name: &str,
+    keep_files: &BTreeSet<String>,
+) -> Result<()> {
     if !target_dir.exists() {
         return Ok(());
     }
@@ -2547,13 +2556,33 @@ fn prune_native_target_outputs(target_dir: &Path, package_name: &str) -> Result<
         let should_remove = file_name == sierra_name
             || file_name == artifacts_name
             || (file_name.starts_with(&format!("{package_name}_"))
-                && file_name.ends_with(".contract_class.json"));
+                && (file_name.ends_with(".contract_class.json")
+                    || file_name.ends_with(".compiled_contract_class.json")));
+        if keep_files.contains(&file_name) {
+            continue;
+        }
         if should_remove {
             fs::remove_file(entry.path())
                 .with_context(|| format!("failed to remove {}", entry.path().display()))?;
         }
     }
     Ok(())
+}
+
+fn compile_native_casm_contract(
+    contract_class: ContractClass,
+    max_casm_bytecode_size: usize,
+) -> Result<CasmContractClass> {
+    let extracted_program = contract_class
+        .extract_sierra_program(false)
+        .context("failed to extract native Sierra program for CASM emission")?;
+    CasmContractClass::from_contract_class(
+        contract_class,
+        extracted_program,
+        false,
+        max_casm_bytecode_size,
+    )
+    .context("failed to compile native CASM contract class")
 }
 
 fn run_native_build(
@@ -2591,7 +2620,6 @@ fn run_native_build_inner(
     let target_dir = workspace_root.join("target").join(profile);
     fs::create_dir_all(&target_dir)
         .with_context(|| format!("failed to create {}", target_dir.display()))?;
-    prune_native_target_outputs(&target_dir, &context.package_name)?;
 
     let mut db = RootDatabase::builder()
         .with_optimizations(Optimizations::enabled_with_default_movable_functions(
@@ -2609,19 +2637,23 @@ fn run_native_build_inner(
                 context.cairo_project_dir.display()
             )
         })?;
-    let crate_ids = CrateInput::into_crate_ids(&db, main_crate_inputs.clone());
-    let contracts = find_contracts(&db, &crate_ids);
-
     let mut compiler_config = CompilerConfig::default();
     compiler_config.diagnostics_reporter = compiler_config
         .diagnostics_reporter
         .with_crates(&main_crate_inputs);
+    let crate_ids = CrateInput::into_crate_ids(&db, main_crate_inputs);
+    let contracts = find_contracts(&db, &crate_ids);
 
     let artifact_count = if contracts.is_empty() {
         let program = compile_prepared_db_program(&db, crate_ids, compiler_config)
             .context("native cairo compile failed")?;
         let output_name = format!("{}.sierra", context.package_name);
-        fs::write(target_dir.join(&output_name), program.to_string())
+        let mut keep_files = BTreeSet::new();
+        keep_files.insert(output_name.clone());
+        prune_native_target_outputs(&target_dir, &context.package_name, &keep_files)?;
+        let output_path = target_dir.join(&output_name);
+        ensure_path_within_root(&target_dir, &output_path, "native sierra artifact path")?;
+        fs::write(&output_path, program.to_string())
             .with_context(|| format!("failed to write native artifact {}", output_name))?;
         1
     } else {
@@ -2635,6 +2667,8 @@ fn run_native_build_inner(
                 contract_classes.len()
             );
         }
+        let mut serialized_artifacts = Vec::with_capacity(contract_classes.len().saturating_mul(2));
+        let mut keep_files = BTreeSet::new();
         let mut contracts_manifest = Vec::with_capacity(contract_classes.len());
         for (contract, contract_class) in contracts.iter().zip(contract_classes.into_iter()) {
             let module_path = contract.submodule_id.full_path(&db);
@@ -2648,27 +2682,21 @@ fn run_native_build_inner(
                 "{}_{}.contract_class.json",
                 context.package_name, artifact_stem
             );
-            let artifact_path = target_dir.join(&artifact_file);
-            write_json_file_compact(&artifact_path, &contract_class)
-                .with_context(|| format!("failed to write {}", artifact_path.display()))?;
+            let artifact_bytes = serde_json::to_vec(&contract_class)
+                .with_context(|| format!("failed to serialize {}", artifact_file))?;
+            serialized_artifacts.push((artifact_file.clone(), artifact_bytes));
+            keep_files.insert(artifact_file.clone());
 
-            let extracted_program = contract_class
-                .extract_sierra_program(false)
-                .context("failed to extract native Sierra program for CASM emission")?;
-            let casm_contract = CasmContractClass::from_contract_class(
-                contract_class,
-                extracted_program,
-                false,
-                native_max_casm_bytecode_size(),
-            )
-            .context("failed to compile native CASM contract class")?;
+            let casm_contract =
+                compile_native_casm_contract(contract_class, native_max_casm_bytecode_size())?;
             let casm_file = format!(
                 "{}_{}.compiled_contract_class.json",
                 context.package_name, artifact_stem
             );
-            let casm_path = target_dir.join(&casm_file);
-            write_json_file_compact(&casm_path, &casm_contract)
-                .with_context(|| format!("failed to write {}", casm_path.display()))?;
+            let casm_bytes = serde_json::to_vec(&casm_contract)
+                .with_context(|| format!("failed to serialize {}", casm_file))?;
+            serialized_artifacts.push((casm_file.clone(), casm_bytes));
+            keep_files.insert(casm_file.clone());
 
             let mut id_hasher = Hasher::new();
             id_hasher.update(module_path.as_bytes());
@@ -2692,7 +2720,20 @@ fn run_native_build_inner(
             contracts: contracts_manifest,
         };
         let manifest_name = format!("{}.starknet_artifacts.json", context.package_name);
+        keep_files.insert(manifest_name.clone());
+        prune_native_target_outputs(&target_dir, &context.package_name, &keep_files)?;
+        for (file_name, bytes) in serialized_artifacts {
+            let artifact_path = target_dir.join(&file_name);
+            ensure_path_within_root(&target_dir, &artifact_path, "native artifact output path")?;
+            fs::write(&artifact_path, bytes)
+                .with_context(|| format!("failed to write {}", artifact_path.display()))?;
+        }
         let manifest_path = target_dir.join(&manifest_name);
+        ensure_path_within_root(
+            &target_dir,
+            &manifest_path,
+            "native starknet artifacts manifest path",
+        )?;
         write_json_file_compact(&manifest_path, &manifest)
             .with_context(|| format!("failed to write {}", manifest_path.display()))?;
         contract_artifact_count + 1

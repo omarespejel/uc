@@ -16,6 +16,21 @@ struct BuildReport {
     exit_code: i32,
 }
 
+#[derive(Debug, Deserialize)]
+struct StarknetArtifactsManifest {
+    contracts: Vec<StarknetArtifactEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StarknetArtifactEntry {
+    artifacts: StarknetArtifactFiles,
+}
+
+#[derive(Debug, Deserialize)]
+struct StarknetArtifactFiles {
+    casm: Option<String>,
+}
+
 struct TestWorkspace {
     root: PathBuf,
 }
@@ -790,6 +805,108 @@ fn integration_daemon_auto_mode_local_hit_skips_daemon_and_missing_scarb() {
 }
 
 #[test]
+fn integration_daemon_auto_mode_local_hit_uses_scarb_key_after_native_fallback() {
+    let _guard = serial_guard();
+    if !scarb_available() {
+        eprintln!(
+            "skipping integration_daemon_auto_mode_local_hit_uses_scarb_key_after_native_fallback: scarb not available"
+        );
+        return;
+    }
+    let workspace = make_test_workspace("daemon-auto-native-fallback-local-hit");
+    let manifest = workspace.root.join("Scarb.toml");
+    let scarb_version = scarb_version_line();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be after unix epoch")
+        .as_nanos();
+    let socket_path =
+        std::env::temp_dir().join(format!("uc-it-dafb-{}-{nonce}.sock", std::process::id()));
+    let missing_corelib = std::env::temp_dir().join(format!(
+        "uc-it-missing-corelib-daemon-auto-native-fallback-{}-{nonce}",
+        std::process::id()
+    ));
+    let no_scarb_path = std::env::temp_dir().join(format!(
+        "uc-it-no-scarb-path-daemon-auto-native-fallback-{}-{nonce}",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&socket_path);
+    let _ = fs::remove_dir_all(&missing_corelib);
+
+    let start_output = run_uc_daemon_start(&socket_path);
+    assert!(
+        start_output.status.success(),
+        "daemon start should succeed: {}",
+        output_to_utf8(&start_output)
+    );
+
+    let (seed_output, seed_report) = run_uc_build_for_root_with_env_overrides(
+        &workspace.root,
+        &manifest,
+        "daemon-auto-native-fallback-seed",
+        "auto",
+        Some(&socket_path),
+        BuildEnvOverrides {
+            path_override: Some(&no_scarb_path),
+            scarb_version_override: Some(&scarb_version),
+            native_mode_override: Some("auto"),
+            native_corelib_override: Some(&missing_corelib),
+        },
+    );
+    assert_success(
+        &seed_output,
+        "daemon auto seed build with native fallback to scarb",
+    );
+    assert!(
+        !seed_report.cache_hit,
+        "seed build should compile once before local-hit probe can be exercised"
+    );
+    let seed_combined = output_to_utf8(&seed_output);
+    assert!(
+        seed_combined.contains("daemon native build failed; daemon fell back to scarb backend"),
+        "daemon seed build should report native->scarb fallback: {seed_combined}"
+    );
+
+    let stop_output = run_uc_daemon_stop(&socket_path);
+    assert!(
+        stop_output.status.success(),
+        "daemon stop should succeed: {}",
+        output_to_utf8(&stop_output)
+    );
+
+    let (probe_output, probe_report) = run_uc_build_for_root_with_env_overrides(
+        &workspace.root,
+        &manifest,
+        "daemon-auto-native-fallback-probe",
+        "auto",
+        Some(&socket_path),
+        BuildEnvOverrides {
+            path_override: Some(&no_scarb_path),
+            scarb_version_override: Some(&scarb_version),
+            native_mode_override: Some("auto"),
+            native_corelib_override: Some(&missing_corelib),
+        },
+    );
+    assert_success(
+        &probe_output,
+        "daemon auto local-hit probe after daemon native fallback",
+    );
+    assert!(
+        probe_report.cache_hit,
+        "local probe should hit the scarb-keyed cache entry populated by daemon fallback"
+    );
+    let probe_combined = output_to_utf8(&probe_output);
+    assert!(
+        !probe_combined.contains("daemon request failed"),
+        "local probe hit should avoid daemon request failure path: {probe_combined}"
+    );
+    assert!(
+        !probe_combined.contains("native compile unavailable"),
+        "local probe hit should avoid local native/scarb compile fallback path: {probe_combined}"
+    );
+}
+
+#[test]
 fn integration_daemon_require_mode_local_hit_skips_missing_daemon_and_scarb() {
     let _guard = serial_guard();
     if !scarb_available() {
@@ -899,6 +1016,50 @@ fn integration_native_auto_mode_falls_back_when_native_backend_unavailable() {
         "scarb fallback should emit starknet artifacts manifest at {}",
         manifest_artifacts.display()
     );
+
+    let (warm_output, warm_report) = run_uc_build_for_root_with_env_overrides(
+        &workspace.root,
+        &manifest,
+        "native-auto-fallback-warm",
+        "off",
+        None,
+        BuildEnvOverrides {
+            native_mode_override: Some("auto"),
+            native_corelib_override: Some(&missing_corelib),
+            ..BuildEnvOverrides::default()
+        },
+    );
+    assert_success(&warm_output, "native auto fallback warm build");
+    assert!(
+        warm_report.cache_hit,
+        "warm fallback build should restore artifacts from cache"
+    );
+    let manifest_bytes = fs::read(&manifest_artifacts).unwrap_or_else(|err| {
+        panic!(
+            "failed to read starknet artifacts manifest {}: {err}",
+            manifest_artifacts.display()
+        )
+    });
+    let artifact_manifest: StarknetArtifactsManifest =
+        serde_json::from_slice(&manifest_bytes).expect("failed to parse starknet artifacts JSON");
+    assert!(
+        !artifact_manifest.contracts.is_empty(),
+        "expected at least one starknet contract entry in {}",
+        manifest_artifacts.display()
+    );
+    let mut referenced_casm_count = 0usize;
+    for contract in artifact_manifest.contracts {
+        if let Some(casm_relative) = contract.artifacts.casm {
+            referenced_casm_count += 1;
+            let casm_path = target_dev.join(&casm_relative);
+            assert!(
+                casm_path.is_file(),
+                "warm restore should materialize CASM artifact {}",
+                casm_path.display()
+            );
+        }
+    }
+    eprintln!("validated {referenced_casm_count} CASM manifest references after warm restore");
 }
 
 #[test]
