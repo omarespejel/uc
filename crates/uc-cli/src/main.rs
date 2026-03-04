@@ -84,10 +84,12 @@ const DEFAULT_CACHE_BUDGET_ENFORCE_EVERY: u64 = 8;
 const DEFAULT_MIN_SCARB_VERSION: &str = "2.14.0";
 const DEFAULT_SESSION_INPUT_CACHE_MAX_ENTRIES: usize = 1024;
 const DEFAULT_FINGERPRINT_INDEX_CACHE_MAX_ENTRIES: usize = 512;
+const DEFAULT_ARTIFACT_INDEX_CACHE_MAX_ENTRIES: usize = 512;
 const DEFAULT_DAEMON_BUILD_PLAN_CACHE_MAX_ENTRIES: usize = 512;
 const DEFAULT_DAEMON_LOCK_HASH_CACHE_MAX_ENTRIES: usize = 512;
 const DEFAULT_DAEMON_SHARED_CACHE_ENABLED: bool = true;
 const DEFAULT_DAEMON_SHARED_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const DEFAULT_UC_DISABLE_SCARB_ARTIFACTS_FINGERPRINT: bool = true;
 const TOOLCHAIN_CHECK_CACHE_SCHEMA_VERSION: u32 = 1;
 const MAX_TOOLCHAIN_CHECK_CACHE_BYTES: u64 = 64 * 1024;
 const DEFAULT_SCARB_TOOLCHAIN_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
@@ -428,6 +430,12 @@ struct SessionInputCacheEntry {
 #[derive(Clone)]
 struct FingerprintIndexCacheEntry {
     index: FingerprintIndex,
+    last_access_epoch_ms: u64,
+}
+
+#[derive(Clone)]
+struct ArtifactIndexCacheEntry {
+    index: ArtifactIndex,
     last_access_epoch_ms: u64,
 }
 
@@ -863,6 +871,17 @@ fn fingerprint_index_cache_max_entries() -> usize {
         parse_env_usize(
             "UC_FINGERPRINT_INDEX_CACHE_MAX_ENTRIES",
             DEFAULT_FINGERPRINT_INDEX_CACHE_MAX_ENTRIES,
+        )
+        .max(1)
+    })
+}
+
+fn artifact_index_cache_max_entries() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_env_usize(
+            "UC_ARTIFACT_INDEX_CACHE_MAX_ENTRIES",
+            DEFAULT_ARTIFACT_INDEX_CACHE_MAX_ENTRIES,
         )
         .max(1)
     })
@@ -1884,6 +1903,18 @@ fn run_build_with_uc_cache(
 fn scarb_build_command(common: &BuildCommonArgs, manifest_path: &Path) -> (Command, Vec<String>) {
     let mut command = Command::new("scarb");
     let mut command_vec = vec!["scarb".to_string()];
+    let disable_artifacts_fingerprint = parse_env_bool(
+        "UC_DISABLE_SCARB_ARTIFACTS_FINGERPRINT",
+        DEFAULT_UC_DISABLE_SCARB_ARTIFACTS_FINGERPRINT,
+    );
+    command.env(
+        "SCARB_ARTIFACTS_FINGERPRINT",
+        if disable_artifacts_fingerprint {
+            "0"
+        } else {
+            "1"
+        },
+    );
 
     command.arg("--manifest-path").arg(manifest_path);
     command_vec.push("--manifest-path".to_string());
@@ -2125,7 +2156,7 @@ fn collect_cached_artifacts_for_entry(
     }
 
     let index_path = cache_root.join("artifact-index-v1.json");
-    let mut index = load_artifact_index(&index_path)?;
+    let mut index = load_artifact_index_cached(&index_path)?;
     let mut updated_index_entries: BTreeMap<String, ArtifactIndexEntry> = BTreeMap::new();
     let mut cached_artifacts = Vec::new();
     let now_ms = epoch_ms_u64().unwrap_or_default();
@@ -2216,6 +2247,7 @@ fn collect_cached_artifacts_for_entry(
     cached_artifacts.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     index.schema_version = ARTIFACT_INDEX_SCHEMA_VERSION;
     index.entries = updated_index_entries;
+    store_artifact_index_cached(&index_path, &index);
     save_artifact_index(&index_path, &index)
         .with_context(|| format!("failed to update artifact index {}", index_path.display()))?;
     Ok(cached_artifacts)
@@ -2617,7 +2649,7 @@ fn metadata_change_unix_ms(metadata: &fs::Metadata) -> Option<u64> {
     {
         let secs = u64::try_from(metadata.ctime()).ok()?;
         let nanos = u64::try_from(metadata.ctime_nsec()).ok()?;
-        return Some(secs.saturating_mul(1000).saturating_add(nanos / 1_000_000));
+        Some(secs.saturating_mul(1000).saturating_add(nanos / 1_000_000))
     }
     #[cfg(not(unix))]
     {

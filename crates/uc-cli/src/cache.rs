@@ -463,7 +463,7 @@ pub(super) fn restore_cached_artifacts(
     }
 
     let index_path = cache_root.join("artifact-index-v1.json");
-    let mut artifact_index = load_artifact_index(&index_path)?;
+    let mut artifact_index = load_artifact_index_cached(&index_path)?;
     let mut artifact_index_changed = false;
     let target_root = workspace_root.join("target").join(profile);
 
@@ -550,6 +550,7 @@ pub(super) fn restore_cached_artifacts(
 
     if artifact_index_changed {
         artifact_index.schema_version = ARTIFACT_INDEX_SCHEMA_VERSION;
+        store_artifact_index_cached(&index_path, &artifact_index);
         if let Err(err) = save_artifact_index(&index_path, &artifact_index) {
             eprintln!(
                 "uc: warning: failed to update artifact index {}: {err:#}",

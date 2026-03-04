@@ -292,6 +292,75 @@ pub(super) fn save_artifact_index(path: &Path, index: &ArtifactIndex) -> Result<
     Ok(())
 }
 
+pub(super) fn artifact_index_cache() -> &'static Mutex<HashMap<String, ArtifactIndexCacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, ArtifactIndexCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(super) fn artifact_index_cache_key(path: &Path) -> String {
+    normalize_fingerprint_path(path)
+}
+
+pub(super) fn load_artifact_index_cached(path: &Path) -> Result<ArtifactIndex> {
+    let key = artifact_index_cache_key(path);
+    let now_ms = epoch_ms_u64().unwrap_or_default();
+    {
+        let mut cache = artifact_index_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = cache.get_mut(&key) {
+            entry.last_access_epoch_ms = now_ms;
+            return Ok(entry.index.clone());
+        }
+    }
+
+    let loaded = load_artifact_index(path)?;
+    let mut cache = artifact_index_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.insert(
+        key,
+        ArtifactIndexCacheEntry {
+            index: loaded.clone(),
+            last_access_epoch_ms: now_ms,
+        },
+    );
+    evict_oldest_artifact_index_cache_entries(&mut cache, artifact_index_cache_max_entries());
+    Ok(loaded)
+}
+
+pub(super) fn store_artifact_index_cached(path: &Path, index: &ArtifactIndex) {
+    let key = artifact_index_cache_key(path);
+    let now_ms = epoch_ms_u64().unwrap_or_default();
+    let mut cache = artifact_index_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.insert(
+        key,
+        ArtifactIndexCacheEntry {
+            index: index.clone(),
+            last_access_epoch_ms: now_ms,
+        },
+    );
+    evict_oldest_artifact_index_cache_entries(&mut cache, artifact_index_cache_max_entries());
+}
+
+pub(super) fn evict_oldest_artifact_index_cache_entries(
+    cache: &mut HashMap<String, ArtifactIndexCacheEntry>,
+    max_entries: usize,
+) {
+    while cache.len() > max_entries {
+        let Some(oldest_key) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_access_epoch_ms)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest_key);
+    }
+}
+
 pub(super) fn compute_build_fingerprint(
     workspace_root: &Path,
     manifest_path: &Path,

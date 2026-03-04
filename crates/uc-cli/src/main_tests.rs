@@ -721,6 +721,55 @@ fn build_env_fingerprint_prefix_override_can_disable_default_prefixes() {
 }
 
 #[test]
+fn scarb_build_command_disables_artifacts_fingerprint_by_default() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::env::remove_var("UC_DISABLE_SCARB_ARTIFACTS_FINGERPRINT");
+    let common = BuildCommonArgs {
+        manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
+        package: None,
+        workspace: false,
+        features: Vec::new(),
+        offline: false,
+        release: false,
+        profile: None,
+    };
+    let (command, _) = scarb_build_command(&common, Path::new("/tmp/workspace/Scarb.toml"));
+    let configured = command
+        .get_envs()
+        .find(|(key, _)| *key == std::ffi::OsStr::new("SCARB_ARTIFACTS_FINGERPRINT"))
+        .and_then(|(_, value)| value)
+        .map(|value| value.to_string_lossy().to_string());
+    assert_eq!(configured.as_deref(), Some("0"));
+}
+
+#[test]
+fn scarb_build_command_can_reenable_artifacts_fingerprint() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::env::set_var("UC_DISABLE_SCARB_ARTIFACTS_FINGERPRINT", "0");
+    let common = BuildCommonArgs {
+        manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
+        package: None,
+        workspace: false,
+        features: Vec::new(),
+        offline: false,
+        release: false,
+        profile: None,
+    };
+    let (command, _) = scarb_build_command(&common, Path::new("/tmp/workspace/Scarb.toml"));
+    let configured = command
+        .get_envs()
+        .find(|(key, _)| *key == std::ffi::OsStr::new("SCARB_ARTIFACTS_FINGERPRINT"))
+        .and_then(|(_, value)| value)
+        .map(|value| value.to_string_lossy().to_string());
+    assert_eq!(configured.as_deref(), Some("1"));
+    std::env::remove_var("UC_DISABLE_SCARB_ARTIFACTS_FINGERPRINT");
+}
+
+#[test]
 fn session_input_cache_key_is_order_independent_for_features() {
     let common_a = BuildCommonArgs {
         manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
@@ -1469,6 +1518,38 @@ fn fingerprint_index_cache_eviction_removes_oldest_entries() {
     );
 
     evict_oldest_fingerprint_index_cache_entries(&mut cache, 2);
+    assert_eq!(cache.len(), 2);
+    assert!(!cache.contains_key("oldest"));
+    assert!(cache.contains_key("middle"));
+    assert!(cache.contains_key("newest"));
+}
+
+#[test]
+fn artifact_index_cache_eviction_removes_oldest_entries() {
+    let mut cache = HashMap::new();
+    cache.insert(
+        "oldest".to_string(),
+        ArtifactIndexCacheEntry {
+            index: ArtifactIndex::empty(),
+            last_access_epoch_ms: 1,
+        },
+    );
+    cache.insert(
+        "middle".to_string(),
+        ArtifactIndexCacheEntry {
+            index: ArtifactIndex::empty(),
+            last_access_epoch_ms: 2,
+        },
+    );
+    cache.insert(
+        "newest".to_string(),
+        ArtifactIndexCacheEntry {
+            index: ArtifactIndex::empty(),
+            last_access_epoch_ms: 3,
+        },
+    );
+
+    evict_oldest_artifact_index_cache_entries(&mut cache, 2);
     assert_eq!(cache.len(), 2);
     assert!(!cache.contains_key("oldest"));
     assert!(cache.contains_key("middle"));
