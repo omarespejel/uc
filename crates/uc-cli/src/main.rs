@@ -119,12 +119,13 @@ const NATIVE_ARTIFACT_ID_TRUNC_HEX_LEN: usize = 13;
 const DEFAULT_NATIVE_MAX_CASM_BYTECODE_SIZE: usize = 81_290;
 const DEFAULT_SCARB_TOOLCHAIN_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
 const DAEMON_PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
-const CACHEABLE_ARTIFACT_SUFFIXES: [&str; 6] = [
+const CACHEABLE_ARTIFACT_SUFFIXES: [&str; 7] = [
     ".sierra.json",
     ".sierra",
     ".casm",
     ".contract_class.json",
     ".compiled_contract_class.json",
+    ".starknet_artifacts.json",
     ".executable.json",
 ];
 
@@ -246,6 +247,53 @@ enum NativeBuildMode {
     Off,
     Auto,
     Require,
+}
+
+#[derive(Debug)]
+struct NativeFallbackEligibleTag;
+
+impl std::fmt::Display for NativeFallbackEligibleTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "native fallback to scarb is allowed")
+    }
+}
+
+impl std::error::Error for NativeFallbackEligibleTag {}
+
+fn native_fallback_eligible_error(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(NativeFallbackEligibleTag).context(message.into())
+}
+
+fn mark_native_fallback_eligible(err: anyhow::Error) -> anyhow::Error {
+    err.context(NativeFallbackEligibleTag)
+}
+
+fn native_error_allows_scarb_fallback(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<NativeFallbackEligibleTag>().is_some()
+}
+
+static NATIVE_DAEMON_BACKEND_POISONED: AtomicBool = AtomicBool::new(false);
+
+fn native_daemon_backend_is_poisoned() -> bool {
+    NATIVE_DAEMON_BACKEND_POISONED.load(Ordering::Relaxed)
+}
+
+fn mark_native_daemon_backend_poisoned() {
+    NATIVE_DAEMON_BACKEND_POISONED.store(true, Ordering::Relaxed);
+}
+
+fn ensure_native_daemon_backend_available() -> Result<()> {
+    if native_daemon_backend_is_poisoned() {
+        return Err(native_fallback_eligible_error(
+            "native daemon backend is disabled after a previous panic; restart `uc daemon` to re-enable native requests",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn set_native_daemon_backend_poisoned_for_test(value: bool) {
+    NATIVE_DAEMON_BACKEND_POISONED.store(value, Ordering::Relaxed);
 }
 
 #[derive(Args, Debug)]
@@ -1978,11 +2026,12 @@ fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildRespon
         Ok(response) => Ok(response),
         Err(native_err)
             if requested_backend == BuildCompileBackend::Native
-                && request.native_fallback_to_scarb =>
+                && request.native_fallback_to_scarb
+                && native_error_allows_scarb_fallback(&native_err) =>
         {
             tracing::warn!(
                 error = %native_err,
-                "daemon native build failed; falling back to scarb backend"
+                "daemon native build unavailable; falling back to scarb backend"
             );
             let scarb_compiler_version = compiler_version_for_backend(BuildCompileBackend::Scarb)?;
             execute_daemon_build_with_backend(
@@ -2245,9 +2294,13 @@ fn run_build_with_uc_cache(
                 run_command_status_silent(command, command_vec)?
             }
         }
-        BuildCompileBackend::Native => {
-            run_native_build(common, manifest_path, &canonical_workspace_root, profile)?
-        }
+        BuildCompileBackend::Native => run_native_build(
+            common,
+            manifest_path,
+            &canonical_workspace_root,
+            profile,
+            options.use_daemon_shared_cache,
+        )?,
     };
     telemetry.compile_ms = run.elapsed_ms;
 
@@ -2393,7 +2446,12 @@ fn toml_escape_basic_string(raw: &str) -> String {
             '\r' => escaped.push_str("\\r"),
             '\t' => escaped.push_str("\\t"),
             c if c.is_control() => {
-                escaped.push_str(&format!("\\u{:04X}", c as u32));
+                let codepoint = c as u32;
+                if codepoint <= 0xFFFF {
+                    escaped.push_str(&format!("\\u{:04X}", codepoint));
+                } else {
+                    escaped.push_str(&format!("\\U{:08X}", codepoint));
+                }
             }
             c => escaped.push(c),
         }
@@ -2418,10 +2476,10 @@ fn resolve_native_corelib_src(workspace_root: &Path) -> Result<PathBuf> {
             );
             return Ok(canonical);
         }
-        bail!(
+        return Err(native_fallback_eligible_error(format!(
             "native corelib override {} is incompatible; expected corelib/src to contain lib.cairo, prelude.cairo, and ops.cairo",
             canonical.display()
-        );
+        )));
     }
 
     let mut candidates: Vec<(&str, PathBuf)> = Vec::new();
@@ -2457,9 +2515,9 @@ fn resolve_native_corelib_src(workspace_root: &Path) -> Result<PathBuf> {
         );
     }
 
-    bail!(
-        "native compile requires a compatible Cairo corelib source path; set UC_NATIVE_CORELIB_SRC=<.../corelib/src>"
-    )
+    Err(native_fallback_eligible_error(
+        "native compile requires a compatible Cairo corelib source path; set UC_NATIVE_CORELIB_SRC=<.../corelib/src>",
+    ))
 }
 
 fn build_native_compile_context(
@@ -2468,10 +2526,14 @@ fn build_native_compile_context(
     workspace_root: &Path,
 ) -> Result<NativeCompileContext> {
     if common.workspace {
-        bail!("native compile does not support --workspace yet");
+        return Err(native_fallback_eligible_error(
+            "native compile does not support --workspace yet",
+        ));
     }
     if !common.features.is_empty() {
-        bail!("native compile does not support --features yet");
+        return Err(native_fallback_eligible_error(
+            "native compile does not support --features yet",
+        ));
     }
 
     let manifest_text = read_text_file_with_limit(manifest_path, MAX_MANIFEST_BYTES, "manifest")?;
@@ -2494,11 +2556,10 @@ fn build_native_compile_context(
 
     if let Some(requested_package) = common.package.as_ref() {
         if requested_package != &package_name {
-            bail!(
+            return Err(native_fallback_eligible_error(format!(
                 "native compile only supports the manifest package `{}` (got --package `{}`)",
-                package_name,
-                requested_package
-            );
+                package_name, requested_package
+            )));
         }
     }
 
@@ -2507,11 +2568,10 @@ fn build_native_compile_context(
             for dependency_name in table.keys() {
                 // Native compile currently supports only the Starknet plugin dependency surface.
                 if dependency_name != "starknet" {
-                    bail!(
+                    return Err(native_fallback_eligible_error(format!(
                         "native compile does not support [{}].{} yet",
-                        section_name,
-                        dependency_name
-                    );
+                        section_name, dependency_name
+                    )));
                 }
             }
         }
@@ -2520,7 +2580,9 @@ fn build_native_compile_context(
     if let Some(lib_table) = manifest.get("lib").and_then(TomlValue::as_table) {
         if let Some(path) = lib_table.get("path").and_then(TomlValue::as_str) {
             if path.trim() != "src/lib.cairo" {
-                bail!("native compile only supports [lib].path = \"src/lib.cairo\"");
+                return Err(native_fallback_eligible_error(
+                    "native compile only supports [lib].path = \"src/lib.cairo\"",
+                ));
             }
         }
     }
@@ -2528,10 +2590,10 @@ fn build_native_compile_context(
     let source_root = workspace_root.join("src");
     let lib_path = source_root.join("lib.cairo");
     if !lib_path.is_file() {
-        bail!(
+        return Err(native_fallback_eligible_error(format!(
             "native compile expects src/lib.cairo (missing at {})",
             lib_path.display()
-        );
+        )));
     }
 
     let crate_name = normalize_package_name_for_cairo_crate(&package_name);
@@ -2557,7 +2619,8 @@ fn build_native_compile_context(
         "native cairo project",
     )?;
 
-    let corelib_src = resolve_native_corelib_src(workspace_root)?;
+    let corelib_src =
+        resolve_native_corelib_src(workspace_root).map_err(mark_native_fallback_eligible)?;
 
     Ok(NativeCompileContext {
         package_name,
@@ -2740,7 +2803,11 @@ fn run_native_build(
     manifest_path: &Path,
     workspace_root: &Path,
     profile: &str,
+    daemon_context: bool,
 ) -> Result<CommandRun> {
+    if daemon_context {
+        ensure_native_daemon_backend_available()?;
+    }
     let result = std::panic::catch_unwind(|| {
         run_native_build_inner(common, manifest_path, workspace_root, profile)
     });
@@ -2748,6 +2815,9 @@ fn run_native_build(
         Ok(result) => result,
         Err(payload) => {
             clear_native_compile_session(workspace_root);
+            if daemon_context {
+                mark_native_daemon_backend_poisoned();
+            }
             let message = if let Some(text) = payload.downcast_ref::<&str>() {
                 (*text).to_string()
             } else if let Some(text) = payload.downcast_ref::<String>() {
@@ -2755,7 +2825,9 @@ fn run_native_build(
             } else {
                 "unknown panic payload".to_string()
             };
-            bail!("native compiler panicked: {message}")
+            Err(native_fallback_eligible_error(format!(
+                "native compiler panicked: {message}"
+            )))
         }
     }
 }

@@ -112,10 +112,13 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                 Ok((run, cache_hit, fingerprint, native_session_key, telemetry))
                             }
                             Err(native_err) => {
+                                if !native_error_allows_scarb_fallback(&native_err) {
+                                    return Err(native_err);
+                                }
                                 eprintln!(
-                                        "uc: native compile unavailable ({}), falling back to scarb backend",
-                                        native_err
-                                    );
+                                    "uc: native compile unavailable ({:#}), falling back to scarb backend",
+                                    native_err
+                                );
                                 let (compiler_version, local_session_key) =
                                     build_scarb_fallback_context()?;
                                 let (run, cache_hit, fingerprint, telemetry) =

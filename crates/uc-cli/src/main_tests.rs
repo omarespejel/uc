@@ -2585,11 +2585,58 @@ fn toml_escape_basic_string_escapes_control_characters() {
 }
 
 #[test]
+fn toml_escape_basic_string_preserves_non_bmp_scalars_without_corrupting_escape_state() {
+    assert_eq!(
+        toml_escape_basic_string("prefix\u{1F642}\u{0007}"),
+        "prefix🙂\\u0007"
+    );
+}
+
+#[test]
 fn cacheable_artifact_suffixes_include_native_compiled_contract_class() {
     assert!(
         CACHEABLE_ARTIFACT_SUFFIXES.contains(&".compiled_contract_class.json"),
         "native CASM artifact suffix must be cacheable for warm restores"
     );
+}
+
+#[test]
+fn cacheable_artifact_suffixes_include_starknet_manifest() {
+    assert!(
+        CACHEABLE_ARTIFACT_SUFFIXES.contains(&".starknet_artifacts.json"),
+        "starknet artifacts manifest suffix must be cacheable for warm restores"
+    );
+}
+
+#[test]
+fn native_error_allows_scarb_fallback_only_when_marked() {
+    let generic = anyhow::Error::msg("native compile failed with diagnostics");
+    assert!(
+        !native_error_allows_scarb_fallback(&generic),
+        "plain errors must not trigger scarb fallback"
+    );
+
+    let eligible = native_fallback_eligible_error("native backend unavailable");
+    assert!(
+        native_error_allows_scarb_fallback(&eligible),
+        "fallback-eligible errors should trigger scarb fallback in auto mode"
+    );
+}
+
+#[test]
+fn ensure_native_daemon_backend_available_rejects_poisoned_state() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    set_native_daemon_backend_poisoned_for_test(false);
+    mark_native_daemon_backend_poisoned();
+    let err =
+        ensure_native_daemon_backend_available().expect_err("poisoned daemon backend should fail");
+    assert!(
+        native_error_allows_scarb_fallback(&err),
+        "poison rejection should be fallback-eligible in native auto mode"
+    );
+    set_native_daemon_backend_poisoned_for_test(false);
 }
 
 #[test]

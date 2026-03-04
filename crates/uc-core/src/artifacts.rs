@@ -22,11 +22,13 @@ pub struct ArtifactMismatch {
     pub candidate_hash: Option<String>,
 }
 
-const DEFAULT_SUFFIXES: [&str; 5] = [
+const DEFAULT_SUFFIXES: [&str; 7] = [
     ".sierra.json",
     ".sierra",
     ".casm",
     ".contract_class.json",
+    ".compiled_contract_class.json",
+    ".starknet_artifacts.json",
     ".executable.json",
 ];
 const MAX_ARTIFACT_SIZE_BYTES: u64 = 64 * 1024 * 1024;
@@ -488,8 +490,9 @@ fn canonicalize_json(value: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonicalize_json, compare_artifact_sets, hash_sierra_json_semantic,
-        normalize_sierra_json_ids, validate_supported_sierra_schema, ArtifactDigest,
+        canonicalize_json, collect_artifact_digests, compare_artifact_sets,
+        hash_sierra_json_semantic, normalize_sierra_json_ids, validate_supported_sierra_schema,
+        ArtifactDigest,
     };
     use serde_json::json;
     use std::fs;
@@ -513,6 +516,53 @@ mod tests {
             "uc-core-{name}-{}-{nonce}.json",
             std::process::id()
         ))
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("uc-core-{name}-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn collect_artifact_digests_includes_native_compiled_and_manifest_suffixes() {
+        let dir = unique_test_dir("artifact-suffixes");
+        fs::create_dir_all(&dir).expect("failed to create artifact suffixes test directory");
+        fs::write(
+            dir.join("pkg_token.compiled_contract_class.json"),
+            br#"{"test":"compiled"}"#,
+        )
+        .expect("failed to write compiled contract class artifact");
+        fs::write(
+            dir.join("pkg.starknet_artifacts.json"),
+            br#"{"contracts":[]}"#,
+        )
+        .expect("failed to write starknet artifacts manifest");
+        fs::write(dir.join("ignored.meta.json"), br#"{"ignored":true}"#)
+            .expect("failed to write ignored artifact");
+
+        let digests = collect_artifact_digests(&dir).expect("failed to collect artifact digests");
+        let relative_paths: Vec<_> = digests
+            .iter()
+            .map(|item| item.relative_path.as_str())
+            .collect();
+        assert!(
+            relative_paths.contains(&"pkg_token.compiled_contract_class.json"),
+            "compiled contract class suffix should be included"
+        );
+        assert!(
+            relative_paths.contains(&"pkg.starknet_artifacts.json"),
+            "starknet artifacts manifest suffix should be included"
+        );
+        assert_eq!(
+            digests.len(),
+            2,
+            "unexpected digest set: {relative_paths:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
