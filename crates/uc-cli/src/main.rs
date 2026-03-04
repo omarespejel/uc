@@ -1,19 +1,33 @@
 use anyhow::{bail, Context, Result};
 use blake3::Hasher;
+#[cfg(feature = "native-compile")]
 use cairo_lang_compiler::db::RootDatabase;
+#[cfg(feature = "native-compile")]
 use cairo_lang_compiler::project::setup_project;
+#[cfg(feature = "native-compile")]
 use cairo_lang_compiler::{compile_prepared_db_program, CompilerConfig};
+#[cfg(feature = "native-compile")]
 use cairo_lang_defs::ids::TopLevelLanguageElementId;
+#[cfg(feature = "native-compile")]
 use cairo_lang_filesystem::db::init_dev_corelib;
+#[cfg(feature = "native-compile")]
 use cairo_lang_filesystem::ids::CrateInput;
+#[cfg(feature = "native-compile")]
 use cairo_lang_lowering::optimizations::config::Optimizations;
+#[cfg(feature = "native-compile")]
 use cairo_lang_lowering::utils::InliningStrategy;
+#[cfg(feature = "native-compile")]
 use cairo_lang_starknet::compile::compile_prepared_db as compile_starknet_prepared_db;
+#[cfg(feature = "native-compile")]
 use cairo_lang_starknet::contract::find_contracts;
+#[cfg(feature = "native-compile")]
 use cairo_lang_starknet::starknet_plugin_suite;
+#[cfg(feature = "native-compile")]
 use cairo_lang_starknet_classes::casm_contract_class::CasmContractClass;
+#[cfg(feature = "native-compile")]
 use cairo_lang_starknet_classes::contract_class::ContractClass;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+#[cfg(feature = "native-compile")]
 use scarb_stable_hash::short_hash;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -103,7 +117,9 @@ const DEFAULT_BUILD_ENTRY_CACHE_MAX_ENTRIES: usize = 1024;
 const DEFAULT_ARTIFACT_INDEX_CACHE_MAX_ENTRIES: usize = 512;
 const DEFAULT_DAEMON_BUILD_PLAN_CACHE_MAX_ENTRIES: usize = 512;
 const DEFAULT_DAEMON_LOCK_HASH_CACHE_MAX_ENTRIES: usize = 512;
+#[cfg(feature = "native-compile")]
 const DEFAULT_NATIVE_COMPILE_SESSION_CACHE_MAX_ENTRIES: usize = 16;
+#[cfg(feature = "native-compile")]
 const DEFAULT_NATIVE_COMPILE_CONTEXT_CACHE_MAX_ENTRIES: usize = 256;
 const DEFAULT_DAEMON_SHARED_CACHE_ENABLED: bool = true;
 const DEFAULT_DAEMON_SHARED_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -117,6 +133,7 @@ const MAX_TOOLCHAIN_CHECK_CACHE_BYTES: u64 = 64 * 1024;
 /// `UC_NATIVE_MAX_CASM_BYTECODE_SIZE` for network-specific tuning.
 /// Reference:
 /// https://docs.starknet.io/architecture-and-concepts/smart-contracts/contract-classes/
+#[cfg(feature = "native-compile")]
 const DEFAULT_NATIVE_MAX_CASM_BYTECODE_SIZE: usize = 81_290;
 const DEFAULT_SCARB_TOOLCHAIN_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
 const DAEMON_PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -265,6 +282,7 @@ fn native_fallback_eligible_error(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(NativeFallbackEligibleTag).context(message.into())
 }
 
+#[cfg(feature = "native-compile")]
 fn mark_native_fallback_eligible(err: anyhow::Error) -> anyhow::Error {
     err.context(NativeFallbackEligibleTag)
 }
@@ -273,16 +291,20 @@ fn native_error_allows_scarb_fallback(err: &anyhow::Error) -> bool {
     err.downcast_ref::<NativeFallbackEligibleTag>().is_some()
 }
 
+#[cfg(feature = "native-compile")]
 static NATIVE_DAEMON_BACKEND_POISONED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(feature = "native-compile")]
 fn native_daemon_backend_is_poisoned() -> bool {
     NATIVE_DAEMON_BACKEND_POISONED.load(Ordering::Acquire)
 }
 
+#[cfg(feature = "native-compile")]
 fn mark_native_daemon_backend_poisoned() {
     NATIVE_DAEMON_BACKEND_POISONED.store(true, Ordering::Release);
 }
 
+#[cfg(feature = "native-compile")]
 fn ensure_native_daemon_backend_available() -> Result<()> {
     if native_daemon_backend_is_poisoned() {
         return Err(native_fallback_eligible_error(
@@ -292,7 +314,7 @@ fn ensure_native_daemon_backend_available() -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native-compile"))]
 fn set_native_daemon_backend_poisoned_for_test(value: bool) {
     NATIVE_DAEMON_BACKEND_POISONED.store(value, Ordering::Release);
 }
@@ -460,6 +482,7 @@ struct BuildCacheRunContext<'a> {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+#[cfg(feature = "native-compile")]
 struct NativeCompileContext {
     package_name: String,
     crate_name: String,
@@ -470,12 +493,14 @@ struct NativeCompileContext {
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[cfg(feature = "native-compile")]
 struct NativeStarknetTargetProps {
     sierra: bool,
     casm: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(feature = "native-compile")]
 struct NativeCompileSessionSignature {
     manifest_path: PathBuf,
     manifest_content_hash: String,
@@ -483,12 +508,14 @@ struct NativeCompileSessionSignature {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg(feature = "native-compile")]
 struct StarknetArtifactsManifest {
     version: u32,
     contracts: Vec<StarknetArtifactEntry>,
 }
 
 #[derive(Debug, Serialize)]
+#[cfg(feature = "native-compile")]
 struct StarknetArtifactEntry {
     id: String,
     package_name: String,
@@ -498,6 +525,7 @@ struct StarknetArtifactEntry {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg(feature = "native-compile")]
 struct StarknetArtifactFiles {
     sierra: String,
     casm: Option<String>,
@@ -636,12 +664,14 @@ struct LockfileHashCacheEntry {
 }
 
 #[derive(Clone)]
+#[cfg(feature = "native-compile")]
 struct NativeCompileSessionCacheEntry {
     session: Arc<Mutex<NativeCompileSessionState>>,
     last_access_epoch_ms: u64,
 }
 
 #[derive(Clone)]
+#[cfg(feature = "native-compile")]
 struct NativeCompileContextCacheEntry {
     manifest_size_bytes: u64,
     manifest_modified_unix_ms: u64,
@@ -650,12 +680,14 @@ struct NativeCompileContextCacheEntry {
     last_access_epoch_ms: u64,
 }
 
+#[cfg(feature = "native-compile")]
 struct NativeCompileSessionState {
     signature: NativeCompileSessionSignature,
     db: RootDatabase,
     main_crate_inputs: Vec<CrateInput>,
 }
 
+#[cfg(feature = "native-compile")]
 struct NativeCompileSessionSnapshot {
     db: RootDatabase,
     main_crate_inputs: Vec<CrateInput>,
@@ -1065,6 +1097,7 @@ fn native_compiler_version_line() -> String {
         .clone()
 }
 
+#[cfg(feature = "native-compile")]
 fn native_max_casm_bytecode_size() -> usize {
     static VALUE: OnceLock<usize> = OnceLock::new();
     *VALUE.get_or_init(|| {
@@ -1243,6 +1276,7 @@ fn daemon_lock_hash_cache_max_entries() -> usize {
     })
 }
 
+#[cfg(feature = "native-compile")]
 fn native_compile_session_cache_max_entries() -> usize {
     static VALUE: OnceLock<usize> = OnceLock::new();
     *VALUE.get_or_init(|| {
@@ -1254,6 +1288,7 @@ fn native_compile_session_cache_max_entries() -> usize {
     })
 }
 
+#[cfg(feature = "native-compile")]
 fn native_compile_context_cache_max_entries() -> usize {
     static VALUE: OnceLock<usize> = OnceLock::new();
     *VALUE.get_or_init(|| {
@@ -2483,6 +2518,7 @@ fn run_build_with_uc_cache(
 /// Maps Scarb package names into a safe Cairo crate key used in `cairo_project.toml`.
 /// The output keeps ASCII alphanumerics and `_`, normalizes all other characters to `_`,
 /// and prefixes a leading digit with `_` so the key remains TOML-bare-key safe.
+#[cfg(feature = "native-compile")]
 fn normalize_package_name_for_cairo_crate(package_name: &str) -> String {
     let mut normalized = String::with_capacity(package_name.len());
     for ch in package_name.chars() {
@@ -2507,6 +2543,7 @@ fn normalize_package_name_for_cairo_crate(package_name: &str) -> String {
 
 /// Produces artifact-safe stem components for generated native outputs.
 /// The result contains only ASCII alphanumerics and `_`; empty results fall back to `contract`.
+#[cfg(feature = "native-compile")]
 fn sanitize_artifact_component(raw: &str) -> String {
     let mut value = String::with_capacity(raw.len());
     for ch in raw.chars() {
@@ -2522,12 +2559,14 @@ fn sanitize_artifact_component(raw: &str) -> String {
     value
 }
 
+#[cfg(feature = "native-compile")]
 fn native_corelib_layout_looks_compatible(corelib_src: &Path) -> bool {
     corelib_src.join("lib.cairo").is_file()
         && corelib_src.join("prelude.cairo").is_file()
         && corelib_src.join("ops.cairo").is_file()
 }
 
+#[cfg(feature = "native-compile")]
 fn toml_escape_basic_string(raw: &str) -> String {
     let mut escaped = String::with_capacity(raw.len());
     for ch in raw.chars() {
@@ -2553,6 +2592,7 @@ fn toml_escape_basic_string(raw: &str) -> String {
     escaped
 }
 
+#[cfg(feature = "native-compile")]
 fn resolve_native_corelib_src(workspace_root: &Path) -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("UC_NATIVE_CORELIB_SRC") {
         let candidate = PathBuf::from(path);
@@ -2618,6 +2658,7 @@ fn resolve_native_corelib_src(workspace_root: &Path) -> Result<PathBuf> {
     ))
 }
 
+#[cfg(feature = "native-compile")]
 fn build_native_compile_context(
     common: &BuildCommonArgs,
     manifest_path: &Path,
@@ -2694,6 +2735,7 @@ fn build_native_compile_context(
     Ok(context)
 }
 
+#[cfg(feature = "native-compile")]
 fn normalized_env_var(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -2701,6 +2743,7 @@ fn normalized_env_var(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+#[cfg(feature = "native-compile")]
 fn validate_native_requested_package(
     requested_package: Option<&str>,
     package_name: &str,
@@ -2716,6 +2759,7 @@ fn validate_native_requested_package(
     Ok(())
 }
 
+#[cfg(feature = "native-compile")]
 fn build_native_compile_context_uncached(
     manifest_path: &Path,
     workspace_root: &Path,
@@ -2818,6 +2862,7 @@ fn build_native_compile_context_uncached(
     })
 }
 
+#[cfg(feature = "native-compile")]
 fn write_text_file_if_changed(path: &Path, contents: &str, label: &str) -> Result<()> {
     match fs::read_to_string(path) {
         Ok(existing) if existing == contents => return Ok(()),
@@ -2833,6 +2878,7 @@ fn write_text_file_if_changed(path: &Path, contents: &str, label: &str) -> Resul
     Ok(())
 }
 
+#[cfg(feature = "native-compile")]
 fn native_cairo_project_toml(
     crate_name: &str,
     escaped_source_root: &str,
@@ -2852,6 +2898,7 @@ fn native_cairo_project_toml(
     content
 }
 
+#[cfg(feature = "native-compile")]
 fn native_contract_package_name(module_path: &str) -> &str {
     module_path
         .split_once("::")
@@ -2859,6 +2906,7 @@ fn native_contract_package_name(module_path: &str) -> &str {
         .unwrap_or(module_path)
 }
 
+#[cfg(feature = "native-compile")]
 fn native_contract_name(module_path: &str) -> &str {
     module_path
         .rsplit_once("::")
@@ -2866,6 +2914,7 @@ fn native_contract_name(module_path: &str) -> &str {
         .unwrap_or(module_path)
 }
 
+#[cfg(feature = "native-compile")]
 fn native_contract_file_stems(module_paths: &[String]) -> Vec<String> {
     let mut seen_names = HashSet::new();
     let duplicate_names: HashSet<String> = module_paths
@@ -2886,10 +2935,12 @@ fn native_contract_file_stems(module_paths: &[String]) -> Vec<String> {
         .collect()
 }
 
+#[cfg(feature = "native-compile")]
 fn native_starknet_artifact_id(package_name: &str, contract_path: &str) -> String {
     short_hash((package_name, contract_path))
 }
 
+#[cfg(feature = "native-compile")]
 fn prune_native_target_outputs(
     target_dir: &Path,
     package_name: &str,
@@ -2927,6 +2978,7 @@ fn prune_native_target_outputs(
     Ok(())
 }
 
+#[cfg(feature = "native-compile")]
 fn compile_native_casm_contract(
     contract_class: ContractClass,
     max_casm_bytecode_size: usize,
@@ -2943,10 +2995,12 @@ fn compile_native_casm_contract(
     .context("failed to compile native CASM contract class")
 }
 
+#[cfg(feature = "native-compile")]
 fn native_compile_session_cache_key(workspace_root: &Path) -> String {
     normalize_fingerprint_path(workspace_root)
 }
 
+#[cfg(feature = "native-compile")]
 fn native_compile_session_signature(
     manifest_path: &Path,
     context: &NativeCompileContext,
@@ -2958,6 +3012,7 @@ fn native_compile_session_signature(
     }
 }
 
+#[cfg(feature = "native-compile")]
 fn build_native_compile_session_state(
     signature: NativeCompileSessionSignature,
 ) -> Result<NativeCompileSessionState> {
@@ -2983,38 +3038,97 @@ fn build_native_compile_session_state(
     })
 }
 
+#[cfg(feature = "native-compile")]
+fn native_compile_session_build_locks() -> &'static Mutex<HashMap<String, Arc<Mutex<()>>>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(feature = "native-compile")]
+fn native_compile_session_build_lock(cache_key: &str) -> Arc<Mutex<()>> {
+    let mut locks = native_compile_session_build_locks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks
+        .entry(cache_key.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+#[cfg(feature = "native-compile")]
+fn release_native_compile_session_build_lock(cache_key: &str, build_lock: &Arc<Mutex<()>>) {
+    let mut locks = native_compile_session_build_locks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(existing_lock) = locks.get(cache_key) {
+        if Arc::ptr_eq(existing_lock, build_lock) && Arc::strong_count(existing_lock) == 2 {
+            locks.remove(cache_key);
+        }
+    }
+}
+
+#[cfg(feature = "native-compile")]
 fn native_compile_session_handle(
     workspace_root: &Path,
     signature: &NativeCompileSessionSignature,
 ) -> Result<Arc<Mutex<NativeCompileSessionState>>> {
     let cache_key = native_compile_session_cache_key(workspace_root);
     let now_ms = epoch_ms_u64().unwrap_or_default();
-    let mut cache = native_compile_session_cache()
+    {
+        let mut cache = native_compile_session_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = cache.get_mut(&cache_key) {
+            entry.last_access_epoch_ms = now_ms;
+            return Ok(entry.session.clone());
+        }
+    }
+
+    // Avoid holding the global cache lock while building RootDatabase. Serialize
+    // cache misses per workspace key with a dedicated lock instead.
+    let build_lock = native_compile_session_build_lock(&cache_key);
+    let build_guard = build_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(entry) = cache.get_mut(&cache_key) {
-        entry.last_access_epoch_ms = now_ms;
-        return Ok(entry.session.clone());
-    }
-    // Keep this lock during a cache miss so concurrent requests don't build
-    // duplicate `RootDatabase` sessions for the same workspace key.
-    let session = Arc::new(Mutex::new(build_native_compile_session_state(
-        signature.clone(),
-    )?));
-    cache.insert(
-        cache_key,
-        NativeCompileSessionCacheEntry {
-            session: session.clone(),
-            last_access_epoch_ms: now_ms,
-        },
-    );
-    evict_oldest_native_compile_session_cache_entries(
-        &mut cache,
-        native_compile_session_cache_max_entries(),
-    );
-    Ok(session)
+    let build_result = (|| -> Result<Arc<Mutex<NativeCompileSessionState>>> {
+        let now_ms = epoch_ms_u64().unwrap_or_default();
+        {
+            let mut cache = native_compile_session_cache()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(entry) = cache.get_mut(&cache_key) {
+                entry.last_access_epoch_ms = now_ms;
+                return Ok(entry.session.clone());
+            }
+        }
+
+        let session = Arc::new(Mutex::new(build_native_compile_session_state(
+            signature.clone(),
+        )?));
+        {
+            let mut cache = native_compile_session_cache()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.insert(
+                cache_key.clone(),
+                NativeCompileSessionCacheEntry {
+                    session: session.clone(),
+                    last_access_epoch_ms: now_ms,
+                },
+            );
+            evict_oldest_native_compile_session_cache_entries(
+                &mut cache,
+                native_compile_session_cache_max_entries(),
+            );
+        }
+        Ok(session)
+    })();
+    drop(build_guard);
+    release_native_compile_session_build_lock(&cache_key, &build_lock);
+    build_result
 }
 
+#[cfg(feature = "native-compile")]
 fn clear_native_compile_session(workspace_root: &Path) {
     let cache_key = native_compile_session_cache_key(workspace_root);
     let mut cache = native_compile_session_cache()
@@ -3023,18 +3137,35 @@ fn clear_native_compile_session(workspace_root: &Path) {
     cache.remove(&cache_key);
 }
 
+#[cfg(feature = "native-compile")]
 fn with_native_compile_session<T>(
     workspace_root: &Path,
     signature: &NativeCompileSessionSignature,
     f: impl FnOnce(&NativeCompileSessionSnapshot) -> Result<T>,
 ) -> Result<T> {
     let session_handle = native_compile_session_handle(workspace_root, signature)?;
+    {
+        let session = session_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if session.signature == *signature {
+            let snapshot = NativeCompileSessionSnapshot {
+                db: session.db.snapshot(),
+                main_crate_inputs: session.main_crate_inputs.clone(),
+            };
+            return f(&snapshot);
+        }
+    }
+
+    // Rebuild outside the per-workspace lock so concurrent requests can keep
+    // progressing instead of queueing behind a long DB refresh.
+    let rebuilt_state = build_native_compile_session_state(signature.clone())?;
     let snapshot = {
         let mut session = session_handle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if session.signature != *signature {
-            *session = build_native_compile_session_state(signature.clone())?;
+            *session = rebuilt_state;
         }
         NativeCompileSessionSnapshot {
             db: session.db.snapshot(),
@@ -3044,6 +3175,7 @@ fn with_native_compile_session<T>(
     f(&snapshot)
 }
 
+#[cfg(feature = "native-compile")]
 fn run_native_build(
     common: &BuildCommonArgs,
     manifest_path: &Path,
@@ -3078,6 +3210,27 @@ fn run_native_build(
     }
 }
 
+#[cfg(not(feature = "native-compile"))]
+fn run_native_build(
+    common: &BuildCommonArgs,
+    manifest_path: &Path,
+    workspace_root: &Path,
+    profile: &str,
+    daemon_context: bool,
+) -> Result<CommandRun> {
+    let _ = (
+        common,
+        manifest_path,
+        workspace_root,
+        profile,
+        daemon_context,
+    );
+    Err(native_fallback_eligible_error(
+        "native compile backend is disabled at build time; rebuild uc with `native-compile` feature",
+    ))
+}
+
+#[cfg(feature = "native-compile")]
 fn validate_native_profile_name(profile: &str) -> Result<()> {
     let mut components = Path::new(profile).components();
     let Some(first) = components.next() else {
@@ -3092,6 +3245,7 @@ fn validate_native_profile_name(profile: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "native-compile")]
 fn native_compiler_config<'a>(
     main_crate_inputs: &'a [CrateInput],
     profile: &str,
@@ -3106,6 +3260,7 @@ fn native_compiler_config<'a>(
     compiler_config
 }
 
+#[cfg(feature = "native-compile")]
 fn native_target_dir(workspace_root: &Path, profile: &str) -> Result<PathBuf> {
     validate_native_profile_name(profile)?;
     let target_dir = workspace_root.join("target").join(profile);
@@ -3113,7 +3268,25 @@ fn native_target_dir(workspace_root: &Path, profile: &str) -> Result<PathBuf> {
     Ok(target_dir)
 }
 
+#[cfg(feature = "native-compile")]
+fn write_native_sierra_artifact(
+    target_dir: &Path,
+    package_name: &str,
+    output_name: &str,
+    sierra_program: &str,
+) -> Result<()> {
+    let output_path = target_dir.join(output_name);
+    ensure_path_within_root(target_dir, &output_path, "native sierra artifact path")?;
+    let mut keep_files = BTreeSet::new();
+    keep_files.insert(output_name.to_string());
+    fs::write(&output_path, sierra_program)
+        .with_context(|| format!("failed to write native artifact {}", output_name))?;
+    prune_native_target_outputs(target_dir, package_name, &keep_files)?;
+    Ok(())
+}
+
 #[inline(never)]
+#[cfg(feature = "native-compile")]
 fn run_native_build_inner(
     common: &BuildCommonArgs,
     manifest_path: &Path,
@@ -3138,13 +3311,12 @@ fn run_native_build_inner(
             )
             .context("native cairo compile failed")?;
             let output_name = format!("{}.sierra", context.package_name);
-            let output_path = target_dir.join(&output_name);
-            ensure_path_within_root(&target_dir, &output_path, "native sierra artifact path")?;
-            let mut keep_files = BTreeSet::new();
-            keep_files.insert(output_name.clone());
-            prune_native_target_outputs(&target_dir, &context.package_name, &keep_files)?;
-            fs::write(&output_path, program.to_string())
-                .with_context(|| format!("failed to write native artifact {}", output_name))?;
+            write_native_sierra_artifact(
+                &target_dir,
+                &context.package_name,
+                &output_name,
+                &program.to_string(),
+            )?;
             return Ok(1);
         }
 
@@ -3239,7 +3411,7 @@ fn run_native_build_inner(
             });
         }
         contracts_manifest.sort_by(|left, right| left.id.cmp(&right.id));
-        let contract_artifact_count = contracts_manifest.len();
+        let serialized_artifact_count = serialized_artifacts.len();
         let manifest = StarknetArtifactsManifest {
             version: 1,
             contracts: contracts_manifest,
@@ -3261,7 +3433,7 @@ fn run_native_build_inner(
         write_json_file_compact(&manifest_path, &manifest)
             .with_context(|| format!("failed to write {}", manifest_path.display()))?;
         prune_native_target_outputs(&target_dir, &context.package_name, &keep_files)?;
-        Ok(contract_artifact_count + 1)
+        Ok(serialized_artifact_count + 1)
     })?;
 
     Ok(CommandRun {
@@ -3280,6 +3452,7 @@ fn run_native_build_inner(
     })
 }
 
+#[cfg(feature = "native-compile")]
 fn write_json_file_compact<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let file =
         File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
@@ -4030,6 +4203,7 @@ fn daemon_lock_hash_cache() -> &'static Mutex<HashMap<String, LockfileHashCacheE
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(feature = "native-compile")]
 fn native_compile_session_cache() -> &'static Mutex<HashMap<String, NativeCompileSessionCacheEntry>>
 {
     static CACHE: OnceLock<Mutex<HashMap<String, NativeCompileSessionCacheEntry>>> =
@@ -4037,6 +4211,7 @@ fn native_compile_session_cache() -> &'static Mutex<HashMap<String, NativeCompil
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(feature = "native-compile")]
 fn native_compile_context_cache() -> &'static Mutex<HashMap<String, NativeCompileContextCacheEntry>>
 {
     static CACHE: OnceLock<Mutex<HashMap<String, NativeCompileContextCacheEntry>>> =
@@ -4044,6 +4219,7 @@ fn native_compile_context_cache() -> &'static Mutex<HashMap<String, NativeCompil
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(feature = "native-compile")]
 fn native_compile_context_cache_key(
     manifest_path: &Path,
     workspace_root: &Path,
@@ -4075,6 +4251,7 @@ fn evict_oldest_daemon_lock_hash_cache_entries(
     }
 }
 
+#[cfg(feature = "native-compile")]
 fn evict_oldest_native_compile_session_cache_entries(
     cache: &mut HashMap<String, NativeCompileSessionCacheEntry>,
     max_entries: usize,
@@ -4091,6 +4268,7 @@ fn evict_oldest_native_compile_session_cache_entries(
     }
 }
 
+#[cfg(feature = "native-compile")]
 fn evict_oldest_native_compile_context_cache_entries(
     cache: &mut HashMap<String, NativeCompileContextCacheEntry>,
     max_entries: usize,
@@ -4510,12 +4688,13 @@ fn persist_daemon_shared_cache_entry_for_build(
     Ok(())
 }
 
+#[cfg(feature = "native-compile")]
 fn resolve_manifest_native_starknet_target_props(
     manifest: &TomlValue,
 ) -> Result<NativeStarknetTargetProps> {
     let mut props = NativeStarknetTargetProps {
         sierra: true,
-        casm: false,
+        casm: true,
     };
     let Some(target_table) = manifest.get("target").and_then(TomlValue::as_table) else {
         return Ok(props);

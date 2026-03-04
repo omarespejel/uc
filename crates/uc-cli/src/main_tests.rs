@@ -2668,7 +2668,7 @@ edition = "2024_07"
         context.starknet_target,
         NativeStarknetTargetProps {
             sierra: true,
-            casm: false
+            casm: true
         }
     );
     let cairo_project = fs::read_to_string(context.cairo_project_dir.join("cairo_project.toml"))
@@ -2829,6 +2829,91 @@ fn native_contract_file_stems_expand_duplicate_contract_names() {
     );
 }
 
+#[cfg(feature = "native-compile")]
+#[test]
+fn write_native_sierra_artifact_does_not_prune_when_write_fails() {
+    let dir = unique_test_dir("uc-native-write-before-prune");
+    let target_dir = dir.join("target/dev");
+    fs::create_dir_all(&target_dir).expect("failed to create target directory");
+    let stale_artifacts = target_dir.join("demo.starknet_artifacts.json");
+    fs::write(&stale_artifacts, "{}").expect("failed to seed stale artifact");
+    fs::create_dir_all(target_dir.join("demo.sierra"))
+        .expect("failed to create blocking output directory");
+
+    let err = write_native_sierra_artifact(&target_dir, "demo", "demo.sierra", "fn main() {}\n")
+        .expect_err("write should fail when the output path is a directory");
+    assert!(
+        format!("{err:#}").contains("failed to write native artifact demo.sierra"),
+        "unexpected error: {err:#}"
+    );
+    assert!(
+        stale_artifacts.exists(),
+        "prune should not run when native sierra write fails"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_compile_session_build_lock_is_per_key_and_released_when_idle() {
+    let key = format!("workspace-{}", epoch_ms_u64().unwrap_or_default());
+    let other_key = format!("{key}-other");
+    {
+        let mut locks = native_compile_session_build_locks()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks.remove(&key);
+        locks.remove(&other_key);
+    }
+
+    let first = native_compile_session_build_lock(&key);
+    let second = native_compile_session_build_lock(&key);
+    let other = native_compile_session_build_lock(&other_key);
+    assert!(
+        std::sync::Arc::ptr_eq(&first, &second),
+        "same key should share one build lock"
+    );
+    assert!(
+        !std::sync::Arc::ptr_eq(&first, &other),
+        "different keys should not contend on one build lock"
+    );
+
+    release_native_compile_session_build_lock(&key, &first);
+    {
+        let locks = native_compile_session_build_locks()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            locks.contains_key(&key),
+            "lock entry must remain while another waiter still holds a reference"
+        );
+    }
+    drop(second);
+    release_native_compile_session_build_lock(&key, &first);
+    {
+        let locks = native_compile_session_build_locks()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            !locks.contains_key(&key),
+            "lock entry should be removed once it is idle"
+        );
+    }
+
+    release_native_compile_session_build_lock(&other_key, &other);
+    drop(other);
+    {
+        let locks = native_compile_session_build_locks()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            !locks.contains_key(&other_key),
+            "independent key entry should also be removed once idle"
+        );
+    }
+}
+
 #[test]
 fn native_compiler_config_sets_replace_ids_by_profile() {
     let empty_inputs: Vec<CrateInput> = Vec::new();
@@ -2858,7 +2943,7 @@ edition = "2024_07"
         props,
         NativeStarknetTargetProps {
             sierra: true,
-            casm: false
+            casm: true
         }
     );
 }
@@ -2906,7 +2991,7 @@ edition = "2024_07"
         props,
         NativeStarknetTargetProps {
             sierra: true,
-            casm: false
+            casm: true
         }
     );
 }
