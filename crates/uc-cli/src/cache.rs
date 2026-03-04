@@ -1,5 +1,13 @@
 use super::*;
 
+#[derive(Clone)]
+pub(super) struct BuildEntryCacheEntry {
+    pub(super) file_size_bytes: u64,
+    pub(super) file_modified_unix_ms: u64,
+    pub(super) entry: BuildCacheEntry,
+    pub(super) last_access_epoch_ms: u64,
+}
+
 pub(super) fn async_persist_scope_key(workspace_root: &Path, profile: &str) -> String {
     format!("{}::{profile}", workspace_root.display())
 }
@@ -207,6 +215,9 @@ pub(super) fn persist_cache_entry(
 
     let bytes = serde_json::to_vec(&entry)?;
     atomic_write_bytes(entry_path, &bytes, "cache entry")?;
+    if let Ok(metadata) = fs::metadata(entry_path) {
+        store_build_entry_cached(entry_path, &metadata, &entry);
+    }
 
     Ok(())
 }
@@ -356,6 +367,122 @@ pub(super) fn is_removable_cache_file(path: &Path) -> bool {
     name != ".lock"
 }
 
+pub(super) fn build_entry_cache() -> &'static Mutex<HashMap<String, BuildEntryCacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, BuildEntryCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(super) fn build_entry_cache_key(path: &Path) -> String {
+    normalize_fingerprint_path(path)
+}
+
+pub(super) fn remove_build_entry_cached(path: &Path) {
+    let key = build_entry_cache_key(path);
+    let mut cache = build_entry_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.remove(&key);
+}
+
+pub(super) fn store_build_entry_cached(
+    path: &Path,
+    metadata: &fs::Metadata,
+    entry: &BuildCacheEntry,
+) {
+    let Ok(file_modified_unix_ms) = metadata_modified_unix_ms(metadata) else {
+        return;
+    };
+    let key = build_entry_cache_key(path);
+    let now_ms = epoch_ms_u64().unwrap_or_default();
+    let mut cache = build_entry_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.insert(
+        key,
+        BuildEntryCacheEntry {
+            file_size_bytes: metadata.len(),
+            file_modified_unix_ms,
+            entry: entry.clone(),
+            last_access_epoch_ms: now_ms,
+        },
+    );
+    evict_oldest_build_entry_cache_entries(&mut cache, build_entry_cache_max_entries());
+}
+
+pub(super) fn evict_oldest_build_entry_cache_entries(
+    cache: &mut HashMap<String, BuildEntryCacheEntry>,
+    max_entries: usize,
+) {
+    while cache.len() > max_entries {
+        let Some(oldest_key) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_access_epoch_ms)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest_key);
+    }
+}
+
+pub(super) fn load_cache_entry_cached(path: &Path) -> Result<Option<BuildCacheEntry>> {
+    if !path.exists() {
+        remove_build_entry_cached(path);
+        return Ok(None);
+    }
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    let max_bytes = max_cache_entry_bytes();
+    if metadata.len() > max_bytes {
+        remove_build_entry_cached(path);
+        eprintln!(
+            "uc: warning: ignoring oversized cache entry {} ({} bytes > {} bytes)",
+            path.display(),
+            metadata.len(),
+            max_bytes
+        );
+        return Ok(None);
+    }
+    let file_modified_unix_ms = metadata_modified_unix_ms(&metadata)?;
+    let key = build_entry_cache_key(path);
+    let now_ms = epoch_ms_u64().unwrap_or_default();
+    {
+        let mut cache = build_entry_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = cache.get_mut(&key) {
+            entry.last_access_epoch_ms = now_ms;
+            if entry.file_size_bytes == metadata.len()
+                && entry.file_modified_unix_ms == file_modified_unix_ms
+            {
+                return Ok(Some(entry.entry.clone()));
+            }
+        }
+    }
+    let loaded = load_cache_entry(path)?;
+    let mut cache = build_entry_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match loaded.as_ref() {
+        Some(entry) => {
+            cache.insert(
+                key,
+                BuildEntryCacheEntry {
+                    file_size_bytes: metadata.len(),
+                    file_modified_unix_ms,
+                    entry: entry.clone(),
+                    last_access_epoch_ms: now_ms,
+                },
+            );
+            evict_oldest_build_entry_cache_entries(&mut cache, build_entry_cache_max_entries());
+        }
+        None => {
+            cache.remove(&key);
+        }
+    }
+    Ok(loaded)
+}
+
 pub(super) fn load_cache_entry(path: &Path) -> Result<Option<BuildCacheEntry>> {
     if !path.exists() {
         return Ok(None);
@@ -459,7 +586,7 @@ pub(super) fn restore_cached_artifacts(
     artifacts: &[CachedArtifact],
 ) -> Result<bool> {
     if artifacts.is_empty() {
-        return Ok(false);
+        return Ok(true);
     }
 
     let index_path = cache_root.join("artifact-index-v1.json");
@@ -495,6 +622,7 @@ pub(super) fn restore_cached_artifacts(
                 }
                 if !matches_cached_artifact
                     && existing_metadata.len() == artifact.size_bytes
+                    && existing_metadata.len() <= max_restore_existing_hash_bytes()
                     && hash_file_blake3(&out_path)? == *expected_hash
                 {
                     upsert_artifact_index_entry_from_metadata(
@@ -556,6 +684,56 @@ pub(super) fn restore_cached_artifacts(
                 "uc: warning: failed to update artifact index {}: {err:#}",
                 index_path.display()
             );
+        }
+    }
+
+    Ok(true)
+}
+
+pub(super) fn cached_artifacts_already_materialized(
+    workspace_root: &Path,
+    profile: &str,
+    cache_root: &Path,
+    artifacts: &[CachedArtifact],
+) -> Result<bool> {
+    if artifacts.is_empty() {
+        return Ok(true);
+    }
+
+    let index_path = cache_root.join("artifact-index-v1.json");
+    let artifact_index = load_artifact_index_cached(&index_path)?;
+    let target_root = workspace_root.join("target").join(profile);
+
+    for artifact in artifacts {
+        validate_hex_digest(
+            "cached artifact blake3 hash",
+            &artifact.blake3_hex,
+            MIN_HASH_LEN,
+        )?;
+        let relative_path = validated_relative_artifact_path(&artifact.relative_path)?;
+        let relative_path_key = normalize_fingerprint_path(&relative_path);
+        let Some(index_entry) = artifact_index.entries.get(&relative_path_key) else {
+            return Ok(false);
+        };
+        let out_path = target_root.join(&relative_path);
+        ensure_path_within_root(&target_root, &out_path, "cache materialized check path")?;
+        let metadata = match fs::metadata(&out_path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to stat {}", out_path.display()))
+            }
+        };
+        if !metadata.is_file() {
+            return Ok(false);
+        }
+        if !artifact_index_entry_matches_expected(
+            index_entry,
+            &metadata,
+            &artifact.blake3_hex,
+            artifact.size_bytes,
+        )? {
+            return Ok(false);
         }
     }
 

@@ -1525,6 +1525,50 @@ fn fingerprint_index_cache_eviction_removes_oldest_entries() {
 }
 
 #[test]
+fn build_entry_cache_eviction_removes_oldest_entries() {
+    let sample_entry = BuildCacheEntry {
+        schema_version: BUILD_CACHE_SCHEMA_VERSION,
+        fingerprint: "fp".to_string(),
+        profile: "dev".to_string(),
+        artifacts: Vec::new(),
+    };
+    let mut cache = HashMap::new();
+    cache.insert(
+        "oldest".to_string(),
+        BuildEntryCacheEntry {
+            file_size_bytes: 1,
+            file_modified_unix_ms: 1,
+            entry: sample_entry.clone(),
+            last_access_epoch_ms: 1,
+        },
+    );
+    cache.insert(
+        "middle".to_string(),
+        BuildEntryCacheEntry {
+            file_size_bytes: 1,
+            file_modified_unix_ms: 1,
+            entry: sample_entry.clone(),
+            last_access_epoch_ms: 2,
+        },
+    );
+    cache.insert(
+        "newest".to_string(),
+        BuildEntryCacheEntry {
+            file_size_bytes: 1,
+            file_modified_unix_ms: 1,
+            entry: sample_entry,
+            last_access_epoch_ms: 3,
+        },
+    );
+
+    evict_oldest_build_entry_cache_entries(&mut cache, 2);
+    assert_eq!(cache.len(), 2);
+    assert!(!cache.contains_key("oldest"));
+    assert!(cache.contains_key("middle"));
+    assert!(cache.contains_key("newest"));
+}
+
+#[test]
 fn artifact_index_cache_eviction_removes_oldest_entries() {
     let mut cache = HashMap::new();
     cache.insert(
@@ -1554,6 +1598,53 @@ fn artifact_index_cache_eviction_removes_oldest_entries() {
     assert!(!cache.contains_key("oldest"));
     assert!(cache.contains_key("middle"));
     assert!(cache.contains_key("newest"));
+}
+
+#[test]
+fn load_cache_entry_cached_invalidates_when_file_changes() {
+    let dir = unique_test_dir("uc-build-entry-cache-invalidate");
+    let entry_path = dir.join("cache/build/test.json");
+    if let Some(parent) = entry_path.parent() {
+        fs::create_dir_all(parent).expect("failed to create cache entry parent");
+    }
+    let first = BuildCacheEntry {
+        schema_version: BUILD_CACHE_SCHEMA_VERSION,
+        fingerprint: "fp-a".to_string(),
+        profile: "dev".to_string(),
+        artifacts: Vec::new(),
+    };
+    persist_cache_entry(
+        &first.profile,
+        &first.fingerprint,
+        &first.artifacts,
+        &entry_path,
+    )
+    .expect("failed to persist first cache entry");
+    let loaded_first = load_cache_entry_cached(&entry_path)
+        .expect("failed to load first cache entry")
+        .expect("first cache entry should exist");
+    assert_eq!(loaded_first.fingerprint, "fp-a");
+
+    // Ensure file mtime changes for the metadata-based cache validator.
+    thread::sleep(Duration::from_millis(5));
+    let second = BuildCacheEntry {
+        schema_version: BUILD_CACHE_SCHEMA_VERSION,
+        fingerprint: "fp-b".to_string(),
+        profile: "dev".to_string(),
+        artifacts: Vec::new(),
+    };
+    persist_cache_entry(
+        &second.profile,
+        &second.fingerprint,
+        &second.artifacts,
+        &entry_path,
+    )
+    .expect("failed to persist second cache entry");
+    let loaded_second = load_cache_entry_cached(&entry_path)
+        .expect("failed to load second cache entry")
+        .expect("second cache entry should exist");
+    assert_eq!(loaded_second.fingerprint, "fp-b");
+    fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -1648,6 +1739,82 @@ fn restore_cached_artifacts_skips_object_restore_when_index_matches() {
     assert_eq!(
         fs::read(&output).expect("failed to read target artifact"),
         b"cached-artifact"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn cached_artifacts_already_materialized_returns_true_when_index_matches() {
+    let dir = unique_test_dir("uc-materialized-index-hit");
+    let workspace = dir.join("workspace");
+    let target_root = workspace.join("target/dev");
+    let cache_root = workspace.join(".uc/cache");
+    fs::create_dir_all(&target_root).expect("failed to create target root");
+
+    let output = target_root.join("demo.sierra.json");
+    fs::write(&output, b"cached-artifact").expect("failed to write target artifact");
+    let output_metadata = fs::metadata(&output).expect("failed to stat target artifact");
+    let expected_hash = hash_file_blake3(&output).expect("failed to hash target artifact");
+
+    let mut artifact_index = ArtifactIndex::empty();
+    artifact_index.entries.insert(
+        "demo.sierra.json".to_string(),
+        ArtifactIndexEntry {
+            size_bytes: output_metadata.len(),
+            modified_unix_ms: metadata_modified_unix_ms(&output_metadata)
+                .expect("failed to read target mtime"),
+            blake3_hex: expected_hash.clone(),
+        },
+    );
+    save_artifact_index(&cache_root.join("artifact-index-v1.json"), &artifact_index)
+        .expect("failed to write artifact index");
+
+    let artifacts = vec![CachedArtifact {
+        relative_path: "demo.sierra.json".to_string(),
+        blake3_hex: expected_hash,
+        size_bytes: output_metadata.len(),
+        object_rel_path: "aa/missing-object.bin".to_string(),
+    }];
+
+    let materialized =
+        cached_artifacts_already_materialized(&workspace, "dev", &cache_root, &artifacts)
+            .expect("materialized check should succeed");
+    assert!(
+        materialized,
+        "index + target metadata should satisfy hot cache-hit check"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn restore_cached_artifacts_skips_large_existing_hash_fallback() {
+    let dir = unique_test_dir("uc-restore-large-hash-guard");
+    let workspace = dir.join("workspace");
+    let target_root = workspace.join("target/dev");
+    let cache_root = workspace.join(".uc/cache");
+    let objects_dir = cache_root.join("objects");
+    fs::create_dir_all(&target_root).expect("failed to create target root");
+    fs::create_dir_all(&objects_dir).expect("failed to create objects root");
+
+    let output = target_root.join("demo.sierra.json");
+    let large_len = DEFAULT_MAX_RESTORE_EXISTING_HASH_BYTES as usize + 4096;
+    fs::write(&output, vec![b'X'; large_len]).expect("failed to write large artifact");
+    let output_metadata = fs::metadata(&output).expect("failed to stat large artifact");
+    let expected_hash = hash_file_blake3(&output).expect("failed to hash large artifact");
+
+    let artifacts = vec![CachedArtifact {
+        relative_path: "demo.sierra.json".to_string(),
+        blake3_hex: expected_hash,
+        size_bytes: output_metadata.len(),
+        object_rel_path: "aa/missing-object.bin".to_string(),
+    }];
+
+    let restored =
+        restore_cached_artifacts(&workspace, "dev", &cache_root, &objects_dir, &artifacts)
+            .expect("restore should return result");
+    assert!(
+        !restored,
+        "large artifacts should avoid hash fallback and miss when object is absent"
     );
     fs::remove_dir_all(&dir).ok();
 }

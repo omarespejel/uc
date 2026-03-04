@@ -61,6 +61,7 @@ const MAX_LOCKFILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_CACHE_ENTRY_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_FINGERPRINT_INDEX_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_ARTIFACT_INDEX_BYTES: u64 = 32 * 1024 * 1024;
+const DEFAULT_MAX_RESTORE_EXISTING_HASH_BYTES: u64 = 1024 * 1024;
 const MAX_CAPTURE_STDOUT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CAPTURE_STDERR_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_MAX_CACHE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
@@ -84,6 +85,7 @@ const DEFAULT_CACHE_BUDGET_ENFORCE_EVERY: u64 = 8;
 const DEFAULT_MIN_SCARB_VERSION: &str = "2.14.0";
 const DEFAULT_SESSION_INPUT_CACHE_MAX_ENTRIES: usize = 1024;
 const DEFAULT_FINGERPRINT_INDEX_CACHE_MAX_ENTRIES: usize = 512;
+const DEFAULT_BUILD_ENTRY_CACHE_MAX_ENTRIES: usize = 1024;
 const DEFAULT_ARTIFACT_INDEX_CACHE_MAX_ENTRIES: usize = 512;
 const DEFAULT_DAEMON_BUILD_PLAN_CACHE_MAX_ENTRIES: usize = 512;
 const DEFAULT_DAEMON_LOCK_HASH_CACHE_MAX_ENTRIES: usize = 512;
@@ -818,6 +820,16 @@ fn max_artifact_index_bytes() -> u64 {
     *VALUE.get_or_init(|| parse_env_u64("UC_MAX_ARTIFACT_INDEX_BYTES", MAX_ARTIFACT_INDEX_BYTES))
 }
 
+fn max_restore_existing_hash_bytes() -> u64 {
+    static VALUE: OnceLock<u64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_env_u64(
+            "UC_MAX_RESTORE_EXISTING_HASH_BYTES",
+            DEFAULT_MAX_RESTORE_EXISTING_HASH_BYTES,
+        )
+    })
+}
+
 fn max_capture_stdout_bytes() -> u64 {
     static VALUE: OnceLock<u64> = OnceLock::new();
     *VALUE.get_or_init(|| parse_env_u64("UC_MAX_CAPTURE_STDOUT_BYTES", MAX_CAPTURE_STDOUT_BYTES))
@@ -871,6 +883,17 @@ fn fingerprint_index_cache_max_entries() -> usize {
         parse_env_usize(
             "UC_FINGERPRINT_INDEX_CACHE_MAX_ENTRIES",
             DEFAULT_FINGERPRINT_INDEX_CACHE_MAX_ENTRIES,
+        )
+        .max(1)
+    })
+}
+
+fn build_entry_cache_max_entries() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_env_usize(
+            "UC_BUILD_ENTRY_CACHE_MAX_ENTRIES",
+            DEFAULT_BUILD_ENTRY_CACHE_MAX_ENTRIES,
         )
         .max(1)
     })
@@ -1728,26 +1751,28 @@ fn run_build_with_uc_cache(
     telemetry.fingerprint_ms = fingerprint_start.elapsed().as_secs_f64() * 1000.0;
 
     let cache_lookup_start = Instant::now();
-    let cached_entry = {
-        let _cache_lock = acquire_cache_lock(&cache_root)?;
-        if let Some(entry) = load_cache_entry(&entry_path)? {
-            if entry.schema_version == BUILD_CACHE_SCHEMA_VERSION
-                && entry.profile == profile
-                && entry.fingerprint == fingerprint
-            {
-                Some(entry)
-            } else {
-                None
-            }
+    let cached_entry = if let Some(entry) = load_cache_entry_cached(&entry_path)? {
+        if entry.schema_version == BUILD_CACHE_SCHEMA_VERSION
+            && entry.profile == profile
+            && entry.fingerprint == fingerprint
+        {
+            Some(entry)
         } else {
             None
         }
+    } else {
+        None
     };
     telemetry.cache_lookup_ms = cache_lookup_start.elapsed().as_secs_f64() * 1000.0;
 
     if let Some(entry) = cached_entry {
         let restore_start = Instant::now();
-        if restore_cached_artifacts(
+        if cached_artifacts_already_materialized(
+            &canonical_workspace_root,
+            profile,
+            &cache_root,
+            &entry.artifacts,
+        )? || restore_cached_artifacts(
             &canonical_workspace_root,
             profile,
             &cache_root,
@@ -2912,8 +2937,7 @@ fn try_restore_daemon_shared_cache(
     let shared_objects_dir = shared_cache_root.join("objects");
     let shared_entry_path = daemon_shared_cache_entry_path(&shared_cache_root, session_key);
     let matching_entry = {
-        let _cache_lock = acquire_cache_lock(&shared_cache_root)?;
-        if let Some(entry) = load_cache_entry(&shared_entry_path)? {
+        if let Some(entry) = load_cache_entry_cached(&shared_entry_path)? {
             if entry.schema_version == BUILD_CACHE_SCHEMA_VERSION
                 && entry.profile == profile
                 && entry.fingerprint == fingerprint
