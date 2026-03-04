@@ -2612,6 +2612,25 @@ fn run_native_build(
     }
 }
 
+fn validate_native_profile_name(profile: &str) -> Result<()> {
+    let mut components = Path::new(profile).components();
+    let Some(first) = components.next() else {
+        bail!("native build profile must not be empty");
+    };
+    if components.next().is_some() || !matches!(first, Component::Normal(_)) {
+        bail!("native build profile contains invalid path component: {profile}");
+    }
+    Ok(())
+}
+
+fn native_target_dir(workspace_root: &Path, profile: &str) -> Result<PathBuf> {
+    validate_native_profile_name(profile)?;
+    let target_dir = workspace_root.join("target").join(profile);
+    ensure_path_within_root(workspace_root, &target_dir, "native build target directory")?;
+    Ok(target_dir)
+}
+
+#[inline(never)]
 fn run_native_build_inner(
     common: &BuildCommonArgs,
     manifest_path: &Path,
@@ -2620,7 +2639,7 @@ fn run_native_build_inner(
 ) -> Result<CommandRun> {
     let started = Instant::now();
     let context = build_native_compile_context(common, manifest_path, workspace_root)?;
-    let target_dir = workspace_root.join("target").join(profile);
+    let target_dir = native_target_dir(workspace_root, profile)?;
     fs::create_dir_all(&target_dir)
         .with_context(|| format!("failed to create {}", target_dir.display()))?;
 
@@ -2669,6 +2688,26 @@ fn run_native_build_inner(
                 contracts.len(),
                 contract_classes.len()
             );
+        }
+        #[cfg(debug_assertions)]
+        {
+            for (index, contract) in contracts.iter().enumerate() {
+                let mut single_class =
+                    compile_starknet_prepared_db(&db, &[contract], CompilerConfig::default())
+                        .with_context(|| {
+                            format!(
+                                "failed to validate native contract ordering for {}",
+                                contract.submodule_id.full_path(&db)
+                            )
+                        })?;
+                let expected_class = single_class
+                    .pop()
+                    .context("single-contract native compile returned no output")?;
+                debug_assert_eq!(
+                    expected_class, contract_classes[index],
+                    "compile_starknet_prepared_db returned classes in unexpected order"
+                );
+            }
         }
         let mut serialized_artifacts = Vec::with_capacity(contract_classes.len().saturating_mul(2));
         let mut keep_files = BTreeSet::new();

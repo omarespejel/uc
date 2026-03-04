@@ -2476,6 +2476,18 @@ alexandria = "0.9.0"
 }
 
 #[test]
+fn native_target_dir_rejects_profile_traversal_escape() {
+    let workspace_root = PathBuf::from("/tmp/uc-native-target-dir");
+    let err = native_target_dir(&workspace_root, "../../escape")
+        .expect_err("profile traversal should be rejected");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("native build profile contains invalid path component"),
+        "unexpected error: {message}"
+    );
+}
+
+#[test]
 fn build_native_compile_context_writes_cairo_project_and_normalizes_crate_name() {
     let _guard = integration_env_lock()
         .lock()
