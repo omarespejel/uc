@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ -z "${BASH_VERSION:-}" ]]; then
+  echo "This script must be executed with bash." >&2
+  exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-}"
@@ -231,6 +236,13 @@ fi
 
 acquire_benchmark_lock() {
   mkdir -p "$(dirname "$BENCH_LOCK_DIR")"
+  if [[ -d "$BENCH_LOCK_DIR" ]]; then
+    local stale_owner_pid=""
+    stale_owner_pid="$(lock_file_pid "$BENCH_LOCK_DIR/pid" || true)"
+    if [[ -n "$stale_owner_pid" ]] && ! process_alive "$stale_owner_pid"; then
+      rm -rf "$BENCH_LOCK_DIR"
+    fi
+  fi
   if mkdir "$BENCH_LOCK_DIR" 2>/dev/null; then
     BENCH_LOCK_HELD=1
     printf '%s\n' "$$" > "$BENCH_LOCK_DIR/pid" 2>/dev/null || true

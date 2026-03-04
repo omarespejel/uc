@@ -277,7 +277,7 @@ pub(super) fn compute_build_fingerprint(
 }
 
 pub(super) fn build_fingerprint_context_digest(
-    canonical_manifest: &Path,
+    manifest_identity: &str,
     common: &BuildCommonArgs,
     profile: &str,
     scarb_version: &str,
@@ -286,7 +286,7 @@ pub(super) fn build_fingerprint_context_digest(
     hasher.update(b"uc-build-fingerprint-context-v1");
     hasher.update(scarb_version.as_bytes());
     hasher.update(current_build_env_fingerprint().as_bytes());
-    hasher.update(normalize_fingerprint_path(canonical_manifest).as_bytes());
+    hasher.update(manifest_identity.as_bytes());
     hasher.update(profile.as_bytes());
     hasher.update(common.package.as_deref().unwrap_or("*").as_bytes());
     hasher.update(if common.workspace {
@@ -415,8 +415,15 @@ pub(super) fn compute_build_fingerprint_with_scarb_version(
     let canonical_manifest = manifest_path
         .canonicalize()
         .with_context(|| format!("failed to canonicalize {}", manifest_path.display()))?;
+    let canonical_workspace_root = workspace_root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", workspace_root.display()))?;
+    let manifest_identity = canonical_manifest
+        .strip_prefix(&canonical_workspace_root)
+        .map(normalize_fingerprint_path)
+        .unwrap_or_else(|_| normalize_fingerprint_path(&canonical_manifest));
     let context_digest =
-        build_fingerprint_context_digest(&canonical_manifest, common, profile, scarb_version);
+        build_fingerprint_context_digest(&manifest_identity, common, profile, scarb_version);
 
     let (index_path, mut index) = if let Some(root) = cache_root {
         let path = root.join("fingerprint/index-v1.json");

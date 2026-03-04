@@ -28,6 +28,17 @@ pub(super) fn async_persist_error_slot() -> &'static Mutex<VecDeque<String>> {
     SLOT.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
+fn async_persist_error_queue_limit() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_env_usize(
+            "UC_ASYNC_PERSIST_ERROR_QUEUE_LIMIT",
+            ASYNC_PERSIST_ERROR_QUEUE_LIMIT,
+        )
+        .max(1)
+    })
+}
+
 fn async_persist_error_log_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("UC_ASYNC_PERSIST_ERROR_LOG_PATH") {
         let path = PathBuf::from(path);
@@ -39,7 +50,7 @@ fn async_persist_error_log_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".uc/cache/persist-errors.log"))
 }
 
-fn maybe_rotate_async_persist_error_log(path: &Path, max_bytes: u64) -> io::Result<()> {
+pub(super) fn maybe_rotate_async_persist_error_log(path: &Path, max_bytes: u64) -> io::Result<()> {
     if max_bytes == 0 {
         return Ok(());
     }
@@ -101,11 +112,12 @@ fn append_async_persist_error_log(message: &str) {
 
 pub(super) fn record_async_persist_error(error: String) {
     append_async_persist_error_log(&error);
+    let queue_limit = async_persist_error_queue_limit();
     let mut slot = async_persist_error_slot()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     slot.push_back(error);
-    while slot.len() > ASYNC_PERSIST_ERROR_QUEUE_LIMIT {
+    while slot.len() > queue_limit {
         if let Some(dropped) = slot.pop_front() {
             append_async_persist_error_log(&format!("queue_drop oldest={dropped}"));
             tracing::warn!(

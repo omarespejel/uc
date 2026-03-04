@@ -18,6 +18,14 @@ pub trait IRegistry<TContractState> {
     fn bump(ref self: TContractState, seed: felt252);
 }
 
+#[starknet::interface]
+pub trait IPermissionedVault<TContractState> {
+    fn balance_of(self: @TContractState, owner: ContractAddress, bucket: felt252) -> u128;
+    fn grant_operator(ref self: TContractState, operator: ContractAddress);
+    fn deposit(ref self: TContractState, bucket: felt252, amount: u128);
+    fn withdraw(ref self: TContractState, bucket: felt252, amount: u128) -> bool;
+}
+
 #[starknet::contract]
 mod token {
     use super::{IRegistryDispatcher, IRegistryDispatcherTrait, IToken};
@@ -42,6 +50,7 @@ mod token {
         allowances: Map<(ContractAddress, ContractAddress), u128>,
         allowance_nonce: Map<(ContractAddress, ContractAddress), u64>,
         permissions: Map<(ContractAddress, felt252), bool>,
+        sync_permission_guard: u8,
     }
 
     #[event]
@@ -200,6 +209,10 @@ mod token {
         let registry = self.registry.read();
         assert(!registry.is_zero(), 'registry=0');
         let caller = get_caller_address();
+        assert(self.sync_permission_guard.read() == 0_u8, 'reentrant');
+        self.sync_permission_guard.write(1_u8);
+        // Smoke fixture assumes registry is trusted, but this guard still prevents
+        // accidental re-entrancy if registry logic is swapped during experiments.
         let seed = IRegistryDispatcher { contract_address: registry }.last_seed();
         self.permissions.write((caller, seed), true);
         self.emit(Event::RegistrySynced(RegistrySynced {
@@ -207,6 +220,7 @@ mod token {
             caller,
             seed,
         }));
+        self.sync_permission_guard.write(0_u8);
     }
 }
 
@@ -251,6 +265,83 @@ mod registry {
             self.last_seed.write(seed);
             self.latest_by_caller.write(caller, seed);
             self.history.write((caller, seed), previous);
+        }
+    }
+}
+
+#[starknet::contract]
+mod permissioned_vault {
+    use super::IPermissionedVault;
+    use core::num::traits::CheckedAdd;
+    use core::num::traits::Zero;
+    use core::option::OptionTrait;
+    use starknet::storage::{
+        Map,
+        StorageMapReadAccess,
+        StorageMapWriteAccess,
+        StoragePointerReadAccess,
+        StoragePointerWriteAccess,
+    };
+    use starknet::{ContractAddress, get_caller_address};
+
+    #[storage]
+    struct Storage {
+        owner: ContractAddress,
+        operators: Map<(ContractAddress, ContractAddress), bool>,
+        balances: Map<(ContractAddress, felt252), u128>,
+        totals_by_bucket: Map<felt252, u128>,
+        audit_log: Map<(ContractAddress, felt252), felt252>,
+    }
+
+    #[constructor]
+    fn constructor(ref self: ContractState, owner: ContractAddress) {
+        assert(!owner.is_zero(), 'owner=0');
+        self.owner.write(owner);
+    }
+
+    #[abi(embed_v0)]
+    impl PermissionedVaultImpl of IPermissionedVault<ContractState> {
+        fn balance_of(self: @ContractState, owner: ContractAddress, bucket: felt252) -> u128 {
+            self.balances.read((owner, bucket))
+        }
+
+        fn grant_operator(ref self: ContractState, operator: ContractAddress) {
+            assert(self.owner.read() == get_caller_address(), 'not owner');
+            assert(!operator.is_zero(), 'operator=0');
+            self.operators.write((self.owner.read(), operator), true);
+        }
+
+        fn deposit(ref self: ContractState, bucket: felt252, amount: u128) {
+            let caller = get_caller_address();
+            let key = (caller, bucket);
+            let before = self.balances.read(key);
+            let after = OptionTrait::expect(before.checked_add(amount), 'balance overflow');
+            self.balances.write(key, after);
+
+            let total_before = self.totals_by_bucket.read(bucket);
+            let total_after = OptionTrait::expect(total_before.checked_add(amount), 'total overflow');
+            self.totals_by_bucket.write(bucket, total_after);
+            self.audit_log.write((caller, bucket), bucket);
+        }
+
+        fn withdraw(ref self: ContractState, bucket: felt252, amount: u128) -> bool {
+            let caller = get_caller_address();
+            let owner = self.owner.read();
+            if caller != owner && !self.operators.read((owner, caller)) {
+                return false;
+            }
+
+            let key = (owner, bucket);
+            let before = self.balances.read(key);
+            if before < amount {
+                return false;
+            }
+            self.balances.write(key, before - amount);
+
+            let total_before = self.totals_by_bucket.read(bucket);
+            self.totals_by_bucket.write(bucket, total_before - amount);
+            self.audit_log.write((caller, bucket), bucket);
+            true
         }
     }
 }

@@ -390,11 +390,13 @@ fn canonicalize_json(value: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonicalize_json, compare_artifact_sets, normalize_sierra_json_ids,
-        validate_supported_sierra_schema, ArtifactDigest,
+        canonicalize_json, compare_artifact_sets, hash_sierra_json_semantic,
+        normalize_sierra_json_ids, validate_supported_sierra_schema, ArtifactDigest,
     };
     use serde_json::json;
-    use std::path::Path;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn artifact(path: &str, hash: &str) -> ArtifactDigest {
         ArtifactDigest {
@@ -402,6 +404,17 @@ mod tests {
             blake3_hex: hash.to_string(),
             size_bytes: 1,
         }
+    }
+
+    fn unique_test_path(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "uc-core-{name}-{}-{nonce}.json",
+            std::process::id()
+        ))
     }
 
     #[test]
@@ -572,5 +585,101 @@ mod tests {
             serde_json::to_string(&canonicalize_json(&a)).unwrap(),
             serde_json::to_string(&canonicalize_json(&b)).unwrap()
         );
+    }
+
+    #[test]
+    fn sierra_semantic_hash_is_stable_across_declaration_id_renumbering() {
+        let path_a = unique_test_path("sierra-hash-a");
+        let path_b = unique_test_path("sierra-hash-b");
+        let body_a = json!({
+            "sierra_format_version": "1.0.0",
+            "type_declarations": [{"id": {"id": 11, "debug_name": "felt252"}}],
+            "libfunc_declarations": [{"id": {"id": 41, "debug_name": "store_temp<felt252>"}}],
+            "funcs": [{
+                "id": {"id": 9, "debug_name": "main"},
+                "signature": {"ret_types": [{"id": 11}]}
+            }],
+        });
+        let body_b = json!({
+            "sierra_format_version": "1.0.0",
+            "type_declarations": [{"id": {"id": 77, "debug_name": "felt252"}}],
+            "libfunc_declarations": [{"id": {"id": 88, "debug_name": "store_temp<felt252>"}}],
+            "funcs": [{
+                "id": {"id": 9, "debug_name": "main"},
+                "signature": {"ret_types": [{"id": 77}]}
+            }],
+        });
+        fs::write(
+            &path_a,
+            serde_json::to_vec(&body_a).expect("failed to encode test sierra a"),
+        )
+        .expect("failed to write test sierra a");
+        fs::write(
+            &path_b,
+            serde_json::to_vec(&body_b).expect("failed to encode test sierra b"),
+        )
+        .expect("failed to write test sierra b");
+
+        let hash_a = hash_sierra_json_semantic(&path_a)
+            .expect("failed to hash sierra a")
+            .0;
+        let hash_b = hash_sierra_json_semantic(&path_b)
+            .expect("failed to hash sierra b")
+            .0;
+        assert_eq!(
+            hash_a, hash_b,
+            "semantic hash should be stable across declaration ID renumbering"
+        );
+
+        let _ = fs::remove_file(&path_a);
+        let _ = fs::remove_file(&path_b);
+    }
+
+    #[test]
+    fn sierra_semantic_hash_changes_when_signature_semantics_change() {
+        let path_a = unique_test_path("sierra-semantic-a");
+        let path_b = unique_test_path("sierra-semantic-b");
+        let body_a = json!({
+            "sierra_format_version": "1.0.0",
+            "type_declarations": [{"id": {"id": 11, "debug_name": "felt252"}}],
+            "libfunc_declarations": [{"id": {"id": 41, "debug_name": "store_temp<felt252>"}}],
+            "funcs": [{
+                "id": {"id": 9, "debug_name": "main"},
+                "signature": {"ret_types": [{"id": 11}]}
+            }],
+        });
+        let body_b = json!({
+            "sierra_format_version": "1.0.0",
+            "type_declarations": [{"id": {"id": 11, "debug_name": "u128"}}],
+            "libfunc_declarations": [{"id": {"id": 41, "debug_name": "store_temp<u128>"}}],
+            "funcs": [{
+                "id": {"id": 9, "debug_name": "main"},
+                "signature": {"ret_types": [{"id": 11}]}
+            }],
+        });
+        fs::write(
+            &path_a,
+            serde_json::to_vec(&body_a).expect("failed to encode semantic test a"),
+        )
+        .expect("failed to write semantic test a");
+        fs::write(
+            &path_b,
+            serde_json::to_vec(&body_b).expect("failed to encode semantic test b"),
+        )
+        .expect("failed to write semantic test b");
+
+        let hash_a = hash_sierra_json_semantic(&path_a)
+            .expect("failed to hash semantic a")
+            .0;
+        let hash_b = hash_sierra_json_semantic(&path_b)
+            .expect("failed to hash semantic b")
+            .0;
+        assert_ne!(
+            hash_a, hash_b,
+            "semantic hash must change when declaration semantics change"
+        );
+
+        let _ = fs::remove_file(&path_a);
+        let _ = fs::remove_file(&path_b);
     }
 }

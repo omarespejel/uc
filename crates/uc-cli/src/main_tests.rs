@@ -546,6 +546,23 @@ fn build_env_fingerprint_supports_extra_prefixes() {
 }
 
 #[test]
+fn build_env_fingerprint_prefix_override_can_disable_default_prefixes() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::env::remove_var("UC_BUILD_ENV_PREFIXES");
+    std::env::set_var("SCARB_TEST_OVERRIDE_FINGERPRINT", "v1");
+    let with_defaults = compute_build_env_fingerprint();
+
+    std::env::set_var("UC_BUILD_ENV_PREFIXES", "");
+    let without_defaults = compute_build_env_fingerprint();
+    assert_ne!(with_defaults, without_defaults);
+
+    std::env::remove_var("SCARB_TEST_OVERRIDE_FINGERPRINT");
+    std::env::remove_var("UC_BUILD_ENV_PREFIXES");
+}
+
+#[test]
 fn session_input_cache_key_is_order_independent_for_features() {
     let common_a = BuildCommonArgs {
         manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
@@ -1127,6 +1144,26 @@ fn async_persist_error_queue_drops_oldest_when_over_capacity() {
 }
 
 #[test]
+fn async_persist_error_log_rotation_rolls_when_threshold_exceeded() {
+    let dir = unique_test_dir("uc-async-log-rotation");
+    let log_path = dir.join("persist-errors.log");
+    fs::write(&log_path, "0123456789").expect("failed to seed async log");
+
+    maybe_rotate_async_persist_error_log(&log_path, 5).expect("rotation should succeed");
+
+    let rotated = dir.join("persist-errors.log.1");
+    assert!(
+        rotated.exists(),
+        "rotated log should exist after threshold rotation"
+    );
+    assert!(
+        !log_path.exists(),
+        "original log path should be moved to rotated path"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn compute_build_fingerprint_changes_when_scarb_version_changes() {
     let _guard = integration_env_lock()
         .lock()
@@ -1157,6 +1194,45 @@ fn compute_build_fingerprint_changes_when_scarb_version_changes() {
     assert_ne!(v1, v2);
 
     fs::remove_dir_all(&workspace).ok();
+}
+
+#[test]
+fn compute_build_fingerprint_is_path_portable_across_workspace_clones() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let workspace_a = prepare_smoke_workspace("uc-fingerprint-clone-a");
+    let workspace_b = prepare_smoke_workspace("uc-fingerprint-clone-b");
+    let manifest_a = workspace_a.join("Scarb.toml");
+    let manifest_b = workspace_b.join("Scarb.toml");
+    let common = smoke_common_args(&manifest_a);
+    let profile = effective_profile(&common);
+
+    let fingerprint_a = compute_build_fingerprint_with_scarb_version(
+        &workspace_a,
+        &manifest_a,
+        &common,
+        &profile,
+        None,
+        "scarb 2.14.0 (test)",
+    )
+    .expect("failed to compute fingerprint for clone A");
+    let fingerprint_b = compute_build_fingerprint_with_scarb_version(
+        &workspace_b,
+        &manifest_b,
+        &common,
+        &profile,
+        None,
+        "scarb 2.14.0 (test)",
+    )
+    .expect("failed to compute fingerprint for clone B");
+    assert_eq!(
+        fingerprint_a, fingerprint_b,
+        "fingerprint should be stable across equivalent workspace clone roots"
+    );
+
+    fs::remove_dir_all(&workspace_a).ok();
+    fs::remove_dir_all(&workspace_b).ok();
 }
 
 #[test]

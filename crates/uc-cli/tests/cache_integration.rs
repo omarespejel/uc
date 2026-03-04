@@ -12,6 +12,7 @@ use walkdir::WalkDir;
 struct BuildReport {
     cache_hit: bool,
     fingerprint: String,
+    session_key: String,
     exit_code: i32,
 }
 
@@ -138,6 +139,31 @@ fn run_uc_build_for_root(
     let report: BuildReport =
         serde_json::from_slice(&report_bytes).expect("failed to decode build report JSON");
     (output, report)
+}
+
+fn run_uc_build_output_only(
+    root: &Path,
+    manifest_path: &Path,
+    daemon_mode: &str,
+    daemon_socket_path: Option<&Path>,
+) -> Output {
+    let mut command = Command::new(uc_bin());
+    command
+        .current_dir(root)
+        .arg("build")
+        .arg("--engine")
+        .arg("uc")
+        .arg("--daemon-mode")
+        .arg(daemon_mode)
+        .arg("--offline")
+        .arg("--manifest-path")
+        .arg(manifest_path);
+    if let Some(socket_path) = daemon_socket_path {
+        command.env("UC_DAEMON_SOCKET_PATH", socket_path);
+    } else {
+        command.env_remove("UC_DAEMON_SOCKET_PATH");
+    }
+    command.output().expect("failed to execute uc build")
 }
 
 fn run_uc_build(workspace: &TestWorkspace, report_tag: &str) -> (Output, BuildReport) {
@@ -521,5 +547,77 @@ fn integration_manifest_path_variants_preserve_fingerprint_determinism() {
     assert_eq!(
         abs_report.fingerprint, rel_report.fingerprint,
         "fingerprint must be stable across equivalent manifest path spellings"
+    );
+    assert_eq!(
+        abs_report.session_key, rel_report.session_key,
+        "session key must be stable across equivalent manifest path spellings"
+    );
+}
+
+#[test]
+fn integration_workspace_clones_preserve_fingerprint_and_session_key() {
+    let _guard = serial_guard();
+    if !scarb_available() {
+        eprintln!(
+            "skipping integration_workspace_clones_preserve_fingerprint_and_session_key: scarb not available"
+        );
+        return;
+    }
+    let workspace_a = make_test_workspace("clone-determinism-a");
+    let workspace_b = make_test_workspace("clone-determinism-b");
+
+    let (output_a, report_a) = run_uc_build(&workspace_a, "clone-a");
+    let (output_b, report_b) = run_uc_build(&workspace_b, "clone-b");
+    assert_success(&output_a, "clone A build");
+    assert_success(&output_b, "clone B build");
+    assert!(
+        !report_a.cache_hit && !report_b.cache_hit,
+        "first build in each clone should be a cache miss"
+    );
+    assert_eq!(
+        report_a.fingerprint, report_b.fingerprint,
+        "fingerprint should be path-portable across equivalent workspace clones"
+    );
+    assert_eq!(
+        report_a.session_key, report_b.session_key,
+        "session key should be path-portable across equivalent workspace clones"
+    );
+}
+
+#[test]
+fn integration_daemon_require_mode_fails_when_daemon_unavailable() {
+    let _guard = serial_guard();
+    if !scarb_available() {
+        eprintln!(
+            "skipping integration_daemon_require_mode_fails_when_daemon_unavailable: scarb not available"
+        );
+        return;
+    }
+    let workspace = make_test_workspace("daemon-require-missing");
+    let socket_path = std::env::temp_dir().join(format!(
+        "uc-it-missing-daemon-{}-{}.sock",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos()
+    ));
+    let _ = fs::remove_file(&socket_path);
+
+    let output = run_uc_build_output_only(
+        &workspace.root,
+        &workspace.root.join("Scarb.toml"),
+        "require",
+        Some(&socket_path),
+    );
+    assert!(
+        !output.status.success(),
+        "daemon require mode should fail when daemon socket is unavailable"
+    );
+    let combined = output_to_utf8(&output);
+    assert!(
+        combined.contains("daemon mode is require but daemon is unavailable")
+            || combined.contains("daemon build request failed"),
+        "unexpected daemon require failure output: {combined}"
     );
 }

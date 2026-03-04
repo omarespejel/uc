@@ -844,6 +844,8 @@ fn should_enforce_cache_size_budget_now() -> bool {
     let persist_index = PERSIST_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     let enforce_every = cache_budget_enforce_every();
     let min_interval_ms = cache_budget_min_interval_ms();
+    // Dual gate to avoid expensive full-tree cache scans on high-frequency builds:
+    // 1) enforce every N persists, and 2) never more often than min_interval_ms.
     if !should_enforce_cache_size_budget_for_persist_index(persist_index, enforce_every) {
         return false;
     }
@@ -2338,6 +2340,14 @@ fn resolve_manifest_cairo_settings_from_manifest(
 }
 
 fn build_env_prefixes() -> Vec<String> {
+    if let Ok(prefixes_override) = std::env::var("UC_BUILD_ENV_PREFIXES") {
+        return prefixes_override
+            .split(',')
+            .map(str::trim)
+            .filter(|prefix| !prefix.is_empty())
+            .map(ToString::to_string)
+            .collect();
+    }
     const BUILD_ENV_PREFIXES: [&str; 3] = ["CAIRO_", "SCARB_", "STARKNET_"];
     let mut prefixes: Vec<String> = BUILD_ENV_PREFIXES
         .iter()
