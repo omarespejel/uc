@@ -2768,29 +2768,25 @@ fn native_compile_session_handle(
 ) -> Result<Arc<Mutex<NativeCompileSessionState>>> {
     let cache_key = native_compile_session_cache_key(workspace_root);
     let now_ms = epoch_ms_u64().unwrap_or_default();
-    {
-        let mut cache = native_compile_session_cache()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(entry) = cache.get_mut(&cache_key) {
-            entry.last_access_epoch_ms = now_ms;
-            return Ok(entry.session.clone());
-        }
-    }
-    let session = Arc::new(Mutex::new(build_native_compile_session_state(
-        signature.clone(),
-    )?));
     let mut cache = native_compile_session_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let entry = cache
-        .entry(cache_key)
-        .or_insert_with(|| NativeCompileSessionCacheEntry {
+    if let Some(entry) = cache.get_mut(&cache_key) {
+        entry.last_access_epoch_ms = now_ms;
+        return Ok(entry.session.clone());
+    }
+    // Keep this lock during a cache miss so concurrent requests don't build
+    // duplicate `RootDatabase` sessions for the same workspace key.
+    let session = Arc::new(Mutex::new(build_native_compile_session_state(
+        signature.clone(),
+    )?));
+    cache.insert(
+        cache_key,
+        NativeCompileSessionCacheEntry {
             session: session.clone(),
             last_access_epoch_ms: now_ms,
-        });
-    entry.last_access_epoch_ms = now_ms;
-    let session = entry.session.clone();
+        },
+    );
     evict_oldest_native_compile_session_cache_entries(
         &mut cache,
         native_compile_session_cache_max_entries(),
@@ -2860,10 +2856,21 @@ fn validate_native_profile_name(profile: &str) -> Result<()> {
     let Some(first) = components.next() else {
         bail!("native build profile must not be empty");
     };
+    if profile.chars().any(|ch| ch == '\0') {
+        bail!("native build profile must not contain NUL bytes: {profile:?}");
+    }
     if components.next().is_some() || !matches!(first, Component::Normal(_)) {
         bail!("native build profile contains invalid path component: {profile}");
     }
     Ok(())
+}
+
+fn native_compiler_config<'a>(main_crate_inputs: &'a [CrateInput]) -> CompilerConfig<'a> {
+    let mut compiler_config = CompilerConfig::default();
+    compiler_config.diagnostics_reporter = compiler_config
+        .diagnostics_reporter
+        .with_crates(main_crate_inputs);
+    compiler_config
 }
 
 fn native_target_dir(workspace_root: &Path, profile: &str) -> Result<PathBuf> {
@@ -2887,16 +2894,16 @@ fn run_native_build_inner(
         .with_context(|| format!("failed to create {}", target_dir.display()))?;
     let signature = native_compile_session_signature(manifest_path, &context);
     let artifact_count = with_native_compile_session(workspace_root, &signature, |session| {
-        let mut compiler_config = CompilerConfig::default();
-        compiler_config.diagnostics_reporter = compiler_config
-            .diagnostics_reporter
-            .with_crates(&session.main_crate_inputs);
         let crate_ids = CrateInput::into_crate_ids(&session.db, session.main_crate_inputs.clone());
         let contracts = find_contracts(&session.db, &crate_ids);
 
         if contracts.is_empty() {
-            let program = compile_prepared_db_program(&session.db, crate_ids, compiler_config)
-                .context("native cairo compile failed")?;
+            let program = compile_prepared_db_program(
+                &session.db,
+                crate_ids,
+                native_compiler_config(&session.main_crate_inputs),
+            )
+            .context("native cairo compile failed")?;
             let output_name = format!("{}.sierra", context.package_name);
             let output_path = target_dir.join(&output_name);
             ensure_path_within_root(&target_dir, &output_path, "native sierra artifact path")?;
@@ -2909,9 +2916,12 @@ fn run_native_build_inner(
         }
 
         let contract_refs: Vec<_> = contracts.iter().collect();
-        let contract_classes =
-            compile_starknet_prepared_db(&session.db, &contract_refs, compiler_config)
-                .context("native starknet compile failed")?;
+        let contract_classes = compile_starknet_prepared_db(
+            &session.db,
+            &contract_refs,
+            native_compiler_config(&session.main_crate_inputs),
+        )
+        .context("native starknet compile failed")?;
         if contract_classes.len() != contracts.len() {
             bail!(
                 "native compile returned mismatched contract classes (expected {}, got {})",
@@ -2925,7 +2935,7 @@ fn run_native_build_inner(
                 let mut single_class = compile_starknet_prepared_db(
                     &session.db,
                     &[contract],
-                    CompilerConfig::default(),
+                    native_compiler_config(&session.main_crate_inputs),
                 )
                 .with_context(|| {
                     format!(
