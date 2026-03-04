@@ -28,6 +28,8 @@ use cairo_lang_starknet_classes::casm_contract_class::CasmContractClass;
 use cairo_lang_starknet_classes::contract_class::ContractClass;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 #[cfg(feature = "native-compile")]
+use salsa::{Database as _, Durability as SalsaDurability};
+#[cfg(feature = "native-compile")]
 use scarb_stable_hash::short_hash;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -117,6 +119,10 @@ const DEFAULT_BUILD_ENTRY_CACHE_MAX_ENTRIES: usize = 1024;
 const DEFAULT_ARTIFACT_INDEX_CACHE_MAX_ENTRIES: usize = 512;
 const DEFAULT_DAEMON_BUILD_PLAN_CACHE_MAX_ENTRIES: usize = 512;
 const DEFAULT_DAEMON_LOCK_HASH_CACHE_MAX_ENTRIES: usize = 512;
+const DEFAULT_METADATA_RESULT_CACHE_MAX_ENTRIES: usize = 512;
+const DEFAULT_METADATA_RESULT_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+const METADATA_RESULT_CACHE_SCHEMA_VERSION: u32 = 1;
+const MAX_METADATA_RESULT_CACHE_ENTRY_BYTES: u64 = 32 * 1024 * 1024;
 #[cfg(feature = "native-compile")]
 const DEFAULT_NATIVE_COMPILE_SESSION_CACHE_MAX_ENTRIES: usize = 16;
 #[cfg(feature = "native-compile")]
@@ -398,7 +404,7 @@ struct BuildArgs {
     report_path: Option<PathBuf>,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 struct MetadataArgs {
     #[arg(long)]
     manifest_path: Option<PathBuf>,
@@ -668,6 +674,18 @@ struct LockfileHashCacheEntry {
 }
 
 #[derive(Clone)]
+struct MetadataResultCacheEntry {
+    manifest_size_bytes: u64,
+    manifest_modified_unix_ms: u64,
+    lock_size_bytes: Option<u64>,
+    lock_modified_unix_ms: Option<u64>,
+    lock_hash: String,
+    run: CommandRun,
+    last_access_epoch_ms: u64,
+    estimated_bytes: u64,
+}
+
+#[derive(Clone)]
 #[cfg(feature = "native-compile")]
 struct NativeCompileSessionCacheEntry {
     session: Arc<Mutex<NativeCompileSessionState>>,
@@ -717,6 +735,17 @@ struct ToolchainCheckCacheEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct MetadataResultCacheFile {
+    schema_version: u32,
+    manifest_size_bytes: u64,
+    manifest_modified_unix_ms: u64,
+    lock_size_bytes: Option<u64>,
+    lock_modified_unix_ms: Option<u64>,
+    lock_hash: String,
+    run: CommandRun,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DaemonStatusPayload {
     pid: u32,
     started_at_epoch_ms: u64,
@@ -737,6 +766,10 @@ struct DaemonStatusPayload {
     native_compile_context_cache_estimated_bytes: u64,
     #[serde(default)]
     native_compile_session_build_locks: u64,
+    #[serde(default)]
+    metadata_result_cache_entries: u64,
+    #[serde(default)]
+    metadata_result_cache_estimated_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -882,10 +915,25 @@ struct NativeCacheTelemetrySnapshot {
     context_entries: u64,
     context_estimated_bytes: u64,
     build_locks: u64,
+    metadata_entries: u64,
+    metadata_estimated_bytes: u64,
+}
+
+#[cfg(feature = "native-compile")]
+fn metadata_result_cache_stats() -> (u64, u64) {
+    let cache = metadata_result_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let bytes = cache
+        .values()
+        .map(|entry| entry.estimated_bytes)
+        .fold(0_u64, u64::saturating_add);
+    (cache.len() as u64, bytes)
 }
 
 #[cfg(feature = "native-compile")]
 fn native_cache_telemetry_snapshot() -> NativeCacheTelemetrySnapshot {
+    let (metadata_entries, metadata_estimated_bytes) = metadata_result_cache_stats();
     let (session_entries, session_estimated_bytes) = {
         let cache = native_compile_session_cache()
             .lock()
@@ -918,6 +966,8 @@ fn native_cache_telemetry_snapshot() -> NativeCacheTelemetrySnapshot {
         context_entries,
         context_estimated_bytes,
         build_locks,
+        metadata_entries,
+        metadata_estimated_bytes,
     }
 }
 
@@ -1353,6 +1403,27 @@ fn daemon_lock_hash_cache_max_entries() -> usize {
     })
 }
 
+fn metadata_result_cache_max_entries() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_env_usize(
+            "UC_METADATA_RESULT_CACHE_MAX_ENTRIES",
+            DEFAULT_METADATA_RESULT_CACHE_MAX_ENTRIES,
+        )
+        .max(1)
+    })
+}
+
+fn metadata_result_cache_max_bytes() -> u64 {
+    static VALUE: OnceLock<u64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_env_u64(
+            "UC_METADATA_RESULT_CACHE_MAX_BYTES",
+            DEFAULT_METADATA_RESULT_CACHE_MAX_BYTES,
+        )
+    })
+}
+
 #[cfg(feature = "native-compile")]
 fn native_compile_session_cache_max_entries() -> usize {
     static VALUE: OnceLock<usize> = OnceLock::new();
@@ -1718,7 +1789,7 @@ fn run_daemon_status(args: DaemonSocketArgs) -> Result<()> {
         let status = daemon_ping(&socket_path)
             .with_context(|| format!("daemon not reachable on {}", socket_path.display()))?;
         println!(
-            "uc daemon running (pid={}, started_at_epoch_ms={}, socket={}, protocol={}, healthy={}, total_requests={}, failed_requests={}, rate_limited_requests={}, native_session_cache_entries={}, native_session_cache_estimated_bytes={}, native_context_cache_entries={}, native_context_cache_estimated_bytes={}, native_build_locks={}, last_error={})",
+            "uc daemon running (pid={}, started_at_epoch_ms={}, socket={}, protocol={}, healthy={}, total_requests={}, failed_requests={}, rate_limited_requests={}, native_session_cache_entries={}, native_session_cache_estimated_bytes={}, native_context_cache_entries={}, native_context_cache_estimated_bytes={}, native_build_locks={}, metadata_cache_entries={}, metadata_cache_estimated_bytes={}, last_error={})",
             status.pid,
             status.started_at_epoch_ms,
             status.socket_path,
@@ -1732,6 +1803,8 @@ fn run_daemon_status(args: DaemonSocketArgs) -> Result<()> {
             status.native_compile_context_cache_entries,
             status.native_compile_context_cache_estimated_bytes,
             status.native_compile_session_build_locks,
+            status.metadata_result_cache_entries,
+            status.metadata_result_cache_estimated_bytes,
             status
                 .last_error
                 .clone()
@@ -1754,7 +1827,7 @@ fn run_daemon_health(args: DaemonSocketArgs) -> Result<()> {
             .with_context(|| format!("daemon not reachable on {}", socket_path.display()))?;
         if status.healthy {
             println!(
-                "healthy (pid={}, total_requests={}, failed_requests={}, rate_limited_requests={}, native_session_cache_entries={}, native_session_cache_estimated_bytes={}, native_context_cache_entries={}, native_context_cache_estimated_bytes={}, native_build_locks={})",
+                "healthy (pid={}, total_requests={}, failed_requests={}, rate_limited_requests={}, native_session_cache_entries={}, native_session_cache_estimated_bytes={}, native_context_cache_entries={}, native_context_cache_estimated_bytes={}, native_build_locks={}, metadata_cache_entries={}, metadata_cache_estimated_bytes={})",
                 status.pid,
                 status.total_requests,
                 status.failed_requests,
@@ -1763,7 +1836,9 @@ fn run_daemon_health(args: DaemonSocketArgs) -> Result<()> {
                 status.native_compile_session_cache_estimated_bytes,
                 status.native_compile_context_cache_entries,
                 status.native_compile_context_cache_estimated_bytes,
-                status.native_compile_session_build_locks
+                status.native_compile_session_build_locks,
+                status.metadata_result_cache_entries,
+                status.metadata_result_cache_estimated_bytes
             );
             Ok(())
         } else {
@@ -1869,6 +1944,8 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
             native_compile_context_cache_entries: native_cache.context_entries,
             native_compile_context_cache_estimated_bytes: native_cache.context_estimated_bytes,
             native_compile_session_build_locks: native_cache.build_locks,
+            metadata_result_cache_entries: native_cache.metadata_entries,
+            metadata_result_cache_estimated_bytes: native_cache.metadata_estimated_bytes,
         });
         let health = Arc::new(Mutex::new(DaemonHealth::default()));
         let rate_limiter = Arc::new(Mutex::new(DaemonRateLimiter::new()));
@@ -2279,14 +2356,281 @@ fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildRespon
     }
 }
 
+fn try_metadata_result_cache_hit(
+    cache_key: &str,
+    entry_path: &Path,
+    manifest_size_bytes: u64,
+    manifest_modified_unix_ms: u64,
+    lock_size_bytes: Option<u64>,
+    lock_modified_unix_ms: Option<u64>,
+    lock_hash: &str,
+) -> Result<Option<CommandRun>> {
+    let now_ms = epoch_ms_u64().unwrap_or_default();
+    {
+        let mut cache = metadata_result_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = cache.get_mut(cache_key) {
+            if metadata_cache_entry_matches(
+                entry,
+                manifest_size_bytes,
+                manifest_modified_unix_ms,
+                lock_size_bytes,
+                lock_modified_unix_ms,
+                lock_hash,
+            ) {
+                entry.last_access_epoch_ms = now_ms;
+                return Ok(Some(entry.run.clone()));
+            }
+            cache.remove(cache_key);
+        }
+    }
+
+    if !entry_path.exists() {
+        return Ok(None);
+    }
+
+    let metadata = match fs::metadata(entry_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", entry_path.display()));
+        }
+    };
+    if metadata.len() > MAX_METADATA_RESULT_CACHE_ENTRY_BYTES {
+        let _ = fs::remove_file(entry_path);
+        tracing::warn!(
+            path = %entry_path.display(),
+            bytes = metadata.len(),
+            max_bytes = MAX_METADATA_RESULT_CACHE_ENTRY_BYTES,
+            "ignoring oversized metadata cache entry"
+        );
+        return Ok(None);
+    }
+    let bytes = read_bytes_with_limit(
+        entry_path,
+        MAX_METADATA_RESULT_CACHE_ENTRY_BYTES,
+        "metadata cache entry",
+    )?;
+    let decoded: MetadataResultCacheFile =
+        match serde_json::from_slice::<MetadataResultCacheFile>(&bytes) {
+            Ok(entry) if entry.schema_version == METADATA_RESULT_CACHE_SCHEMA_VERSION => entry,
+            Ok(_) => {
+                let _ = fs::remove_file(entry_path);
+                return Ok(None);
+            }
+            Err(err) => {
+                let _ = fs::remove_file(entry_path);
+                tracing::warn!(
+                    path = %entry_path.display(),
+                    error = %err,
+                    "ignoring unreadable metadata cache entry"
+                );
+                return Ok(None);
+            }
+        };
+    if !metadata_cache_file_matches(
+        &decoded,
+        manifest_size_bytes,
+        manifest_modified_unix_ms,
+        lock_size_bytes,
+        lock_modified_unix_ms,
+        lock_hash,
+    ) {
+        return Ok(None);
+    }
+
+    let estimated_bytes = metadata_run_estimated_bytes(&decoded.run);
+    {
+        let mut cache = metadata_result_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.insert(
+            cache_key.to_string(),
+            MetadataResultCacheEntry {
+                manifest_size_bytes,
+                manifest_modified_unix_ms,
+                lock_size_bytes,
+                lock_modified_unix_ms,
+                lock_hash: lock_hash.to_string(),
+                run: decoded.run.clone(),
+                last_access_epoch_ms: now_ms,
+                estimated_bytes,
+            },
+        );
+        evict_oldest_metadata_result_cache_entries(
+            &mut cache,
+            metadata_result_cache_max_entries(),
+            metadata_result_cache_max_bytes(),
+        );
+    }
+    Ok(Some(decoded.run))
+}
+
+struct MetadataResultCacheWriteContext<'a> {
+    cache_key: &'a str,
+    cache_root: &'a Path,
+    entry_path: &'a Path,
+    manifest_size_bytes: u64,
+    manifest_modified_unix_ms: u64,
+    lock_size_bytes: Option<u64>,
+    lock_modified_unix_ms: Option<u64>,
+    lock_hash: &'a str,
+}
+
+fn store_metadata_result_cache_entry(
+    context: &MetadataResultCacheWriteContext<'_>,
+    run: &CommandRun,
+) -> Result<()> {
+    let cache_entry = MetadataResultCacheFile {
+        schema_version: METADATA_RESULT_CACHE_SCHEMA_VERSION,
+        manifest_size_bytes: context.manifest_size_bytes,
+        manifest_modified_unix_ms: context.manifest_modified_unix_ms,
+        lock_size_bytes: context.lock_size_bytes,
+        lock_modified_unix_ms: context.lock_modified_unix_ms,
+        lock_hash: context.lock_hash.to_string(),
+        run: run.clone(),
+    };
+    let bytes =
+        serde_json::to_vec(&cache_entry).context("failed to encode metadata cache entry")?;
+    if bytes.len() as u64 > MAX_METADATA_RESULT_CACHE_ENTRY_BYTES {
+        tracing::warn!(
+            path = %context.entry_path.display(),
+            bytes = bytes.len(),
+            max_bytes = MAX_METADATA_RESULT_CACHE_ENTRY_BYTES,
+            "skipping metadata cache write: entry exceeds max size"
+        );
+        return Ok(());
+    }
+
+    let _cache_lock = acquire_cache_lock(context.cache_root)?;
+    atomic_write_bytes(context.entry_path, &bytes, "metadata cache entry")?;
+    if should_enforce_cache_size_budget_now() {
+        enforce_cache_size_budget(context.cache_root)?;
+    }
+
+    let now_ms = epoch_ms_u64().unwrap_or_default();
+    let estimated_bytes = metadata_run_estimated_bytes(run);
+    {
+        let mut cache = metadata_result_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.insert(
+            context.cache_key.to_string(),
+            MetadataResultCacheEntry {
+                manifest_size_bytes: context.manifest_size_bytes,
+                manifest_modified_unix_ms: context.manifest_modified_unix_ms,
+                lock_size_bytes: context.lock_size_bytes,
+                lock_modified_unix_ms: context.lock_modified_unix_ms,
+                lock_hash: context.lock_hash.to_string(),
+                run: run.clone(),
+                last_access_epoch_ms: now_ms,
+                estimated_bytes,
+            },
+        );
+        evict_oldest_metadata_result_cache_entries(
+            &mut cache,
+            metadata_result_cache_max_entries(),
+            metadata_result_cache_max_bytes(),
+        );
+    }
+    Ok(())
+}
+
+fn run_scarb_metadata_with_uc_cache(
+    args: &MetadataArgs,
+    manifest_path: &Path,
+    capture_output: bool,
+) -> Result<CommandRun> {
+    let (command, command_vec) = scarb_metadata_command(args, manifest_path);
+    if !capture_output {
+        return run_command_status(command, command_vec);
+    }
+
+    let workspace_root = manifest_path
+        .parent()
+        .context("manifest path has no parent")?
+        .to_path_buf();
+    let cache_root = workspace_root.join(".uc/cache");
+    ensure_path_within_root(&workspace_root, &cache_root, "metadata cache root")?;
+    let manifest_metadata = fs::metadata(manifest_path)
+        .with_context(|| format!("failed to stat {}", manifest_path.display()))?;
+    let manifest_size_bytes = manifest_metadata.len();
+    let manifest_modified_unix_ms = metadata_modified_unix_ms(&manifest_metadata)?;
+    let (lock_size_bytes, lock_modified_unix_ms, lock_hash) = daemon_lock_state(manifest_path)?;
+    let scarb_version = scarb_version_line()?;
+    let build_env_fingerprint = current_build_env_fingerprint();
+    let cache_key =
+        metadata_result_cache_key(args, manifest_path, &scarb_version, &build_env_fingerprint);
+    let entry_path = metadata_cache_entry_path(&workspace_root, &cache_key);
+    ensure_path_within_root(&workspace_root, &entry_path, "metadata cache entry path")?;
+
+    let lookup_start = Instant::now();
+    if let Some(mut cached_run) = try_metadata_result_cache_hit(
+        &cache_key,
+        &entry_path,
+        manifest_size_bytes,
+        manifest_modified_unix_ms,
+        lock_size_bytes,
+        lock_modified_unix_ms,
+        &lock_hash,
+    )? {
+        cached_run.elapsed_ms = lookup_start.elapsed().as_secs_f64() * 1000.0;
+        tracing::debug!(
+            manifest_path = %manifest_path.display(),
+            cache_key = %cache_key,
+            lookup_ms = cached_run.elapsed_ms,
+            "uc metadata result cache hit"
+        );
+        return Ok(cached_run);
+    }
+    tracing::debug!(
+        manifest_path = %manifest_path.display(),
+        cache_key = %cache_key,
+        lookup_ms = lookup_start.elapsed().as_secs_f64() * 1000.0,
+        "uc metadata result cache miss"
+    );
+
+    let run_start = Instant::now();
+    let run = run_command_capture(command, command_vec)?;
+    let run_ms = run_start.elapsed().as_secs_f64() * 1000.0;
+    tracing::debug!(
+        manifest_path = %manifest_path.display(),
+        command_ms = run_ms,
+        exit_code = run.exit_code,
+        "uc metadata command completed"
+    );
+
+    if run.exit_code == 0 {
+        let persist_start = Instant::now();
+        let write_context = MetadataResultCacheWriteContext {
+            cache_key: &cache_key,
+            cache_root: &cache_root,
+            entry_path: &entry_path,
+            manifest_size_bytes,
+            manifest_modified_unix_ms,
+            lock_size_bytes,
+            lock_modified_unix_ms,
+            lock_hash: &lock_hash,
+        };
+        store_metadata_result_cache_entry(&write_context, &run)?;
+        tracing::debug!(
+            manifest_path = %manifest_path.display(),
+            persist_ms = persist_start.elapsed().as_secs_f64() * 1000.0,
+            "uc metadata cache persisted"
+        );
+    }
+
+    Ok(run)
+}
+
 fn execute_daemon_metadata(request: DaemonMetadataRequest) -> Result<DaemonMetadataResponse> {
     validate_daemon_protocol_version(&request.protocol_version)
         .context("daemon metadata request protocol mismatch")?;
     validate_metadata_format_version(request.format_version)?;
     let args = metadata_args_from_daemon_request(&request);
     let manifest_path = resolve_manifest_path(&args.manifest_path)?;
-    let (command, command_vec) = scarb_metadata_command(&args, &manifest_path);
-    let run = run_command(command, command_vec, request.capture_output)?;
+    let run = run_scarb_metadata_with_uc_cache(&args, &manifest_path, request.capture_output)?;
     Ok(DaemonMetadataResponse { run })
 }
 
@@ -3308,6 +3652,7 @@ fn build_native_compile_session_state(
     workspace_root: &Path,
     signature: NativeCompileSessionSignature,
 ) -> Result<NativeCompileSessionState> {
+    let db_start = Instant::now();
     let mut db = RootDatabase::builder()
         .with_optimizations(Optimizations::enabled_with_default_movable_functions(
             InliningStrategy::Default,
@@ -3315,7 +3660,9 @@ fn build_native_compile_session_state(
         .with_default_plugin_suite(starknet_plugin_suite())
         .build()
         .context("failed to initialize native cairo compiler database")?;
+    let db_init_ms = db_start.elapsed().as_secs_f64() * 1000.0;
     init_dev_corelib(&mut db, signature.context.corelib_src.clone());
+    let setup_start = Instant::now();
     let main_crate_inputs = setup_project(&mut db, &signature.context.cairo_project_dir)
         .with_context(|| {
             format!(
@@ -3323,8 +3670,19 @@ fn build_native_compile_session_state(
                 signature.context.cairo_project_dir.display()
             )
         })?;
+    let setup_project_ms = setup_start.elapsed().as_secs_f64() * 1000.0;
+    let scan_start = Instant::now();
     let (tracked_sources, tracked_source_bytes) = native_collect_tracked_sources(workspace_root)?;
+    let source_scan_ms = scan_start.elapsed().as_secs_f64() * 1000.0;
     let source_root_modified_unix_ms = native_source_root_modified_unix_ms(workspace_root)?;
+    tracing::debug!(
+        workspace_root = %workspace_root.display(),
+        db_init_ms,
+        setup_project_ms,
+        source_scan_ms,
+        tracked_sources = tracked_sources.len(),
+        "native session state built"
+    );
     Ok(NativeCompileSessionState {
         signature,
         db,
@@ -3437,6 +3795,28 @@ fn clear_native_compile_session(workspace_root: &Path) {
 }
 
 #[cfg(feature = "native-compile")]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum NativeSessionRefreshAction {
+    None,
+    IncrementalChangedSet,
+    FullRebuild,
+}
+
+#[cfg(feature = "native-compile")]
+fn native_session_refresh_action(
+    needs_full_rebuild: bool,
+    changed_source_set_detected: bool,
+) -> NativeSessionRefreshAction {
+    if needs_full_rebuild {
+        return NativeSessionRefreshAction::FullRebuild;
+    }
+    if changed_source_set_detected {
+        return NativeSessionRefreshAction::IncrementalChangedSet;
+    }
+    NativeSessionRefreshAction::None
+}
+
+#[cfg(feature = "native-compile")]
 fn with_native_compile_session<T>(
     workspace_root: &Path,
     signature: &NativeCompileSessionSignature,
@@ -3462,21 +3842,29 @@ fn with_native_compile_session<T>(
     } else {
         native_source_root_modified_unix_ms(workspace_root)?
     };
-    let (changed_files, removed_files) =
+    let drift_scan_start = Instant::now();
+    let (changed_files, removed_files, current_source_snapshot) =
         if needs_full_rebuild || source_root_mtime == previous_source_root_mtime {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), None)
         } else {
-            let (current_sources, _current_source_bytes) =
+            let (current_sources, current_source_bytes) =
                 native_collect_tracked_sources(workspace_root)?;
             let (changed_files, removed_files) =
                 native_diff_tracked_sources(&previous_sources, &current_sources);
-            (changed_files, removed_files)
+            (
+                changed_files,
+                removed_files,
+                Some((current_sources, current_source_bytes)),
+            )
         };
+    let drift_scan_ms = drift_scan_start.elapsed().as_secs_f64() * 1000.0;
 
     let changed_source_set_detected = !changed_files.is_empty() || !removed_files.is_empty();
+    let refresh_action =
+        native_session_refresh_action(needs_full_rebuild, changed_source_set_detected);
     // Keep the worker state persistent, but refresh it only when a changed-file
     // set indicates source drift or when manifest/context signatures changed.
-    let mut rebuilt_state = if needs_full_rebuild || changed_source_set_detected {
+    let mut rebuilt_state = if matches!(refresh_action, NativeSessionRefreshAction::FullRebuild) {
         Some(build_native_compile_session_state(
             workspace_root,
             signature.clone(),
@@ -3484,6 +3872,7 @@ fn with_native_compile_session<T>(
     } else {
         None
     };
+    let mut current_source_snapshot = current_source_snapshot;
     let estimated_bytes;
     let snapshot = {
         let mut session = session_handle
@@ -3495,16 +3884,26 @@ fn with_native_compile_session<T>(
             } else {
                 *session = build_native_compile_session_state(workspace_root, signature.clone())?;
             }
-        } else if changed_source_set_detected {
-            if let Some(state) = rebuilt_state.take() {
-                *session = state;
-            } else {
-                *session = build_native_compile_session_state(workspace_root, signature.clone())?;
+        } else if matches!(
+            refresh_action,
+            NativeSessionRefreshAction::IncrementalChangedSet
+        ) {
+            // Trigger an incremental Salsa revision bump so untracked file-content
+            // reads re-evaluate only impacted units instead of rebuilding the whole
+            // native compiler database/session.
+            session.db.synthetic_write(SalsaDurability::LOW);
+            if let Some((tracked_sources, tracked_source_bytes)) = current_source_snapshot.take() {
+                session.tracked_sources = tracked_sources;
+                session.tracked_source_bytes = tracked_source_bytes;
+            }
+            if source_root_mtime != 0 {
+                session.source_root_modified_unix_ms = source_root_mtime;
             }
             tracing::debug!(
                 changed_files = changed_files.len(),
                 removed_files = removed_files.len(),
-                "native session refreshed from changed-file set"
+                drift_scan_ms,
+                "native session incrementally refreshed from changed-file set"
             );
         } else if source_root_mtime != 0
             && session.source_root_modified_unix_ms != source_root_mtime
@@ -3640,11 +4039,16 @@ fn run_native_build_inner(
     profile: &str,
 ) -> Result<CommandRun> {
     let started = Instant::now();
+    let context_start = Instant::now();
     let context = build_native_compile_context(common, manifest_path, workspace_root)?;
+    let context_ms = context_start.elapsed().as_secs_f64() * 1000.0;
+    let target_dir_start = Instant::now();
     let target_dir = native_target_dir(workspace_root, profile)?;
     fs::create_dir_all(&target_dir)
         .with_context(|| format!("failed to create {}", target_dir.display()))?;
+    let target_dir_ms = target_dir_start.elapsed().as_secs_f64() * 1000.0;
     let signature = native_compile_session_signature(manifest_path, &context);
+    let compile_start = Instant::now();
     let artifact_count = with_native_compile_session(workspace_root, &signature, |session| {
         let crate_ids = CrateInput::into_crate_ids(&session.db, session.main_crate_inputs.clone());
         let contracts = find_contracts(&session.db, &crate_ids);
@@ -3781,8 +4185,8 @@ fn run_native_build_inner(
         prune_native_target_outputs(&target_dir, &context.package_name, &keep_files)?;
         Ok(serialized_artifact_count + 1)
     })?;
-
-    Ok(CommandRun {
+    let compile_ms = compile_start.elapsed().as_secs_f64() * 1000.0;
+    let run = CommandRun {
         command: vec![
             "uc-native".to_string(),
             "build".to_string(),
@@ -3795,7 +4199,19 @@ fn run_native_build_inner(
         elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
         stdout: format!("uc: native compile produced {} artifacts\n", artifact_count),
         stderr: String::new(),
-    })
+    };
+    tracing::debug!(
+        manifest_path = %manifest_path.display(),
+        workspace_root = %workspace_root.display(),
+        profile,
+        context_ms,
+        target_dir_ms,
+        compile_ms,
+        total_ms = run.elapsed_ms,
+        artifact_count,
+        "native build cold-path telemetry"
+    );
+    Ok(run)
 }
 
 #[cfg(feature = "native-compile")]
@@ -4549,6 +4965,11 @@ fn daemon_lock_hash_cache() -> &'static Mutex<HashMap<String, LockfileHashCacheE
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn metadata_result_cache() -> &'static Mutex<HashMap<String, MetadataResultCacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, MetadataResultCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 #[cfg(feature = "native-compile")]
 fn native_compile_session_cache() -> &'static Mutex<HashMap<String, NativeCompileSessionCacheEntry>>
 {
@@ -4586,6 +5007,32 @@ fn evict_oldest_daemon_lock_hash_cache_entries(
     max_entries: usize,
 ) {
     while cache.len() > max_entries {
+        let Some(oldest_key) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_access_epoch_ms)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest_key);
+    }
+}
+
+fn evict_oldest_metadata_result_cache_entries(
+    cache: &mut HashMap<String, MetadataResultCacheEntry>,
+    max_entries: usize,
+    max_bytes: u64,
+) {
+    loop {
+        let total_bytes = cache
+            .values()
+            .map(|entry| entry.estimated_bytes)
+            .fold(0_u64, u64::saturating_add);
+        let over_entry_budget = cache.len() > max_entries;
+        let over_byte_budget = max_bytes > 0 && total_bytes > max_bytes;
+        if !over_entry_budget && !over_byte_budget {
+            break;
+        }
         let Some(oldest_key) = cache
             .iter()
             .min_by_key(|(_, entry)| entry.last_access_epoch_ms)
@@ -4663,6 +5110,76 @@ fn metadata_change_unix_ms(metadata: &fs::Metadata) -> Option<u64> {
         let _ = metadata;
         None
     }
+}
+
+fn metadata_cache_entry_path(workspace_root: &Path, cache_key: &str) -> PathBuf {
+    workspace_root
+        .join(".uc/cache/metadata")
+        .join(format!("{cache_key}.json"))
+}
+
+fn metadata_result_cache_key(
+    args: &MetadataArgs,
+    manifest_path: &Path,
+    scarb_version: &str,
+    build_env_fingerprint: &str,
+) -> String {
+    let mut hasher = Hasher::new();
+    hasher.update(b"uc-metadata-result-cache-v1");
+    hasher.update(normalize_fingerprint_path(manifest_path).as_bytes());
+    hasher.update(args.format_version.to_string().as_bytes());
+    hasher.update(if args.offline { b"offline" } else { b"online" });
+    hasher.update(
+        args.global_cache_dir
+            .as_ref()
+            .map(|path| normalize_fingerprint_path(path))
+            .unwrap_or_else(|| "*".to_string())
+            .as_bytes(),
+    );
+    hasher.update(scarb_version.as_bytes());
+    hasher.update(build_env_fingerprint.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+fn metadata_run_estimated_bytes(run: &CommandRun) -> u64 {
+    run.stdout.len() as u64
+        + run.stderr.len() as u64
+        + run
+            .command
+            .iter()
+            .map(|part| part.len() as u64)
+            .sum::<u64>()
+        + 256
+}
+
+fn metadata_cache_entry_matches(
+    entry: &MetadataResultCacheEntry,
+    manifest_size_bytes: u64,
+    manifest_modified_unix_ms: u64,
+    lock_size_bytes: Option<u64>,
+    lock_modified_unix_ms: Option<u64>,
+    lock_hash: &str,
+) -> bool {
+    entry.manifest_size_bytes == manifest_size_bytes
+        && entry.manifest_modified_unix_ms == manifest_modified_unix_ms
+        && entry.lock_size_bytes == lock_size_bytes
+        && entry.lock_modified_unix_ms == lock_modified_unix_ms
+        && entry.lock_hash == lock_hash
+}
+
+fn metadata_cache_file_matches(
+    entry: &MetadataResultCacheFile,
+    manifest_size_bytes: u64,
+    manifest_modified_unix_ms: u64,
+    lock_size_bytes: Option<u64>,
+    lock_modified_unix_ms: Option<u64>,
+    lock_hash: &str,
+) -> bool {
+    entry.manifest_size_bytes == manifest_size_bytes
+        && entry.manifest_modified_unix_ms == manifest_modified_unix_ms
+        && entry.lock_size_bytes == lock_size_bytes
+        && entry.lock_modified_unix_ms == lock_modified_unix_ms
+        && entry.lock_hash == lock_hash
 }
 
 fn daemon_build_plan_cache_key(

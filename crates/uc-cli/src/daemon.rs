@@ -272,6 +272,8 @@ pub(super) fn daemon_status_snapshot(
         native_compile_context_cache_entries: native_cache.context_entries,
         native_compile_context_cache_estimated_bytes: native_cache.context_estimated_bytes,
         native_compile_session_build_locks: native_cache.build_locks,
+        metadata_result_cache_entries: native_cache.metadata_entries,
+        metadata_result_cache_estimated_bytes: native_cache.metadata_estimated_bytes,
     }
 }
 

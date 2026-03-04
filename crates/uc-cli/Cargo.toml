@@ -35,6 +35,7 @@ libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 scarb-stable-hash = { workspace = true, optional = true }
+salsa.workspace = true
 sysinfo.workspace = true
 toml.workspace = true
 tracing.workspace = true

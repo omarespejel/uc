@@ -50,6 +50,53 @@ jobs:
           name: benchmark-results
           path: benchmarks/results/
 
+  benchmark-research-strict:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Scarb
+        uses: software-mansion/setup-scarb@v1
+
+      - name: Install benchmark tools
+        run: sudo apt-get update && sudo apt-get install -y jq util-linux
+
+      - name: Prepare research workspace
+        run: |
+          set -euo pipefail
+          RESEARCH_ROOT="$RUNNER_TEMP/research-workspace"
+          mkdir -p "$RESEARCH_ROOT"
+          git clone --depth 1 https://github.com/software-mansion/scarb.git "$RESEARCH_ROOT/scarb"
+          echo "UC_RESEARCH_ROOT=$RESEARCH_ROOT" >> "$GITHUB_ENV"
+
+      - name: Build uc CLI
+        run: cargo build -p uc-cli
+
+      - name: Run strict-pinned research stability gate
+        run: |
+          chmod +x benchmarks/scripts/run_local_benchmarks.sh
+          chmod +x benchmarks/scripts/run_stability_benchmarks.sh
+          chmod +x benchmarks/scripts/gate_benchmark_summary.sh
+          ./benchmarks/scripts/run_stability_benchmarks.sh \
+            --matrix research \
+            --workspace-root "$UC_RESEARCH_ROOT" \
+            --runs 12 \
+            --cold-runs 12 \
+            --cycles 5 \
+            --cpu-set 0 \
+            --strict-pinning \
+            --host-preflight require \
+            --gate-config benchmarks/gates/perf-gate-research.json
+
+      - name: Upload research benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-research
+          path: benchmarks/results/
+
   determinism-matrix:
     runs-on: ${{ matrix.os }}
     strategy:

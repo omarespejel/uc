@@ -2756,6 +2756,7 @@ dependencies = [
  "cairo-lang-starknet-classes",
  "clap",
  "libc",
+ "salsa",
  "scarb-stable-hash",
  "serde",
  "serde_json",

@@ -1327,6 +1327,64 @@ fn daemon_lock_hash_cache_eviction_removes_oldest_entries() {
 }
 
 #[test]
+fn metadata_result_cache_eviction_respects_entry_and_byte_budgets() {
+    let run = |suffix: &str, size: usize| CommandRun {
+        command: vec!["scarb".to_string(), "metadata".to_string()],
+        exit_code: 0,
+        elapsed_ms: 1.0,
+        stdout: format!("{}{}", suffix, "x".repeat(size)),
+        stderr: String::new(),
+    };
+    let mut cache = HashMap::new();
+    cache.insert(
+        "oldest".to_string(),
+        MetadataResultCacheEntry {
+            manifest_size_bytes: 1,
+            manifest_modified_unix_ms: 1,
+            lock_size_bytes: Some(1),
+            lock_modified_unix_ms: Some(1),
+            lock_hash: "a".repeat(64),
+            run: run("a", 1024),
+            last_access_epoch_ms: 1,
+            estimated_bytes: 2048,
+        },
+    );
+    cache.insert(
+        "middle".to_string(),
+        MetadataResultCacheEntry {
+            manifest_size_bytes: 1,
+            manifest_modified_unix_ms: 1,
+            lock_size_bytes: Some(1),
+            lock_modified_unix_ms: Some(1),
+            lock_hash: "b".repeat(64),
+            run: run("b", 1024),
+            last_access_epoch_ms: 2,
+            estimated_bytes: 2048,
+        },
+    );
+    cache.insert(
+        "newest".to_string(),
+        MetadataResultCacheEntry {
+            manifest_size_bytes: 1,
+            manifest_modified_unix_ms: 1,
+            lock_size_bytes: Some(1),
+            lock_modified_unix_ms: Some(1),
+            lock_hash: "c".repeat(64),
+            run: run("c", 1024),
+            last_access_epoch_ms: 3,
+            estimated_bytes: 2048,
+        },
+    );
+
+    // Budget forces eviction by both max entries and max bytes.
+    evict_oldest_metadata_result_cache_entries(&mut cache, 2, 4096);
+    assert_eq!(cache.len(), 2);
+    assert!(!cache.contains_key("oldest"));
+    assert!(cache.contains_key("middle"));
+    assert!(cache.contains_key("newest"));
+}
+
+#[test]
 fn daemon_lock_state_reuses_cache_when_metadata_is_unchanged() {
     let _guard = integration_env_lock()
         .lock()
@@ -1405,6 +1463,226 @@ edition = "2024_07"
     assert_ne!(
         hash_first, hash_second,
         "lock hash cache must invalidate when lockfile content changes"
+    );
+
+    fs::remove_dir_all(&workspace).ok();
+}
+
+#[test]
+fn metadata_result_cache_key_changes_with_metadata_options() {
+    let manifest_path = Path::new("/tmp/workspace/Scarb.toml");
+    let scarb_version = "scarb 2.14.0 (cache-key-test)";
+    let build_env = "env:fingerprint";
+
+    let base = MetadataArgs {
+        manifest_path: Some(manifest_path.to_path_buf()),
+        format_version: 1,
+        daemon_mode: DaemonModeArg::Off,
+        offline: false,
+        global_cache_dir: None,
+        report_path: None,
+    };
+    let base_key = metadata_result_cache_key(&base, manifest_path, scarb_version, build_env);
+
+    let mut offline = base.clone();
+    offline.offline = true;
+    let offline_key = metadata_result_cache_key(&offline, manifest_path, scarb_version, build_env);
+    assert_ne!(base_key, offline_key);
+
+    let mut format_v2 = base.clone();
+    format_v2.format_version = 2;
+    let format_v2_key =
+        metadata_result_cache_key(&format_v2, manifest_path, scarb_version, build_env);
+    assert_ne!(base_key, format_v2_key);
+
+    let mut cache_dir = base.clone();
+    cache_dir.global_cache_dir = Some(PathBuf::from("/tmp/cache-a"));
+    let cache_dir_key =
+        metadata_result_cache_key(&cache_dir, manifest_path, scarb_version, build_env);
+    assert_ne!(base_key, cache_dir_key);
+}
+
+#[test]
+fn metadata_result_cache_roundtrip_hits_when_inputs_match() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    metadata_result_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+    daemon_lock_hash_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+
+    let workspace = unique_test_dir("uc-metadata-cache-roundtrip");
+    let manifest_path = workspace.join("Scarb.toml");
+    let lock_path = workspace.join("Scarb.lock");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("failed to write manifest");
+    fs::write(&lock_path, "version = 1\n").expect("failed to write lock file");
+
+    let manifest_metadata = fs::metadata(&manifest_path).expect("failed to stat manifest");
+    let manifest_size_bytes = manifest_metadata.len();
+    let manifest_modified_unix_ms =
+        metadata_modified_unix_ms(&manifest_metadata).expect("failed to read manifest mtime");
+    let (lock_size_bytes, lock_modified_unix_ms, lock_hash) =
+        daemon_lock_state(&manifest_path).expect("failed to resolve lock state");
+
+    let args = MetadataArgs {
+        manifest_path: Some(manifest_path.clone()),
+        format_version: 1,
+        daemon_mode: DaemonModeArg::Off,
+        offline: true,
+        global_cache_dir: Some(workspace.join(".scarb-cache")),
+        report_path: None,
+    };
+    let cache_key = metadata_result_cache_key(
+        &args,
+        &manifest_path,
+        "scarb 2.14.0 (metadata-cache-test)",
+        "env:fingerprint",
+    );
+    let cache_root = workspace.join(".uc/cache");
+    let entry_path = metadata_cache_entry_path(&workspace, &cache_key);
+    let run = CommandRun {
+        command: vec!["scarb".to_string(), "metadata".to_string()],
+        exit_code: 0,
+        elapsed_ms: 42.0,
+        stdout: "{\"packages\":[]}\n".to_string(),
+        stderr: String::new(),
+    };
+
+    let write_context = MetadataResultCacheWriteContext {
+        cache_key: &cache_key,
+        cache_root: &cache_root,
+        entry_path: &entry_path,
+        manifest_size_bytes,
+        manifest_modified_unix_ms,
+        lock_size_bytes,
+        lock_modified_unix_ms,
+        lock_hash: &lock_hash,
+    };
+    store_metadata_result_cache_entry(&write_context, &run)
+        .expect("failed to store metadata cache entry");
+    assert!(entry_path.exists(), "cache entry should be persisted");
+
+    let hit = try_metadata_result_cache_hit(
+        &cache_key,
+        &entry_path,
+        manifest_size_bytes,
+        manifest_modified_unix_ms,
+        lock_size_bytes,
+        lock_modified_unix_ms,
+        &lock_hash,
+    )
+    .expect("cache lookup should succeed")
+    .expect("cache entry should hit");
+    assert_eq!(hit.exit_code, 0);
+    assert_eq!(hit.stdout, run.stdout);
+    assert_eq!(hit.command, run.command);
+
+    fs::remove_dir_all(&workspace).ok();
+}
+
+#[test]
+fn metadata_result_cache_misses_when_lock_hash_changes() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    metadata_result_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+    daemon_lock_hash_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+
+    let workspace = unique_test_dir("uc-metadata-cache-lock-change");
+    let manifest_path = workspace.join("Scarb.toml");
+    let lock_path = workspace.join("Scarb.lock");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("failed to write manifest");
+    fs::write(&lock_path, "version = 1\n").expect("failed to write lock file");
+
+    let manifest_metadata = fs::metadata(&manifest_path).expect("failed to stat manifest");
+    let manifest_size_bytes = manifest_metadata.len();
+    let manifest_modified_unix_ms =
+        metadata_modified_unix_ms(&manifest_metadata).expect("failed to read manifest mtime");
+    let (lock_size_bytes, lock_modified_unix_ms, lock_hash) =
+        daemon_lock_state(&manifest_path).expect("failed to resolve lock state");
+
+    let args = MetadataArgs {
+        manifest_path: Some(manifest_path.clone()),
+        format_version: 1,
+        daemon_mode: DaemonModeArg::Off,
+        offline: false,
+        global_cache_dir: None,
+        report_path: None,
+    };
+    let cache_key = metadata_result_cache_key(
+        &args,
+        &manifest_path,
+        "scarb 2.14.0 (metadata-cache-test)",
+        "env:fingerprint",
+    );
+    let cache_root = workspace.join(".uc/cache");
+    let entry_path = metadata_cache_entry_path(&workspace, &cache_key);
+    let run = CommandRun {
+        command: vec!["scarb".to_string(), "metadata".to_string()],
+        exit_code: 0,
+        elapsed_ms: 42.0,
+        stdout: "{\"packages\":[]}\n".to_string(),
+        stderr: String::new(),
+    };
+    let write_context = MetadataResultCacheWriteContext {
+        cache_key: &cache_key,
+        cache_root: &cache_root,
+        entry_path: &entry_path,
+        manifest_size_bytes,
+        manifest_modified_unix_ms,
+        lock_size_bytes,
+        lock_modified_unix_ms,
+        lock_hash: &lock_hash,
+    };
+    store_metadata_result_cache_entry(&write_context, &run)
+        .expect("failed to store metadata cache entry");
+
+    std::thread::sleep(Duration::from_millis(5));
+    fs::write(&lock_path, "version = 2\n").expect("failed to mutate lock file");
+    let (new_lock_size_bytes, new_lock_modified_unix_ms, new_lock_hash) =
+        daemon_lock_state(&manifest_path).expect("failed to resolve mutated lock state");
+    assert_ne!(lock_hash, new_lock_hash);
+
+    let hit = try_metadata_result_cache_hit(
+        &cache_key,
+        &entry_path,
+        manifest_size_bytes,
+        manifest_modified_unix_ms,
+        new_lock_size_bytes,
+        new_lock_modified_unix_ms,
+        &new_lock_hash,
+    )
+    .expect("cache lookup should succeed");
+    assert!(
+        hit.is_none(),
+        "cache must miss when lock hash changes for the same key"
     );
 
     fs::remove_dir_all(&workspace).ok();
@@ -2932,6 +3210,27 @@ fn native_compile_session_build_lock_is_per_key_and_released_when_idle() {
             "independent key entry should also be removed once idle"
         );
     }
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_session_refresh_action_prefers_incremental_for_changed_sets() {
+    assert_eq!(
+        native_session_refresh_action(false, false),
+        NativeSessionRefreshAction::None
+    );
+    assert_eq!(
+        native_session_refresh_action(false, true),
+        NativeSessionRefreshAction::IncrementalChangedSet
+    );
+    assert_eq!(
+        native_session_refresh_action(true, false),
+        NativeSessionRefreshAction::FullRebuild
+    );
+    assert_eq!(
+        native_session_refresh_action(true, true),
+        NativeSessionRefreshAction::FullRebuild
+    );
 }
 
 #[cfg(feature = "native-compile")]
