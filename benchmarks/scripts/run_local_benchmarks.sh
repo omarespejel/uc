@@ -8,6 +8,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
+HOST_PREFLIGHT_LIB="$SCRIPT_DIR/lib/benchmark_host_preflight.sh"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-}"
 MATRIX="${MATRIX:-research}"
 TOOL="${TOOL:-scarb}"
@@ -20,6 +21,8 @@ UC_BUILD_PROFILE="${UC_BUILD_PROFILE:-release}"
 CPU_SET="${CPU_SET:-${UC_BENCH_CPU_SET:-}}"
 NICE_LEVEL="${NICE_LEVEL:-${UC_BENCH_NICE_LEVEL:-0}}"
 STRICT_PINNING="${STRICT_PINNING:-${UC_BENCH_STRICT_PINNING:-0}}"
+HOST_PREFLIGHT_MODE="${HOST_PREFLIGHT_MODE:-warn}"
+ALLOW_NOISY_HOST="${ALLOW_NOISY_HOST:-0}"
 WARM_SETTLE_SECONDS="${WARM_SETTLE_SECONDS:-2.2}"
 BENCH_LOCK_DIR="${BENCH_LOCK_DIR:-$ROOT_DIR/.uc/benchmarks.lock}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
@@ -40,6 +43,13 @@ declare -a EXEC_PREFIX=()
 declare -a CMD_REPLY=()
 LAST_MEASURE_STDERR_FILE=""
 LAST_MEASURE_ELAPSED_MS=""
+
+if [[ ! -f "$HOST_PREFLIGHT_LIB" ]]; then
+  echo "Missing benchmark host preflight helper: $HOST_PREFLIGHT_LIB" >&2
+  exit 1
+fi
+# shellcheck source=benchmarks/scripts/lib/benchmark_host_preflight.sh
+source "$HOST_PREFLIGHT_LIB"
 
 if [[ -z "$UC_BIN" ]]; then
   case "$UC_BUILD_PROFILE" in
@@ -96,8 +106,10 @@ Options:
   --nice-level <n>            Optional process nice level (default: 0)
   --warm-settle-seconds <n>   Wait after warm-up before warm-noop samples (default: 2.2)
   --strict-pinning            Fail if requested pinning cannot be applied
+  --host-preflight <mode>     Host-noise preflight mode (off|warn|require, default: warn)
+  --allow-noisy-host          Disable host-noise preflight checks
   BENCH_LOCK_DIR=<path>       Optional env var to override benchmark lock path
-  NOTE                        Do not run concurrent `uc build` jobs in benchmark workspaces.
+  NOTE                        Do not run concurrent \`uc build\` jobs in benchmark workspaces.
   --help                      Show this help
 USAGE
 }
@@ -167,6 +179,15 @@ while [[ $# -gt 0 ]]; do
       STRICT_PINNING=1
       shift
       ;;
+    --host-preflight)
+      require_option_value "$1" "${2-}"
+      HOST_PREFLIGHT_MODE="$2"
+      shift 2
+      ;;
+    --allow-noisy-host)
+      ALLOW_NOISY_HOST=1
+      shift
+      ;;
     --help)
       usage
       exit 0
@@ -203,6 +224,14 @@ if ! [[ "$WARM_SETTLE_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   echo "--warm-settle-seconds must be a positive number, got: $WARM_SETTLE_SECONDS" >&2
   exit 1
 fi
+if [[ "$HOST_PREFLIGHT_MODE" != "off" && "$HOST_PREFLIGHT_MODE" != "warn" && "$HOST_PREFLIGHT_MODE" != "require" ]]; then
+  echo "--host-preflight must be one of: off, warn, require (got: $HOST_PREFLIGHT_MODE)" >&2
+  exit 1
+fi
+if [[ "$ALLOW_NOISY_HOST" != "0" && "$ALLOW_NOISY_HOST" != "1" ]]; then
+  echo "ALLOW_NOISY_HOST must be 0 or 1, got: $ALLOW_NOISY_HOST" >&2
+  exit 1
+fi
 
 OUT_JSON="$OUT_DIR/${TOOL}-baseline-$STAMP.json"
 OUT_MD="$OUT_DIR/${TOOL}-baseline-$STAMP.md"
@@ -231,6 +260,12 @@ fi
 if [[ "$MATRIX" == "research" && -z "$WORKSPACE_ROOT" ]]; then
   echo "WORKSPACE_ROOT is required for research matrix runs." >&2
   echo "Set WORKSPACE_ROOT to a path where scarb/examples exists." >&2
+  exit 1
+fi
+if [[ "$ALLOW_NOISY_HOST" == "1" ]]; then
+  HOST_PREFLIGHT_MODE="off"
+fi
+if ! uc_bench_preflight_host_noise "$HOST_PREFLIGHT_MODE"; then
   exit 1
 fi
 
@@ -996,6 +1031,7 @@ jq -s \
   --arg build_offline "$BUILD_OFFLINE" \
   --arg uc_daemon_mode "$UC_DAEMON_MODE" \
   --arg strict_pinning "$STRICT_PINNING" \
+  --arg host_preflight_mode "$HOST_PREFLIGHT_MODE" \
   --arg taskset_enabled "$TASKSET_ENABLED" \
   --arg cpu_governor "$CPU_GOVERNOR" \
   --arg warm_settle_seconds "$WARM_SETTLE_SECONDS" \
@@ -1018,6 +1054,7 @@ jq -s \
       build_offline: ($build_offline == "1"),
       uc_daemon_mode: $uc_daemon_mode,
       strict_pinning: ($strict_pinning == "1"),
+      host_preflight_mode: $host_preflight_mode,
       taskset_enabled: ($taskset_enabled == "1"),
       cpu_governor: $cpu_governor,
       warm_settle_seconds: ($warm_settle_seconds | tonumber),
@@ -1043,6 +1080,7 @@ jq -s \
   echo "- Nice level: $NICE_LEVEL"
   echo "- Build mode: $(if [[ "$BUILD_OFFLINE" == "1" ]]; then echo "offline"; else echo "online"; fi)"
   echo "- UC daemon mode: $UC_DAEMON_MODE"
+  echo "- Host preflight mode: $HOST_PREFLIGHT_MODE"
   echo "- CPU governor: $CPU_GOVERNOR"
   echo "- Warm settle seconds: $WARM_SETTLE_SECONDS"
   echo

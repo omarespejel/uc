@@ -14,6 +14,8 @@ UC_DAEMON_MODE="${UC_DAEMON_MODE:-off}"
 CPU_SET="${CPU_SET:-${UC_BENCH_CPU_SET:-}}"
 NICE_LEVEL="${NICE_LEVEL:-${UC_BENCH_NICE_LEVEL:-0}}"
 STRICT_PINNING="${STRICT_PINNING:-${UC_BENCH_STRICT_PINNING:-0}}"
+HOST_PREFLIGHT_MODE="${HOST_PREFLIGHT_MODE:-require}"
+ALLOW_NOISY_HOST="${ALLOW_NOISY_HOST:-0}"
 WARM_SETTLE_SECONDS="${WARM_SETTLE_SECONDS:-2.2}"
 LOCK_BASELINE="${LOCK_BASELINE:-0}"
 ALLOW_UNPINNED="${ALLOW_UNPINNED:-0}"
@@ -44,6 +46,8 @@ Options:
   --nice-level <n>             Optional process nice level passed to local runner
   --warm-settle-seconds <n>    Wait after warm-up before warm-noop samples (default: 2.2)
   --strict-pinning             Fail if requested pinning cannot be applied
+  --host-preflight <mode>      Host-noise preflight mode (off|warn|require, default: require)
+  --allow-noisy-host           Disable host-noise preflight checks (not recommended)
   --allow-unpinned             Allow running without CPU affinity pinning safeguards
   --lock-baseline              Copy passing stability summary into benchmarks/baselines
   --gate-config <path>         Optional gate rules JSON path
@@ -116,6 +120,15 @@ while [[ $# -gt 0 ]]; do
       STRICT_PINNING=1
       shift
       ;;
+    --host-preflight)
+      require_option_value "$1" "${2-}"
+      HOST_PREFLIGHT_MODE="$2"
+      shift 2
+      ;;
+    --allow-noisy-host)
+      ALLOW_NOISY_HOST=1
+      shift
+      ;;
     --allow-unpinned)
       ALLOW_UNPINNED=1
       shift
@@ -169,6 +182,14 @@ if ! [[ "$WARM_SETTLE_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   echo "--warm-settle-seconds must be a positive number, got: $WARM_SETTLE_SECONDS" >&2
   exit 1
 fi
+if [[ "$HOST_PREFLIGHT_MODE" != "off" && "$HOST_PREFLIGHT_MODE" != "warn" && "$HOST_PREFLIGHT_MODE" != "require" ]]; then
+  echo "--host-preflight must be one of: off, warn, require (got: $HOST_PREFLIGHT_MODE)" >&2
+  exit 1
+fi
+if [[ "$ALLOW_NOISY_HOST" != "0" && "$ALLOW_NOISY_HOST" != "1" ]]; then
+  echo "ALLOW_NOISY_HOST must be 0 or 1, got: $ALLOW_NOISY_HOST" >&2
+  exit 1
+fi
 if [[ "$MATRIX" == "research" && -z "$WORKSPACE_ROOT" ]]; then
   echo "--workspace-root is required for research matrix" >&2
   exit 1
@@ -190,6 +211,9 @@ if [[ -n "$GATE_CONFIG" && ! -f "$GATE_CONFIG" ]]; then
   echo "Gate config not found: $GATE_CONFIG" >&2
   exit 1
 fi
+if [[ "$ALLOW_NOISY_HOST" == "1" ]]; then
+  HOST_PREFLIGHT_MODE="off"
+fi
 
 mkdir -p "$OUT_DIR"
 : > "$TMP_DIR/cycle-summaries.ndjson"
@@ -198,6 +222,7 @@ run_benchmark() {
   local tool="$1"
   local cycle="$2"
   local log="$TMP_DIR/${tool}-cycle-${cycle}.log"
+  local status=0
   local -a cmd=(
     "$ROOT_DIR/benchmarks/scripts/run_local_benchmarks.sh"
     --matrix "$MATRIX"
@@ -206,6 +231,7 @@ run_benchmark() {
     --cold-runs "$COLD_RUNS"
     --warm-settle-seconds "$WARM_SETTLE_SECONDS"
     --uc-daemon-mode "$UC_DAEMON_MODE"
+    --host-preflight "$HOST_PREFLIGHT_MODE"
   )
   if [[ "$BUILD_OFFLINE" == "0" ]]; then
     cmd+=(--build-online)
@@ -224,9 +250,13 @@ run_benchmark() {
   fi
 
   if [[ -n "$WORKSPACE_ROOT" ]]; then
-    WORKSPACE_ROOT="$WORKSPACE_ROOT" "${cmd[@]}" | tee "$log" >&2
+    WORKSPACE_ROOT="$WORKSPACE_ROOT" "${cmd[@]}" | tee "$log" >&2 || status=$?
   else
-    "${cmd[@]}" | tee "$log" >&2
+    "${cmd[@]}" | tee "$log" >&2 || status=$?
+  fi
+
+  if [[ "$status" -ne 0 ]]; then
+    return "$status"
   fi
 
   awk '/^Benchmark JSON:/ {print $3}' "$log" | tail -n1
@@ -242,7 +272,10 @@ for cycle in $(seq 1 "$CYCLES"); do
     order=("uc" "scarb")
   fi
   for tool in "${order[@]}"; do
-    result_json="$(run_benchmark "$tool" "$cycle")"
+    if ! result_json="$(run_benchmark "$tool" "$cycle")"; then
+      echo "Benchmark run failed for tool '$tool' in cycle $cycle." >&2
+      exit 1
+    fi
     if [[ "$tool" == "scarb" ]]; then
       scarb_json="$result_json"
     else
@@ -312,6 +345,7 @@ jq -s \
   --arg build_offline "$BUILD_OFFLINE" \
   --arg uc_daemon_mode "$UC_DAEMON_MODE" \
   --arg strict_pinning "$STRICT_PINNING" \
+  --arg host_preflight_mode "$HOST_PREFLIGHT_MODE" \
   --arg warm_settle_seconds "$WARM_SETTLE_SECONDS" '
     def median(a):
       (a | sort) as $s
@@ -339,6 +373,7 @@ jq -s \
         build_offline: ($build_offline == "1"),
         uc_daemon_mode: $uc_daemon_mode,
         strict_pinning: ($strict_pinning == "1"),
+        host_preflight_mode: $host_preflight_mode,
         warm_settle_seconds: ($warm_settle_seconds | tonumber)
       },
       cycle_reports: map({
@@ -390,6 +425,7 @@ jq -s \
   echo "- UC daemon mode: $(jq -r '.pinned_conditions.uc_daemon_mode' "$OUT_JSON")"
   echo "- Run order: alternates per cycle (scarb-first, uc-first)"
   echo "- Strict pinning: $(jq -r '.pinned_conditions.strict_pinning' "$OUT_JSON")"
+  echo "- Host preflight mode: $(jq -r '.pinned_conditions.host_preflight_mode' "$OUT_JSON")"
   echo "- Warm settle seconds: $(jq -r '.pinned_conditions.warm_settle_seconds' "$OUT_JSON")"
   if [[ -n "$WORKSPACE_ROOT" ]]; then
     echo "- Workspace root: $WORKSPACE_ROOT"
