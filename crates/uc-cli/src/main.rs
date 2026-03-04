@@ -57,6 +57,7 @@ const FINGERPRINT_TIMEOUT_MS: u64 = 30_000;
 const FINGERPRINT_MTIME_RECHECK_WINDOW_MS: u64 = 2_000;
 const MAX_CACHEABLE_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_LOCKFILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_CACHE_ENTRY_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_FINGERPRINT_INDEX_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_ARTIFACT_INDEX_BYTES: u64 = 32 * 1024 * 1024;
@@ -83,6 +84,7 @@ const DEFAULT_CACHE_BUDGET_ENFORCE_EVERY: u64 = 8;
 const DEFAULT_MIN_SCARB_VERSION: &str = "2.14.0";
 const DEFAULT_SESSION_INPUT_CACHE_MAX_ENTRIES: usize = 1024;
 const DEFAULT_FINGERPRINT_INDEX_CACHE_MAX_ENTRIES: usize = 512;
+const DEFAULT_DAEMON_BUILD_PLAN_CACHE_MAX_ENTRIES: usize = 512;
 const TOOLCHAIN_CHECK_CACHE_SCHEMA_VERSION: u32 = 1;
 const MAX_TOOLCHAIN_CHECK_CACHE_BYTES: u64 = 64 * 1024;
 const DEFAULT_SCARB_TOOLCHAIN_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
@@ -422,6 +424,26 @@ struct SessionInputCacheEntry {
 #[derive(Clone)]
 struct FingerprintIndexCacheEntry {
     index: FingerprintIndex,
+    last_access_epoch_ms: u64,
+}
+
+#[derive(Clone)]
+struct DaemonBuildPlan {
+    manifest_path: PathBuf,
+    workspace_root: PathBuf,
+    profile: String,
+    session_key: String,
+    strict_invalidation_key: String,
+}
+
+#[derive(Clone)]
+struct DaemonBuildPlanCacheEntry {
+    manifest_size_bytes: u64,
+    manifest_modified_unix_ms: u64,
+    lock_size_bytes: Option<u64>,
+    lock_modified_unix_ms: Option<u64>,
+    lock_hash: String,
+    plan: DaemonBuildPlan,
     last_access_epoch_ms: u64,
 }
 
@@ -828,6 +850,17 @@ fn fingerprint_index_cache_max_entries() -> usize {
         parse_env_usize(
             "UC_FINGERPRINT_INDEX_CACHE_MAX_ENTRIES",
             DEFAULT_FINGERPRINT_INDEX_CACHE_MAX_ENTRIES,
+        )
+        .max(1)
+    })
+}
+
+fn daemon_build_plan_cache_max_entries() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_env_usize(
+            "UC_DAEMON_BUILD_PLAN_CACHE_MAX_ENTRIES",
+            DEFAULT_DAEMON_BUILD_PLAN_CACHE_MAX_ENTRIES,
         )
         .max(1)
     })
@@ -1537,20 +1570,27 @@ fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildRespon
     validate_scarb_toolchain()?;
     let common = common_args_from_daemon_request(&request);
     let manifest_path = resolve_manifest_path(&common.manifest_path)?;
-    let workspace_root = manifest_path
-        .parent()
-        .context("manifest path has no parent")?
-        .to_path_buf();
-    let profile = effective_profile(&common);
-    let session_input = build_session_input(&common, &manifest_path, &profile)?;
-    let session_key = session_input.deterministic_key_hex();
+    let (plan, plan_cache_hit) = prepare_daemon_build_plan(&common, &manifest_path)?;
+    if plan_cache_hit {
+        tracing::debug!(
+            manifest_path = %plan.manifest_path.display(),
+            invalidation_key = %plan.strict_invalidation_key,
+            "uc daemon build plan cache hit"
+        );
+    } else {
+        tracing::debug!(
+            manifest_path = %plan.manifest_path.display(),
+            invalidation_key = %plan.strict_invalidation_key,
+            "uc daemon build plan cache miss"
+        );
+    }
 
     let (run, cache_hit, fingerprint, telemetry) = run_build_with_uc_cache(
         &common,
-        &manifest_path,
-        &workspace_root,
-        &profile,
-        &session_key,
+        &plan.manifest_path,
+        &plan.workspace_root,
+        &plan.profile,
+        &plan.session_key,
         BuildRunOptions {
             capture_output: request.capture_output,
             inherit_output_when_uncaptured: request.capture_output,
@@ -1562,7 +1602,7 @@ fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildRespon
         run,
         cache_hit,
         fingerprint,
-        session_key,
+        session_key: plan.session_key,
         telemetry,
     })
 }
@@ -2424,6 +2464,193 @@ fn build_session_input(
         evict_oldest_session_input_cache_entries(&mut cache, session_input_cache_max_entries());
     }
     Ok(input)
+}
+
+fn daemon_build_plan_cache() -> &'static Mutex<HashMap<String, DaemonBuildPlanCacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, DaemonBuildPlanCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn evict_oldest_daemon_build_plan_cache_entries(
+    cache: &mut HashMap<String, DaemonBuildPlanCacheEntry>,
+    max_entries: usize,
+) {
+    while cache.len() > max_entries {
+        let Some(oldest_key) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_access_epoch_ms)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest_key);
+    }
+}
+
+fn daemon_build_plan_cache_key(
+    common: &BuildCommonArgs,
+    manifest_path: &Path,
+    profile: &str,
+    scarb_version: &str,
+    build_env_fingerprint: &str,
+) -> String {
+    let mut hasher = Hasher::new();
+    hasher.update(b"uc-daemon-build-plan-cache-v1");
+    hasher.update(normalize_fingerprint_path(manifest_path).as_bytes());
+    hasher.update(scarb_version.as_bytes());
+    hasher.update(build_env_fingerprint.as_bytes());
+    hasher.update(profile.as_bytes());
+    hasher.update(common.package.as_deref().unwrap_or("*").as_bytes());
+    hasher.update(if common.workspace {
+        b"workspace"
+    } else {
+        b"package"
+    });
+    hasher.update(if common.offline {
+        b"offline"
+    } else {
+        b"online"
+    });
+    hasher.update(if common.release { b"release" } else { b"dev" });
+    let mut features = common.features.clone();
+    features.sort_unstable();
+    features.dedup();
+    for feature in features {
+        hasher.update(feature.as_bytes());
+        hasher.update(b",");
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn daemon_lock_state(manifest_path: &Path) -> Result<(Option<u64>, Option<u64>, String)> {
+    let lock_path = manifest_path
+        .parent()
+        .context("manifest path has no parent")?
+        .join("Scarb.lock");
+    let metadata = match fs::metadata(&lock_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok((None, None, "lock:none".to_string()));
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", lock_path.display()));
+        }
+    };
+    if !metadata.is_file() {
+        bail!("Scarb.lock path is not a file: {}", lock_path.display());
+    }
+    let bytes = read_bytes_with_limit(&lock_path, MAX_LOCKFILE_BYTES, "Scarb.lock")?;
+    let mut hasher = Hasher::new();
+    hasher.update(b"uc-scarb-lock-v1");
+    hasher.update(&bytes);
+    let lock_hash = format!("lock-blake3:{}", hasher.finalize().to_hex());
+    Ok((
+        Some(metadata.len()),
+        Some(metadata_modified_unix_ms(&metadata)?),
+        lock_hash,
+    ))
+}
+
+fn daemon_build_plan_invalidation_key(session_input: &SessionInput, lock_hash: &str) -> String {
+    let mut hasher = Hasher::new();
+    hasher.update(b"uc-daemon-build-plan-invalidation-v1");
+    hasher.update(session_input.compiler_version.as_bytes());
+    hasher.update(session_input.build_env_fingerprint.as_bytes());
+    hasher.update(session_input.manifest_content_hash.as_bytes());
+    hasher.update(session_input.profile.as_bytes());
+    hasher.update(session_input.target_family.as_bytes());
+    hasher.update(if session_input.offline {
+        b"offline"
+    } else {
+        b"online"
+    });
+    hasher.update(session_input.package.as_deref().unwrap_or("*").as_bytes());
+    let mut features = session_input.features.clone();
+    features.sort_unstable();
+    features.dedup();
+    for feature in features {
+        hasher.update(feature.as_bytes());
+        hasher.update(b",");
+    }
+    hasher.update(lock_hash.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+fn prepare_daemon_build_plan(
+    common: &BuildCommonArgs,
+    manifest_path: &Path,
+) -> Result<(DaemonBuildPlan, bool)> {
+    let profile = effective_profile(common);
+    let scarb_version = scarb_version_line()?;
+    let build_env_fingerprint = current_build_env_fingerprint();
+    let cache_key = daemon_build_plan_cache_key(
+        common,
+        manifest_path,
+        &profile,
+        &scarb_version,
+        &build_env_fingerprint,
+    );
+
+    let manifest_metadata = fs::metadata(manifest_path)
+        .with_context(|| format!("failed to stat {}", manifest_path.display()))?;
+    let manifest_size_bytes = manifest_metadata.len();
+    let manifest_modified_unix_ms = metadata_modified_unix_ms(&manifest_metadata)?;
+    let (lock_size_bytes, lock_modified_unix_ms, lock_hash) = daemon_lock_state(manifest_path)?;
+    let cache_now_ms = epoch_ms_u64().unwrap_or_default();
+
+    {
+        let mut cache = daemon_build_plan_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = cache.get_mut(&cache_key) {
+            entry.last_access_epoch_ms = cache_now_ms;
+            if entry.manifest_size_bytes == manifest_size_bytes
+                && entry.manifest_modified_unix_ms == manifest_modified_unix_ms
+                && entry.lock_size_bytes == lock_size_bytes
+                && entry.lock_modified_unix_ms == lock_modified_unix_ms
+                && entry.lock_hash == lock_hash
+            {
+                return Ok((entry.plan.clone(), true));
+            }
+        }
+    }
+
+    let workspace_root = manifest_path
+        .parent()
+        .context("manifest path has no parent")?
+        .to_path_buf();
+    let session_input = build_session_input(common, manifest_path, &profile)?;
+    let session_key = session_input.deterministic_key_hex();
+    let strict_invalidation_key = daemon_build_plan_invalidation_key(&session_input, &lock_hash);
+    let plan = DaemonBuildPlan {
+        manifest_path: manifest_path.to_path_buf(),
+        workspace_root,
+        profile,
+        session_key,
+        strict_invalidation_key,
+    };
+    {
+        let mut cache = daemon_build_plan_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.insert(
+            cache_key,
+            DaemonBuildPlanCacheEntry {
+                manifest_size_bytes,
+                manifest_modified_unix_ms,
+                lock_size_bytes,
+                lock_modified_unix_ms,
+                lock_hash: lock_hash.clone(),
+                plan: plan.clone(),
+                last_access_epoch_ms: cache_now_ms,
+            },
+        );
+        evict_oldest_daemon_build_plan_cache_entries(
+            &mut cache,
+            daemon_build_plan_cache_max_entries(),
+        );
+    }
+    Ok((plan, false))
 }
 
 fn resolve_manifest_cairo_settings_from_manifest(

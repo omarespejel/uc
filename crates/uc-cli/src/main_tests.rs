@@ -786,6 +786,324 @@ fn session_input_cache_key_changes_with_build_env_fingerprint() {
 }
 
 #[test]
+fn daemon_build_plan_cache_key_is_order_independent_for_features() {
+    let common_a = BuildCommonArgs {
+        manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
+        package: Some("demo".to_string()),
+        workspace: false,
+        features: vec!["b".to_string(), "a".to_string(), "a".to_string()],
+        offline: true,
+        release: false,
+        profile: None,
+    };
+    let common_b = BuildCommonArgs {
+        manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
+        package: Some("demo".to_string()),
+        workspace: false,
+        features: vec!["a".to_string(), "b".to_string()],
+        offline: true,
+        release: false,
+        profile: None,
+    };
+    let key_a = daemon_build_plan_cache_key(
+        &common_a,
+        Path::new("/tmp/workspace/Scarb.toml"),
+        "dev",
+        "scarb 2.14.0",
+        "env-a",
+    );
+    let key_b = daemon_build_plan_cache_key(
+        &common_b,
+        Path::new("/tmp/workspace/Scarb.toml"),
+        "dev",
+        "scarb 2.14.0",
+        "env-a",
+    );
+    assert_eq!(
+        key_a, key_b,
+        "equivalent feature sets should produce identical daemon plan cache keys"
+    );
+}
+
+#[test]
+fn daemon_build_plan_cache_eviction_removes_oldest_entries() {
+    let sample_plan = DaemonBuildPlan {
+        manifest_path: PathBuf::from("/tmp/workspace/Scarb.toml"),
+        workspace_root: PathBuf::from("/tmp/workspace"),
+        profile: "dev".to_string(),
+        session_key: "s".repeat(64),
+        strict_invalidation_key: "k".repeat(64),
+    };
+    let mut cache = HashMap::new();
+    cache.insert(
+        "oldest".to_string(),
+        DaemonBuildPlanCacheEntry {
+            manifest_size_bytes: 1,
+            manifest_modified_unix_ms: 1,
+            lock_size_bytes: Some(1),
+            lock_modified_unix_ms: Some(1),
+            lock_hash: "lock-hash-a".to_string(),
+            plan: sample_plan.clone(),
+            last_access_epoch_ms: 1,
+        },
+    );
+    cache.insert(
+        "middle".to_string(),
+        DaemonBuildPlanCacheEntry {
+            manifest_size_bytes: 1,
+            manifest_modified_unix_ms: 1,
+            lock_size_bytes: Some(1),
+            lock_modified_unix_ms: Some(1),
+            lock_hash: "lock-hash-b".to_string(),
+            plan: sample_plan.clone(),
+            last_access_epoch_ms: 2,
+        },
+    );
+    cache.insert(
+        "newest".to_string(),
+        DaemonBuildPlanCacheEntry {
+            manifest_size_bytes: 1,
+            manifest_modified_unix_ms: 1,
+            lock_size_bytes: Some(1),
+            lock_modified_unix_ms: Some(1),
+            lock_hash: "lock-hash-c".to_string(),
+            plan: sample_plan,
+            last_access_epoch_ms: 3,
+        },
+    );
+
+    evict_oldest_daemon_build_plan_cache_entries(&mut cache, 2);
+    assert_eq!(cache.len(), 2);
+    assert!(!cache.contains_key("oldest"));
+    assert!(cache.contains_key("middle"));
+    assert!(cache.contains_key("newest"));
+}
+
+#[test]
+fn prepare_daemon_build_plan_reuses_when_inputs_unchanged_and_invalidates_on_lock_change() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::env::set_var("UC_SCARB_VERSION_LINE", "scarb 2.14.0 (plan-cache-test)");
+
+    let workspace = unique_test_dir("uc-daemon-plan-cache");
+    let manifest_path = workspace.join("Scarb.toml");
+    let lock_path = workspace.join("Scarb.lock");
+    let src_dir = workspace.join("src");
+    fs::create_dir_all(&src_dir).expect("failed to create src dir");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("failed to write manifest");
+    fs::write(&lock_path, "version = 1\n").expect("failed to write lock file");
+    fs::write(src_dir.join("lib.cairo"), "fn main() -> felt252 { 1 }\n")
+        .expect("failed to write source file");
+
+    let common = BuildCommonArgs {
+        manifest_path: Some(manifest_path.clone()),
+        package: None,
+        workspace: false,
+        features: vec!["feature_b".to_string(), "feature_a".to_string()],
+        offline: false,
+        release: false,
+        profile: None,
+    };
+
+    let (plan_first, hit_first) =
+        prepare_daemon_build_plan(&common, &manifest_path).expect("first plan build should work");
+    let (plan_second, hit_second) =
+        prepare_daemon_build_plan(&common, &manifest_path).expect("second plan build should work");
+
+    assert!(!hit_first, "first plan build should be a miss");
+    assert!(hit_second, "second plan build should reuse cached plan");
+    assert_eq!(plan_first.session_key, plan_second.session_key);
+    assert_eq!(
+        plan_first.strict_invalidation_key, plan_second.strict_invalidation_key,
+        "invalidation key should remain stable when inputs are unchanged"
+    );
+
+    fs::write(&lock_path, "version = 2\n[metadata]\nseed = \"changed\"\n")
+        .expect("failed to mutate lock file");
+    let (plan_third, hit_third) =
+        prepare_daemon_build_plan(&common, &manifest_path).expect("third plan build should work");
+
+    assert!(
+        !hit_third,
+        "lock changes must invalidate daemon build plan cache"
+    );
+    assert_ne!(
+        plan_second.strict_invalidation_key, plan_third.strict_invalidation_key,
+        "invalidation key should change when Scarb.lock changes"
+    );
+
+    std::env::remove_var("UC_SCARB_VERSION_LINE");
+    fs::remove_dir_all(&workspace).ok();
+}
+
+#[test]
+fn prepare_daemon_build_plan_reuses_for_equivalent_feature_sets() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::env::set_var(
+        "UC_SCARB_VERSION_LINE",
+        "scarb 2.14.0 (plan-cache-features)",
+    );
+
+    let workspace = unique_test_dir("uc-daemon-plan-cache-features");
+    let manifest_path = workspace.join("Scarb.toml");
+    let lock_path = workspace.join("Scarb.lock");
+    let src_dir = workspace.join("src");
+    fs::create_dir_all(&src_dir).expect("failed to create src dir");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("failed to write manifest");
+    fs::write(&lock_path, "version = 1\n").expect("failed to write lock file");
+    fs::write(src_dir.join("lib.cairo"), "fn main() -> felt252 { 1 }\n")
+        .expect("failed to write source file");
+
+    let common_a = BuildCommonArgs {
+        manifest_path: Some(manifest_path.clone()),
+        package: None,
+        workspace: false,
+        features: vec!["feature_b".to_string(), "feature_a".to_string()],
+        offline: false,
+        release: false,
+        profile: None,
+    };
+    let common_b = BuildCommonArgs {
+        manifest_path: Some(manifest_path.clone()),
+        package: None,
+        workspace: false,
+        features: vec![
+            "feature_a".to_string(),
+            "feature_b".to_string(),
+            "feature_a".to_string(),
+        ],
+        offline: false,
+        release: false,
+        profile: None,
+    };
+
+    let (plan_first, hit_first) =
+        prepare_daemon_build_plan(&common_a, &manifest_path).expect("first plan build should work");
+    let (plan_second, hit_second) = prepare_daemon_build_plan(&common_b, &manifest_path)
+        .expect("second plan build should reuse cache");
+
+    assert!(!hit_first, "first plan build should miss");
+    assert!(
+        hit_second,
+        "equivalent feature sets should reuse daemon plan cache entry"
+    );
+    assert_eq!(
+        plan_first.session_key, plan_second.session_key,
+        "session key should remain stable for equivalent feature sets"
+    );
+
+    std::env::remove_var("UC_SCARB_VERSION_LINE");
+    fs::remove_dir_all(&workspace).ok();
+}
+
+#[test]
+fn prepare_daemon_build_plan_invalidates_on_profile_env_and_toolchain_changes() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::env::set_var(
+        "UC_SCARB_VERSION_LINE",
+        "scarb 2.14.0 (plan-cache-toolchain-a)",
+    );
+    std::env::remove_var("SCARB_PLAN_CACHE_TEST_ENV");
+
+    let workspace = unique_test_dir("uc-daemon-plan-cache-context");
+    let manifest_path = workspace.join("Scarb.toml");
+    let lock_path = workspace.join("Scarb.lock");
+    let src_dir = workspace.join("src");
+    fs::create_dir_all(&src_dir).expect("failed to create src dir");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("failed to write manifest");
+    fs::write(&lock_path, "version = 1\n").expect("failed to write lock file");
+    fs::write(src_dir.join("lib.cairo"), "fn main() -> felt252 { 1 }\n")
+        .expect("failed to write source file");
+
+    let common_dev = BuildCommonArgs {
+        manifest_path: Some(manifest_path.clone()),
+        package: None,
+        workspace: false,
+        features: vec!["feature_a".to_string()],
+        offline: false,
+        release: false,
+        profile: None,
+    };
+    let common_release = BuildCommonArgs {
+        release: true,
+        ..common_dev.clone()
+    };
+
+    let (dev_first, dev_first_hit) =
+        prepare_daemon_build_plan(&common_dev, &manifest_path).expect("dev plan build should work");
+    let (_, dev_second_hit) = prepare_daemon_build_plan(&common_dev, &manifest_path)
+        .expect("second dev plan build should work");
+    assert!(!dev_first_hit, "first dev request should miss");
+    assert!(dev_second_hit, "second dev request should hit");
+
+    let (release_plan, release_hit) = prepare_daemon_build_plan(&common_release, &manifest_path)
+        .expect("release plan build should work");
+    assert!(
+        !release_hit,
+        "changing profile/release must invalidate daemon plan cache"
+    );
+    assert_ne!(
+        dev_first.session_key, release_plan.session_key,
+        "session key must change between dev and release profiles"
+    );
+
+    std::env::set_var("SCARB_PLAN_CACHE_TEST_ENV", "v1");
+    let (_, env_change_hit) = prepare_daemon_build_plan(&common_dev, &manifest_path)
+        .expect("env-changed plan build should work");
+    assert!(
+        !env_change_hit,
+        "build environment fingerprint changes must invalidate plan cache"
+    );
+    let (_, env_stable_hit) = prepare_daemon_build_plan(&common_dev, &manifest_path)
+        .expect("env-stable plan build should work");
+    assert!(env_stable_hit, "unchanged env fingerprint should hit");
+
+    std::env::set_var(
+        "UC_SCARB_VERSION_LINE",
+        "scarb 2.14.0 (plan-cache-toolchain-b)",
+    );
+    let (_, toolchain_change_hit) = prepare_daemon_build_plan(&common_dev, &manifest_path)
+        .expect("toolchain-changed plan build should work");
+    assert!(
+        !toolchain_change_hit,
+        "scarb version changes must invalidate daemon plan cache"
+    );
+
+    std::env::remove_var("SCARB_PLAN_CACHE_TEST_ENV");
+    std::env::remove_var("UC_SCARB_VERSION_LINE");
+    fs::remove_dir_all(&workspace).ok();
+}
+
+#[test]
 fn cache_budget_enforcement_stride_triggers_every_nth_persist() {
     assert!(!should_enforce_cache_size_budget_for_persist_index(1, 8));
     assert!(!should_enforce_cache_size_budget_for_persist_index(7, 8));
