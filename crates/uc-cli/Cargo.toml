@@ -17,6 +17,7 @@ native-compile = [
   "dep:cairo-lang-lowering",
   "dep:cairo-lang-starknet",
   "dep:cairo-lang-starknet-classes",
+  "dep:scarb-stable-hash",
 ]
 dev-benchmark-command = []
 
@@ -33,6 +34,7 @@ clap.workspace = true
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+scarb-stable-hash = { workspace = true, optional = true }
 sysinfo.workspace = true
 toml.workspace = true
 tracing.workspace = true

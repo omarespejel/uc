@@ -989,6 +989,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "data-encoding"
+version = "2.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
+
+[[package]]
 name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2124,6 +2130,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "scarb-stable-hash"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1902536b23a05dd165d3992865870aaf1b0650317767cbf171ed2ca5903732a9"
+dependencies = [
+ "data-encoding",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "schemars"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2740,6 +2756,7 @@ dependencies = [
  "cairo-lang-starknet-classes",
  "clap",
  "libc",
+ "scarb-stable-hash",
  "serde",
  "serde_json",
  "sysinfo",

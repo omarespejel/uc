@@ -1118,6 +1118,44 @@ fn native_build_mode_parses_expected_values() {
 }
 
 #[test]
+fn parse_lockfile_dependency_version_extracts_target_package() {
+    let lockfile = r#"
+[[package]]
+name = "foo"
+version = "1.0.0"
+
+[[package]]
+name = "cairo-lang-compiler"
+version = "2.16.0"
+"#;
+    assert_eq!(
+        parse_lockfile_dependency_version(lockfile, "cairo-lang-compiler"),
+        Some("2.16.0".to_string())
+    );
+    assert_eq!(
+        parse_lockfile_dependency_version(lockfile, "missing-package"),
+        None
+    );
+}
+
+#[test]
+fn native_compiler_version_line_includes_cairo_lang_version() {
+    let line = native_compiler_version_line();
+    assert!(
+        line.starts_with("uc-native "),
+        "native compiler version should include uc prefix: {line}"
+    );
+    assert!(
+        line.contains("cairo-lang"),
+        "native compiler version should include cairo-lang marker: {line}"
+    );
+    assert!(
+        line.contains(native_cairo_lang_compiler_version()),
+        "native compiler version should include resolved cairo-lang version: {line}"
+    );
+}
+
+#[test]
 fn daemon_build_plan_cache_key_is_order_independent_for_features() {
     let common_a = BuildCommonArgs {
         manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
@@ -2534,6 +2572,13 @@ edition = "2024_07"
     let context =
         build_native_compile_context(&common, &manifest_path, &dir).expect("context should build");
     assert_eq!(context.crate_name, "demo_native");
+    assert_eq!(
+        context.starknet_target,
+        NativeStarknetTargetProps {
+            sierra: true,
+            casm: false
+        }
+    );
     let cairo_project = fs::read_to_string(context.cairo_project_dir.join("cairo_project.toml"))
         .expect("failed to read cairo project");
     assert!(
@@ -2559,6 +2604,135 @@ fn native_cairo_project_toml_prefers_explicit_cairo_edition() {
     assert!(
         rendered.contains("[config.global]\nedition = \"2023_10\""),
         "explicit cairo edition should be rendered"
+    );
+}
+
+#[test]
+fn native_starknet_artifact_id_matches_scarb_contract_id_shape() {
+    assert_eq!(
+        native_starknet_artifact_id("uc_smoke", "uc_smoke::contract_patterns::portfolio_router"),
+        "3jvjjppd7e8d4"
+    );
+}
+
+#[test]
+fn native_contract_file_stems_expand_duplicate_contract_names() {
+    let stems = native_contract_file_stems(&[
+        "demo::alpha::Balance".to_string(),
+        "demo::beta::Balance".to_string(),
+        "demo::gamma::Vault".to_string(),
+    ]);
+    assert_eq!(
+        stems,
+        vec![
+            "demo_alpha_Balance".to_string(),
+            "demo_beta_Balance".to_string(),
+            "Vault".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn native_compiler_config_sets_replace_ids_by_profile() {
+    let empty_inputs: Vec<CrateInput> = Vec::new();
+    assert!(
+        native_compiler_config(&empty_inputs, "dev").replace_ids,
+        "dev profile should default to replace IDs"
+    );
+    assert!(
+        !native_compiler_config(&empty_inputs, "release").replace_ids,
+        "release profile should not replace IDs by default"
+    );
+}
+
+#[test]
+fn resolve_manifest_native_starknet_target_props_defaults_match_scarb() {
+    let manifest: TomlValue = toml::from_str(
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("manifest should parse");
+    let props = resolve_manifest_native_starknet_target_props(&manifest)
+        .expect("default target props should parse");
+    assert_eq!(
+        props,
+        NativeStarknetTargetProps {
+            sierra: true,
+            casm: false
+        }
+    );
+}
+
+#[test]
+fn resolve_manifest_native_starknet_target_props_respects_explicit_flags() {
+    let manifest: TomlValue = toml::from_str(
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+
+[target.starknet-contract]
+sierra = true
+casm = true
+"#,
+    )
+    .expect("manifest should parse");
+    let props = resolve_manifest_native_starknet_target_props(&manifest)
+        .expect("explicit target props should parse");
+    assert_eq!(
+        props,
+        NativeStarknetTargetProps {
+            sierra: true,
+            casm: true
+        }
+    );
+}
+
+#[test]
+fn resolve_manifest_native_starknet_target_props_accepts_single_target_array_entry() {
+    let manifest: TomlValue = toml::from_str(
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+
+[[target.starknet-contract]]
+"#,
+    )
+    .expect("manifest should parse");
+    let props = resolve_manifest_native_starknet_target_props(&manifest)
+        .expect("single target array should be supported");
+    assert_eq!(
+        props,
+        NativeStarknetTargetProps {
+            sierra: true,
+            casm: false
+        }
+    );
+}
+
+#[test]
+fn resolve_manifest_native_starknet_target_props_rejects_multiple_target_array_entries() {
+    let manifest: TomlValue = toml::from_str(
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+
+[[target.starknet-contract]]
+
+[[target.starknet-contract]]
+"#,
+    )
+    .expect("manifest should parse");
+    let err = resolve_manifest_native_starknet_target_props(&manifest)
+        .expect_err("multiple target entries should be rejected");
+    assert!(
+        format!("{err:#}").contains("supports a single [[target.starknet-contract]] entry"),
+        "unexpected error: {err:#}"
     );
 }
 

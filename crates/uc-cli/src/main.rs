@@ -14,6 +14,7 @@ use cairo_lang_starknet::starknet_plugin_suite;
 use cairo_lang_starknet_classes::casm_contract_class::CasmContractClass;
 use cairo_lang_starknet_classes::contract_class::ContractClass;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use scarb_stable_hash::short_hash;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(target_os = "macos")]
@@ -109,7 +110,6 @@ const DEFAULT_UC_DISABLE_SCARB_ARTIFACTS_FINGERPRINT: bool = false;
 const DEFAULT_UC_NATIVE_BUILD_MODE: &str = "off";
 const TOOLCHAIN_CHECK_CACHE_SCHEMA_VERSION: u32 = 1;
 const MAX_TOOLCHAIN_CHECK_CACHE_BYTES: u64 = 64 * 1024;
-const NATIVE_ARTIFACT_ID_TRUNC_HEX_LEN: usize = 13;
 /// Default Starknet CASM bytecode limit used by native compile.
 /// Mirrors the current Cairo/Scarb default (81_290) used for Starknet contract
 /// class validation and can be overridden with
@@ -275,11 +275,11 @@ fn native_error_allows_scarb_fallback(err: &anyhow::Error) -> bool {
 static NATIVE_DAEMON_BACKEND_POISONED: AtomicBool = AtomicBool::new(false);
 
 fn native_daemon_backend_is_poisoned() -> bool {
-    NATIVE_DAEMON_BACKEND_POISONED.load(Ordering::Relaxed)
+    NATIVE_DAEMON_BACKEND_POISONED.load(Ordering::Acquire)
 }
 
 fn mark_native_daemon_backend_poisoned() {
-    NATIVE_DAEMON_BACKEND_POISONED.store(true, Ordering::Relaxed);
+    NATIVE_DAEMON_BACKEND_POISONED.store(true, Ordering::Release);
 }
 
 fn ensure_native_daemon_backend_available() -> Result<()> {
@@ -293,7 +293,7 @@ fn ensure_native_daemon_backend_available() -> Result<()> {
 
 #[cfg(test)]
 fn set_native_daemon_backend_poisoned_for_test(value: bool) {
-    NATIVE_DAEMON_BACKEND_POISONED.store(value, Ordering::Relaxed);
+    NATIVE_DAEMON_BACKEND_POISONED.store(value, Ordering::Release);
 }
 
 #[derive(Args, Debug)]
@@ -464,7 +464,14 @@ struct NativeCompileContext {
     crate_name: String,
     cairo_project_dir: PathBuf,
     corelib_src: PathBuf,
+    starknet_target: NativeStarknetTargetProps,
     manifest_content_hash: String,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+struct NativeStarknetTargetProps {
+    sierra: bool,
+    casm: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -635,6 +642,11 @@ struct NativeCompileSessionCacheEntry {
 
 struct NativeCompileSessionState {
     signature: NativeCompileSessionSignature,
+    db: RootDatabase,
+    main_crate_inputs: Vec<CrateInput>,
+}
+
+struct NativeCompileSessionSnapshot {
     db: RootDatabase,
     main_crate_inputs: Vec<CrateInput>,
 }
@@ -990,8 +1002,57 @@ fn native_build_mode() -> NativeBuildMode {
     })
 }
 
+fn parse_lockfile_dependency_version(lockfile: &str, dependency_name: &str) -> Option<String> {
+    let mut in_target_package = false;
+    for line in lockfile.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[[package]]" {
+            in_target_package = false;
+            continue;
+        }
+        if let Some(name) = trimmed
+            .strip_prefix("name = \"")
+            .and_then(|raw| raw.strip_suffix('"'))
+        {
+            in_target_package = name == dependency_name;
+            continue;
+        }
+        if in_target_package {
+            if let Some(version) = trimmed
+                .strip_prefix("version = \"")
+                .and_then(|raw| raw.strip_suffix('"'))
+            {
+                return Some(version.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn native_cairo_lang_compiler_version() -> &'static str {
+    static VALUE: OnceLock<String> = OnceLock::new();
+    VALUE
+        .get_or_init(|| {
+            parse_lockfile_dependency_version(
+                include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock")),
+                "cairo-lang-compiler",
+            )
+            .unwrap_or_else(|| "unknown".to_string())
+        })
+        .as_str()
+}
+
 fn native_compiler_version_line() -> String {
-    format!("uc-native {}", env!("CARGO_PKG_VERSION"))
+    static VALUE: OnceLock<String> = OnceLock::new();
+    VALUE
+        .get_or_init(|| {
+            format!(
+                "uc-native {} cairo-lang {}",
+                env!("CARGO_PKG_VERSION"),
+                native_cairo_lang_compiler_version()
+            )
+        })
+        .clone()
 }
 
 fn native_max_casm_bytecode_size() -> usize {
@@ -2477,8 +2538,9 @@ fn resolve_native_corelib_src(workspace_root: &Path) -> Result<PathBuf> {
             return Ok(canonical);
         }
         return Err(native_fallback_eligible_error(format!(
-            "native corelib override {} is incompatible; expected corelib/src to contain lib.cairo, prelude.cairo, and ops.cairo",
-            canonical.display()
+            "native corelib override {} is incompatible; expected corelib/src to contain lib.cairo, prelude.cairo, and ops.cairo compatible with cairo-lang {}",
+            canonical.display(),
+            native_cairo_lang_compiler_version()
         )));
     }
 
@@ -2516,7 +2578,10 @@ fn resolve_native_corelib_src(workspace_root: &Path) -> Result<PathBuf> {
     }
 
     Err(native_fallback_eligible_error(
-        "native compile requires a compatible Cairo corelib source path; set UC_NATIVE_CORELIB_SRC=<.../corelib/src>",
+        format!(
+            "native compile requires a Cairo corelib source path compatible with cairo-lang {}; set UC_NATIVE_CORELIB_SRC=<.../corelib/src>",
+            native_cairo_lang_compiler_version()
+        ),
     ))
 }
 
@@ -2544,6 +2609,8 @@ fn build_native_compile_context(
     )?;
     let manifest_content_hash = compute_manifest_content_hash_bytes(manifest_text.as_bytes());
     validate_manifest_dependency_sanity_from_manifest(manifest_path, &manifest)?;
+    let starknet_target = resolve_manifest_native_starknet_target_props(&manifest)
+        .map_err(mark_native_fallback_eligible)?;
     let package_table = manifest
         .get("package")
         .and_then(TomlValue::as_table)
@@ -2588,6 +2655,11 @@ fn build_native_compile_context(
             }
         }
     }
+    if !starknet_target.sierra {
+        return Err(native_fallback_eligible_error(
+            "native compile currently requires [target.starknet-contract].sierra = true",
+        ));
+    }
 
     let source_root = workspace_root.join("src");
     let lib_path = source_root.join("lib.cairo");
@@ -2631,6 +2703,7 @@ fn build_native_compile_context(
         crate_name,
         cairo_project_dir,
         corelib_src,
+        starknet_target,
         manifest_content_hash,
     })
 }
@@ -2667,6 +2740,44 @@ fn native_cairo_project_toml(
         content.push_str("\"\n");
     }
     content
+}
+
+fn native_contract_package_name(module_path: &str) -> &str {
+    module_path
+        .split_once("::")
+        .map(|(package, _)| package)
+        .unwrap_or(module_path)
+}
+
+fn native_contract_name(module_path: &str) -> &str {
+    module_path
+        .rsplit_once("::")
+        .map(|(_, contract)| contract)
+        .unwrap_or(module_path)
+}
+
+fn native_contract_file_stems(module_paths: &[String]) -> Vec<String> {
+    let mut seen_names = HashSet::new();
+    let duplicate_names: HashSet<String> = module_paths
+        .iter()
+        .map(|path| native_contract_name(path).to_string())
+        .filter(|contract_name| !seen_names.insert(contract_name.clone()))
+        .collect();
+    module_paths
+        .iter()
+        .map(|path| {
+            let contract_name = native_contract_name(path);
+            if duplicate_names.contains(contract_name) {
+                path.replace("::", "_")
+            } else {
+                contract_name.to_string()
+            }
+        })
+        .collect()
+}
+
+fn native_starknet_artifact_id(package_name: &str, contract_path: &str) -> String {
+    short_hash((package_name, contract_path))
 }
 
 fn prune_native_target_outputs(
@@ -2805,16 +2916,22 @@ fn clear_native_compile_session(workspace_root: &Path) {
 fn with_native_compile_session<T>(
     workspace_root: &Path,
     signature: &NativeCompileSessionSignature,
-    f: impl FnOnce(&NativeCompileSessionState) -> Result<T>,
+    f: impl FnOnce(&NativeCompileSessionSnapshot) -> Result<T>,
 ) -> Result<T> {
     let session_handle = native_compile_session_handle(workspace_root, signature)?;
-    let mut session = session_handle
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if session.signature != *signature {
-        *session = build_native_compile_session_state(signature.clone())?;
-    }
-    f(&session)
+    let snapshot = {
+        let mut session = session_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if session.signature != *signature {
+            *session = build_native_compile_session_state(signature.clone())?;
+        }
+        NativeCompileSessionSnapshot {
+            db: session.db.snapshot(),
+            main_crate_inputs: session.main_crate_inputs.clone(),
+        }
+    };
+    f(&snapshot)
 }
 
 fn run_native_build(
@@ -2865,11 +2982,17 @@ fn validate_native_profile_name(profile: &str) -> Result<()> {
     Ok(())
 }
 
-fn native_compiler_config<'a>(main_crate_inputs: &'a [CrateInput]) -> CompilerConfig<'a> {
+fn native_compiler_config<'a>(
+    main_crate_inputs: &'a [CrateInput],
+    profile: &str,
+) -> CompilerConfig<'a> {
     let mut compiler_config = CompilerConfig::default();
     compiler_config.diagnostics_reporter = compiler_config
         .diagnostics_reporter
         .with_crates(main_crate_inputs);
+    // Scarb built-in profiles default to `sierra-replace-ids = true` for dev-like
+    // profiles and `false` for release; mirror that behavior for parity.
+    compiler_config.replace_ids = profile != "release";
     compiler_config
 }
 
@@ -2901,17 +3024,17 @@ fn run_native_build_inner(
             let program = compile_prepared_db_program(
                 &session.db,
                 crate_ids,
-                native_compiler_config(&session.main_crate_inputs),
+                native_compiler_config(&session.main_crate_inputs, profile),
             )
             .context("native cairo compile failed")?;
             let output_name = format!("{}.sierra", context.package_name);
             let output_path = target_dir.join(&output_name);
             ensure_path_within_root(&target_dir, &output_path, "native sierra artifact path")?;
+            let mut keep_files = BTreeSet::new();
+            keep_files.insert(output_name.clone());
+            prune_native_target_outputs(&target_dir, &context.package_name, &keep_files)?;
             fs::write(&output_path, program.to_string())
                 .with_context(|| format!("failed to write native artifact {}", output_name))?;
-            let mut keep_files = BTreeSet::new();
-            keep_files.insert(output_name);
-            prune_native_target_outputs(&target_dir, &context.package_name, &keep_files)?;
             return Ok(1);
         }
 
@@ -2919,7 +3042,7 @@ fn run_native_build_inner(
         let contract_classes = compile_starknet_prepared_db(
             &session.db,
             &contract_refs,
-            native_compiler_config(&session.main_crate_inputs),
+            native_compiler_config(&session.main_crate_inputs, profile),
         )
         .context("native starknet compile failed")?;
         if contract_classes.len() != contracts.len() {
@@ -2935,7 +3058,7 @@ fn run_native_build_inner(
                 let mut single_class = compile_starknet_prepared_db(
                     &session.db,
                     &[contract],
-                    native_compiler_config(&session.main_crate_inputs),
+                    native_compiler_config(&session.main_crate_inputs, profile),
                 )
                 .with_context(|| {
                     format!(
@@ -2955,51 +3078,57 @@ fn run_native_build_inner(
         let mut serialized_artifacts = Vec::with_capacity(contract_classes.len().saturating_mul(2));
         let mut keep_files = BTreeSet::new();
         let mut contracts_manifest = Vec::with_capacity(contract_classes.len());
+        let module_paths: Vec<String> = contracts
+            .iter()
+            .map(|contract| contract.submodule_id.full_path(&session.db))
+            .collect();
+        let contract_stems = native_contract_file_stems(&module_paths);
         // `compile_prepared_db` currently preserves input order (`contracts.par_iter().collect()`).
         // Keep this zipped mapping explicit so a future upstream change is easy to audit here.
-        for (contract, contract_class) in contracts.iter().zip(contract_classes.into_iter()) {
-            let module_path = contract.submodule_id.full_path(&session.db);
-            let contract_name = module_path
-                .rsplit("::")
-                .next()
-                .unwrap_or("contract")
-                .to_string();
-            let mut id_hasher = Hasher::new();
-            id_hasher.update(module_path.as_bytes());
-            let digest = id_hasher.finalize().to_hex();
-            let id = digest[..NATIVE_ARTIFACT_ID_TRUNC_HEX_LEN].to_string();
-            let artifact_stem = sanitize_artifact_component(&contract_name);
-            let artifact_file = format!(
-                "{}_{}_{}.contract_class.json",
-                context.package_name, artifact_stem, id
+        for ((module_path, contract_stem), contract_class) in module_paths
+            .into_iter()
+            .zip(contract_stems.into_iter())
+            .zip(contract_classes.into_iter())
+        {
+            let package_name = native_contract_package_name(&module_path).to_string();
+            let contract_name = native_contract_name(&module_path).to_string();
+            let artifact_id = native_starknet_artifact_id(&package_name, &module_path);
+            let file_stem = format!(
+                "{}_{}",
+                context.package_name,
+                sanitize_artifact_component(&contract_stem)
             );
+            let artifact_file = format!("{file_stem}.contract_class.json");
             let artifact_bytes = serde_json::to_vec(&contract_class)
                 .with_context(|| format!("failed to serialize {}", artifact_file))?;
             serialized_artifacts.push((artifact_file.clone(), artifact_bytes));
             keep_files.insert(artifact_file.clone());
 
-            let casm_contract =
-                compile_native_casm_contract(contract_class, native_max_casm_bytecode_size())?;
-            let casm_file = format!(
-                "{}_{}_{}.compiled_contract_class.json",
-                context.package_name, artifact_stem, id
-            );
-            let casm_bytes = serde_json::to_vec(&casm_contract)
-                .with_context(|| format!("failed to serialize {}", casm_file))?;
-            serialized_artifacts.push((casm_file.clone(), casm_bytes));
-            keep_files.insert(casm_file.clone());
+            let casm_file = if context.starknet_target.casm {
+                let casm_contract =
+                    compile_native_casm_contract(contract_class, native_max_casm_bytecode_size())?;
+                let file_name = format!("{file_stem}.compiled_contract_class.json");
+                let casm_bytes = serde_json::to_vec(&casm_contract)
+                    .with_context(|| format!("failed to serialize {}", file_name))?;
+                serialized_artifacts.push((file_name.clone(), casm_bytes));
+                keep_files.insert(file_name.clone());
+                Some(file_name)
+            } else {
+                None
+            };
 
             contracts_manifest.push(StarknetArtifactEntry {
-                id,
-                package_name: context.package_name.clone(),
+                id: artifact_id,
+                package_name,
                 contract_name,
                 module_path,
                 artifacts: StarknetArtifactFiles {
                     sierra: artifact_file,
-                    casm: Some(casm_file),
+                    casm: casm_file,
                 },
             });
         }
+        contracts_manifest.sort_by(|left, right| left.id.cmp(&right.id));
         let contract_artifact_count = contracts_manifest.len();
         let manifest = StarknetArtifactsManifest {
             version: 1,
@@ -4231,6 +4360,48 @@ fn persist_daemon_shared_cache_entry_for_build(
         enforce_cache_size_budget_with_budget(&shared_cache_root, max_bytes)?;
     }
     Ok(())
+}
+
+fn resolve_manifest_native_starknet_target_props(
+    manifest: &TomlValue,
+) -> Result<NativeStarknetTargetProps> {
+    let mut props = NativeStarknetTargetProps {
+        sierra: true,
+        casm: false,
+    };
+    let Some(target_table) = manifest.get("target").and_then(TomlValue::as_table) else {
+        return Ok(props);
+    };
+    let Some(starknet_target) = target_table.get("starknet-contract") else {
+        return Ok(props);
+    };
+    let target_props = match starknet_target {
+        TomlValue::Table(table) => table,
+        TomlValue::Array(entries) => {
+            if entries.len() != 1 {
+                bail!("native compile supports a single [[target.starknet-contract]] entry");
+            }
+            entries[0].as_table().context(
+                "native compile expects [[target.starknet-contract]] entries to be tables",
+            )?
+        }
+        _ => {
+            bail!(
+                "native compile expects [target.starknet-contract] or [[target.starknet-contract]]"
+            );
+        }
+    };
+    if let Some(value) = target_props.get("sierra") {
+        props.sierra = value
+            .as_bool()
+            .context("native compile expects [target.starknet-contract].sierra to be a boolean")?;
+    }
+    if let Some(value) = target_props.get("casm") {
+        props.casm = value
+            .as_bool()
+            .context("native compile expects [target.starknet-contract].casm to be a boolean")?;
+    }
+    Ok(props)
 }
 
 fn resolve_manifest_cairo_settings_from_manifest(

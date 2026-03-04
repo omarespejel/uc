@@ -1,5 +1,93 @@
 use super::*;
 
+const DAEMON_LOCAL_PROBE_HINT_SUFFIX: &str = ".fallback-session-key";
+
+fn daemon_local_probe_hint_path(
+    workspace_root: &Path,
+    primary_session_key: &str,
+) -> Result<PathBuf> {
+    validate_hex_digest(
+        "daemon local probe primary session key",
+        primary_session_key,
+        SESSION_KEY_LEN,
+    )?;
+    let hint_dir = workspace_root.join(".uc/cache/probe-hints");
+    ensure_path_within_root(
+        workspace_root,
+        &hint_dir,
+        "daemon local probe hint directory",
+    )?;
+    let hint_path = hint_dir.join(format!(
+        "{primary_session_key}{DAEMON_LOCAL_PROBE_HINT_SUFFIX}"
+    ));
+    ensure_path_within_root(workspace_root, &hint_path, "daemon local probe hint path")?;
+    Ok(hint_path)
+}
+
+fn load_daemon_local_probe_hint(
+    workspace_root: &Path,
+    primary_session_key: &str,
+) -> Result<Option<String>> {
+    let hint_path = daemon_local_probe_hint_path(workspace_root, primary_session_key)?;
+    let contents = match fs::read_to_string(&hint_path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed to read daemon probe hint {}", hint_path.display())
+            });
+        }
+    };
+    let hinted_session_key = contents.trim();
+    if hinted_session_key.is_empty() || hinted_session_key == primary_session_key {
+        return Ok(None);
+    }
+    validate_hex_digest(
+        "daemon local probe hinted session key",
+        hinted_session_key,
+        SESSION_KEY_LEN,
+    )?;
+    Ok(Some(hinted_session_key.to_string()))
+}
+
+fn persist_daemon_local_probe_hint(
+    workspace_root: &Path,
+    primary_session_key: &str,
+    hinted_session_key: &str,
+) -> Result<()> {
+    if hinted_session_key == primary_session_key {
+        return Ok(());
+    }
+    validate_hex_digest(
+        "daemon local probe hinted session key",
+        hinted_session_key,
+        SESSION_KEY_LEN,
+    )?;
+    let hint_path = daemon_local_probe_hint_path(workspace_root, primary_session_key)?;
+    let parent = hint_path
+        .parent()
+        .context("daemon local probe hint path has no parent directory")?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create daemon probe hint dir {}",
+            parent.display()
+        )
+    })?;
+    fs::write(&hint_path, format!("{hinted_session_key}\n"))
+        .with_context(|| format!("failed to write daemon probe hint {}", hint_path.display()))?;
+    Ok(())
+}
+
+fn clear_daemon_local_probe_hint(workspace_root: &Path, primary_session_key: &str) -> Result<()> {
+    let hint_path = daemon_local_probe_hint_path(workspace_root, primary_session_key)?;
+    match fs::remove_file(&hint_path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err)
+            .with_context(|| format!("failed to remove daemon probe hint {}", hint_path.display())),
+    }
+}
+
 pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
     let common = args.common;
     let report_path = args.report_path;
@@ -127,6 +215,11 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                         &compiler_version,
                                         BuildCompileBackend::Scarb,
                                     )?;
+                                let _ = persist_daemon_local_probe_hint(
+                                    &workspace_root,
+                                    &native_session_key,
+                                    &local_session_key,
+                                );
                                 Ok((run, cache_hit, fingerprint, local_session_key, telemetry))
                             }
                         }
@@ -186,6 +279,23 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
              -> Result<
                 Option<(CommandRun, String, BuildPhaseTelemetry, String)>,
             > {
+                if include_scarb_fallback_probe {
+                    if let Some(hinted_session_key) =
+                        load_daemon_local_probe_hint(&workspace_root, primary_session_key)?
+                    {
+                        let scarb_compiler_version = scarb_version_line()?;
+                        if let Some((run, fingerprint, telemetry)) = try_local_uc_cache_hit(
+                            &common,
+                            &manifest_path,
+                            &workspace_root,
+                            &profile,
+                            &hinted_session_key,
+                            &scarb_compiler_version,
+                        )? {
+                            return Ok(Some((run, fingerprint, telemetry, hinted_session_key)));
+                        }
+                    }
+                }
                 if let Some((run, fingerprint, telemetry)) = try_local_uc_cache_hit(
                     &common,
                     &manifest_path,
@@ -194,6 +304,9 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                     primary_session_key,
                     primary_compiler_version,
                 )? {
+                    if include_scarb_fallback_probe {
+                        let _ = clear_daemon_local_probe_hint(&workspace_root, primary_session_key);
+                    }
                     return Ok(Some((
                         run,
                         fingerprint,
@@ -214,6 +327,11 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             &scarb_session_key,
                             &scarb_compiler_version,
                         )? {
+                            let _ = persist_daemon_local_probe_hint(
+                                &workspace_root,
+                                primary_session_key,
+                                &scarb_session_key,
+                            );
                             return Ok(Some((run, fingerprint, telemetry, scarb_session_key)));
                         }
                     }
@@ -253,6 +371,19 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                         daemon_compile_backend,
                         daemon_native_fallback_to_scarb,
                     )? {
+                        if daemon_native_fallback_to_scarb
+                            && response.compile_backend == DaemonBuildBackend::Scarb
+                            && response.session_key != local_session_key
+                        {
+                            let _ = persist_daemon_local_probe_hint(
+                                &workspace_root,
+                                &local_session_key,
+                                &response.session_key,
+                            );
+                        } else if response.session_key == local_session_key {
+                            let _ =
+                                clear_daemon_local_probe_hint(&workspace_root, &local_session_key);
+                        }
                         daemon_used = true;
                         session_key = response.session_key;
                         phase_telemetry = Some(response.telemetry);
@@ -291,6 +422,19 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             daemon_native_fallback_to_scarb,
                         )?
                         .context("daemon mode is require but daemon is unavailable")?;
+                        if daemon_native_fallback_to_scarb
+                            && response.compile_backend == DaemonBuildBackend::Scarb
+                            && response.session_key != local_session_key
+                        {
+                            let _ = persist_daemon_local_probe_hint(
+                                &workspace_root,
+                                &local_session_key,
+                                &response.session_key,
+                            );
+                        } else if response.session_key == local_session_key {
+                            let _ =
+                                clear_daemon_local_probe_hint(&workspace_root, &local_session_key);
+                        }
                         daemon_used = true;
                         session_key = response.session_key;
                         phase_telemetry = Some(response.telemetry);
