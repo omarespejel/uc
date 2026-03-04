@@ -121,6 +121,10 @@ const DEFAULT_DAEMON_LOCK_HASH_CACHE_MAX_ENTRIES: usize = 512;
 const DEFAULT_NATIVE_COMPILE_SESSION_CACHE_MAX_ENTRIES: usize = 16;
 #[cfg(feature = "native-compile")]
 const DEFAULT_NATIVE_COMPILE_CONTEXT_CACHE_MAX_ENTRIES: usize = 256;
+#[cfg(feature = "native-compile")]
+const DEFAULT_NATIVE_COMPILE_SESSION_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+#[cfg(feature = "native-compile")]
+const DEFAULT_NATIVE_COMPILE_CONTEXT_CACHE_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_DAEMON_SHARED_CACHE_ENABLED: bool = true;
 const DEFAULT_DAEMON_SHARED_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const DEFAULT_UC_DISABLE_SCARB_ARTIFACTS_FINGERPRINT: bool = false;
@@ -668,6 +672,7 @@ struct LockfileHashCacheEntry {
 struct NativeCompileSessionCacheEntry {
     session: Arc<Mutex<NativeCompileSessionState>>,
     last_access_epoch_ms: u64,
+    estimated_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -678,6 +683,14 @@ struct NativeCompileContextCacheEntry {
     manifest_change_unix_ms: Option<u64>,
     context: NativeCompileContext,
     last_access_epoch_ms: u64,
+    estimated_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(feature = "native-compile")]
+struct NativeTrackedFileState {
+    size_bytes: u64,
+    modified_unix_ms: u64,
 }
 
 #[cfg(feature = "native-compile")]
@@ -685,6 +698,9 @@ struct NativeCompileSessionState {
     signature: NativeCompileSessionSignature,
     db: RootDatabase,
     main_crate_inputs: Vec<CrateInput>,
+    tracked_sources: BTreeMap<String, NativeTrackedFileState>,
+    tracked_source_bytes: u64,
+    source_root_modified_unix_ms: u64,
 }
 
 #[cfg(feature = "native-compile")]
@@ -711,6 +727,16 @@ struct DaemonStatusPayload {
     failed_requests: u64,
     rate_limited_requests: u64,
     last_error: Option<String>,
+    #[serde(default)]
+    native_compile_session_cache_entries: u64,
+    #[serde(default)]
+    native_compile_session_cache_estimated_bytes: u64,
+    #[serde(default)]
+    native_compile_context_cache_entries: u64,
+    #[serde(default)]
+    native_compile_context_cache_estimated_bytes: u64,
+    #[serde(default)]
+    native_compile_session_build_locks: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -847,6 +873,57 @@ struct DaemonHealth {
     consecutive_failures: u64,
     last_error: Option<String>,
     last_failure_at: Option<Instant>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct NativeCacheTelemetrySnapshot {
+    session_entries: u64,
+    session_estimated_bytes: u64,
+    context_entries: u64,
+    context_estimated_bytes: u64,
+    build_locks: u64,
+}
+
+#[cfg(feature = "native-compile")]
+fn native_cache_telemetry_snapshot() -> NativeCacheTelemetrySnapshot {
+    let (session_entries, session_estimated_bytes) = {
+        let cache = native_compile_session_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let bytes = cache
+            .values()
+            .map(|entry| entry.estimated_bytes)
+            .fold(0_u64, u64::saturating_add);
+        (cache.len() as u64, bytes)
+    };
+    let (context_entries, context_estimated_bytes) = {
+        let cache = native_compile_context_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let bytes = cache
+            .values()
+            .map(|entry| entry.estimated_bytes)
+            .fold(0_u64, u64::saturating_add);
+        (cache.len() as u64, bytes)
+    };
+    let build_locks = {
+        let locks = native_compile_session_build_locks()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks.len() as u64
+    };
+    NativeCacheTelemetrySnapshot {
+        session_entries,
+        session_estimated_bytes,
+        context_entries,
+        context_estimated_bytes,
+        build_locks,
+    }
+}
+
+#[cfg(not(feature = "native-compile"))]
+fn native_cache_telemetry_snapshot() -> NativeCacheTelemetrySnapshot {
+    NativeCacheTelemetrySnapshot::default()
 }
 
 impl DaemonRateLimiter {
@@ -1300,6 +1377,28 @@ fn native_compile_context_cache_max_entries() -> usize {
     })
 }
 
+#[cfg(feature = "native-compile")]
+fn native_compile_session_cache_max_bytes() -> u64 {
+    static VALUE: OnceLock<u64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_env_u64(
+            "UC_NATIVE_COMPILE_SESSION_CACHE_MAX_BYTES",
+            DEFAULT_NATIVE_COMPILE_SESSION_CACHE_MAX_BYTES,
+        )
+    })
+}
+
+#[cfg(feature = "native-compile")]
+fn native_compile_context_cache_max_bytes() -> u64 {
+    static VALUE: OnceLock<u64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_env_u64(
+            "UC_NATIVE_COMPILE_CONTEXT_CACHE_MAX_BYTES",
+            DEFAULT_NATIVE_COMPILE_CONTEXT_CACHE_MAX_BYTES,
+        )
+    })
+}
+
 fn daemon_shared_cache_enabled() -> bool {
     static VALUE: OnceLock<bool> = OnceLock::new();
     *VALUE.get_or_init(|| {
@@ -1619,7 +1718,7 @@ fn run_daemon_status(args: DaemonSocketArgs) -> Result<()> {
         let status = daemon_ping(&socket_path)
             .with_context(|| format!("daemon not reachable on {}", socket_path.display()))?;
         println!(
-            "uc daemon running (pid={}, started_at_epoch_ms={}, socket={}, protocol={}, healthy={}, total_requests={}, failed_requests={}, rate_limited_requests={}, last_error={})",
+            "uc daemon running (pid={}, started_at_epoch_ms={}, socket={}, protocol={}, healthy={}, total_requests={}, failed_requests={}, rate_limited_requests={}, native_session_cache_entries={}, native_session_cache_estimated_bytes={}, native_context_cache_entries={}, native_context_cache_estimated_bytes={}, native_build_locks={}, last_error={})",
             status.pid,
             status.started_at_epoch_ms,
             status.socket_path,
@@ -1628,6 +1727,11 @@ fn run_daemon_status(args: DaemonSocketArgs) -> Result<()> {
             status.total_requests,
             status.failed_requests,
             status.rate_limited_requests,
+            status.native_compile_session_cache_entries,
+            status.native_compile_session_cache_estimated_bytes,
+            status.native_compile_context_cache_entries,
+            status.native_compile_context_cache_estimated_bytes,
+            status.native_compile_session_build_locks,
             status
                 .last_error
                 .clone()
@@ -1650,11 +1754,16 @@ fn run_daemon_health(args: DaemonSocketArgs) -> Result<()> {
             .with_context(|| format!("daemon not reachable on {}", socket_path.display()))?;
         if status.healthy {
             println!(
-                "healthy (pid={}, total_requests={}, failed_requests={}, rate_limited_requests={})",
+                "healthy (pid={}, total_requests={}, failed_requests={}, rate_limited_requests={}, native_session_cache_entries={}, native_session_cache_estimated_bytes={}, native_context_cache_entries={}, native_context_cache_estimated_bytes={}, native_build_locks={})",
                 status.pid,
                 status.total_requests,
                 status.failed_requests,
-                status.rate_limited_requests
+                status.rate_limited_requests,
+                status.native_compile_session_cache_entries,
+                status.native_compile_session_cache_estimated_bytes,
+                status.native_compile_context_cache_entries,
+                status.native_compile_context_cache_estimated_bytes,
+                status.native_compile_session_build_locks
             );
             Ok(())
         } else {
@@ -1744,6 +1853,7 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
                 )
             },
         )?;
+        let native_cache = native_cache_telemetry_snapshot();
         let status = Arc::new(DaemonStatusPayload {
             pid: std::process::id(),
             started_at_epoch_ms: epoch_ms_u64()?,
@@ -1754,6 +1864,11 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
             failed_requests: 0,
             rate_limited_requests: 0,
             last_error: None,
+            native_compile_session_cache_entries: native_cache.session_entries,
+            native_compile_session_cache_estimated_bytes: native_cache.session_estimated_bytes,
+            native_compile_context_cache_entries: native_cache.context_entries,
+            native_compile_context_cache_estimated_bytes: native_cache.context_estimated_bytes,
+            native_compile_session_build_locks: native_cache.build_locks,
         });
         let health = Arc::new(Mutex::new(DaemonHealth::default()));
         let rate_limiter = Arc::new(Mutex::new(DaemonRateLimiter::new()));
@@ -2725,11 +2840,13 @@ fn build_native_compile_context(
                 manifest_change_unix_ms,
                 context: context.clone(),
                 last_access_epoch_ms: cache_now_ms,
+                estimated_bytes: native_compile_context_estimated_bytes(&context),
             },
         );
         evict_oldest_native_compile_context_cache_entries(
             &mut cache,
             native_compile_context_cache_max_entries(),
+            native_compile_context_cache_max_bytes(),
         );
     }
     Ok(context)
@@ -2879,6 +2996,150 @@ fn write_text_file_if_changed(path: &Path, contents: &str, label: &str) -> Resul
 }
 
 #[cfg(feature = "native-compile")]
+fn native_compile_context_estimated_bytes(context: &NativeCompileContext) -> u64 {
+    let path_bytes = normalize_fingerprint_path(&context.cairo_project_dir).len()
+        + normalize_fingerprint_path(&context.corelib_src).len();
+    let scalar_bytes = context.package_name.len()
+        + context.crate_name.len()
+        + context.manifest_content_hash.len()
+        + path_bytes;
+    u64::try_from(scalar_bytes).unwrap_or(u64::MAX)
+}
+
+#[cfg(feature = "native-compile")]
+fn native_source_root_modified_unix_ms(workspace_root: &Path) -> Result<u64> {
+    let source_root = workspace_root.join("src");
+    let metadata = match fs::metadata(&source_root) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", source_root.display()));
+        }
+    };
+    if !metadata.is_dir() {
+        return Ok(0);
+    }
+    metadata_modified_unix_ms(&metadata)
+}
+
+#[cfg(feature = "native-compile")]
+fn native_collect_tracked_sources(
+    workspace_root: &Path,
+) -> Result<(BTreeMap<String, NativeTrackedFileState>, u64)> {
+    let mut files = Vec::new();
+    let walker = WalkDir::new(workspace_root)
+        .follow_links(false)
+        .max_depth(MAX_FINGERPRINT_DEPTH)
+        .into_iter()
+        .filter_entry(|entry| !is_ignored_entry(workspace_root, entry.path()));
+    for entry in walker.filter_map(|entry| entry.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let is_cairo = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("cairo"));
+        if is_cairo {
+            if files.len() >= max_fingerprint_files() {
+                bail!(
+                    "native source tracker found too many files (>{}); refusing to continue",
+                    max_fingerprint_files()
+                );
+            }
+            files.push(path.to_path_buf());
+        }
+    }
+    files.sort();
+
+    let mut tracked = BTreeMap::new();
+    let mut total_bytes = 0_u64;
+    for path in files {
+        let rel = path
+            .strip_prefix(workspace_root)
+            .unwrap_or(&path)
+            .to_path_buf();
+        let rel = normalize_fingerprint_path(&rel);
+        let metadata =
+            fs::metadata(&path).with_context(|| format!("failed to stat {}", path.display()))?;
+        let size_bytes = metadata.len();
+        if size_bytes > max_fingerprint_file_bytes() {
+            bail!(
+                "native source tracker file {} exceeds size limit ({} bytes > {} bytes)",
+                path.display(),
+                size_bytes,
+                max_fingerprint_file_bytes()
+            );
+        }
+        total_bytes = total_bytes.saturating_add(size_bytes);
+        if total_bytes > max_fingerprint_total_bytes() {
+            bail!(
+                "native source tracker budget exceeded ({} bytes > {} bytes)",
+                total_bytes,
+                max_fingerprint_total_bytes()
+            );
+        }
+        tracked.insert(
+            rel,
+            NativeTrackedFileState {
+                size_bytes,
+                modified_unix_ms: metadata_modified_unix_ms(&metadata)?,
+            },
+        );
+    }
+    Ok((tracked, total_bytes))
+}
+
+#[cfg(feature = "native-compile")]
+fn native_diff_tracked_sources(
+    previous: &BTreeMap<String, NativeTrackedFileState>,
+    current: &BTreeMap<String, NativeTrackedFileState>,
+) -> (Vec<String>, Vec<String>) {
+    let mut changed = Vec::new();
+    let mut removed = Vec::new();
+    for (rel, state) in current {
+        if previous.get(rel) != Some(state) {
+            changed.push(rel.clone());
+        }
+    }
+    for rel in previous.keys() {
+        if !current.contains_key(rel) {
+            removed.push(rel.clone());
+        }
+    }
+    (changed, removed)
+}
+
+#[cfg(feature = "native-compile")]
+fn native_compile_session_state_estimated_bytes(state: &NativeCompileSessionState) -> u64 {
+    let tracked_meta_bytes = state.tracked_sources.len() as u64 * 96;
+    state
+        .tracked_source_bytes
+        .saturating_add(tracked_meta_bytes)
+        .saturating_add(512 * 1024)
+}
+
+#[cfg(feature = "native-compile")]
+fn update_native_compile_session_cached_estimated_bytes(
+    workspace_root: &Path,
+    estimated_bytes: u64,
+) {
+    let cache_key = native_compile_session_cache_key(workspace_root);
+    let mut cache = native_compile_session_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(entry) = cache.get_mut(&cache_key) {
+        entry.estimated_bytes = estimated_bytes;
+        evict_oldest_native_compile_session_cache_entries(
+            &mut cache,
+            native_compile_session_cache_max_entries(),
+            native_compile_session_cache_max_bytes(),
+        );
+    }
+}
+
+#[cfg(feature = "native-compile")]
 fn native_cairo_project_toml(
     crate_name: &str,
     escaped_source_root: &str,
@@ -3014,6 +3275,7 @@ fn native_compile_session_signature(
 
 #[cfg(feature = "native-compile")]
 fn build_native_compile_session_state(
+    workspace_root: &Path,
     signature: NativeCompileSessionSignature,
 ) -> Result<NativeCompileSessionState> {
     let mut db = RootDatabase::builder()
@@ -3031,10 +3293,15 @@ fn build_native_compile_session_state(
                 signature.context.cairo_project_dir.display()
             )
         })?;
+    let (tracked_sources, tracked_source_bytes) = native_collect_tracked_sources(workspace_root)?;
+    let source_root_modified_unix_ms = native_source_root_modified_unix_ms(workspace_root)?;
     Ok(NativeCompileSessionState {
         signature,
         db,
         main_crate_inputs,
+        tracked_sources,
+        tracked_source_bytes,
+        source_root_modified_unix_ms,
     })
 }
 
@@ -3102,9 +3369,9 @@ fn native_compile_session_handle(
             }
         }
 
-        let session = Arc::new(Mutex::new(build_native_compile_session_state(
-            signature.clone(),
-        )?));
+        let state = build_native_compile_session_state(workspace_root, signature.clone())?;
+        let estimated_bytes = native_compile_session_state_estimated_bytes(&state);
+        let session = Arc::new(Mutex::new(state));
         {
             let mut cache = native_compile_session_cache()
                 .lock()
@@ -3114,11 +3381,13 @@ fn native_compile_session_handle(
                 NativeCompileSessionCacheEntry {
                     session: session.clone(),
                     last_access_epoch_ms: now_ms,
+                    estimated_bytes,
                 },
             );
             evict_oldest_native_compile_session_cache_entries(
                 &mut cache,
                 native_compile_session_cache_max_entries(),
+                native_compile_session_cache_max_bytes(),
             );
         }
         Ok(session)
@@ -3144,34 +3413,81 @@ fn with_native_compile_session<T>(
     f: impl FnOnce(&NativeCompileSessionSnapshot) -> Result<T>,
 ) -> Result<T> {
     let session_handle = native_compile_session_handle(workspace_root, signature)?;
-    {
+    let (needs_full_rebuild, previous_sources, previous_source_root_mtime) = {
         let session = session_handle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if session.signature == *signature {
-            let snapshot = NativeCompileSessionSnapshot {
-                db: session.db.snapshot(),
-                main_crate_inputs: session.main_crate_inputs.clone(),
-            };
-            return f(&snapshot);
+        if session.signature != *signature {
+            (true, BTreeMap::new(), 0_u64)
+        } else {
+            (
+                false,
+                session.tracked_sources.clone(),
+                session.source_root_modified_unix_ms,
+            )
         }
-    }
+    };
+    let source_root_mtime = if needs_full_rebuild {
+        0_u64
+    } else {
+        native_source_root_modified_unix_ms(workspace_root)?
+    };
+    let (changed_files, removed_files) =
+        if needs_full_rebuild || source_root_mtime == previous_source_root_mtime {
+            (Vec::new(), Vec::new())
+        } else {
+            let (current_sources, _current_source_bytes) =
+                native_collect_tracked_sources(workspace_root)?;
+            let (changed_files, removed_files) =
+                native_diff_tracked_sources(&previous_sources, &current_sources);
+            (changed_files, removed_files)
+        };
 
-    // Rebuild outside the per-workspace lock so concurrent requests can keep
-    // progressing instead of queueing behind a long DB refresh.
-    let rebuilt_state = build_native_compile_session_state(signature.clone())?;
+    let changed_source_set_detected = !changed_files.is_empty() || !removed_files.is_empty();
+    // Keep the worker state persistent, but refresh it only when a changed-file
+    // set indicates source drift or when manifest/context signatures changed.
+    let mut rebuilt_state = if needs_full_rebuild || changed_source_set_detected {
+        Some(build_native_compile_session_state(
+            workspace_root,
+            signature.clone(),
+        )?)
+    } else {
+        None
+    };
+    let estimated_bytes;
     let snapshot = {
         let mut session = session_handle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if session.signature != *signature {
-            *session = rebuilt_state;
+            if let Some(state) = rebuilt_state.take() {
+                *session = state;
+            } else {
+                *session = build_native_compile_session_state(workspace_root, signature.clone())?;
+            }
+        } else if changed_source_set_detected {
+            if let Some(state) = rebuilt_state.take() {
+                *session = state;
+            } else {
+                *session = build_native_compile_session_state(workspace_root, signature.clone())?;
+            }
+            tracing::debug!(
+                changed_files = changed_files.len(),
+                removed_files = removed_files.len(),
+                "native session refreshed from changed-file set"
+            );
+        } else if source_root_mtime != 0
+            && session.source_root_modified_unix_ms != source_root_mtime
+        {
+            session.source_root_modified_unix_ms = source_root_mtime;
         }
+        estimated_bytes = native_compile_session_state_estimated_bytes(&session);
         NativeCompileSessionSnapshot {
             db: session.db.snapshot(),
             main_crate_inputs: session.main_crate_inputs.clone(),
         }
     };
+    update_native_compile_session_cached_estimated_bytes(workspace_root, estimated_bytes);
     f(&snapshot)
 }
 
@@ -4255,8 +4571,18 @@ fn evict_oldest_daemon_lock_hash_cache_entries(
 fn evict_oldest_native_compile_session_cache_entries(
     cache: &mut HashMap<String, NativeCompileSessionCacheEntry>,
     max_entries: usize,
+    max_bytes: u64,
 ) {
-    while cache.len() > max_entries {
+    loop {
+        let total_bytes = cache
+            .values()
+            .map(|entry| entry.estimated_bytes)
+            .fold(0_u64, u64::saturating_add);
+        let over_entry_budget = cache.len() > max_entries;
+        let over_byte_budget = max_bytes > 0 && total_bytes > max_bytes;
+        if !over_entry_budget && !over_byte_budget {
+            break;
+        }
         let Some(oldest_key) = cache
             .iter()
             .min_by_key(|(_, entry)| entry.last_access_epoch_ms)
@@ -4272,8 +4598,18 @@ fn evict_oldest_native_compile_session_cache_entries(
 fn evict_oldest_native_compile_context_cache_entries(
     cache: &mut HashMap<String, NativeCompileContextCacheEntry>,
     max_entries: usize,
+    max_bytes: u64,
 ) {
-    while cache.len() > max_entries {
+    loop {
+        let total_bytes = cache
+            .values()
+            .map(|entry| entry.estimated_bytes)
+            .fold(0_u64, u64::saturating_add);
+        let over_entry_budget = cache.len() > max_entries;
+        let over_byte_budget = max_bytes > 0 && total_bytes > max_bytes;
+        if !over_entry_budget && !over_byte_budget {
+            break;
+        }
         let Some(oldest_key) = cache
             .iter()
             .min_by_key(|(_, entry)| entry.last_access_epoch_ms)

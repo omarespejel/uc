@@ -256,6 +256,7 @@ pub(super) fn daemon_status_snapshot(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
+    let native_cache = native_cache_telemetry_snapshot();
     DaemonStatusPayload {
         pid: base.pid,
         started_at_epoch_ms: base.started_at_epoch_ms,
@@ -266,6 +267,11 @@ pub(super) fn daemon_status_snapshot(
         failed_requests: snapshot.failed_requests,
         rate_limited_requests: snapshot.rate_limited_requests,
         last_error: snapshot.last_error,
+        native_compile_session_cache_entries: native_cache.session_entries,
+        native_compile_session_cache_estimated_bytes: native_cache.session_estimated_bytes,
+        native_compile_context_cache_entries: native_cache.context_entries,
+        native_compile_context_cache_estimated_bytes: native_cache.context_estimated_bytes,
+        native_compile_session_build_locks: native_cache.build_locks,
     }
 }
 

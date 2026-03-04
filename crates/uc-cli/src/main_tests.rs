@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeMap;
 use std::fs;
 use std::sync::{Mutex, OnceLock as TestOnceLock};
 use std::thread;
@@ -2912,6 +2913,79 @@ fn native_compile_session_build_lock_is_per_key_and_released_when_idle() {
             "independent key entry should also be removed once idle"
         );
     }
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_diff_tracked_sources_detects_changed_and_removed_files() {
+    let previous = BTreeMap::from([
+        (
+            "src/lib.cairo".to_string(),
+            NativeTrackedFileState {
+                size_bytes: 10,
+                modified_unix_ms: 100,
+            },
+        ),
+        (
+            "src/old.cairo".to_string(),
+            NativeTrackedFileState {
+                size_bytes: 4,
+                modified_unix_ms: 50,
+            },
+        ),
+    ]);
+    let current = BTreeMap::from([
+        (
+            "src/lib.cairo".to_string(),
+            NativeTrackedFileState {
+                size_bytes: 12,
+                modified_unix_ms: 101,
+            },
+        ),
+        (
+            "src/new.cairo".to_string(),
+            NativeTrackedFileState {
+                size_bytes: 2,
+                modified_unix_ms: 77,
+            },
+        ),
+    ]);
+
+    let (changed, removed) = native_diff_tracked_sources(&previous, &current);
+    assert_eq!(
+        changed,
+        vec!["src/lib.cairo".to_string(), "src/new.cairo".to_string()]
+    );
+    assert_eq!(removed, vec!["src/old.cairo".to_string()]);
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_collect_tracked_sources_tracks_only_cairo_files() {
+    let dir = unique_test_dir("uc-native-track-sources");
+    fs::create_dir_all(dir.join("src")).expect("failed to create src directory");
+    fs::write(dir.join("src/lib.cairo"), "fn lib() {}\n").expect("failed to write cairo file");
+    fs::write(dir.join("src/notes.txt"), "ignore me\n").expect("failed to write non-cairo file");
+    fs::write(
+        dir.join("Scarb.toml"),
+        "[package]\nname=\"x\"\nversion=\"0.1.0\"\n",
+    )
+    .expect("failed to write manifest");
+
+    let (tracked, total_bytes) =
+        native_collect_tracked_sources(&dir).expect("source tracking should succeed");
+    assert_eq!(tracked.len(), 1, "only cairo files should be tracked");
+    assert!(
+        tracked.contains_key("src/lib.cairo"),
+        "tracked source set should include src/lib.cairo"
+    );
+    assert!(
+        !tracked.contains_key("Scarb.toml"),
+        "manifest changes are handled by session signature and should not be tracked as source files"
+    );
+    assert!(total_bytes > 0, "tracked source bytes should be non-zero");
+
+    fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
