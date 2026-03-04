@@ -197,8 +197,9 @@ pub(super) fn save_fingerprint_index(path: &Path, index: &FingerprintIndex) -> R
     Ok(())
 }
 
-pub(super) fn fingerprint_index_cache() -> &'static Mutex<HashMap<String, FingerprintIndex>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, FingerprintIndex>>> = OnceLock::new();
+pub(super) fn fingerprint_index_cache(
+) -> &'static Mutex<HashMap<String, FingerprintIndexCacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, FingerprintIndexCacheEntry>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -208,12 +209,14 @@ pub(super) fn fingerprint_index_cache_key(path: &Path) -> String {
 
 pub(super) fn load_fingerprint_index_cached(path: &Path) -> Result<FingerprintIndex> {
     let key = fingerprint_index_cache_key(path);
+    let now_ms = epoch_ms_u64().unwrap_or_default();
     {
-        let cache = fingerprint_index_cache()
+        let mut cache = fingerprint_index_cache()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(index) = cache.get(&key) {
-            return Ok(index.clone());
+        if let Some(entry) = cache.get_mut(&key) {
+            entry.last_access_epoch_ms = now_ms;
+            return Ok(entry.index.clone());
         }
     }
 
@@ -221,16 +224,47 @@ pub(super) fn load_fingerprint_index_cached(path: &Path) -> Result<FingerprintIn
     let mut cache = fingerprint_index_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    cache.insert(key, loaded.clone());
+    cache.insert(
+        key,
+        FingerprintIndexCacheEntry {
+            index: loaded.clone(),
+            last_access_epoch_ms: now_ms,
+        },
+    );
+    evict_oldest_fingerprint_index_cache_entries(&mut cache, fingerprint_index_cache_max_entries());
     Ok(loaded)
 }
 
 pub(super) fn store_fingerprint_index_cached(path: &Path, index: &FingerprintIndex) {
     let key = fingerprint_index_cache_key(path);
+    let now_ms = epoch_ms_u64().unwrap_or_default();
     let mut cache = fingerprint_index_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    cache.insert(key, index.clone());
+    cache.insert(
+        key,
+        FingerprintIndexCacheEntry {
+            index: index.clone(),
+            last_access_epoch_ms: now_ms,
+        },
+    );
+    evict_oldest_fingerprint_index_cache_entries(&mut cache, fingerprint_index_cache_max_entries());
+}
+
+pub(super) fn evict_oldest_fingerprint_index_cache_entries(
+    cache: &mut HashMap<String, FingerprintIndexCacheEntry>,
+    max_entries: usize,
+) {
+    while cache.len() > max_entries {
+        let Some(oldest_key) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_access_epoch_ms)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest_key);
+    }
 }
 
 pub(super) fn load_artifact_index(path: &Path) -> Result<ArtifactIndex> {

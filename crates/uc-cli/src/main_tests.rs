@@ -800,6 +800,96 @@ fn stale_lock_age_cleanup_never_removes_live_pid_lock() {
 }
 
 #[test]
+fn lock_file_has_pid_marker_detects_prefixed_lines() {
+    assert!(lock_file_has_pid_marker("pid=1234\n"));
+    assert!(lock_file_has_pid_marker("meta=1\n  pid=abc\n"));
+    assert!(!lock_file_has_pid_marker("owner=1234\n"));
+}
+
+#[test]
+fn session_input_cache_eviction_removes_oldest_entries() {
+    let sample_input = SessionInput {
+        compiler_version: "scarb 2.14.0".to_string(),
+        profile: "dev".to_string(),
+        offline: false,
+        package: None,
+        features: Vec::new(),
+        cfg_set: Vec::new(),
+        manifest_content_hash: "manifest-blake3:abc".to_string(),
+        target_family: "workspace".to_string(),
+        cairo_edition: None,
+        cairo_lang_version: None,
+        build_env_fingerprint: String::new(),
+    };
+    let mut cache = HashMap::new();
+    cache.insert(
+        "oldest".to_string(),
+        SessionInputCacheEntry {
+            manifest_size_bytes: 1,
+            manifest_modified_unix_ms: 1,
+            input: sample_input.clone(),
+            last_access_epoch_ms: 1,
+        },
+    );
+    cache.insert(
+        "middle".to_string(),
+        SessionInputCacheEntry {
+            manifest_size_bytes: 1,
+            manifest_modified_unix_ms: 1,
+            input: sample_input.clone(),
+            last_access_epoch_ms: 2,
+        },
+    );
+    cache.insert(
+        "newest".to_string(),
+        SessionInputCacheEntry {
+            manifest_size_bytes: 1,
+            manifest_modified_unix_ms: 1,
+            input: sample_input,
+            last_access_epoch_ms: 3,
+        },
+    );
+
+    evict_oldest_session_input_cache_entries(&mut cache, 2);
+    assert_eq!(cache.len(), 2);
+    assert!(!cache.contains_key("oldest"));
+    assert!(cache.contains_key("middle"));
+    assert!(cache.contains_key("newest"));
+}
+
+#[test]
+fn fingerprint_index_cache_eviction_removes_oldest_entries() {
+    let mut cache = HashMap::new();
+    cache.insert(
+        "oldest".to_string(),
+        FingerprintIndexCacheEntry {
+            index: FingerprintIndex::empty(),
+            last_access_epoch_ms: 1,
+        },
+    );
+    cache.insert(
+        "middle".to_string(),
+        FingerprintIndexCacheEntry {
+            index: FingerprintIndex::empty(),
+            last_access_epoch_ms: 2,
+        },
+    );
+    cache.insert(
+        "newest".to_string(),
+        FingerprintIndexCacheEntry {
+            index: FingerprintIndex::empty(),
+            last_access_epoch_ms: 3,
+        },
+    );
+
+    evict_oldest_fingerprint_index_cache_entries(&mut cache, 2);
+    assert_eq!(cache.len(), 2);
+    assert!(!cache.contains_key("oldest"));
+    assert!(cache.contains_key("middle"));
+    assert!(cache.contains_key("newest"));
+}
+
+#[test]
 fn validate_daemon_protocol_version_rejects_mismatch() {
     let err = validate_daemon_protocol_version("0.0.0").expect_err("expected mismatch");
     assert!(

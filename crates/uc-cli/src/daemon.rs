@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(super) fn daemon_socket_path(override_path: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = override_path {
@@ -280,8 +281,8 @@ pub(super) fn handle_daemon_connection(
     mut stream: UnixStream,
     status: &DaemonStatusPayload,
     health: &Arc<Mutex<DaemonHealth>>,
-    should_shutdown: &mut bool,
-    rate_limiter: &mut DaemonRateLimiter,
+    should_shutdown: &Arc<AtomicBool>,
+    rate_limiter: &Arc<Mutex<DaemonRateLimiter>>,
 ) -> Result<()> {
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
@@ -303,7 +304,13 @@ pub(super) fn handle_daemon_connection(
     }
     maybe_auto_recover_daemon_health(health);
 
-    if !rate_limiter.allow() {
+    let allowed = {
+        let mut limiter = rate_limiter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        limiter.allow()
+    };
+    if !allowed {
         record_daemon_rate_limit(health);
         let response = DaemonResponse::Error {
             message: "daemon rate limit exceeded; retry shortly".to_string(),
@@ -360,7 +367,7 @@ pub(super) fn handle_daemon_connection(
         }
         DaemonRequest::Shutdown => {
             record_daemon_success(health);
-            *should_shutdown = true;
+            should_shutdown.store(true, Ordering::Relaxed);
             DaemonResponse::Ack
         }
         DaemonRequest::Build(request) => match execute_daemon_build(request) {

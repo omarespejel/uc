@@ -21,7 +21,7 @@ use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -81,6 +81,8 @@ const DEFAULT_ASYNC_PERSIST_ERROR_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const CACHE_LOCK_STALE_AFTER_SECONDS: u64 = 300;
 const DEFAULT_CACHE_BUDGET_ENFORCE_EVERY: u64 = 8;
 const DEFAULT_MIN_SCARB_VERSION: &str = "2.14.0";
+const DEFAULT_SESSION_INPUT_CACHE_MAX_ENTRIES: usize = 1024;
+const DEFAULT_FINGERPRINT_INDEX_CACHE_MAX_ENTRIES: usize = 512;
 const TOOLCHAIN_CHECK_CACHE_SCHEMA_VERSION: u32 = 1;
 const MAX_TOOLCHAIN_CHECK_CACHE_BYTES: u64 = 64 * 1024;
 const DEFAULT_SCARB_TOOLCHAIN_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
@@ -414,6 +416,13 @@ struct SessionInputCacheEntry {
     manifest_size_bytes: u64,
     manifest_modified_unix_ms: u64,
     input: SessionInput,
+    last_access_epoch_ms: u64,
+}
+
+#[derive(Clone)]
+struct FingerprintIndexCacheEntry {
+    index: FingerprintIndex,
+    last_access_epoch_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -799,6 +808,28 @@ fn cache_budget_min_interval_ms() -> u64 {
             "UC_CACHE_BUDGET_MIN_INTERVAL_MS",
             DEFAULT_CACHE_BUDGET_MIN_INTERVAL_MS,
         )
+    })
+}
+
+fn session_input_cache_max_entries() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_env_usize(
+            "UC_SESSION_INPUT_CACHE_MAX_ENTRIES",
+            DEFAULT_SESSION_INPUT_CACHE_MAX_ENTRIES,
+        )
+        .max(1)
+    })
+}
+
+fn fingerprint_index_cache_max_entries() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_env_usize(
+            "UC_FINGERPRINT_INDEX_CACHE_MAX_ENTRIES",
+            DEFAULT_FINGERPRINT_INDEX_CACHE_MAX_ENTRIES,
+        )
+        .max(1)
     })
 }
 
@@ -1218,6 +1249,9 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
         remove_socket_if_exists(&socket_path)?;
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("failed to bind daemon socket {}", socket_path.display()))?;
+        listener
+            .set_nonblocking(true)
+            .context("failed to set daemon listener non-blocking mode")?;
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).with_context(
             || {
                 format!(
@@ -1226,7 +1260,7 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
                 )
             },
         )?;
-        let status = DaemonStatusPayload {
+        let status = Arc::new(DaemonStatusPayload {
             pid: std::process::id(),
             started_at_epoch_ms: epoch_ms_u64()?,
             socket_path: socket_path.display().to_string(),
@@ -1236,33 +1270,49 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
             failed_requests: 0,
             rate_limited_requests: 0,
             last_error: None,
-        };
+        });
         let health = Arc::new(Mutex::new(DaemonHealth::default()));
-        let mut rate_limiter = DaemonRateLimiter::new();
+        let rate_limiter = Arc::new(Mutex::new(DaemonRateLimiter::new()));
+        let should_shutdown = Arc::new(AtomicBool::new(false));
 
-        let mut should_shutdown = false;
-        for incoming in listener.incoming() {
-            match incoming {
-                Ok(stream) => {
-                    if let Err(err) = handle_daemon_connection(
-                        stream,
-                        &status,
-                        &health,
-                        &mut should_shutdown,
-                        &mut rate_limiter,
-                    ) {
-                        record_daemon_failure(&health, format!("{err:#}"));
-                        tracing::error!(error = %format!("{err:#}"), "daemon request handling failed");
-                        eprintln!("uc daemon: request handling failed: {err:#}");
-                    }
+        loop {
+            if should_shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let status = Arc::clone(&status);
+                    let health = Arc::clone(&health);
+                    let should_shutdown = Arc::clone(&should_shutdown);
+                    let rate_limiter = Arc::clone(&rate_limiter);
+                    thread::spawn(move || {
+                        if let Err(err) = handle_daemon_connection(
+                            stream,
+                            status.as_ref(),
+                            &health,
+                            &should_shutdown,
+                            &rate_limiter,
+                        ) {
+                            record_daemon_failure(&health, format!("{err:#}"));
+                            tracing::error!(
+                                error = %format!("{err:#}"),
+                                "daemon request handling failed"
+                            );
+                            eprintln!("uc daemon: request handling failed: {err:#}");
+                        }
+                    });
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(20));
                 }
                 Err(err) => {
+                    if should_shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
                     tracing::error!(error = %err, "daemon socket accept failed");
                     eprintln!("uc daemon: socket accept failed: {err}");
+                    thread::sleep(Duration::from_millis(50));
                 }
-            }
-            if should_shutdown {
-                break;
             }
         }
         remove_socket_if_exists(&socket_path)?;
@@ -2247,6 +2297,22 @@ fn session_input_cache() -> &'static Mutex<HashMap<String, SessionInputCacheEntr
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn evict_oldest_session_input_cache_entries(
+    cache: &mut HashMap<String, SessionInputCacheEntry>,
+    max_entries: usize,
+) {
+    while cache.len() > max_entries {
+        let Some(oldest_key) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_access_epoch_ms)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest_key);
+    }
+}
+
 fn session_input_cache_key(
     common: &BuildCommonArgs,
     manifest_path: &Path,
@@ -2300,11 +2366,13 @@ fn build_session_input(
         &scarb_version,
         &build_env_fingerprint,
     );
+    let cache_now_ms = epoch_ms_u64().unwrap_or_default();
     {
-        let cache = session_input_cache()
+        let mut cache = session_input_cache()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(entry) = cache.get(&cache_key) {
+        if let Some(entry) = cache.get_mut(&cache_key) {
+            entry.last_access_epoch_ms = cache_now_ms;
             if entry.manifest_size_bytes == manifest_size_bytes
                 && entry.manifest_modified_unix_ms == manifest_modified_unix_ms
             {
@@ -2353,8 +2421,10 @@ fn build_session_input(
                 manifest_size_bytes,
                 manifest_modified_unix_ms,
                 input: input.clone(),
+                last_access_epoch_ms: cache_now_ms,
             },
         );
+        evict_oldest_session_input_cache_entries(&mut cache, session_input_cache_max_entries());
     }
     Ok(input)
 }
@@ -2654,6 +2724,9 @@ fn maybe_cleanup_stale_lock(lock_path: &Path) -> Result<bool> {
                 .with_context(|| format!("failed to remove stale lock {}", lock_path.display()))?;
             return Ok(true);
         }
+        if lock_file_has_pid_marker(&contents) {
+            return Ok(false);
+        }
     }
 
     let modified = match metadata.modified() {
@@ -2684,6 +2757,12 @@ fn lock_file_pid(contents: &str) -> Option<u32> {
         let value = line.strip_prefix("pid=")?;
         value.trim().parse::<u32>().ok()
     })
+}
+
+fn lock_file_has_pid_marker(contents: &str) -> bool {
+    contents
+        .lines()
+        .any(|line| line.trim_start().starts_with("pid="))
 }
 
 #[cfg(unix)]
