@@ -86,6 +86,8 @@ const DEFAULT_SESSION_INPUT_CACHE_MAX_ENTRIES: usize = 1024;
 const DEFAULT_FINGERPRINT_INDEX_CACHE_MAX_ENTRIES: usize = 512;
 const DEFAULT_DAEMON_BUILD_PLAN_CACHE_MAX_ENTRIES: usize = 512;
 const DEFAULT_DAEMON_LOCK_HASH_CACHE_MAX_ENTRIES: usize = 512;
+const DEFAULT_DAEMON_SHARED_CACHE_ENABLED: bool = true;
+const DEFAULT_DAEMON_SHARED_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const TOOLCHAIN_CHECK_CACHE_SCHEMA_VERSION: u32 = 1;
 const MAX_TOOLCHAIN_CHECK_CACHE_BYTES: u64 = 64 * 1024;
 const DEFAULT_SCARB_TOOLCHAIN_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
@@ -329,6 +331,7 @@ struct BuildRunOptions {
     capture_output: bool,
     inherit_output_when_uncaptured: bool,
     async_cache_persist: bool,
+    use_daemon_shared_cache: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -884,6 +887,26 @@ fn daemon_lock_hash_cache_max_entries() -> usize {
             DEFAULT_DAEMON_LOCK_HASH_CACHE_MAX_ENTRIES,
         )
         .max(1)
+    })
+}
+
+fn daemon_shared_cache_enabled() -> bool {
+    static VALUE: OnceLock<bool> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_env_bool(
+            "UC_DAEMON_SHARED_CACHE_ENABLED",
+            DEFAULT_DAEMON_SHARED_CACHE_ENABLED,
+        )
+    })
+}
+
+fn daemon_shared_cache_max_bytes() -> u64 {
+    static VALUE: OnceLock<u64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_env_u64(
+            "UC_DAEMON_SHARED_CACHE_MAX_BYTES",
+            DEFAULT_DAEMON_SHARED_CACHE_MAX_BYTES,
+        )
     })
 }
 
@@ -1616,6 +1639,7 @@ fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildRespon
             capture_output: request.capture_output,
             inherit_output_when_uncaptured: request.capture_output,
             async_cache_persist: request.async_cache_persist,
+            use_daemon_shared_cache: true,
         },
     )?;
 
@@ -1734,6 +1758,36 @@ fn run_build_with_uc_cache(
         telemetry.cache_restore_ms = restore_start.elapsed().as_secs_f64() * 1000.0;
     }
 
+    if options.use_daemon_shared_cache {
+        let shared_lookup_start = Instant::now();
+        let shared_restore = try_restore_daemon_shared_cache(
+            &canonical_workspace_root,
+            profile,
+            session_key,
+            &fingerprint,
+        )?;
+        telemetry.cache_lookup_ms += shared_lookup_start.elapsed().as_secs_f64() * 1000.0;
+        if let Some(restored_count) = shared_restore {
+            let total_elapsed_ms =
+                telemetry.fingerprint_ms + telemetry.cache_lookup_ms + telemetry.cache_restore_ms;
+            let run = CommandRun {
+                command: vec![
+                    "uc".to_string(),
+                    "build".to_string(),
+                    "--engine".to_string(),
+                    "uc".to_string(),
+                    "--cache-hit".to_string(),
+                    "--daemon-shared-cache".to_string(),
+                ],
+                exit_code: 0,
+                elapsed_ms: total_elapsed_ms,
+                stdout: format!("uc: cache hit, restored {} artifacts\n", restored_count),
+                stderr: String::new(),
+            };
+            return Ok((run, true, fingerprint, telemetry));
+        }
+    }
+
     let (command, command_vec) = scarb_build_command(common, manifest_path);
     let run = if options.capture_output {
         run_command_capture(command, command_vec)?
@@ -1781,9 +1835,27 @@ fn run_build_with_uc_cache(
                     }
                 }
             }
+            if options.use_daemon_shared_cache {
+                let shared_persist_start = Instant::now();
+                if let Err(err) = persist_daemon_shared_cache_entry_for_build(
+                    &canonical_workspace_root,
+                    profile,
+                    session_key,
+                    &fingerprint,
+                ) {
+                    tracing::warn!(
+                        error = %format!("{err:#}"),
+                        "daemon shared cache persistence failed"
+                    );
+                    eprintln!("uc: warning: daemon shared cache persistence failed: {err:#}");
+                } else {
+                    telemetry.cache_persist_ms =
+                        shared_persist_start.elapsed().as_secs_f64() * 1000.0;
+                }
+            }
         } else {
             let persist_start = Instant::now();
-            persist_cache_entry_for_build(
+            let cached_artifacts = persist_cache_entry_for_build_with_artifacts(
                 &canonical_workspace_root,
                 profile,
                 &fingerprint,
@@ -1791,6 +1863,16 @@ fn run_build_with_uc_cache(
                 &objects_dir,
                 &entry_path,
             )?;
+            if options.use_daemon_shared_cache {
+                persist_daemon_shared_cache_entry_with_artifacts(
+                    &canonical_workspace_root,
+                    profile,
+                    session_key,
+                    &fingerprint,
+                    &objects_dir,
+                    &cached_artifacts,
+                )?;
+            }
             telemetry.cache_persist_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
         }
     }
@@ -2750,6 +2832,156 @@ fn prepare_daemon_build_plan(
         );
     }
     Ok((plan, false))
+}
+
+fn daemon_shared_cache_base_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("UC_DAEMON_SHARED_CACHE_DIR") {
+        let path = PathBuf::from(path);
+        if !path.as_os_str().is_empty() {
+            return path;
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".uc/daemon-cache");
+    }
+    std::env::temp_dir().join("uc-daemon-cache")
+}
+
+fn daemon_shared_cache_root(workspace_root: &Path) -> PathBuf {
+    let mut hasher = Hasher::new();
+    hasher.update(b"uc-daemon-shared-cache-root-v1");
+    hasher.update(normalize_fingerprint_path(workspace_root).as_bytes());
+    let digest = hasher.finalize().to_hex().to_string();
+    daemon_shared_cache_base_dir()
+        .join(&digest[0..2])
+        .join(digest)
+}
+
+fn daemon_shared_cache_entry_path(shared_cache_root: &Path, session_key: &str) -> PathBuf {
+    shared_cache_root
+        .join("build")
+        .join(format!("{session_key}.json"))
+}
+
+fn try_restore_daemon_shared_cache(
+    workspace_root: &Path,
+    profile: &str,
+    session_key: &str,
+    fingerprint: &str,
+) -> Result<Option<usize>> {
+    if !daemon_shared_cache_enabled() {
+        return Ok(None);
+    }
+    let shared_cache_root = daemon_shared_cache_root(workspace_root);
+    if !shared_cache_root.exists() {
+        return Ok(None);
+    }
+    let shared_objects_dir = shared_cache_root.join("objects");
+    let shared_entry_path = daemon_shared_cache_entry_path(&shared_cache_root, session_key);
+    let matching_entry = {
+        let _cache_lock = acquire_cache_lock(&shared_cache_root)?;
+        if let Some(entry) = load_cache_entry(&shared_entry_path)? {
+            if entry.schema_version == BUILD_CACHE_SCHEMA_VERSION
+                && entry.profile == profile
+                && entry.fingerprint == fingerprint
+            {
+                Some(entry)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    let Some(entry) = matching_entry else {
+        return Ok(None);
+    };
+    if !restore_cached_artifacts(
+        workspace_root,
+        profile,
+        &shared_cache_root,
+        &shared_objects_dir,
+        &entry.artifacts,
+    )? {
+        return Ok(None);
+    }
+    Ok(Some(entry.artifacts.len()))
+}
+
+fn persist_daemon_shared_cache_entry_with_artifacts(
+    workspace_root: &Path,
+    profile: &str,
+    session_key: &str,
+    fingerprint: &str,
+    source_objects_dir: &Path,
+    cached_artifacts: &[CachedArtifact],
+) -> Result<()> {
+    if !daemon_shared_cache_enabled() {
+        return Ok(());
+    }
+    let shared_cache_root = daemon_shared_cache_root(workspace_root);
+    let shared_objects_dir = shared_cache_root.join("objects");
+    let shared_entry_path = daemon_shared_cache_entry_path(&shared_cache_root, session_key);
+
+    let _cache_lock = acquire_cache_lock(&shared_cache_root)?;
+    for artifact in cached_artifacts {
+        let source_object_path = source_objects_dir.join(&artifact.object_rel_path);
+        let target_object_path = shared_objects_dir.join(&artifact.object_rel_path);
+        if !cache_object_matches_expected(
+            &target_object_path,
+            &artifact.blake3_hex,
+            artifact.size_bytes,
+        )? {
+            let _ = fs::remove_file(&target_object_path);
+            if let Some(parent) = target_object_path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            persist_artifact_object(&source_object_path, &target_object_path).with_context(
+                || {
+                    format!(
+                        "failed to mirror cached artifact object {} to daemon shared cache {}",
+                        source_object_path.display(),
+                        target_object_path.display()
+                    )
+                },
+            )?;
+        }
+    }
+
+    persist_cache_entry(profile, fingerprint, cached_artifacts, &shared_entry_path)?;
+    let max_bytes = daemon_shared_cache_max_bytes();
+    if max_bytes > 0 {
+        enforce_cache_size_budget_with_budget(&shared_cache_root, max_bytes)?;
+    }
+    Ok(())
+}
+
+fn persist_daemon_shared_cache_entry_for_build(
+    workspace_root: &Path,
+    profile: &str,
+    session_key: &str,
+    fingerprint: &str,
+) -> Result<()> {
+    if !daemon_shared_cache_enabled() {
+        return Ok(());
+    }
+    let shared_cache_root = daemon_shared_cache_root(workspace_root);
+    let shared_objects_dir = shared_cache_root.join("objects");
+    let shared_entry_path = daemon_shared_cache_entry_path(&shared_cache_root, session_key);
+    let cached_artifacts = collect_cached_artifacts_for_entry(
+        workspace_root,
+        profile,
+        &shared_cache_root,
+        &shared_objects_dir,
+    )?;
+    let _cache_lock = acquire_cache_lock(&shared_cache_root)?;
+    persist_cache_entry(profile, fingerprint, &cached_artifacts, &shared_entry_path)?;
+    let max_bytes = daemon_shared_cache_max_bytes();
+    if max_bytes > 0 {
+        enforce_cache_size_budget_with_budget(&shared_cache_root, max_bytes)?;
+    }
+    Ok(())
 }
 
 fn resolve_manifest_cairo_settings_from_manifest(

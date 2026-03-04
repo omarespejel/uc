@@ -118,6 +118,7 @@ fn run_smoke_cached_build(
             capture_output: true,
             inherit_output_when_uncaptured: true,
             async_cache_persist: false,
+            use_daemon_shared_cache: false,
         },
     )
 }
@@ -1696,6 +1697,148 @@ fn collect_cached_artifacts_for_entry_rebuilds_corrupted_existing_object() {
         fs::read(&object_path).expect("failed to read repaired cache object"),
         b"fresh-artifact"
     );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn daemon_shared_cache_root_is_workspace_scoped_and_stable() {
+    let root_a_1 = daemon_shared_cache_root(Path::new("/tmp/workspace-a"));
+    let root_a_2 = daemon_shared_cache_root(Path::new("/tmp/workspace-a"));
+    let root_b = daemon_shared_cache_root(Path::new("/tmp/workspace-b"));
+    assert_eq!(root_a_1, root_a_2);
+    assert_ne!(root_a_1, root_b);
+}
+
+#[test]
+fn run_build_with_uc_cache_restores_from_daemon_shared_cache_when_local_cache_is_missing() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::env::set_var(
+        "UC_SCARB_VERSION_LINE",
+        "scarb 2.14.0 (daemon-shared-cache-test)",
+    );
+
+    let dir = unique_test_dir("uc-daemon-shared-cache-restore");
+    let shared_cache_dir = dir.join("daemon-shared-cache");
+    std::env::set_var("UC_DAEMON_SHARED_CACHE_DIR", &shared_cache_dir);
+    let workspace = dir.join("workspace");
+    let src_dir = workspace.join("src");
+    fs::create_dir_all(&src_dir).expect("failed to create src directory");
+    let manifest_path = workspace.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("failed to write manifest");
+    fs::write(workspace.join("Scarb.lock"), "version = 1\n").expect("failed to write lock file");
+    fs::write(src_dir.join("lib.cairo"), "fn main() -> felt252 { 1 }\n")
+        .expect("failed to write source file");
+
+    let common = BuildCommonArgs {
+        manifest_path: Some(manifest_path.clone()),
+        package: None,
+        workspace: false,
+        features: Vec::new(),
+        offline: false,
+        release: false,
+        profile: None,
+    };
+    let profile = "dev";
+    let workspace_root = manifest_path
+        .parent()
+        .expect("manifest must have parent")
+        .to_path_buf();
+    let session_key = build_session_input(&common, &manifest_path, profile)
+        .expect("failed to build session input")
+        .deterministic_key_hex();
+    let fingerprint = compute_build_fingerprint(
+        &workspace_root,
+        &manifest_path,
+        &common,
+        profile,
+        Some(&workspace_root.join(".uc/cache")),
+    )
+    .expect("failed to compute fingerprint");
+
+    let target_root = workspace_root.join("target").join(profile);
+    fs::create_dir_all(&target_root).expect("failed to create target root");
+    let artifact_rel = "demo.sierra.json";
+    let artifact_path = target_root.join(artifact_rel);
+    let artifact_bytes = b"{\"artifact\":\"daemon-shared\"}";
+    fs::write(&artifact_path, artifact_bytes).expect("failed to write artifact");
+    let artifact_hash = hash_file_blake3(&artifact_path).expect("failed to hash artifact");
+    let artifact_size = fs::metadata(&artifact_path)
+        .expect("failed to stat artifact")
+        .len();
+
+    let shared_cache_root = daemon_shared_cache_root(&workspace_root);
+    let shared_objects_dir = shared_cache_root.join("objects");
+    let object_rel_path = format!("{}/{}.bin", &artifact_hash[0..2], artifact_hash);
+    let shared_object_path = shared_objects_dir.join(&object_rel_path);
+    fs::create_dir_all(
+        shared_object_path
+            .parent()
+            .expect("shared object should have parent"),
+    )
+    .expect("failed to create shared object parent");
+    persist_artifact_object(&artifact_path, &shared_object_path)
+        .expect("failed to persist shared object");
+
+    let shared_entry_path = daemon_shared_cache_entry_path(&shared_cache_root, &session_key);
+    persist_cache_entry(
+        profile,
+        &fingerprint,
+        &[CachedArtifact {
+            relative_path: artifact_rel.to_string(),
+            blake3_hex: artifact_hash.clone(),
+            size_bytes: artifact_size,
+            object_rel_path: object_rel_path.clone(),
+        }],
+        &shared_entry_path,
+    )
+    .expect("failed to persist shared cache entry");
+
+    fs::remove_dir_all(workspace_root.join("target")).expect("failed to remove target directory");
+    fs::remove_dir_all(workspace_root.join(".uc")).ok();
+    assert!(
+        !artifact_path.exists(),
+        "artifact must be removed before shared-restore test"
+    );
+
+    let (run, cache_hit, returned_fingerprint, telemetry) = run_build_with_uc_cache(
+        &common,
+        &manifest_path,
+        &workspace_root,
+        profile,
+        &session_key,
+        BuildRunOptions {
+            capture_output: false,
+            inherit_output_when_uncaptured: true,
+            async_cache_persist: false,
+            use_daemon_shared_cache: true,
+        },
+    )
+    .expect("shared cache restore should succeed");
+
+    assert!(cache_hit, "daemon shared cache should provide cache hit");
+    assert_eq!(returned_fingerprint, fingerprint);
+    assert_eq!(
+        fs::read(&artifact_path).expect("failed to read restored artifact"),
+        artifact_bytes
+    );
+    assert!(
+        run.command.iter().any(|arg| arg == "--daemon-shared-cache"),
+        "cache-hit command marker should indicate daemon shared cache path"
+    );
+    assert_eq!(telemetry.compile_ms, 0.0);
+
+    std::env::remove_var("UC_SCARB_VERSION_LINE");
+    std::env::remove_var("UC_DAEMON_SHARED_CACHE_DIR");
     fs::remove_dir_all(&dir).ok();
 }
 

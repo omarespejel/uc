@@ -45,6 +45,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             capture_output: false,
                             inherit_output_when_uncaptured: true,
                             async_cache_persist: false,
+                            use_daemon_shared_cache: false,
                         },
                     )?;
                     Ok((run, cache_hit, fingerprint, local_session_key, telemetry))

@@ -219,6 +219,25 @@ pub(super) fn persist_cache_entry_for_build(
     objects_dir: &Path,
     entry_path: &Path,
 ) -> Result<()> {
+    let _ = persist_cache_entry_for_build_with_artifacts(
+        workspace_root,
+        profile,
+        fingerprint,
+        cache_root,
+        objects_dir,
+        entry_path,
+    )?;
+    Ok(())
+}
+
+pub(super) fn persist_cache_entry_for_build_with_artifacts(
+    workspace_root: &Path,
+    profile: &str,
+    fingerprint: &str,
+    cache_root: &Path,
+    objects_dir: &Path,
+    entry_path: &Path,
+) -> Result<Vec<CachedArtifact>> {
     let cached_artifacts =
         collect_cached_artifacts_for_entry(workspace_root, profile, cache_root, objects_dir)?;
     let _cache_lock = acquire_cache_lock(cache_root)?;
@@ -226,7 +245,7 @@ pub(super) fn persist_cache_entry_for_build(
     if should_enforce_cache_size_budget_now() {
         enforce_cache_size_budget(cache_root)?;
     }
-    Ok(())
+    Ok(cached_artifacts)
 }
 
 pub(super) fn enforce_cache_size_budget(cache_root: &Path) -> Result<()> {
