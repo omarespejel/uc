@@ -880,6 +880,131 @@ fn daemon_build_plan_cache_eviction_removes_oldest_entries() {
 }
 
 #[test]
+fn daemon_lock_hash_cache_eviction_removes_oldest_entries() {
+    let mut cache = HashMap::new();
+    cache.insert(
+        "oldest".to_string(),
+        LockfileHashCacheEntry {
+            size_bytes: 10,
+            modified_unix_ms: 10,
+            change_unix_ms: Some(10),
+            lock_hash: "a".repeat(64),
+            last_access_epoch_ms: 1,
+        },
+    );
+    cache.insert(
+        "middle".to_string(),
+        LockfileHashCacheEntry {
+            size_bytes: 11,
+            modified_unix_ms: 11,
+            change_unix_ms: Some(11),
+            lock_hash: "b".repeat(64),
+            last_access_epoch_ms: 2,
+        },
+    );
+    cache.insert(
+        "newest".to_string(),
+        LockfileHashCacheEntry {
+            size_bytes: 12,
+            modified_unix_ms: 12,
+            change_unix_ms: Some(12),
+            lock_hash: "c".repeat(64),
+            last_access_epoch_ms: 3,
+        },
+    );
+
+    evict_oldest_daemon_lock_hash_cache_entries(&mut cache, 2);
+    assert_eq!(cache.len(), 2);
+    assert!(!cache.contains_key("oldest"));
+    assert!(cache.contains_key("middle"));
+    assert!(cache.contains_key("newest"));
+}
+
+#[test]
+fn daemon_lock_state_reuses_cache_when_metadata_is_unchanged() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    daemon_lock_hash_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+
+    let workspace = unique_test_dir("uc-daemon-lock-hash-cache");
+    let manifest_path = workspace.join("Scarb.toml");
+    let lock_path = workspace.join("Scarb.lock");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("failed to write manifest");
+    fs::write(&lock_path, "version = 1\n").expect("failed to write lock file");
+
+    let (size_first, modified_first, hash_first) =
+        daemon_lock_state(&manifest_path).expect("first lock state read should work");
+    let (size_second, modified_second, hash_second) =
+        daemon_lock_state(&manifest_path).expect("second lock state read should work");
+    assert_eq!(size_first, size_second);
+    assert_eq!(modified_first, modified_second);
+    assert_eq!(hash_first, hash_second);
+
+    let cache = daemon_lock_hash_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(cache.len(), 1, "lock hash cache should keep a single entry");
+    let entry = cache
+        .values()
+        .next()
+        .expect("expected one lock hash cache entry");
+    assert_eq!(entry.lock_hash, hash_second);
+    drop(cache);
+
+    fs::remove_dir_all(&workspace).ok();
+}
+
+#[test]
+fn daemon_lock_state_invalidates_cache_when_lockfile_changes() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    daemon_lock_hash_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+
+    let workspace = unique_test_dir("uc-daemon-lock-hash-invalidate");
+    let manifest_path = workspace.join("Scarb.toml");
+    let lock_path = workspace.join("Scarb.lock");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("failed to write manifest");
+    fs::write(&lock_path, "state = \"aaaaaaaa\"\n").expect("failed to write lock file");
+
+    let (_, _, hash_first) =
+        daemon_lock_state(&manifest_path).expect("first lock state read should work");
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    fs::write(&lock_path, "state = \"bbbbbbbb\"\n").expect("failed to mutate lock file");
+    let (_, _, hash_second) =
+        daemon_lock_state(&manifest_path).expect("second lock state read should work");
+    assert_ne!(
+        hash_first, hash_second,
+        "lock hash cache must invalidate when lockfile content changes"
+    );
+
+    fs::remove_dir_all(&workspace).ok();
+}
+
+#[test]
 fn prepare_daemon_build_plan_reuses_when_inputs_unchanged_and_invalidates_on_lock_change() {
     let _guard = integration_env_lock()
         .lock()

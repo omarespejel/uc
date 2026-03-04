@@ -12,7 +12,7 @@ use std::os::fd::AsRawFd;
 #[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(unix)]
@@ -85,6 +85,7 @@ const DEFAULT_MIN_SCARB_VERSION: &str = "2.14.0";
 const DEFAULT_SESSION_INPUT_CACHE_MAX_ENTRIES: usize = 1024;
 const DEFAULT_FINGERPRINT_INDEX_CACHE_MAX_ENTRIES: usize = 512;
 const DEFAULT_DAEMON_BUILD_PLAN_CACHE_MAX_ENTRIES: usize = 512;
+const DEFAULT_DAEMON_LOCK_HASH_CACHE_MAX_ENTRIES: usize = 512;
 const TOOLCHAIN_CHECK_CACHE_SCHEMA_VERSION: u32 = 1;
 const MAX_TOOLCHAIN_CHECK_CACHE_BYTES: u64 = 64 * 1024;
 const DEFAULT_SCARB_TOOLCHAIN_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
@@ -444,6 +445,15 @@ struct DaemonBuildPlanCacheEntry {
     lock_modified_unix_ms: Option<u64>,
     lock_hash: String,
     plan: DaemonBuildPlan,
+    last_access_epoch_ms: u64,
+}
+
+#[derive(Clone)]
+struct LockfileHashCacheEntry {
+    size_bytes: u64,
+    modified_unix_ms: u64,
+    change_unix_ms: Option<u64>,
+    lock_hash: String,
     last_access_epoch_ms: u64,
 }
 
@@ -861,6 +871,17 @@ fn daemon_build_plan_cache_max_entries() -> usize {
         parse_env_usize(
             "UC_DAEMON_BUILD_PLAN_CACHE_MAX_ENTRIES",
             DEFAULT_DAEMON_BUILD_PLAN_CACHE_MAX_ENTRIES,
+        )
+        .max(1)
+    })
+}
+
+fn daemon_lock_hash_cache_max_entries() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_env_usize(
+            "UC_DAEMON_LOCK_HASH_CACHE_MAX_ENTRIES",
+            DEFAULT_DAEMON_LOCK_HASH_CACHE_MAX_ENTRIES,
         )
         .max(1)
     })
@@ -2487,6 +2508,41 @@ fn evict_oldest_daemon_build_plan_cache_entries(
     }
 }
 
+fn daemon_lock_hash_cache() -> &'static Mutex<HashMap<String, LockfileHashCacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, LockfileHashCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn evict_oldest_daemon_lock_hash_cache_entries(
+    cache: &mut HashMap<String, LockfileHashCacheEntry>,
+    max_entries: usize,
+) {
+    while cache.len() > max_entries {
+        let Some(oldest_key) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_access_epoch_ms)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest_key);
+    }
+}
+
+fn metadata_change_unix_ms(metadata: &fs::Metadata) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let secs = u64::try_from(metadata.ctime()).ok()?;
+        let nanos = u64::try_from(metadata.ctime_nsec()).ok()?;
+        return Some(secs.saturating_mul(1000).saturating_add(nanos / 1_000_000));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
 fn daemon_build_plan_cache_key(
     common: &BuildCommonArgs,
     manifest_path: &Path,
@@ -2539,14 +2595,57 @@ fn daemon_lock_state(manifest_path: &Path) -> Result<(Option<u64>, Option<u64>, 
     if !metadata.is_file() {
         bail!("Scarb.lock path is not a file: {}", lock_path.display());
     }
+    let lock_size_bytes = metadata.len();
+    let lock_modified_unix_ms = metadata_modified_unix_ms(&metadata)?;
+    let lock_change_unix_ms = metadata_change_unix_ms(&metadata);
+    let cache_key = normalize_fingerprint_path(&lock_path);
+    let cache_now_ms = epoch_ms_u64().unwrap_or_default();
+    {
+        let mut cache = daemon_lock_hash_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = cache.get_mut(&cache_key) {
+            entry.last_access_epoch_ms = cache_now_ms;
+            if entry.size_bytes == lock_size_bytes
+                && entry.modified_unix_ms == lock_modified_unix_ms
+                && entry.change_unix_ms == lock_change_unix_ms
+            {
+                return Ok((
+                    Some(lock_size_bytes),
+                    Some(lock_modified_unix_ms),
+                    entry.lock_hash.clone(),
+                ));
+            }
+        }
+    }
+
     let bytes = read_bytes_with_limit(&lock_path, MAX_LOCKFILE_BYTES, "Scarb.lock")?;
     let mut hasher = Hasher::new();
     hasher.update(b"uc-scarb-lock-v1");
     hasher.update(&bytes);
     let lock_hash = format!("lock-blake3:{}", hasher.finalize().to_hex());
+    {
+        let mut cache = daemon_lock_hash_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.insert(
+            cache_key,
+            LockfileHashCacheEntry {
+                size_bytes: lock_size_bytes,
+                modified_unix_ms: lock_modified_unix_ms,
+                change_unix_ms: lock_change_unix_ms,
+                lock_hash: lock_hash.clone(),
+                last_access_epoch_ms: cache_now_ms,
+            },
+        );
+        evict_oldest_daemon_lock_hash_cache_entries(
+            &mut cache,
+            daemon_lock_hash_cache_max_entries(),
+        );
+    }
     Ok((
-        Some(metadata.len()),
-        Some(metadata_modified_unix_ms(&metadata)?),
+        Some(lock_size_bytes),
+        Some(lock_modified_unix_ms),
         lock_hash,
     ))
 }
