@@ -2649,9 +2649,7 @@ fn run_native_build_inner(
                 context.package_name, artifact_stem
             );
             let artifact_path = target_dir.join(&artifact_file);
-            let encoded = serde_json::to_vec_pretty(&contract_class)
-                .context("failed to encode native contract class JSON")?;
-            fs::write(&artifact_path, encoded)
+            write_json_file_compact(&artifact_path, &contract_class)
                 .with_context(|| format!("failed to write {}", artifact_path.display()))?;
 
             let extracted_program = contract_class
@@ -2669,9 +2667,7 @@ fn run_native_build_inner(
                 context.package_name, artifact_stem
             );
             let casm_path = target_dir.join(&casm_file);
-            let casm_encoded = serde_json::to_vec_pretty(&casm_contract)
-                .context("failed to encode native CASM contract class JSON")?;
-            fs::write(&casm_path, casm_encoded)
+            write_json_file_compact(&casm_path, &casm_contract)
                 .with_context(|| format!("failed to write {}", casm_path.display()))?;
 
             let mut id_hasher = Hasher::new();
@@ -2697,9 +2693,7 @@ fn run_native_build_inner(
         };
         let manifest_name = format!("{}.starknet_artifacts.json", context.package_name);
         let manifest_path = target_dir.join(&manifest_name);
-        let encoded = serde_json::to_vec(&manifest)
-            .context("failed to encode native starknet artifacts manifest")?;
-        fs::write(&manifest_path, encoded)
+        write_json_file_compact(&manifest_path, &manifest)
             .with_context(|| format!("failed to write {}", manifest_path.display()))?;
         contract_artifact_count + 1
     };
@@ -2718,6 +2712,18 @@ fn run_native_build_inner(
         stdout: format!("uc: native compile produced {} artifacts\n", artifact_count),
         stderr: String::new(),
     })
+}
+
+fn write_json_file_compact<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let file =
+        File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+    let mut writer = io::BufWriter::new(file);
+    serde_json::to_writer(&mut writer, value)
+        .with_context(|| format!("failed to serialize JSON to {}", path.display()))?;
+    writer
+        .flush()
+        .with_context(|| format!("failed to flush {}", path.display()))?;
+    Ok(())
 }
 
 fn scarb_build_command(common: &BuildCommonArgs, manifest_path: &Path) -> (Command, Vec<String>) {
