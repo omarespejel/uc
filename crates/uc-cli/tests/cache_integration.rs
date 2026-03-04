@@ -271,6 +271,57 @@ fn integration_semantic_edit_invalidates_then_recovers_to_hit() {
 }
 
 #[test]
+fn integration_contract_fixture_semantic_edit_invalidates_then_recovers_to_hit() {
+    let _guard = serial_guard();
+    if !scarb_available() {
+        eprintln!(
+            "skipping integration_contract_fixture_semantic_edit_invalidates_then_recovers_to_hit: scarb not available"
+        );
+        return;
+    }
+    let workspace = make_test_workspace("contract-semantic-edit");
+
+    let (baseline_output, baseline_report) = run_uc_build(&workspace, "contract-baseline");
+    assert_success(&baseline_output, "contract baseline build");
+    assert!(
+        !baseline_report.cache_hit,
+        "contract baseline build should miss cache"
+    );
+
+    let contract_file = workspace.root.join("src/contract_patterns.cairo");
+    let baseline = fs::read_to_string(&contract_file).expect("failed to read contract fixture");
+    let edited = baseline.replacen(
+        "let nonce = self.allowance_nonce.read((owner, spender)) + 1_u64;",
+        "let nonce = self.allowance_nonce.read((owner, spender)) + 2_u64;",
+        1,
+    );
+    assert_ne!(
+        baseline, edited,
+        "contract semantic edit marker should exist in fixture"
+    );
+    fs::write(&contract_file, edited).expect("failed to write contract semantic edit");
+
+    let (edit_output, edit_report) = run_uc_build(&workspace, "contract-after-edit");
+    assert_success(&edit_output, "contract post-edit build");
+    assert!(
+        !edit_report.cache_hit,
+        "contract semantic edit must invalidate cache"
+    );
+    assert_ne!(
+        baseline_report.fingerprint, edit_report.fingerprint,
+        "fingerprint should change after contract semantic edit"
+    );
+
+    let (steady_output, steady_report) = run_uc_build(&workspace, "contract-after-edit-steady");
+    assert_success(&steady_output, "contract steady post-edit build");
+    assert!(
+        steady_report.cache_hit,
+        "contract steady build should hit cache"
+    );
+    assert_eq!(edit_report.fingerprint, steady_report.fingerprint);
+}
+
+#[test]
 fn integration_corrupted_cache_entry_recovers_without_crash() {
     let _guard = serial_guard();
     if !scarb_available() {

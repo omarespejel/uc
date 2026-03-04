@@ -850,6 +850,9 @@ fn fingerprint_ignores_cairo_comment_only_edits() {
 
 #[test]
 fn async_persist_error_queue_retains_multiple_failures() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _ = take_async_persist_errors();
     record_async_persist_error("err-a".to_string());
     record_async_persist_error("err-b".to_string());
@@ -858,10 +861,14 @@ fn async_persist_error_queue_retains_multiple_failures() {
         take_async_persist_errors(),
         vec!["err-a".to_string(), "err-b".to_string()]
     );
+    let _ = take_async_persist_errors();
 }
 
 #[test]
 fn async_persist_error_queue_drops_oldest_when_over_capacity() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _ = take_async_persist_errors();
     let overflow = ASYNC_PERSIST_ERROR_QUEUE_LIMIT + 3;
     for i in 0..overflow {
@@ -875,6 +882,7 @@ fn async_persist_error_queue_drops_oldest_when_over_capacity() {
         drained.last().map(String::as_str),
         Some(format!("err-{}", overflow - 1).as_str())
     );
+    let _ = take_async_persist_errors();
 }
 
 #[test]

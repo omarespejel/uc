@@ -28,13 +28,86 @@ pub(super) fn async_persist_error_slot() -> &'static Mutex<VecDeque<String>> {
     SLOT.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
+fn async_persist_error_log_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("UC_ASYNC_PERSIST_ERROR_LOG_PATH") {
+        let path = PathBuf::from(path);
+        if !path.as_os_str().is_empty() {
+            return Some(path);
+        }
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".uc/cache/persist-errors.log"))
+}
+
+fn maybe_rotate_async_persist_error_log(path: &Path, max_bytes: u64) -> io::Result<()> {
+    if max_bytes == 0 {
+        return Ok(());
+    }
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    if metadata.len() < max_bytes {
+        return Ok(());
+    }
+
+    let rotated = PathBuf::from(format!("{}.1", path.display()));
+    let _ = fs::remove_file(&rotated);
+    fs::rename(path, rotated)
+}
+
+fn append_async_persist_error_log(message: &str) {
+    let Some(path) = async_persist_error_log_path() else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if let Err(err) = fs::create_dir_all(parent) {
+        eprintln!(
+            "uc: warning: failed to create async persist error log dir {}: {err}",
+            parent.display()
+        );
+        return;
+    }
+
+    let max_bytes = async_persist_error_log_max_bytes();
+    if let Err(err) = maybe_rotate_async_persist_error_log(&path, max_bytes) {
+        eprintln!(
+            "uc: warning: failed to rotate async persist error log {}: {err}",
+            path.display()
+        );
+    }
+
+    let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => file,
+        Err(err) => {
+            eprintln!(
+                "uc: warning: failed to open async persist error log {}: {err}",
+                path.display()
+            );
+            return;
+        }
+    };
+    let now_ms = epoch_ms_u64().unwrap_or_default();
+    if let Err(err) = writeln!(file, "{now_ms}\t{}", message.replace('\n', "\\n")) {
+        eprintln!(
+            "uc: warning: failed to write async persist error log {}: {err}",
+            path.display()
+        );
+    }
+}
+
 pub(super) fn record_async_persist_error(error: String) {
+    append_async_persist_error_log(&error);
     let mut slot = async_persist_error_slot()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     slot.push_back(error);
     while slot.len() > ASYNC_PERSIST_ERROR_QUEUE_LIMIT {
         if let Some(dropped) = slot.pop_front() {
+            append_async_persist_error_log(&format!("queue_drop oldest={dropped}"));
             tracing::warn!(
                 dropped_error = %dropped,
                 "async cache persistence error queue dropped oldest entry"
