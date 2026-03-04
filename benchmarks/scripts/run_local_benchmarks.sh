@@ -11,6 +11,7 @@ COLD_RUNS="${COLD_RUNS:-12}"
 BUILD_OFFLINE="${BUILD_OFFLINE:-1}"
 UC_DAEMON_MODE="${UC_DAEMON_MODE:-off}"
 UC_DAEMON_CAPTURE_OUTPUT="${UC_DAEMON_CAPTURE_OUTPUT:-}"
+UC_BUILD_PROFILE="${UC_BUILD_PROFILE:-release}"
 CPU_SET="${CPU_SET:-${UC_BENCH_CPU_SET:-}}"
 NICE_LEVEL="${NICE_LEVEL:-${UC_BENCH_NICE_LEVEL:-0}}"
 STRICT_PINNING="${STRICT_PINNING:-${UC_BENCH_STRICT_PINNING:-0}}"
@@ -21,7 +22,9 @@ OUT_DIR="$ROOT_DIR/benchmarks/results"
 OUT_JSON=""
 OUT_MD=""
 TMP_DIR="$(mktemp -d)"
-UC_BIN="$ROOT_DIR/target/debug/uc"
+UC_BIN="${UC_BIN:-}"
+UC_BIN_FROM_ENV=0
+CARGO_BUILD_FLAGS=()
 UC_DAEMON_SOCKET_PATH="${UC_DAEMON_SOCKET_PATH:-$TMP_DIR/uc-daemon.sock}"
 UC_DAEMON_STARTED=0
 TASKSET_ENABLED=0
@@ -32,6 +35,24 @@ declare -a EXEC_PREFIX=()
 declare -a CMD_REPLY=()
 LAST_MEASURE_STDERR_FILE=""
 LAST_MEASURE_ELAPSED_MS=""
+
+if [[ -z "$UC_BIN" ]]; then
+  case "$UC_BUILD_PROFILE" in
+    release)
+      UC_BIN="$ROOT_DIR/target/release/uc"
+      CARGO_BUILD_FLAGS+=(--release)
+      ;;
+    debug)
+      UC_BIN="$ROOT_DIR/target/debug/uc"
+      ;;
+    *)
+      echo "UC_BUILD_PROFILE must be 'release' or 'debug' (got: $UC_BUILD_PROFILE)" >&2
+      exit 1
+      ;;
+  esac
+else
+  UC_BIN_FROM_ENV=1
+fi
 
 export UC_DAEMON_SOCKET_PATH
 # Keep language/runtime behavior stable across cycles.
@@ -64,6 +85,8 @@ Options:
   --build-online              Measure build scenarios in online mode (default: offline)
   --uc-daemon-mode <mode>     UC daemon mode for uc tool (off|require, default: off)
   UC_DAEMON_CAPTURE_OUTPUT    Optional env override (0/1) for daemon build output capture
+  UC_BUILD_PROFILE            UC cargo profile for benchmark binary (release|debug, default: release)
+  UC_BIN                      Optional path override for uc benchmark binary
   --cpu-set <list>            Optional CPU affinity list (e.g. 0 or 0-1)
   --nice-level <n>            Optional process nice level (default: 0)
   --warm-settle-seconds <n>   Wait after warm-up before warm-noop samples (default: 2.2)
@@ -310,7 +333,13 @@ with_exec_prefix() {
 
 if [[ "$TOOL" == "uc" ]]; then
   require_cmd cargo
-  (cd "$ROOT_DIR" && cargo build -p uc-cli >/dev/null)
+  if [[ "$UC_BIN_FROM_ENV" == "0" ]]; then
+    (cd "$ROOT_DIR" && cargo build -p uc-cli "${CARGO_BUILD_FLAGS[@]}" >/dev/null)
+  fi
+  if [[ ! -x "$UC_BIN" ]]; then
+    echo "UC benchmark binary is missing or not executable: $UC_BIN" >&2
+    exit 1
+  fi
   export UC_PHASE_TIMING=1
   if [[ "$UC_DAEMON_MODE" != "off" && -z "$UC_DAEMON_CAPTURE_OUTPUT" ]]; then
     # For benchmark daemon runs, suppress output capture to avoid IPC copy overhead.

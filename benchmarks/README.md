@@ -3,6 +3,7 @@
 Benchmark harness and baseline artifacts for Scarb vs `uc` performance and parity tracking.
 
 `run_local_benchmarks.sh` runs on `bash` and supports CPU affinity backends (`taskset` or `hwloc-bind`) plus optional pinning flags for lower variance (`--cpu-set`, `--nice-level`, `--strict-pinning`).
+By default, UC benchmarks use the release binary (`target/release/uc`) to reflect production startup/runtime behavior. Override with `UC_BUILD_PROFILE=debug` or an explicit `UC_BIN=/abs/path/to/uc`.
 Build scenarios are measured in offline mode by default for stability (`--build-online` to opt out). The default UC benchmark mode is `--uc-daemon-mode off` for lower run-to-run jitter (`require` is still supported). `uc` runs emit per-sample phase telemetry (`phase_samples` + `phase_stats`) in benchmark JSON.
 
 ## Folders

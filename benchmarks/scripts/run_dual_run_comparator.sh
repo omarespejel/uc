@@ -4,6 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${(%):-%N}")" && pwd -P)"
 ROOT_DIR="$(git -C "$SCRIPT_DIR/../.." rev-parse --show-toplevel 2>/dev/null || (cd "$SCRIPT_DIR/../.." && pwd -P))"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-}"
+UC_BUILD_PROFILE="${UC_BUILD_PROFILE:-release}"
+UC_BIN="${UC_BIN:-}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR="$ROOT_DIR/benchmarks/results"
 SUMMARY_MD="$OUT_DIR/compare-summary-$STAMP.md"
@@ -18,8 +20,26 @@ WORKSPACE_ROOT="$(cd "$WORKSPACE_ROOT" && pwd -P)"
 mkdir -p "$OUT_DIR"
 
 cd "$ROOT_DIR"
-cargo build -p uc-cli >/dev/null
-UC_BIN="$ROOT_DIR/target/debug/uc"
+if [[ -z "$UC_BIN" ]]; then
+  case "$UC_BUILD_PROFILE" in
+    release)
+      cargo build -p uc-cli --release >/dev/null
+      UC_BIN="$ROOT_DIR/target/release/uc"
+      ;;
+    debug)
+      cargo build -p uc-cli >/dev/null
+      UC_BIN="$ROOT_DIR/target/debug/uc"
+      ;;
+    *)
+      echo "UC_BUILD_PROFILE must be 'release' or 'debug' (got: $UC_BUILD_PROFILE)" >&2
+      exit 1
+      ;;
+  esac
+fi
+if [[ ! -x "$UC_BIN" ]]; then
+  echo "UC comparator binary is missing or not executable: $UC_BIN" >&2
+  exit 1
+fi
 
 run_case() {
   local name="$1"
