@@ -234,8 +234,7 @@ fn run_uc_build_output_only(
         manifest_path,
         daemon_mode,
         daemon_socket_path,
-        None,
-        None,
+        BuildEnvOverrides::default(),
     )
 }
 
@@ -244,8 +243,7 @@ fn run_uc_build_output_only_with_env_overrides(
     manifest_path: &Path,
     daemon_mode: &str,
     daemon_socket_path: Option<&Path>,
-    native_mode_override: Option<&str>,
-    native_corelib_override: Option<&Path>,
+    overrides: BuildEnvOverrides<'_>,
 ) -> Output {
     let mut command = Command::new(uc_bin());
     command
@@ -263,12 +261,12 @@ fn run_uc_build_output_only_with_env_overrides(
     } else {
         command.env_remove("UC_DAEMON_SOCKET_PATH");
     }
-    if let Some(mode) = native_mode_override {
+    if let Some(mode) = overrides.native_mode_override {
         command.env("UC_NATIVE_BUILD_MODE", mode);
     } else {
         command.env_remove("UC_NATIVE_BUILD_MODE");
     }
-    if let Some(corelib_src) = native_corelib_override {
+    if let Some(corelib_src) = overrides.native_corelib_override {
         command.env("UC_NATIVE_CORELIB_SRC", corelib_src);
     } else {
         command.env_remove("UC_NATIVE_CORELIB_SRC");
@@ -890,6 +888,17 @@ fn integration_native_auto_mode_falls_back_when_native_backend_unavailable() {
         combined.contains("native compile unavailable"),
         "native auto mode should log fallback reason: {combined}"
     );
+    let target_dev = workspace.root.join("target/dev");
+    assert!(
+        target_dev.exists(),
+        "scarb fallback should materialize target artifacts directory"
+    );
+    let manifest_artifacts = target_dev.join("uc_smoke.starknet_artifacts.json");
+    assert!(
+        manifest_artifacts.exists(),
+        "scarb fallback should emit starknet artifacts manifest at {}",
+        manifest_artifacts.display()
+    );
 }
 
 #[test]
@@ -918,8 +927,11 @@ fn integration_native_require_mode_fails_when_native_backend_unavailable() {
         &manifest,
         "off",
         None,
-        Some("require"),
-        Some(&missing_corelib),
+        BuildEnvOverrides {
+            native_mode_override: Some("require"),
+            native_corelib_override: Some(&missing_corelib),
+            ..BuildEnvOverrides::default()
+        },
     );
     assert!(
         !output.status.success(),
@@ -928,6 +940,96 @@ fn integration_native_require_mode_fails_when_native_backend_unavailable() {
     let combined = output_to_utf8(&output);
     assert!(
         combined.contains("native compile mode is require but native backend failed"),
+        "unexpected native require failure output: {combined}"
+    );
+}
+
+#[test]
+fn integration_native_auto_mode_falls_back_on_incompatible_corelib_override() {
+    let _guard = serial_guard();
+    if !scarb_available() {
+        eprintln!(
+            "skipping integration_native_auto_mode_falls_back_on_incompatible_corelib_override: scarb not available"
+        );
+        return;
+    }
+    let workspace = make_test_workspace("native-auto-bad-corelib");
+    let manifest = workspace.root.join("Scarb.toml");
+    let bad_corelib = std::env::temp_dir().join(format!(
+        "uc-it-bad-corelib-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&bad_corelib).expect("failed to create bad corelib directory");
+    fs::write(bad_corelib.join("lib.cairo"), "fn main() {}\n")
+        .expect("failed to write bad corelib lib.cairo");
+
+    let (output, report) = run_uc_build_for_root_with_env_overrides(
+        &workspace.root,
+        &manifest,
+        "native-auto-bad-corelib",
+        "off",
+        None,
+        BuildEnvOverrides {
+            native_mode_override: Some("auto"),
+            native_corelib_override: Some(&bad_corelib),
+            ..BuildEnvOverrides::default()
+        },
+    );
+    assert_success(&output, "native auto fallback build with bad corelib");
+    assert_eq!(report.exit_code, 0);
+    let combined = output_to_utf8(&output);
+    assert!(
+        combined.contains("native corelib override"),
+        "native auto mode should log invalid corelib reason: {combined}"
+    );
+}
+
+#[test]
+fn integration_native_require_mode_fails_on_incompatible_corelib_override() {
+    let _guard = serial_guard();
+    if !scarb_available() {
+        eprintln!(
+            "skipping integration_native_require_mode_fails_on_incompatible_corelib_override: scarb not available"
+        );
+        return;
+    }
+    let workspace = make_test_workspace("native-require-bad-corelib");
+    let manifest = workspace.root.join("Scarb.toml");
+    let bad_corelib = std::env::temp_dir().join(format!(
+        "uc-it-bad-corelib-require-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&bad_corelib).expect("failed to create bad corelib directory");
+    fs::write(bad_corelib.join("lib.cairo"), "fn main() {}\n")
+        .expect("failed to write bad corelib lib.cairo");
+
+    let output = run_uc_build_output_only_with_env_overrides(
+        &workspace.root,
+        &manifest,
+        "off",
+        None,
+        BuildEnvOverrides {
+            native_mode_override: Some("require"),
+            native_corelib_override: Some(&bad_corelib),
+            ..BuildEnvOverrides::default()
+        },
+    );
+    assert!(
+        !output.status.success(),
+        "native require mode should fail when corelib override is incompatible"
+    );
+    let combined = output_to_utf8(&output);
+    assert!(
+        combined.contains("native compile mode is require but native backend failed")
+            && combined.contains("native corelib override"),
         "unexpected native require failure output: {combined}"
     );
 }

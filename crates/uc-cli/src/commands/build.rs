@@ -29,6 +29,20 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             (run, false, fingerprint)
         }
         EngineArg::Uc => {
+            let native_mode = native_build_mode();
+            if !matches!(daemon_mode, DaemonModeArg::Off)
+                && !matches!(native_mode, NativeBuildMode::Off)
+            {
+                tracing::warn!(
+                    daemon_mode = ?daemon_mode,
+                    native_mode = ?native_mode,
+                    "native build mode is ignored when daemon mode is enabled"
+                );
+                eprintln!(
+                    "uc: native build mode is ignored when daemon mode is enabled; using scarb backend in daemon mode"
+                );
+            }
+
             let run_local_with_backend =
                 |session_key: &str,
                  compiler_version: &str,
@@ -59,7 +73,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                 };
 
             match daemon_mode {
-                DaemonModeArg::Off => match native_build_mode() {
+                DaemonModeArg::Off => match native_mode {
                     NativeBuildMode::Off => {
                         let compiler_version = scarb_version_line()?;
                         let local_session_key = build_session_input_with_compiler_version(

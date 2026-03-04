@@ -9,17 +9,24 @@ name = "uc"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["native-compile"]
+native-compile = [
+  "dep:cairo-lang-compiler",
+  "dep:cairo-lang-defs",
+  "dep:cairo-lang-filesystem",
+  "dep:cairo-lang-lowering",
+  "dep:cairo-lang-starknet",
+]
 dev-benchmark-command = []
 
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
-cairo-lang-compiler = "2.16.0"
-cairo-lang-defs = "2.16.0"
-cairo-lang-filesystem = "2.16.0"
-cairo-lang-lowering = "2.16.0"
-cairo-lang-starknet = "2.16.0"
+cairo-lang-compiler = { workspace = true, optional = true }
+cairo-lang-defs = { workspace = true, optional = true }
+cairo-lang-filesystem = { workspace = true, optional = true }
+cairo-lang-lowering = { workspace = true, optional = true }
+cairo-lang-starknet = { workspace = true, optional = true }
 clap.workspace = true
 libc.workspace = true
 serde.workspace = true

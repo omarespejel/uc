@@ -13,6 +13,11 @@ version = "0.1.0"
 [workspace.dependencies]
 anyhow = "1"
 blake3 = "1"
+cairo-lang-compiler = "2.16.0"
+cairo-lang-defs = "2.16.0"
+cairo-lang-filesystem = "2.16.0"
+cairo-lang-lowering = "2.16.0"
+cairo-lang-starknet = "2.16.0"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }

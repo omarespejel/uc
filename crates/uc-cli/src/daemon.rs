@@ -112,10 +112,11 @@ pub(super) fn read_line_limited<R: BufRead>(
 
         let newline_pos = chunk.iter().position(|byte| *byte == b'\n');
         let take_len = newline_pos.unwrap_or(chunk.len());
-        bytes.extend_from_slice(&chunk[..take_len]);
-        if bytes.len() > max_bytes {
+        let remaining = max_bytes.saturating_sub(bytes.len());
+        if take_len > remaining {
             bail!("{label} exceeds size limit ({max_bytes} bytes)");
         }
+        bytes.extend_from_slice(&chunk[..take_len]);
 
         let consumed = if newline_pos.is_some() {
             take_len + 1
@@ -144,6 +145,18 @@ pub(super) fn daemon_request(
         daemon_request_read_timeout(request),
         daemon_request_write_timeout(),
     )
+}
+
+fn debug_daemon_response_enabled() -> bool {
+    static VALUE: OnceLock<bool> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        matches!(
+            std::env::var("UC_DEBUG_DAEMON_RESPONSE")
+                .ok()
+                .map(|value| value.trim().to_ascii_lowercase()),
+            Some(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on")
+        )
+    })
 }
 
 #[cfg(unix)]
@@ -185,12 +198,7 @@ pub(super) fn daemon_request_with_timeouts(
     match decode_daemon_response(response_line.trim_end()) {
         Ok(response) => Ok(response),
         Err(err) => {
-            if matches!(
-                std::env::var("UC_DEBUG_DAEMON_RESPONSE")
-                    .ok()
-                    .map(|value| value.trim().to_ascii_lowercase()),
-                Some(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on")
-            ) {
+            if debug_daemon_response_enabled() {
                 eprintln!(
                     "uc: debug raw daemon response: {}",
                     response_line.trim_end()
@@ -201,11 +209,15 @@ pub(super) fn daemon_request_with_timeouts(
     }
 }
 
+// Parse via serde_json::Value first, then deserialize into the protocol type. This preserves
+// compatibility with our tagged+flattened daemon payload decoding across serde versions.
 pub(super) fn decode_daemon_request(line: &str) -> serde_json::Result<DaemonRequest> {
     let value: serde_json::Value = serde_json::from_str(line)?;
     serde_json::from_value(value)
 }
 
+// Parse via serde_json::Value first, then deserialize into the protocol type. This preserves
+// compatibility with our tagged+flattened daemon payload decoding across serde versions.
 pub(super) fn decode_daemon_response(line: &str) -> serde_json::Result<DaemonResponse> {
     let value: serde_json::Value = serde_json::from_str(line)?;
     serde_json::from_value(value)

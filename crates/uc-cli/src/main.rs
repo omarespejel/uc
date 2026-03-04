@@ -2,8 +2,9 @@ use anyhow::{bail, Context, Result};
 use blake3::Hasher;
 use cairo_lang_compiler::db::RootDatabase;
 use cairo_lang_compiler::project::setup_project;
-use cairo_lang_compiler::{compile_cairo_project_at_path, CompilerConfig};
+use cairo_lang_compiler::{compile_prepared_db_program, CompilerConfig};
 use cairo_lang_defs::ids::TopLevelLanguageElementId;
+use cairo_lang_filesystem::db::init_dev_corelib;
 use cairo_lang_filesystem::ids::CrateInput;
 use cairo_lang_lowering::optimizations::config::Optimizations;
 use cairo_lang_lowering::utils::InliningStrategy;
@@ -105,6 +106,7 @@ const DEFAULT_UC_DISABLE_SCARB_ARTIFACTS_FINGERPRINT: bool = false;
 const DEFAULT_UC_NATIVE_BUILD_MODE: &str = "off";
 const TOOLCHAIN_CHECK_CACHE_SCHEMA_VERSION: u32 = 1;
 const MAX_TOOLCHAIN_CHECK_CACHE_BYTES: u64 = 64 * 1024;
+const NATIVE_ARTIFACT_ID_TRUNC_HEX_LEN: usize = 13;
 const DEFAULT_SCARB_TOOLCHAIN_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
 const DAEMON_PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CACHEABLE_ARTIFACT_SUFFIXES: [&str; 5] = [
@@ -378,7 +380,7 @@ struct NativeCompileContext {
     package_name: String,
     crate_name: String,
     cairo_project_dir: PathBuf,
-    corelib_root: PathBuf,
+    corelib_src: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
@@ -2138,10 +2140,33 @@ fn run_build_with_uc_cache(
     Ok((run, false, fingerprint, telemetry))
 }
 
+/// Maps Scarb package names into a safe Cairo crate key used in `cairo_project.toml`.
+/// The output keeps ASCII alphanumerics and `_`, normalizes all other characters to `_`,
+/// and prefixes a leading digit with `_` so the key remains TOML-bare-key safe.
 fn normalize_package_name_for_cairo_crate(package_name: &str) -> String {
-    package_name.replace('-', "_")
+    let mut normalized = String::with_capacity(package_name.len());
+    for ch in package_name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            normalized.push(ch);
+        } else {
+            normalized.push('_');
+        }
+    }
+    if normalized.is_empty() {
+        return "crate".to_string();
+    }
+    if normalized
+        .as_bytes()
+        .first()
+        .is_some_and(|first| first.is_ascii_digit())
+    {
+        return format!("_{normalized}");
+    }
+    normalized
 }
 
+/// Produces artifact-safe stem components for generated native outputs.
+/// The result contains only ASCII alphanumerics and `_`; empty results fall back to `contract`.
 fn sanitize_artifact_component(raw: &str) -> String {
     let mut value = String::with_capacity(raw.len());
     for ch in raw.chars() {
@@ -2157,31 +2182,74 @@ fn sanitize_artifact_component(raw: &str) -> String {
     value
 }
 
+fn native_corelib_layout_looks_compatible(corelib_src: &Path) -> bool {
+    corelib_src.join("lib.cairo").is_file()
+        && corelib_src.join("prelude.cairo").is_file()
+        && corelib_src.join("ops.cairo").is_file()
+}
+
+fn toml_escape_basic_string(raw: &str) -> String {
+    raw.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 fn resolve_native_corelib_src(workspace_root: &Path) -> Result<PathBuf> {
-    let mut candidates = Vec::new();
     if let Some(path) = std::env::var_os("UC_NATIVE_CORELIB_SRC") {
-        candidates.push(PathBuf::from(path));
-    }
-    if let Some(parent) = workspace_root.parent() {
-        candidates.push(parent.join("cairo/corelib/src"));
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        candidates.push(PathBuf::from(home).join(".cairo/corelib/src"));
+        let candidate = PathBuf::from(path);
+        let canonical = candidate.canonicalize().with_context(|| {
+            format!(
+                "failed to canonicalize native corelib override {}",
+                candidate.display()
+            )
+        })?;
+        if native_corelib_layout_looks_compatible(&canonical) {
+            tracing::debug!(
+                source = "env",
+                corelib_src = %canonical.display(),
+                "selected native corelib source path"
+            );
+            return Ok(canonical);
+        }
+        bail!(
+            "native corelib override {} is incompatible; expected corelib/src to contain lib.cairo, prelude.cairo, and ops.cairo",
+            canonical.display()
+        );
     }
 
-    for candidate in candidates {
-        if candidate.exists() {
-            return candidate.canonicalize().with_context(|| {
-                format!(
-                    "failed to canonicalize native corelib path {}",
-                    candidate.display()
-                )
-            });
+    let mut candidates: Vec<(&str, PathBuf)> = Vec::new();
+    if let Some(parent) = workspace_root.parent() {
+        candidates.push(("workspace-parent", parent.join("cairo/corelib/src")));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(("home", PathBuf::from(home).join(".cairo/corelib/src")));
+    }
+
+    for (source, candidate) in candidates {
+        if !candidate.exists() {
+            continue;
         }
+        let canonical = candidate.canonicalize().with_context(|| {
+            format!(
+                "failed to canonicalize native corelib path {}",
+                candidate.display()
+            )
+        })?;
+        if native_corelib_layout_looks_compatible(&canonical) {
+            tracing::debug!(
+                source,
+                corelib_src = %canonical.display(),
+                "selected native corelib source path"
+            );
+            return Ok(canonical);
+        }
+        tracing::debug!(
+            source,
+            corelib_src = %canonical.display(),
+            "skipping incompatible native corelib candidate"
+        );
     }
 
     bail!(
-        "native compile requires a Cairo corelib source path; set UC_NATIVE_CORELIB_SRC=<.../corelib/src>"
+        "native compile requires a compatible Cairo corelib source path; set UC_NATIVE_CORELIB_SRC=<.../corelib/src>"
     )
 }
 
@@ -2270,7 +2338,8 @@ fn build_native_compile_context(
     })?;
     let cairo_project_path = cairo_project_dir.join("cairo_project.toml");
     let source_root_string = normalize_fingerprint_path(&source_root);
-    let cairo_project_toml = format!("[crate_roots]\n{crate_name} = \"{source_root_string}\"\n");
+    let escaped_source_root = toml_escape_basic_string(&source_root_string);
+    let cairo_project_toml = format!("[crate_roots]\n{crate_name} = \"{escaped_source_root}\"\n");
     fs::write(&cairo_project_path, cairo_project_toml).with_context(|| {
         format!(
             "failed to write native cairo project {}",
@@ -2279,16 +2348,12 @@ fn build_native_compile_context(
     })?;
 
     let corelib_src = resolve_native_corelib_src(workspace_root)?;
-    let corelib_root = corelib_src
-        .parent()
-        .map(Path::to_path_buf)
-        .context("native corelib path must end in /corelib/src")?;
 
     Ok(NativeCompileContext {
         package_name,
         crate_name,
         cairo_project_dir,
-        corelib_root,
+        corelib_src,
     })
 }
 
@@ -2358,22 +2423,15 @@ fn run_native_build_inner(
         .with_context(|| format!("failed to create {}", target_dir.display()))?;
     prune_native_target_outputs(&target_dir, &context.package_name)?;
 
-    let corelib_parent = context
-        .corelib_root
-        .parent()
-        .map(Path::to_path_buf)
-        .context("native corelib root must have a parent directory")?;
-    let detect_manifest_hint = corelib_parent.join(".uc-native/detect");
-    let _env_guard = EnvVarRestore::set("CARGO_MANIFEST_DIR", &detect_manifest_hint);
-
     let mut db = RootDatabase::builder()
         .with_optimizations(Optimizations::enabled_with_default_movable_functions(
             InliningStrategy::Default,
         ))
-        .detect_corelib()
         .with_default_plugin_suite(starknet_plugin_suite())
         .build()
         .context("failed to initialize native cairo compiler database")?;
+    init_dev_corelib(&mut db, context.corelib_src.clone());
+
     let main_crate_inputs =
         setup_project(&mut db, &context.cairo_project_dir).with_context(|| {
             format!(
@@ -2390,12 +2448,8 @@ fn run_native_build_inner(
         .with_crates(&main_crate_inputs);
 
     let artifact_count = if contracts.is_empty() {
-        let program = compile_cairo_project_at_path(
-            &context.cairo_project_dir,
-            CompilerConfig::default(),
-            InliningStrategy::Default,
-        )
-        .context("native cairo compile failed")?;
+        let program = compile_prepared_db_program(&db, crate_ids, compiler_config)
+            .context("native cairo compile failed")?;
         let output_name = format!("{}.sierra", context.package_name);
         fs::write(target_dir.join(&output_name), program.to_string())
             .with_context(|| format!("failed to write native artifact {}", output_name))?;
@@ -2433,7 +2487,7 @@ fn run_native_build_inner(
             let mut id_hasher = Hasher::new();
             id_hasher.update(module_path.as_bytes());
             let digest = id_hasher.finalize().to_hex();
-            let id = digest[..13].to_string();
+            let id = digest[..NATIVE_ARTIFACT_ID_TRUNC_HEX_LEN].to_string();
 
             contracts_manifest.push(StarknetArtifactEntry {
                 id,
@@ -2442,6 +2496,8 @@ fn run_native_build_inner(
                 module_path,
                 artifacts: StarknetArtifactFiles {
                     sierra: artifact_file,
+                    // Keep parity with Scarb's default starknet_artifacts output, which records
+                    // `casm: null` for contract entries in this build mode.
                     casm: None,
                 },
             });
@@ -2673,29 +2729,6 @@ fn join_stream_thread(handle: thread::JoinHandle<Result<Vec<u8>>>, label: &str) 
     match handle.join() {
         Ok(result) => result,
         Err(_) => bail!("command {label} reader thread panicked"),
-    }
-}
-
-struct EnvVarRestore {
-    key: &'static str,
-    original: Option<std::ffi::OsString>,
-}
-
-impl EnvVarRestore {
-    fn set(key: &'static str, value: &Path) -> Self {
-        let original = std::env::var_os(key);
-        std::env::set_var(key, value);
-        Self { key, original }
-    }
-}
-
-impl Drop for EnvVarRestore {
-    fn drop(&mut self) {
-        if let Some(value) = &self.original {
-            std::env::set_var(self.key, value);
-        } else {
-            std::env::remove_var(self.key);
-        }
     }
 }
 

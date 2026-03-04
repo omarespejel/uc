@@ -89,6 +89,14 @@ fn prepare_smoke_workspace(prefix: &str) -> PathBuf {
     dir
 }
 
+fn create_mock_native_corelib(corelib_src: &Path) {
+    fs::create_dir_all(corelib_src).expect("failed to create mock corelib src");
+    fs::write(corelib_src.join("lib.cairo"), "mod prelude;\nmod ops;\n")
+        .expect("failed to write mock corelib lib.cairo");
+    fs::write(corelib_src.join("prelude.cairo"), "").expect("failed to write mock prelude");
+    fs::write(corelib_src.join("ops.cairo"), "").expect("failed to write mock ops");
+}
+
 fn smoke_common_args(manifest_path: &Path) -> BuildCommonArgs {
     BuildCommonArgs {
         manifest_path: Some(manifest_path.to_path_buf()),
@@ -962,6 +970,9 @@ fn native_build_mode_parses_expected_values() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     std::env::remove_var("UC_NATIVE_BUILD_MODE");
+    assert_eq!(native_build_mode(), NativeBuildMode::Off);
+
+    std::env::set_var("UC_NATIVE_BUILD_MODE", "off");
     assert_eq!(native_build_mode(), NativeBuildMode::Off);
 
     std::env::set_var("UC_NATIVE_BUILD_MODE", "auto");
@@ -2316,7 +2327,7 @@ edition = "2024_07"
     .expect("failed to write manifest");
 
     let fake_corelib_src = dir.join("toolchain/corelib/src");
-    fs::create_dir_all(&fake_corelib_src).expect("failed to create fake corelib path");
+    create_mock_native_corelib(&fake_corelib_src);
     std::env::set_var("UC_NATIVE_CORELIB_SRC", &fake_corelib_src);
 
     let common = BuildCommonArgs {
@@ -2339,6 +2350,139 @@ edition = "2024_07"
     );
 
     std::env::remove_var("UC_NATIVE_CORELIB_SRC");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn normalize_package_name_for_cairo_crate_sanitizes_toml_bare_key_shape() {
+    assert_eq!(
+        normalize_package_name_for_cairo_crate("cairo.contracts-2"),
+        "cairo_contracts_2"
+    );
+    assert_eq!(
+        normalize_package_name_for_cairo_crate("9demo"),
+        "_9demo",
+        "crate keys should not start with a digit"
+    );
+}
+
+#[test]
+fn toml_escape_basic_string_escapes_backslashes_and_quotes() {
+    assert_eq!(
+        toml_escape_basic_string(r#"C:\tmp\project "v2""#),
+        r#"C:\\tmp\\project \"v2\""#
+    );
+}
+
+#[test]
+fn resolve_native_corelib_src_prefers_explicit_env_override() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = unique_test_dir("uc-native-corelib-env-override");
+    let workspace_root = dir.join("workspace");
+    fs::create_dir_all(&workspace_root).expect("failed to create workspace root");
+
+    let home = dir.join("home");
+    let home_corelib = home.join(".cairo/corelib/src");
+    create_mock_native_corelib(&home_corelib);
+
+    let sibling_corelib = dir.join("cairo/corelib/src");
+    create_mock_native_corelib(&sibling_corelib);
+
+    let override_corelib = dir.join("override/corelib/src");
+    create_mock_native_corelib(&override_corelib);
+
+    let original_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", &home);
+    std::env::set_var("UC_NATIVE_CORELIB_SRC", &override_corelib);
+
+    let resolved = resolve_native_corelib_src(&workspace_root).expect("resolve should succeed");
+    assert_eq!(
+        resolved,
+        override_corelib
+            .canonicalize()
+            .expect("failed to canonicalize override corelib")
+    );
+
+    std::env::remove_var("UC_NATIVE_CORELIB_SRC");
+    if let Some(value) = original_home {
+        std::env::set_var("HOME", value);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn resolve_native_corelib_src_rejects_incompatible_env_override() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = unique_test_dir("uc-native-corelib-bad-override");
+    let workspace_root = dir.join("workspace");
+    fs::create_dir_all(&workspace_root).expect("failed to create workspace root");
+
+    let bad_override = dir.join("bad/corelib/src");
+    fs::create_dir_all(&bad_override).expect("failed to create bad override directory");
+    fs::write(bad_override.join("lib.cairo"), "fn main() {}\n")
+        .expect("failed to write bad corelib lib.cairo");
+
+    let original_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", dir.join("home"));
+    std::env::set_var("UC_NATIVE_CORELIB_SRC", &bad_override);
+
+    let err =
+        resolve_native_corelib_src(&workspace_root).expect_err("incompatible override should fail");
+    assert!(
+        format!("{err:#}").contains("native corelib override"),
+        "unexpected error: {err:#}"
+    );
+
+    std::env::remove_var("UC_NATIVE_CORELIB_SRC");
+    if let Some(value) = original_home {
+        std::env::set_var("HOME", value);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn resolve_native_corelib_src_skips_incompatible_home_and_uses_workspace_sibling() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = unique_test_dir("uc-native-corelib-fallback");
+    let workspace_root = dir.join("workspace");
+    fs::create_dir_all(&workspace_root).expect("failed to create workspace root");
+
+    let home = dir.join("home");
+    let home_corelib = home.join(".cairo/corelib/src");
+    fs::create_dir_all(&home_corelib).expect("failed to create home corelib");
+    fs::write(home_corelib.join("lib.cairo"), "fn main() {}\n")
+        .expect("failed to write incompatible home corelib");
+
+    let sibling_corelib = dir.join("cairo/corelib/src");
+    create_mock_native_corelib(&sibling_corelib);
+
+    let original_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", &home);
+    std::env::remove_var("UC_NATIVE_CORELIB_SRC");
+
+    let resolved = resolve_native_corelib_src(&workspace_root).expect("resolve should succeed");
+    assert_eq!(
+        resolved,
+        sibling_corelib
+            .canonicalize()
+            .expect("failed to canonicalize sibling corelib")
+    );
+
+    if let Some(value) = original_home {
+        std::env::set_var("HOME", value);
+    } else {
+        std::env::remove_var("HOME");
+    }
     fs::remove_dir_all(&dir).ok();
 }
 
