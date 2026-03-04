@@ -128,13 +128,28 @@ pub(super) fn daemon_request(
     socket_path: &Path,
     request: &DaemonRequest,
 ) -> Result<DaemonResponse> {
+    daemon_request_with_timeouts(
+        socket_path,
+        request,
+        daemon_request_read_timeout(request),
+        daemon_request_write_timeout(),
+    )
+}
+
+#[cfg(unix)]
+pub(super) fn daemon_request_with_timeouts(
+    socket_path: &Path,
+    request: &DaemonRequest,
+    read_timeout: Option<Duration>,
+    write_timeout: Option<Duration>,
+) -> Result<DaemonResponse> {
     let mut stream = UnixStream::connect(socket_path)
         .with_context(|| format!("failed to connect daemon socket {}", socket_path.display()))?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(120)))
+        .set_read_timeout(read_timeout)
         .with_context(|| format!("failed to set read timeout for {}", socket_path.display()))?;
     stream
-        .set_write_timeout(Some(Duration::from_secs(30)))
+        .set_write_timeout(write_timeout)
         .with_context(|| format!("failed to set write timeout for {}", socket_path.display()))?;
 
     let payload = serde_json::to_vec(request).context("failed to encode daemon request")?;

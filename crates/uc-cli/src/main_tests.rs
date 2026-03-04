@@ -678,6 +678,57 @@ fn parse_metadata_format_version_accepts_supported_values() {
 }
 
 #[test]
+fn timeout_duration_from_secs_zero_disables_timeout() {
+    assert_eq!(timeout_duration_from_secs(0), None);
+    assert_eq!(timeout_duration_from_secs(9), Some(Duration::from_secs(9)));
+}
+
+#[test]
+fn daemon_request_read_timeout_prefers_build_override_for_build_requests() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::env::set_var("UC_DAEMON_CLIENT_READ_TIMEOUT_SECS", "7");
+    std::env::set_var("UC_DAEMON_BUILD_READ_TIMEOUT_SECS", "13");
+
+    let build_request = DaemonRequest::Build(DaemonBuildRequest {
+        protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+        manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
+        package: None,
+        workspace: false,
+        features: Vec::new(),
+        offline: true,
+        release: false,
+        profile: None,
+        async_cache_persist: false,
+        capture_output: true,
+    });
+
+    assert_eq!(
+        daemon_request_read_timeout(&DaemonRequest::Ping),
+        Some(Duration::from_secs(7))
+    );
+    assert_eq!(
+        daemon_request_read_timeout(&build_request),
+        Some(Duration::from_secs(13))
+    );
+
+    std::env::remove_var("UC_DAEMON_CLIENT_READ_TIMEOUT_SECS");
+    std::env::remove_var("UC_DAEMON_BUILD_READ_TIMEOUT_SECS");
+}
+
+#[test]
+fn stale_lock_age_cleanup_never_removes_live_pid_lock() {
+    let old_age = Duration::from_secs(CACHE_LOCK_STALE_AFTER_SECONDS + 60);
+    assert!(!should_cleanup_stale_lock_by_age(true, old_age));
+    assert!(!should_cleanup_stale_lock_by_age(
+        false,
+        Duration::from_secs(CACHE_LOCK_STALE_AFTER_SECONDS)
+    ));
+    assert!(should_cleanup_stale_lock_by_age(false, old_age));
+}
+
+#[test]
 fn validate_daemon_protocol_version_rejects_mismatch() {
     let err = validate_daemon_protocol_version("0.0.0").expect_err("expected mismatch");
     assert!(

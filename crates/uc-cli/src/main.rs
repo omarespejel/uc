@@ -72,6 +72,9 @@ const DAEMON_RATE_WINDOW_SECONDS: u64 = 1;
 const DAEMON_MAX_REQUESTS_PER_WINDOW: usize = 32;
 const DAEMON_LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 const DAEMON_UNHEALTHY_RECOVERY_SECONDS: u64 = 5;
+const DEFAULT_DAEMON_CLIENT_READ_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_DAEMON_BUILD_READ_TIMEOUT_SECS: u64 = 0;
+const DEFAULT_DAEMON_CLIENT_WRITE_TIMEOUT_SECS: u64 = 30;
 const ASYNC_PERSIST_ERROR_QUEUE_LIMIT: usize = 32;
 const ASYNC_PERSIST_QUEUE_LIMIT: usize = 128;
 const DEFAULT_ASYNC_PERSIST_ERROR_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -909,6 +912,45 @@ fn should_log_phase_telemetry() -> bool {
     }
 }
 
+fn timeout_duration_from_secs(seconds: u64) -> Option<Duration> {
+    if seconds == 0 {
+        return None;
+    }
+    Some(Duration::from_secs(seconds))
+}
+
+fn daemon_control_read_timeout() -> Option<Duration> {
+    timeout_duration_from_secs(parse_env_u64(
+        "UC_DAEMON_CLIENT_READ_TIMEOUT_SECS",
+        DEFAULT_DAEMON_CLIENT_READ_TIMEOUT_SECS,
+    ))
+}
+
+fn daemon_build_read_timeout() -> Option<Duration> {
+    timeout_duration_from_secs(parse_env_u64(
+        "UC_DAEMON_BUILD_READ_TIMEOUT_SECS",
+        DEFAULT_DAEMON_BUILD_READ_TIMEOUT_SECS,
+    ))
+}
+
+fn daemon_client_write_timeout() -> Option<Duration> {
+    timeout_duration_from_secs(parse_env_u64(
+        "UC_DAEMON_CLIENT_WRITE_TIMEOUT_SECS",
+        DEFAULT_DAEMON_CLIENT_WRITE_TIMEOUT_SECS,
+    ))
+}
+
+fn daemon_request_read_timeout(request: &DaemonRequest) -> Option<Duration> {
+    match request {
+        DaemonRequest::Build(_) => daemon_build_read_timeout(),
+        _ => daemon_control_read_timeout(),
+    }
+}
+
+fn daemon_request_write_timeout() -> Option<Duration> {
+    daemon_client_write_timeout()
+}
+
 fn resolve_diagnostics_threshold(cli_value: Option<f64>) -> Result<f64> {
     if let Some(value) = cli_value {
         return Ok(value);
@@ -1138,13 +1180,23 @@ fn run_daemon_stop(args: DaemonSocketArgs) -> Result<()> {
         }
 
         let deadline = Instant::now() + Duration::from_secs(3);
+        let mut stopped = false;
         while Instant::now() < deadline {
             if daemon_ping(&socket_path).is_err() {
+                stopped = true;
                 break;
             }
             thread::sleep(Duration::from_millis(50));
         }
-        remove_socket_if_exists(&socket_path)?;
+        if !stopped && daemon_ping(&socket_path).is_ok() {
+            bail!(
+                "daemon did not stop within timeout and is still reachable on {}",
+                socket_path.display()
+            );
+        }
+        if socket_path.exists() {
+            remove_socket_if_exists(&socket_path)?;
+        }
         println!("uc daemon stopped ({})", socket_path.display());
         Ok(())
     }
@@ -2595,12 +2647,12 @@ fn maybe_cleanup_stale_lock(lock_path: &Path) -> Result<bool> {
 
     if let Ok(contents) = fs::read_to_string(lock_path) {
         if let Some(pid) = lock_file_pid(&contents) {
-            if !is_process_alive(pid) {
-                fs::remove_file(lock_path).with_context(|| {
-                    format!("failed to remove stale lock {}", lock_path.display())
-                })?;
-                return Ok(true);
+            if is_process_alive(pid) {
+                return Ok(false);
             }
+            fs::remove_file(lock_path)
+                .with_context(|| format!("failed to remove stale lock {}", lock_path.display()))?;
+            return Ok(true);
         }
     }
 
@@ -2612,12 +2664,19 @@ fn maybe_cleanup_stale_lock(lock_path: &Path) -> Result<bool> {
         Ok(duration) => duration,
         Err(_) => return Ok(false),
     };
-    if age > Duration::from_secs(CACHE_LOCK_STALE_AFTER_SECONDS) {
+    if should_cleanup_stale_lock_by_age(false, age) {
         fs::remove_file(lock_path)
             .with_context(|| format!("failed to remove stale lock {}", lock_path.display()))?;
         return Ok(true);
     }
     Ok(false)
+}
+
+fn should_cleanup_stale_lock_by_age(has_live_pid: bool, age: Duration) -> bool {
+    if has_live_pid {
+        return false;
+    }
+    age > Duration::from_secs(CACHE_LOCK_STALE_AFTER_SECONDS)
 }
 
 fn lock_file_pid(contents: &str) -> Option<u32> {
