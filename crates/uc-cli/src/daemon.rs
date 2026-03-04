@@ -184,6 +184,21 @@ pub(super) fn daemon_ping(socket_path: &Path) -> Result<DaemonStatusPayload> {
     }
 }
 
+pub(super) fn daemon_request_protocol_version(request: &DaemonRequest) -> Option<&str> {
+    match request {
+        DaemonRequest::Build(payload) => Some(payload.protocol_version.as_str()),
+        DaemonRequest::Metadata(payload) => Some(payload.protocol_version.as_str()),
+        DaemonRequest::Ping | DaemonRequest::Shutdown => None,
+    }
+}
+
+pub(super) fn validate_daemon_request_protocol_version(request: &DaemonRequest) -> Result<()> {
+    let Some(version) = daemon_request_protocol_version(request) else {
+        return Ok(());
+    };
+    validate_daemon_protocol_version(version).context("daemon request protocol mismatch")
+}
+
 #[cfg(unix)]
 pub(super) fn daemon_status_snapshot(
     base: &DaemonStatusPayload,
@@ -322,6 +337,21 @@ pub(super) fn handle_daemon_connection(
             return Ok(());
         }
     };
+
+    if let Err(err) = validate_daemon_request_protocol_version(&request) {
+        let message = format!("{err:#}");
+        record_daemon_failure(health, message.clone());
+        let response = DaemonResponse::Error { message };
+        let payload = serde_json::to_vec(&response).context("failed to encode daemon response")?;
+        stream
+            .write_all(&payload)
+            .context("failed to write daemon response")?;
+        stream
+            .write_all(b"\n")
+            .context("failed to write daemon response newline")?;
+        stream.flush().context("failed to flush daemon response")?;
+        return Ok(());
+    }
 
     let response = match request {
         DaemonRequest::Ping => {

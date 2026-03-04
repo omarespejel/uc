@@ -244,6 +244,77 @@ fn daemon_metadata_request_serialization_supports_wire_format() {
     }
 }
 
+#[test]
+fn daemon_request_protocol_validation_skips_ping_and_shutdown() {
+    assert!(validate_daemon_request_protocol_version(&DaemonRequest::Ping).is_ok());
+    assert!(validate_daemon_request_protocol_version(&DaemonRequest::Shutdown).is_ok());
+}
+
+#[test]
+fn daemon_request_protocol_validation_rejects_mismatch_for_build_and_metadata() {
+    let build = DaemonRequest::Build(DaemonBuildRequest {
+        protocol_version: "0.0.0".to_string(),
+        manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
+        package: None,
+        workspace: false,
+        features: Vec::new(),
+        offline: false,
+        release: false,
+        profile: None,
+        async_cache_persist: false,
+        capture_output: true,
+    });
+    let metadata = DaemonRequest::Metadata(DaemonMetadataRequest {
+        protocol_version: "0.0.0".to_string(),
+        manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
+        format_version: 1,
+        offline: false,
+        global_cache_dir: None,
+        capture_output: false,
+    });
+
+    let build_err = validate_daemon_request_protocol_version(&build)
+        .expect_err("build request protocol mismatch should fail");
+    assert!(
+        format!("{build_err:#}").contains("daemon protocol mismatch"),
+        "unexpected build mismatch error: {build_err:#}"
+    );
+
+    let metadata_err = validate_daemon_request_protocol_version(&metadata)
+        .expect_err("metadata request protocol mismatch should fail");
+    assert!(
+        format!("{metadata_err:#}").contains("daemon protocol mismatch"),
+        "unexpected metadata mismatch error: {metadata_err:#}"
+    );
+}
+
+#[test]
+fn daemon_request_protocol_validation_accepts_current_protocol() {
+    let build = DaemonRequest::Build(DaemonBuildRequest {
+        protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+        manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
+        package: None,
+        workspace: false,
+        features: Vec::new(),
+        offline: false,
+        release: false,
+        profile: None,
+        async_cache_persist: false,
+        capture_output: true,
+    });
+    let metadata = DaemonRequest::Metadata(DaemonMetadataRequest {
+        protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+        manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
+        format_version: 1,
+        offline: false,
+        global_cache_dir: None,
+        capture_output: false,
+    });
+
+    assert!(validate_daemon_request_protocol_version(&build).is_ok());
+    assert!(validate_daemon_request_protocol_version(&metadata).is_ok());
+}
+
 #[cfg(unix)]
 #[test]
 fn try_uc_build_via_daemon_auto_mode_falls_back_on_daemon_error() {

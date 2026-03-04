@@ -224,6 +224,7 @@ fn validate_supported_sierra_schema(value: &Value, path: &Path) -> Result<()> {
     // fail fast so we do not accidentally normalize semantically meaningful identifiers.
     validate_declaration_section_ids(value, "type_declarations", path)?;
     validate_declaration_section_ids(value, "libfunc_declarations", path)?;
+    validate_declaration_id_uniqueness(value, path)?;
     Ok(())
 }
 
@@ -240,6 +241,7 @@ fn validate_declaration_section_ids(value: &Value, section: &str, path: &Path) -
                 index
             )
         })?;
+        validate_declaration_id_shape(id_value, path, section, index)?;
         if extract_numeric_id(Some(id_value)).is_none() {
             bail!(
                 "unsupported Sierra schema in {}: {}[{}].id must be numeric",
@@ -247,6 +249,102 @@ fn validate_declaration_section_ids(value: &Value, section: &str, path: &Path) -
                 section,
                 index
             );
+        }
+    }
+    Ok(())
+}
+
+fn validate_declaration_id_shape(
+    id_value: &Value,
+    path: &Path,
+    section: &str,
+    index: usize,
+) -> Result<()> {
+    match id_value {
+        Value::Number(_) => Ok(()),
+        Value::Object(map) => {
+            let nested_id = map.get("id").with_context(|| {
+                format!(
+                    "unsupported Sierra schema in {}: {}[{}].id object is missing nested `id`",
+                    path.display(),
+                    section,
+                    index
+                )
+            })?;
+            if extract_numeric_id(Some(nested_id)).is_none() {
+                bail!(
+                    "unsupported Sierra schema in {}: {}[{}].id nested value must be numeric",
+                    path.display(),
+                    section,
+                    index
+                );
+            }
+            if let Some(debug_name) = map.get("debug_name") {
+                if !debug_name.is_string() {
+                    bail!(
+                        "unsupported Sierra schema in {}: {}[{}].id.debug_name must be a string",
+                        path.display(),
+                        section,
+                        index
+                    );
+                }
+            }
+            for key in map.keys() {
+                if key != "id" && key != "debug_name" {
+                    bail!(
+                        "unsupported Sierra schema in {}: {}[{}].id has unexpected key `{}`",
+                        path.display(),
+                        section,
+                        index,
+                        key
+                    );
+                }
+            }
+            Ok(())
+        }
+        _ => bail!(
+            "unsupported Sierra schema in {}: {}[{}].id must be numeric or an object with numeric `id`",
+            path.display(),
+            section,
+            index
+        ),
+    }
+}
+
+fn validate_declaration_id_uniqueness(value: &Value, path: &Path) -> Result<()> {
+    let mut seen: HashMap<i64, (&'static str, usize)> = HashMap::new();
+    for section in ["type_declarations", "libfunc_declarations"] {
+        let Some(items) = value.get(section).and_then(Value::as_array) else {
+            continue;
+        };
+        for (index, item) in items.iter().enumerate() {
+            let id_value = item.get("id").with_context(|| {
+                format!(
+                    "unsupported Sierra schema in {}: {}[{}] is missing `id`",
+                    path.display(),
+                    section,
+                    index
+                )
+            })?;
+            let raw_id = extract_numeric_id(Some(id_value)).with_context(|| {
+                format!(
+                    "unsupported Sierra schema in {}: {}[{}].id must be numeric",
+                    path.display(),
+                    section,
+                    index
+                )
+            })?;
+            if let Some((prev_section, prev_index)) = seen.insert(raw_id, (section, index)) {
+                bail!(
+                    "unsupported Sierra schema in {}: declaration id `{}` is reused by {}[{}] and {}[{}]",
+                    path.display(),
+                    raw_id,
+                    prev_section,
+                    prev_index,
+                    section,
+                    index
+                );
+            }
         }
     }
     Ok(())
@@ -559,6 +657,31 @@ mod tests {
         let err = validate_supported_sierra_schema(&value, Path::new("sample.sierra.json"))
             .expect_err("non-numeric declaration IDs should be rejected");
         assert!(format!("{err:#}").contains("unsupported Sierra schema"));
+    }
+
+    #[test]
+    fn sierra_schema_guard_rejects_unexpected_declaration_id_object_keys() {
+        let value = json!({
+            "sierra_format_version": "1.0.0",
+            "type_declarations": [{
+                "id": { "id": 7, "debug_name": "felt252", "semantic_id": "stable-name" }
+            }],
+        });
+        let err = validate_supported_sierra_schema(&value, Path::new("sample.sierra.json"))
+            .expect_err("unexpected declaration id object keys should be rejected");
+        assert!(format!("{err:#}").contains("unexpected key"));
+    }
+
+    #[test]
+    fn sierra_schema_guard_rejects_reused_declaration_ids() {
+        let value = json!({
+            "sierra_format_version": "1.0.0",
+            "type_declarations": [{ "id": 11 }],
+            "libfunc_declarations": [{ "id": 11 }],
+        });
+        let err = validate_supported_sierra_schema(&value, Path::new("sample.sierra.json"))
+            .expect_err("reused declaration IDs should be rejected");
+        assert!(format!("{err:#}").contains("is reused by"));
     }
 
     #[test]
