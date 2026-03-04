@@ -1688,6 +1688,7 @@ fn run_build_with_uc_cache(
     let canonical_workspace_root = workspace_root.to_path_buf();
     validate_hex_digest("session key", session_key, SESSION_KEY_LEN)?;
     let cache_root = canonical_workspace_root.join(".uc/cache");
+    let local_cache_preexisted = cache_root.exists();
     ensure_path_within_root(&canonical_workspace_root, &cache_root, "cache root")?;
     let objects_dir = cache_root.join("objects");
     let entry_path = cache_root.join("build").join(format!("{session_key}.json"));
@@ -1835,7 +1836,7 @@ fn run_build_with_uc_cache(
                     }
                 }
             }
-            if options.use_daemon_shared_cache {
+            if options.use_daemon_shared_cache && !local_cache_preexisted {
                 let shared_persist_start = Instant::now();
                 if let Err(err) = persist_daemon_shared_cache_entry_for_build(
                     &canonical_workspace_root,
@@ -1863,7 +1864,7 @@ fn run_build_with_uc_cache(
                 &objects_dir,
                 &entry_path,
             )?;
-            if options.use_daemon_shared_cache {
+            if options.use_daemon_shared_cache && !local_cache_preexisted {
                 persist_daemon_shared_cache_entry_with_artifacts(
                     &canonical_workspace_root,
                     profile,
