@@ -101,6 +101,21 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             &native_compiler_version,
                         )?
                         .deterministic_key_hex();
+                        let build_scarb_fallback_context =
+                            || -> Result<(String, String)> {
+                                let compiler_version = scarb_version_line()?;
+                                let session_key =
+                                    build_session_input_with_compiler_version(
+                                        &common,
+                                        &manifest_path,
+                                        &profile,
+                                        &compiler_version,
+                                    )?
+                                    .deterministic_key_hex();
+                                Ok((compiler_version, session_key))
+                            };
+                        let mut precomputed_scarb_fallback =
+                            build_scarb_fallback_context().ok();
                         match run_local_with_backend(
                             &native_session_key,
                             &native_compiler_version,
@@ -116,14 +131,14 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                         "uc: native compile unavailable ({}), falling back to scarb backend",
                                         native_err
                                     );
-                                let compiler_version = scarb_version_line()?;
-                                let local_session_key = build_session_input_with_compiler_version(
-                                    &common,
-                                    &manifest_path,
-                                    &profile,
-                                    &compiler_version,
-                                )?
-                                .deterministic_key_hex();
+                                let (compiler_version, local_session_key) =
+                                    if let Some((version, key)) =
+                                        precomputed_scarb_fallback.take()
+                                    {
+                                        (version, key)
+                                    } else {
+                                        build_scarb_fallback_context()?
+                                    };
                                 let (run, cache_hit, fingerprint, telemetry) =
                                     run_local_with_backend(
                                         &local_session_key,
