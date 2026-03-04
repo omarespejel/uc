@@ -2737,6 +2737,7 @@ dependencies = [
  "cairo-lang-filesystem",
  "cairo-lang-lowering",
  "cairo-lang-starknet",
+ "cairo-lang-starknet-classes",
  "clap",
  "libc",
  "serde",

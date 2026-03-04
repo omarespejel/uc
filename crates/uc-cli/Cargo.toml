@@ -16,6 +16,7 @@ native-compile = [
   "dep:cairo-lang-filesystem",
   "dep:cairo-lang-lowering",
   "dep:cairo-lang-starknet",
+  "dep:cairo-lang-starknet-classes",
 ]
 dev-benchmark-command = []
 
@@ -27,6 +28,7 @@ cairo-lang-defs = { workspace = true, optional = true }
 cairo-lang-filesystem = { workspace = true, optional = true }
 cairo-lang-lowering = { workspace = true, optional = true }
 cairo-lang-starknet = { workspace = true, optional = true }
+cairo-lang-starknet-classes = { workspace = true, optional = true }
 clap.workspace = true
 libc.workspace = true
 serde.workspace = true

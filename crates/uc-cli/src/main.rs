@@ -11,6 +11,7 @@ use cairo_lang_lowering::utils::InliningStrategy;
 use cairo_lang_starknet::compile::compile_prepared_db as compile_starknet_prepared_db;
 use cairo_lang_starknet::contract::find_contracts;
 use cairo_lang_starknet::starknet_plugin_suite;
+use cairo_lang_starknet_classes::casm_contract_class::CasmContractClass;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -2484,6 +2485,26 @@ fn run_native_build_inner(
             fs::write(&artifact_path, encoded)
                 .with_context(|| format!("failed to write {}", artifact_path.display()))?;
 
+            let extracted_program = contract_class
+                .extract_sierra_program(false)
+                .context("failed to extract native Sierra program for CASM emission")?;
+            let casm_contract = CasmContractClass::from_contract_class(
+                contract_class.clone(),
+                extracted_program,
+                false,
+                usize::MAX,
+            )
+            .context("failed to compile native CASM contract class")?;
+            let casm_file = format!(
+                "{}_{}.compiled_contract_class.json",
+                context.package_name, artifact_stem
+            );
+            let casm_path = target_dir.join(&casm_file);
+            let casm_encoded = serde_json::to_vec_pretty(&casm_contract)
+                .context("failed to encode native CASM contract class JSON")?;
+            fs::write(&casm_path, casm_encoded)
+                .with_context(|| format!("failed to write {}", casm_path.display()))?;
+
             let mut id_hasher = Hasher::new();
             id_hasher.update(module_path.as_bytes());
             let digest = id_hasher.finalize().to_hex();
@@ -2496,9 +2517,7 @@ fn run_native_build_inner(
                 module_path,
                 artifacts: StarknetArtifactFiles {
                     sierra: artifact_file,
-                    // Keep parity with Scarb's default starknet_artifacts output, which records
-                    // `casm: null` for contract entries in this build mode.
-                    casm: None,
+                    casm: Some(casm_file),
                 },
             });
         }
