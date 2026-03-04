@@ -207,6 +207,30 @@ enum BuildCompileBackend {
     Native,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum DaemonBuildBackend {
+    #[default]
+    Scarb,
+    Native,
+}
+
+impl DaemonBuildBackend {
+    fn from_compile_backend(backend: BuildCompileBackend) -> Self {
+        match backend {
+            BuildCompileBackend::Scarb => Self::Scarb,
+            BuildCompileBackend::Native => Self::Native,
+        }
+    }
+
+    fn into_compile_backend(self) -> BuildCompileBackend {
+        match self {
+            Self::Scarb => BuildCompileBackend::Scarb,
+            Self::Native => BuildCompileBackend::Native,
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum NativeBuildMode {
     Off,
@@ -572,6 +596,10 @@ struct DaemonBuildRequest {
     async_cache_persist: bool,
     #[serde(default = "default_daemon_capture_output")]
     capture_output: bool,
+    #[serde(default)]
+    compile_backend: DaemonBuildBackend,
+    #[serde(default)]
+    native_fallback_to_scarb: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -582,6 +610,8 @@ struct DaemonBuildResponse {
     session_key: String,
     #[serde(default)]
     telemetry: BuildPhaseTelemetry,
+    #[serde(default)]
+    compile_backend: DaemonBuildBackend,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1564,10 +1594,18 @@ fn try_uc_build_via_daemon(
     common: &BuildCommonArgs,
     manifest_path: &Path,
     fallback_to_local: bool,
+    compile_backend: BuildCompileBackend,
+    native_fallback_to_scarb: bool,
 ) -> Result<Option<DaemonBuildResponse>> {
     #[cfg(not(unix))]
     {
-        let _ = (common, manifest_path, fallback_to_local);
+        let _ = (
+            common,
+            manifest_path,
+            fallback_to_local,
+            compile_backend,
+            native_fallback_to_scarb,
+        );
         return Ok(None);
     }
     #[cfg(unix)]
@@ -1583,6 +1621,8 @@ fn try_uc_build_via_daemon(
                 manifest_path,
                 daemon_async_cache_persist_enabled(),
                 daemon_capture_output_enabled(),
+                compile_backend,
+                native_fallback_to_scarb,
             ),
         };
         let response = match daemon_request(&socket_path, &request) {
@@ -1600,7 +1640,34 @@ fn try_uc_build_via_daemon(
         };
 
         match response {
-            DaemonResponse::Build { payload } => Ok(Some(payload)),
+            DaemonResponse::Build { payload } => {
+                let actual_backend = payload.compile_backend.into_compile_backend();
+                let backend_mismatch = actual_backend != compile_backend
+                    && !(compile_backend == BuildCompileBackend::Native
+                        && native_fallback_to_scarb
+                        && actual_backend == BuildCompileBackend::Scarb);
+                if backend_mismatch {
+                    let message = format!(
+                        "daemon returned backend {:?} when {:?} was requested",
+                        payload.compile_backend, compile_backend
+                    );
+                    if fallback_to_local {
+                        eprintln!("uc: {message}, falling back to local engine");
+                        Ok(None)
+                    } else {
+                        bail!("daemon build request failed: {message}");
+                    }
+                } else {
+                    if actual_backend == BuildCompileBackend::Scarb
+                        && compile_backend == BuildCompileBackend::Native
+                    {
+                        eprintln!(
+                            "uc: daemon native build failed; daemon fell back to scarb backend"
+                        );
+                    }
+                    Ok(Some(payload))
+                }
+            }
             DaemonResponse::Error { message } => {
                 if fallback_to_local {
                     if daemon_response_protocol_mismatch(&message) {
@@ -1699,6 +1766,8 @@ fn daemon_build_request_from_common(
     manifest_path: &Path,
     async_cache_persist: bool,
     capture_output: bool,
+    compile_backend: BuildCompileBackend,
+    native_fallback_to_scarb: bool,
 ) -> DaemonBuildRequest {
     DaemonBuildRequest {
         protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
@@ -1711,6 +1780,8 @@ fn daemon_build_request_from_common(
         profile: common.profile.clone(),
         async_cache_persist,
         capture_output,
+        compile_backend: DaemonBuildBackend::from_compile_backend(compile_backend),
+        native_fallback_to_scarb,
     }
 }
 
@@ -1755,39 +1826,56 @@ fn metadata_args_from_daemon_request(request: &DaemonMetadataRequest) -> Metadat
     }
 }
 
-fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildResponse> {
-    validate_daemon_protocol_version(&request.protocol_version)
-        .context("daemon build request protocol mismatch")?;
-    // Daemon mode validates the Scarb toolchain in the daemon process so clients avoid repeated
-    // `scarb --version` subprocess overhead per request.
-    validate_scarb_toolchain()?;
-    let common = common_args_from_daemon_request(&request);
-    let manifest_path = resolve_manifest_path(&common.manifest_path)?;
-    let (plan, plan_cache_hit) = prepare_daemon_build_plan(&common, &manifest_path)?;
+fn compiler_version_for_backend(backend: BuildCompileBackend) -> Result<String> {
+    match backend {
+        BuildCompileBackend::Scarb => {
+            // Daemon mode validates the Scarb toolchain in the daemon process so clients avoid
+            // repeated `scarb --version` subprocess overhead per request.
+            validate_scarb_toolchain()?;
+            scarb_version_line()
+        }
+        BuildCompileBackend::Native => Ok(native_compiler_version_line()),
+    }
+}
+
+fn execute_daemon_build_with_backend(
+    request: &DaemonBuildRequest,
+    common: &BuildCommonArgs,
+    manifest_path: &Path,
+    compile_backend: BuildCompileBackend,
+    compiler_version: &str,
+) -> Result<DaemonBuildResponse> {
+    let (plan, plan_cache_hit) = prepare_daemon_build_plan_with_compiler_version(
+        common,
+        manifest_path,
+        compile_backend,
+        compiler_version,
+    )?;
     if plan_cache_hit {
         tracing::debug!(
             manifest_path = %plan.manifest_path.display(),
             invalidation_key = %plan.strict_invalidation_key,
+            compile_backend = ?compile_backend,
             "uc daemon build plan cache hit"
         );
     } else {
         tracing::debug!(
             manifest_path = %plan.manifest_path.display(),
             invalidation_key = %plan.strict_invalidation_key,
+            compile_backend = ?compile_backend,
             "uc daemon build plan cache miss"
         );
     }
 
-    let compiler_version = scarb_version_line()?;
     let (run, cache_hit, fingerprint, telemetry) = run_build_with_uc_cache(
-        &common,
+        common,
         BuildCacheRunContext {
             manifest_path: &plan.manifest_path,
             workspace_root: &plan.workspace_root,
             profile: &plan.profile,
             session_key: &plan.session_key,
-            compiler_version: &compiler_version,
-            compile_backend: BuildCompileBackend::Scarb,
+            compiler_version,
+            compile_backend,
             options: BuildRunOptions {
                 capture_output: request.capture_output,
                 inherit_output_when_uncaptured: request.capture_output,
@@ -1803,7 +1891,45 @@ fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildRespon
         fingerprint,
         session_key: plan.session_key,
         telemetry,
+        compile_backend: DaemonBuildBackend::from_compile_backend(compile_backend),
     })
+}
+
+fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildResponse> {
+    validate_daemon_protocol_version(&request.protocol_version)
+        .context("daemon build request protocol mismatch")?;
+    let common = common_args_from_daemon_request(&request);
+    let manifest_path = resolve_manifest_path(&common.manifest_path)?;
+    let requested_backend = request.compile_backend.into_compile_backend();
+    let requested_compiler_version = compiler_version_for_backend(requested_backend)?;
+    match execute_daemon_build_with_backend(
+        &request,
+        &common,
+        &manifest_path,
+        requested_backend,
+        &requested_compiler_version,
+    ) {
+        Ok(response) => Ok(response),
+        Err(native_err)
+            if requested_backend == BuildCompileBackend::Native
+                && request.native_fallback_to_scarb =>
+        {
+            tracing::warn!(
+                error = %native_err,
+                "daemon native build failed; falling back to scarb backend"
+            );
+            let scarb_compiler_version = compiler_version_for_backend(BuildCompileBackend::Scarb)?;
+            execute_daemon_build_with_backend(
+                &request,
+                &common,
+                &manifest_path,
+                BuildCompileBackend::Scarb,
+                &scarb_compiler_version,
+            )
+            .context("daemon native fallback to scarb failed")
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn execute_daemon_metadata(request: DaemonMetadataRequest) -> Result<DaemonMetadataResponse> {
@@ -3172,6 +3298,7 @@ fn session_input_cache_key(
     hasher.finalize().to_hex().to_string()
 }
 
+#[cfg(test)]
 fn build_session_input(
     common: &BuildCommonArgs,
     manifest_path: &Path,
@@ -3322,13 +3449,18 @@ fn daemon_build_plan_cache_key(
     common: &BuildCommonArgs,
     manifest_path: &Path,
     profile: &str,
-    scarb_version: &str,
+    compile_backend: BuildCompileBackend,
+    compiler_version: &str,
     build_env_fingerprint: &str,
 ) -> String {
     let mut hasher = Hasher::new();
     hasher.update(b"uc-daemon-build-plan-cache-v1");
     hasher.update(normalize_fingerprint_path(manifest_path).as_bytes());
-    hasher.update(scarb_version.as_bytes());
+    hasher.update(match compile_backend {
+        BuildCompileBackend::Scarb => b"scarb" as &[u8],
+        BuildCompileBackend::Native => b"native" as &[u8],
+    });
+    hasher.update(compiler_version.as_bytes());
     hasher.update(build_env_fingerprint.as_bytes());
     hasher.update(profile.as_bytes());
     hasher.update(common.package.as_deref().unwrap_or("*").as_bytes());
@@ -3450,18 +3582,34 @@ fn daemon_build_plan_invalidation_key(session_input: &SessionInput, lock_hash: &
     hasher.finalize().to_hex().to_string()
 }
 
+#[cfg(test)]
 fn prepare_daemon_build_plan(
     common: &BuildCommonArgs,
     manifest_path: &Path,
 ) -> Result<(DaemonBuildPlan, bool)> {
+    let compiler_version = scarb_version_line()?;
+    prepare_daemon_build_plan_with_compiler_version(
+        common,
+        manifest_path,
+        BuildCompileBackend::Scarb,
+        &compiler_version,
+    )
+}
+
+fn prepare_daemon_build_plan_with_compiler_version(
+    common: &BuildCommonArgs,
+    manifest_path: &Path,
+    compile_backend: BuildCompileBackend,
+    compiler_version: &str,
+) -> Result<(DaemonBuildPlan, bool)> {
     let profile = effective_profile(common);
-    let scarb_version = scarb_version_line()?;
     let build_env_fingerprint = current_build_env_fingerprint();
     let cache_key = daemon_build_plan_cache_key(
         common,
         manifest_path,
         &profile,
-        &scarb_version,
+        compile_backend,
+        compiler_version,
         &build_env_fingerprint,
     );
 
@@ -3493,7 +3641,12 @@ fn prepare_daemon_build_plan(
         .parent()
         .context("manifest path has no parent")?
         .to_path_buf();
-    let session_input = build_session_input(common, manifest_path, &profile)?;
+    let session_input = build_session_input_with_compiler_version(
+        common,
+        manifest_path,
+        &profile,
+        compiler_version,
+    )?;
     let session_key = session_input.deterministic_key_hex();
     let strict_invalidation_key = daemon_build_plan_invalidation_key(&session_input, &lock_hash);
     let plan = DaemonBuildPlan {

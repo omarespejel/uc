@@ -30,19 +30,6 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         }
         EngineArg::Uc => {
             let native_mode = native_build_mode();
-            if !matches!(daemon_mode, DaemonModeArg::Off)
-                && !matches!(native_mode, NativeBuildMode::Off)
-            {
-                tracing::warn!(
-                    daemon_mode = ?daemon_mode,
-                    native_mode = ?native_mode,
-                    "native build mode is ignored when daemon mode is enabled"
-                );
-                eprintln!(
-                    "uc: native build mode is ignored when daemon mode is enabled; using scarb backend in daemon mode"
-                );
-            }
-
             let run_local_with_backend =
                 |session_key: &str,
                  compiler_version: &str,
@@ -72,8 +59,14 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                     Ok((run, cache_hit, fingerprint, telemetry))
                 };
 
-            match daemon_mode {
-                DaemonModeArg::Off => match native_mode {
+            let run_local_for_native_mode = |mode: NativeBuildMode| -> Result<(
+                CommandRun,
+                bool,
+                String,
+                String,
+                BuildPhaseTelemetry,
+            )> {
+                match mode {
                     NativeBuildMode::Off => {
                         let compiler_version = scarb_version_line()?;
                         let local_session_key = build_session_input_with_compiler_version(
@@ -88,9 +81,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             &compiler_version,
                             BuildCompileBackend::Scarb,
                         )?;
-                        session_key = local_session_key;
-                        phase_telemetry = Some(telemetry);
-                        (run, cache_hit, fingerprint)
+                        Ok((run, cache_hit, fingerprint, local_session_key, telemetry))
                     }
                     NativeBuildMode::Auto => {
                         let native_compiler_version = native_compiler_version_line();
@@ -101,30 +92,25 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             &native_compiler_version,
                         )?
                         .deterministic_key_hex();
-                        let build_scarb_fallback_context =
-                            || -> Result<(String, String)> {
-                                let compiler_version = scarb_version_line()?;
-                                let session_key =
-                                    build_session_input_with_compiler_version(
-                                        &common,
-                                        &manifest_path,
-                                        &profile,
-                                        &compiler_version,
-                                    )?
-                                    .deterministic_key_hex();
-                                Ok((compiler_version, session_key))
-                            };
-                        let mut precomputed_scarb_fallback =
-                            build_scarb_fallback_context().ok();
+                        let build_scarb_fallback_context = || -> Result<(String, String)> {
+                            let compiler_version = scarb_version_line()?;
+                            let session_key = build_session_input_with_compiler_version(
+                                &common,
+                                &manifest_path,
+                                &profile,
+                                &compiler_version,
+                            )?
+                            .deterministic_key_hex();
+                            Ok((compiler_version, session_key))
+                        };
+                        let mut precomputed_scarb_fallback = build_scarb_fallback_context().ok();
                         match run_local_with_backend(
                             &native_session_key,
                             &native_compiler_version,
                             BuildCompileBackend::Native,
                         ) {
                             Ok((run, cache_hit, fingerprint, telemetry)) => {
-                                session_key = native_session_key;
-                                phase_telemetry = Some(telemetry);
-                                (run, cache_hit, fingerprint)
+                                Ok((run, cache_hit, fingerprint, native_session_key, telemetry))
                             }
                             Err(native_err) => {
                                 eprintln!(
@@ -132,8 +118,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                         native_err
                                     );
                                 let (compiler_version, local_session_key) =
-                                    if let Some((version, key)) =
-                                        precomputed_scarb_fallback.take()
+                                    if let Some((version, key)) = precomputed_scarb_fallback.take()
                                     {
                                         (version, key)
                                     } else {
@@ -145,9 +130,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                         &compiler_version,
                                         BuildCompileBackend::Scarb,
                                     )?;
-                                session_key = local_session_key;
-                                phase_telemetry = Some(telemetry);
-                                (run, cache_hit, fingerprint)
+                                Ok((run, cache_hit, fingerprint, local_session_key, telemetry))
                             }
                         }
                     }
@@ -166,13 +149,31 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             BuildCompileBackend::Native,
                         )
                         .context("native compile mode is require but native backend failed")?;
-                        session_key = native_session_key;
-                        phase_telemetry = Some(telemetry);
-                        (run, cache_hit, fingerprint)
+                        Ok((run, cache_hit, fingerprint, native_session_key, telemetry))
                     }
-                },
+                }
+            };
+
+            match daemon_mode {
+                DaemonModeArg::Off => {
+                    let (run, cache_hit, fingerprint, local_session_key, telemetry) =
+                        run_local_for_native_mode(native_mode)?;
+                    session_key = local_session_key;
+                    phase_telemetry = Some(telemetry);
+                    (run, cache_hit, fingerprint)
+                }
                 DaemonModeArg::Auto => {
-                    let compiler_version = scarb_version_line()?;
+                    let daemon_compile_backend = if native_mode == NativeBuildMode::Off {
+                        BuildCompileBackend::Scarb
+                    } else {
+                        BuildCompileBackend::Native
+                    };
+                    let daemon_native_fallback_to_scarb = native_mode == NativeBuildMode::Auto;
+                    let compiler_version = if daemon_compile_backend == BuildCompileBackend::Scarb {
+                        scarb_version_line()?
+                    } else {
+                        native_compiler_version_line()
+                    };
                     let local_session_key = build_session_input_with_compiler_version(
                         &common,
                         &manifest_path,
@@ -191,26 +192,37 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                         session_key = local_session_key;
                         phase_telemetry = Some(telemetry);
                         (run, true, fingerprint)
-                    } else if let Some(response) =
-                        try_uc_build_via_daemon(&common, &manifest_path, true)?
-                    {
+                    } else if let Some(response) = try_uc_build_via_daemon(
+                        &common,
+                        &manifest_path,
+                        true,
+                        daemon_compile_backend,
+                        daemon_native_fallback_to_scarb,
+                    )? {
                         daemon_used = true;
                         session_key = response.session_key;
                         phase_telemetry = Some(response.telemetry);
                         (response.run, response.cache_hit, response.fingerprint)
                     } else {
-                        let (run, cache_hit, fingerprint, telemetry) = run_local_with_backend(
-                            &local_session_key,
-                            &compiler_version,
-                            BuildCompileBackend::Scarb,
-                        )?;
-                        session_key = local_session_key;
+                        let (run, cache_hit, fingerprint, fallback_session_key, telemetry) =
+                            run_local_for_native_mode(native_mode)?;
+                        session_key = fallback_session_key;
                         phase_telemetry = Some(telemetry);
                         (run, cache_hit, fingerprint)
                     }
                 }
                 DaemonModeArg::Require => {
-                    let compiler_version = scarb_version_line()?;
+                    let daemon_compile_backend = if native_mode == NativeBuildMode::Off {
+                        BuildCompileBackend::Scarb
+                    } else {
+                        BuildCompileBackend::Native
+                    };
+                    let daemon_native_fallback_to_scarb = native_mode == NativeBuildMode::Auto;
+                    let compiler_version = if daemon_compile_backend == BuildCompileBackend::Scarb {
+                        scarb_version_line()?
+                    } else {
+                        native_compiler_version_line()
+                    };
                     let local_session_key = build_session_input_with_compiler_version(
                         &common,
                         &manifest_path,
@@ -230,8 +242,14 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                         phase_telemetry = Some(telemetry);
                         (run, true, fingerprint)
                     } else {
-                        let response = try_uc_build_via_daemon(&common, &manifest_path, false)?
-                            .context("daemon mode is require but daemon is unavailable")?;
+                        let response = try_uc_build_via_daemon(
+                            &common,
+                            &manifest_path,
+                            false,
+                            daemon_compile_backend,
+                            daemon_native_fallback_to_scarb,
+                        )?
+                        .context("daemon mode is require but daemon is unavailable")?;
                         daemon_used = true;
                         session_key = response.session_key;
                         phase_telemetry = Some(response.telemetry);

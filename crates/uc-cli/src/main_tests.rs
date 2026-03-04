@@ -184,6 +184,8 @@ fn daemon_build_request_roundtrip_preserves_async_cache_persist() {
         Path::new("/tmp/workspace/Scarb.toml"),
         true,
         false,
+        BuildCompileBackend::Native,
+        true,
     );
     let restored = common_args_from_daemon_request(&request);
 
@@ -196,6 +198,8 @@ fn daemon_build_request_roundtrip_preserves_async_cache_persist() {
     assert_eq!(restored.offline, common.offline);
     assert_eq!(restored.release, common.release);
     assert_eq!(restored.profile, common.profile);
+    assert_eq!(request.compile_backend, DaemonBuildBackend::Native);
+    assert!(request.native_fallback_to_scarb);
 }
 
 #[test]
@@ -212,12 +216,16 @@ fn daemon_build_request_serialization_supports_async_cache_persist_wire_field() 
             profile: None,
             async_cache_persist: true,
             capture_output: true,
+            compile_backend: DaemonBuildBackend::Native,
+            native_fallback_to_scarb: true,
         },
     };
     let json = serde_json::to_string(&request).expect("failed to encode request");
     assert!(json.contains("\"type\":\"build\""));
     assert!(json.contains("\"async_cache_persist\":true"));
     assert!(json.contains("\"capture_output\":true"));
+    assert!(json.contains("\"compile_backend\":\"native\""));
+    assert!(json.contains("\"native_fallback_to_scarb\":true"));
 
     let decoded: DaemonRequest =
         serde_json::from_str(&json).expect("failed to decode daemon request");
@@ -228,6 +236,8 @@ fn daemon_build_request_serialization_supports_async_cache_persist_wire_field() 
             assert_eq!(payload.protocol_version, DAEMON_PROTOCOL_VERSION);
             assert_eq!(payload.manifest_path, "/tmp/workspace/Scarb.toml");
             assert_eq!(payload.features, vec!["feature_a".to_string()]);
+            assert_eq!(payload.compile_backend, DaemonBuildBackend::Native);
+            assert!(payload.native_fallback_to_scarb);
         }
         _ => panic!("expected build request"),
     }
@@ -245,6 +255,8 @@ fn daemon_build_request_defaults_capture_output_when_missing_from_wire() {
         DaemonRequest::Build { payload } => {
             assert!(payload.capture_output);
             assert_eq!(payload.protocol_version, DAEMON_PROTOCOL_VERSION);
+            assert_eq!(payload.compile_backend, DaemonBuildBackend::Scarb);
+            assert!(!payload.native_fallback_to_scarb);
         }
         _ => panic!("expected build request"),
     }
@@ -273,6 +285,7 @@ fn daemon_build_response_roundtrip_preserves_telemetry_fields() {
                 cache_persist_async: true,
                 cache_persist_scheduled: false,
             },
+            compile_backend: DaemonBuildBackend::Native,
         },
     };
 
@@ -287,6 +300,7 @@ fn daemon_build_response_roundtrip_preserves_telemetry_fields() {
             assert_eq!(payload.telemetry.compile_ms, 4.0);
             assert!(payload.telemetry.cache_persist_async);
             assert!(!payload.telemetry.cache_persist_scheduled);
+            assert_eq!(payload.compile_backend, DaemonBuildBackend::Native);
         }
         _ => panic!("expected build response"),
     }
@@ -306,6 +320,7 @@ fn daemon_build_response_deserializes_with_nested_telemetry_object() {
         "cache_hit":false,
         "fingerprint":"f",
         "session_key":"s",
+        "compile_backend":"scarb",
         "telemetry":{
             "fingerprint_ms":0.1,
             "cache_lookup_ms":0.2,
@@ -321,6 +336,40 @@ fn daemon_build_response_deserializes_with_nested_telemetry_object() {
         DaemonResponse::Build { payload } => {
             assert_eq!(payload.run.elapsed_ms, 12.5);
             assert_eq!(payload.telemetry.compile_ms, 10.0);
+            assert_eq!(payload.compile_backend, DaemonBuildBackend::Scarb);
+        }
+        _ => panic!("expected build response"),
+    }
+}
+
+#[test]
+fn daemon_build_response_defaults_compile_backend_to_scarb_when_missing_from_wire() {
+    let json = r#"{
+        "type":"build",
+        "run":{
+            "command":["scarb","build"],
+            "exit_code":0,
+            "elapsed_ms":2.5,
+            "stdout":"",
+            "stderr":""
+        },
+        "cache_hit":true,
+        "fingerprint":"f",
+        "session_key":"s",
+        "telemetry":{
+            "fingerprint_ms":0.0,
+            "cache_lookup_ms":0.0,
+            "cache_restore_ms":0.0,
+            "compile_ms":0.0,
+            "cache_persist_ms":0.0,
+            "cache_persist_async":false,
+            "cache_persist_scheduled":false
+        }
+    }"#;
+    let decoded = decode_daemon_response(json).expect("failed to decode daemon response");
+    match decoded {
+        DaemonResponse::Build { payload } => {
+            assert_eq!(payload.compile_backend, DaemonBuildBackend::Scarb);
         }
         _ => panic!("expected build response"),
     }
@@ -376,6 +425,8 @@ fn daemon_request_protocol_validation_rejects_mismatch_for_build_and_metadata() 
             profile: None,
             async_cache_persist: false,
             capture_output: true,
+            compile_backend: DaemonBuildBackend::Scarb,
+            native_fallback_to_scarb: false,
         },
     };
     let metadata = DaemonRequest::Metadata {
@@ -418,6 +469,8 @@ fn daemon_request_protocol_validation_accepts_current_protocol() {
             profile: None,
             async_cache_persist: false,
             capture_output: true,
+            compile_backend: DaemonBuildBackend::Scarb,
+            native_fallback_to_scarb: false,
         },
     };
     let metadata = DaemonRequest::Metadata {
@@ -548,8 +601,14 @@ fn try_uc_build_via_daemon_auto_mode_falls_back_on_daemon_error() {
         release: false,
         profile: None,
     };
-    let result = try_uc_build_via_daemon(&common, Path::new("/tmp/workspace/Scarb.toml"), true)
-        .expect("auto mode should not fail hard when daemon returns error");
+    let result = try_uc_build_via_daemon(
+        &common,
+        Path::new("/tmp/workspace/Scarb.toml"),
+        true,
+        BuildCompileBackend::Scarb,
+        false,
+    )
+    .expect("auto mode should not fail hard when daemon returns error");
     assert!(result.is_none());
 
     server.join().expect("daemon test server panicked");
@@ -602,12 +661,84 @@ fn try_uc_build_via_daemon_require_mode_surfaces_daemon_error() {
         release: false,
         profile: None,
     };
-    let err = try_uc_build_via_daemon(&common, Path::new("/tmp/workspace/Scarb.toml"), false)
-        .expect_err("require mode should fail when daemon returns an error");
+    let err = try_uc_build_via_daemon(
+        &common,
+        Path::new("/tmp/workspace/Scarb.toml"),
+        false,
+        BuildCompileBackend::Scarb,
+        false,
+    )
+    .expect_err("require mode should fail when daemon returns an error");
     let text = format!("{err:#}");
     assert!(
         text.contains("daemon build request failed: simulated daemon failure"),
         "unexpected error: {text}"
+    );
+
+    server.join().expect("daemon test server panicked");
+    std::env::remove_var("UC_DAEMON_SOCKET_PATH");
+    let _ = fs::remove_file(&socket_path);
+}
+
+#[cfg(unix)]
+#[test]
+fn try_uc_build_via_daemon_require_mode_rejects_backend_mismatch() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let socket_path = unique_unix_socket_path("uc-daemon-require-backend-mismatch");
+    let _ = fs::remove_file(&socket_path);
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+        .expect("failed to bind test daemon socket");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("failed to accept daemon request");
+        let mut line = String::new();
+        {
+            let mut reader = std::io::BufReader::new(
+                stream
+                    .try_clone()
+                    .expect("failed to clone daemon test stream"),
+            );
+            let _ = std::io::BufRead::read_line(&mut reader, &mut line)
+                .expect("failed to read daemon request");
+        }
+        assert!(
+            !line.trim().is_empty(),
+            "daemon request payload should not be empty"
+        );
+        stream
+            .write_all(
+                br#"{"type":"build","run":{"command":["uc","build"],"exit_code":0,"elapsed_ms":1.0,"stdout":"","stderr":""},"cache_hit":false,"fingerprint":"fp","session_key":"abc","telemetry":{"fingerprint_ms":0.0,"cache_lookup_ms":0.0,"cache_restore_ms":0.0,"compile_ms":0.0,"cache_persist_ms":0.0,"cache_persist_async":false,"cache_persist_scheduled":false}}"#,
+            )
+            .expect("failed to write daemon response");
+        stream
+            .write_all(b"\n")
+            .expect("failed to write daemon response delimiter");
+        stream.flush().expect("failed to flush daemon response");
+    });
+    std::env::set_var("UC_DAEMON_SOCKET_PATH", &socket_path);
+
+    let common = BuildCommonArgs {
+        manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
+        package: None,
+        workspace: false,
+        features: Vec::new(),
+        offline: false,
+        release: false,
+        profile: None,
+    };
+    let err = try_uc_build_via_daemon(
+        &common,
+        Path::new("/tmp/workspace/Scarb.toml"),
+        false,
+        BuildCompileBackend::Native,
+        false,
+    )
+    .expect_err("backend mismatch should fail in require mode");
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("daemon returned backend"),
+        "unexpected backend mismatch error: {text}"
     );
 
     server.join().expect("daemon test server panicked");
@@ -1010,6 +1141,7 @@ fn daemon_build_plan_cache_key_is_order_independent_for_features() {
         &common_a,
         Path::new("/tmp/workspace/Scarb.toml"),
         "dev",
+        BuildCompileBackend::Scarb,
         "scarb 2.14.0",
         "env-a",
     );
@@ -1017,12 +1149,46 @@ fn daemon_build_plan_cache_key_is_order_independent_for_features() {
         &common_b,
         Path::new("/tmp/workspace/Scarb.toml"),
         "dev",
+        BuildCompileBackend::Scarb,
         "scarb 2.14.0",
         "env-a",
     );
     assert_eq!(
         key_a, key_b,
         "equivalent feature sets should produce identical daemon plan cache keys"
+    );
+}
+
+#[test]
+fn daemon_build_plan_cache_key_changes_with_compile_backend() {
+    let common = BuildCommonArgs {
+        manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
+        package: Some("demo".to_string()),
+        workspace: false,
+        features: vec!["feature_a".to_string()],
+        offline: false,
+        release: false,
+        profile: None,
+    };
+    let scarb_key = daemon_build_plan_cache_key(
+        &common,
+        Path::new("/tmp/workspace/Scarb.toml"),
+        "dev",
+        BuildCompileBackend::Scarb,
+        "scarb 2.16.0",
+        "env-a",
+    );
+    let native_key = daemon_build_plan_cache_key(
+        &common,
+        Path::new("/tmp/workspace/Scarb.toml"),
+        "dev",
+        BuildCompileBackend::Native,
+        "uc-native 0.1.0",
+        "env-a",
+    );
+    assert_ne!(
+        scarb_key, native_key,
+        "daemon build plan cache key should partition by compile backend"
     );
 }
 
@@ -1560,6 +1726,8 @@ fn daemon_request_read_timeout_prefers_build_override_for_build_requests() {
             profile: None,
             async_cache_persist: false,
             capture_output: true,
+            compile_backend: DaemonBuildBackend::Scarb,
+            native_fallback_to_scarb: false,
         },
     };
 

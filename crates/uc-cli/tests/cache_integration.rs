@@ -945,6 +945,52 @@ fn integration_native_require_mode_fails_when_native_backend_unavailable() {
 }
 
 #[test]
+fn integration_daemon_auto_mode_respects_native_require_on_local_fallback() {
+    let _guard = serial_guard();
+    let workspace = make_test_workspace("daemon-auto-native-require");
+    let manifest = workspace.root.join("Scarb.toml");
+    let missing_corelib = std::env::temp_dir().join(format!(
+        "uc-it-missing-corelib-daemon-auto-require-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos()
+    ));
+    let missing_socket = std::env::temp_dir().join(format!(
+        "uc-it-missing-daemon-native-require-{}-{}.sock",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos()
+    ));
+    let _ = fs::remove_dir_all(&missing_corelib);
+    let _ = fs::remove_file(&missing_socket);
+
+    let output = run_uc_build_output_only_with_env_overrides(
+        &workspace.root,
+        &manifest,
+        "auto",
+        Some(&missing_socket),
+        BuildEnvOverrides {
+            native_mode_override: Some("require"),
+            native_corelib_override: Some(&missing_corelib),
+            ..BuildEnvOverrides::default()
+        },
+    );
+    assert!(
+        !output.status.success(),
+        "daemon auto local fallback should honor native=require when daemon is unavailable"
+    );
+    let combined = output_to_utf8(&output);
+    assert!(
+        combined.contains("native compile mode is require but native backend failed"),
+        "unexpected daemon auto native=require failure output: {combined}"
+    );
+}
+
+#[test]
 fn integration_native_auto_mode_falls_back_on_incompatible_corelib_override() {
     let _guard = serial_guard();
     if !scarb_available() {
