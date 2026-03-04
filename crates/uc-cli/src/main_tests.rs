@@ -828,6 +828,62 @@ fn cache_budget_enforcement_state_interval_zero_uses_stride_only() {
 }
 
 #[test]
+fn cache_budget_enforcement_evicts_oldest_objects_before_metadata_files() {
+    let dir = unique_test_dir("uc-cache-budget-evict");
+    let cache_root = dir.join(".uc/cache");
+    let objects_dir = cache_root.join("objects");
+    let build_dir = cache_root.join("build");
+    fs::create_dir_all(&objects_dir).expect("failed to create cache objects dir");
+    fs::create_dir_all(&build_dir).expect("failed to create cache build dir");
+
+    let old_object = objects_dir.join("aa/old.bin");
+    let new_object = objects_dir.join("bb/new.bin");
+    let build_entry = build_dir.join("entry.json");
+    let lock_file = cache_root.join(".lock");
+
+    fs::create_dir_all(
+        old_object
+            .parent()
+            .expect("old object path should include parent"),
+    )
+    .expect("failed to create old object parent");
+    fs::create_dir_all(
+        new_object
+            .parent()
+            .expect("new object path should include parent"),
+    )
+    .expect("failed to create new object parent");
+
+    fs::write(&old_object, vec![b'a'; 32]).expect("failed to write old object");
+    thread::sleep(Duration::from_millis(15));
+    fs::write(&new_object, vec![b'b'; 32]).expect("failed to write new object");
+    thread::sleep(Duration::from_millis(15));
+    fs::write(&build_entry, vec![b'c'; 32]).expect("failed to write build entry");
+    fs::write(&lock_file, "pid=1234\n").expect("failed to write lock file");
+
+    enforce_cache_size_budget_with_budget(&cache_root, 72).expect("cache eviction should succeed");
+
+    assert!(
+        !old_object.exists(),
+        "oldest object should be evicted first when over budget"
+    );
+    assert!(
+        new_object.exists(),
+        "newer object should remain when one eviction is sufficient"
+    );
+    assert!(
+        build_entry.exists(),
+        "metadata/build files should remain when object eviction satisfies budget"
+    );
+    assert!(
+        lock_file.exists(),
+        "cache lock marker must never be removed by eviction"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn parse_metadata_format_version_accepts_supported_values() {
     assert_eq!(parse_metadata_format_version("1").unwrap(), 1);
     assert_eq!(parse_metadata_format_version("2").unwrap(), 2);

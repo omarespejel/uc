@@ -230,7 +230,10 @@ pub(super) fn persist_cache_entry_for_build(
 }
 
 pub(super) fn enforce_cache_size_budget(cache_root: &Path) -> Result<()> {
-    let budget = max_cache_bytes();
+    enforce_cache_size_budget_with_budget(cache_root, max_cache_bytes())
+}
+
+pub(super) fn enforce_cache_size_budget_with_budget(cache_root: &Path, budget: u64) -> Result<()> {
     if budget == 0 || !cache_root.exists() {
         return Ok(());
     }

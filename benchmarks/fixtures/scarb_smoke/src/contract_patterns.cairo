@@ -26,6 +26,12 @@ pub trait IPermissionedVault<TContractState> {
     fn withdraw(ref self: TContractState, bucket: felt252, amount: u128) -> bool;
 }
 
+#[starknet::interface]
+pub trait IPortfolioRouter<TContractState> {
+    fn configure(ref self: TContractState, token: ContractAddress, vault: ContractAddress);
+    fn rebalance(ref self: TContractState, bucket: felt252, amount: u128) -> bool;
+}
+
 #[starknet::contract]
 mod token {
     use super::{IRegistryDispatcher, IRegistryDispatcherTrait, IToken};
@@ -342,6 +348,68 @@ mod permissioned_vault {
             self.totals_by_bucket.write(bucket, total_before - amount);
             self.audit_log.write((caller, bucket), bucket);
             true
+        }
+    }
+}
+
+#[starknet::contract]
+mod portfolio_router {
+    use super::{
+        IPortfolioRouter,
+        IPermissionedVaultDispatcher,
+        IPermissionedVaultDispatcherTrait,
+        ITokenDispatcher,
+        ITokenDispatcherTrait,
+    };
+    use core::num::traits::Zero;
+    use starknet::storage::{StoragePointerReadAccess, StoragePointerWriteAccess};
+    use starknet::{ContractAddress, get_caller_address};
+
+    #[storage]
+    struct Storage {
+        owner: ContractAddress,
+        token: ContractAddress,
+        vault: ContractAddress,
+        last_actor: ContractAddress,
+        last_bucket: felt252,
+        last_amount: u128,
+    }
+
+    #[constructor]
+    fn constructor(ref self: ContractState, owner: ContractAddress) {
+        assert(!owner.is_zero(), 'owner=0');
+        self.owner.write(owner);
+    }
+
+    #[abi(embed_v0)]
+    impl PortfolioRouterImpl of IPortfolioRouter<ContractState> {
+        fn configure(ref self: ContractState, token: ContractAddress, vault: ContractAddress) {
+            assert(self.owner.read() == get_caller_address(), 'not owner');
+            assert(!token.is_zero(), 'token=0');
+            assert(!vault.is_zero(), 'vault=0');
+            self.token.write(token);
+            self.vault.write(vault);
+        }
+
+        fn rebalance(ref self: ContractState, bucket: felt252, amount: u128) -> bool {
+            let token = self.token.read();
+            let vault = self.vault.read();
+            if token.is_zero() || vault.is_zero() {
+                return false;
+            }
+
+            let transferred = ITokenDispatcher { contract_address: token }.transfer(vault, amount);
+            if !transferred {
+                return false;
+            }
+
+            // Touch a second contract call path so fixture builds cover cross-contract dispatch.
+            let deposited = IPermissionedVaultDispatcher { contract_address: vault }
+                .withdraw(bucket, amount);
+            self.last_actor.write(get_caller_address());
+            self.last_bucket.write(bucket);
+            self.last_amount.write(amount);
+            deposited
         }
     }
 }

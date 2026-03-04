@@ -3,9 +3,9 @@
 This fixture intentionally combines multiple Starknet patterns so UC cache/fingerprint logic is exercised on realistic Cairo shapes while keeping benchmark runtime small.
 
 Included patterns:
-- Multiple `#[starknet::contract]` modules (`token`, `registry`, `permissioned_vault`)
-- Cross-contract dispatcher call (`token -> registry`)
-- Interface-heavy ABI surfaces (`IToken`, `IRegistry`, `IPermissionedVault`)
+- Multiple `#[starknet::contract]` modules (`token`, `registry`, `permissioned_vault`, `portfolio_router`)
+- Cross-contract dispatcher calls (`token -> registry`, `portfolio_router -> token/vault`)
+- Interface-heavy ABI surfaces (`IToken`, `IRegistry`, `IPermissionedVault`, `IPortfolioRouter`)
 - Nested storage keys and tuple maps for deterministic artifact stress
 
 Security/trust notes for fixture-only code:
