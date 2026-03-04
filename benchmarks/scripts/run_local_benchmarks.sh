@@ -41,6 +41,7 @@ BENCH_LOCK_HELD=0
 
 declare -a EXEC_PREFIX=()
 declare -a CMD_REPLY=()
+declare -a SCENARIO_FILTERS=()
 LAST_MEASURE_STDERR_FILE=""
 LAST_MEASURE_ELAPSED_MS=""
 
@@ -105,6 +106,7 @@ Options:
   --cpu-set <list>            Optional CPU affinity list (e.g. 0 or 0-1)
   --nice-level <n>            Optional process nice level (default: 0)
   --warm-settle-seconds <n>   Wait after warm-up before warm-noop samples (default: 2.2)
+  --scenario <name[,name...]> Restrict to specific scenario(s); repeatable
   --strict-pinning            Fail if requested pinning cannot be applied
   --host-preflight <mode>     Host-noise preflight mode (off|warn|require, default: warn)
   --allow-noisy-host          Disable host-noise preflight checks
@@ -122,6 +124,34 @@ require_option_value() {
     usage
     exit 1
   fi
+}
+
+add_scenario_filters() {
+  local raw="$1"
+  local item trimmed
+  local -a items=()
+  IFS=',' read -r -a items <<< "$raw"
+  for item in "${items[@]}"; do
+    trimmed="${item#"${item%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    if [[ -n "$trimmed" ]]; then
+      SCENARIO_FILTERS+=("$trimmed")
+    fi
+  done
+}
+
+scenario_enabled() {
+  local scenario="$1"
+  if [[ "${#SCENARIO_FILTERS[@]}" -eq 0 ]]; then
+    return 0
+  fi
+  local selected
+  for selected in "${SCENARIO_FILTERS[@]}"; do
+    if [[ "$selected" == "$scenario" ]]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 while [[ $# -gt 0 ]]; do
@@ -173,6 +203,11 @@ while [[ $# -gt 0 ]]; do
     --warm-settle-seconds)
       require_option_value "$1" "${2-}"
       WARM_SETTLE_SECONDS="$2"
+      shift 2
+      ;;
+    --scenario)
+      require_option_value "$1" "${2-}"
+      add_scenario_filters "$2"
       shift 2
       ;;
     --strict-pinning)
@@ -232,6 +267,17 @@ if [[ "$ALLOW_NOISY_HOST" != "0" && "$ALLOW_NOISY_HOST" != "1" ]]; then
   echo "ALLOW_NOISY_HOST must be 0 or 1, got: $ALLOW_NOISY_HOST" >&2
   exit 1
 fi
+if [[ "${#SCENARIO_FILTERS[@]}" -gt 0 ]]; then
+  declare -A _scenario_seen=()
+  declare -a _scenario_deduped=()
+  for scenario in "${SCENARIO_FILTERS[@]}"; do
+    if [[ -z "${_scenario_seen[$scenario]:-}" ]]; then
+      _scenario_seen[$scenario]=1
+      _scenario_deduped+=("$scenario")
+    fi
+  done
+  SCENARIO_FILTERS=("${_scenario_deduped[@]}")
+fi
 
 OUT_JSON="$OUT_DIR/${TOOL}-baseline-$STAMP.json"
 OUT_MD="$OUT_DIR/${TOOL}-baseline-$STAMP.md"
@@ -261,6 +307,18 @@ if [[ "$MATRIX" == "research" && -z "$WORKSPACE_ROOT" ]]; then
   echo "WORKSPACE_ROOT is required for research matrix runs." >&2
   echo "Set WORKSPACE_ROOT to a path where scarb/examples exists." >&2
   exit 1
+fi
+if [[ "${#SCENARIO_FILTERS[@]}" -gt 0 ]]; then
+  for scenario in "${SCENARIO_FILTERS[@]}"; do
+    case "$MATRIX:$scenario" in
+      research:build.cold|research:build.warm_noop|research:build.warm_edit|research:metadata.online_cold|research:metadata.offline_warm) ;;
+      smoke:build.cold|smoke:build.warm_noop|smoke:build.warm_edit|smoke:build.warm_edit_semantic) ;;
+      *)
+        echo "Scenario '$scenario' is not supported for matrix '$MATRIX'" >&2
+        exit 1
+        ;;
+    esac
+  done
 fi
 if [[ "$ALLOW_NOISY_HOST" == "1" ]]; then
   HOST_PREFLIGHT_MODE="off"
@@ -971,25 +1029,45 @@ if [[ "$MATRIX" == "research" ]]; then
   build_command_for_manifest "$WS_MANIFEST"
   WS_BUILD_CMD=("${CMD_REPLY[@]}")
 
-  prime_build_dependencies_if_needed "hello_world" "$HELLO_MANIFEST"
-  prime_build_dependencies_if_needed "workspaces" "$WS_MANIFEST"
+  if scenario_enabled "build.cold" || scenario_enabled "build.warm_noop" || scenario_enabled "build.warm_edit"; then
+    prime_build_dependencies_if_needed "hello_world" "$HELLO_MANIFEST"
+    prime_build_dependencies_if_needed "workspaces" "$WS_MANIFEST"
+  fi
 
-  run_build_cold "hello_world" "$HELLO_DIR" "$COLD_RUNS" "${HELLO_BUILD_CMD[@]}"
-  run_build_warm_noop "hello_world" "$HELLO_DIR" "$RUNS" "${HELLO_BUILD_CMD[@]}"
-  run_build_warm_edit "hello_world" "$HELLO_DIR" "$HELLO_DIR/src/lib.cairo" "$RUNS" "${HELLO_BUILD_CMD[@]}"
+  if scenario_enabled "build.cold"; then
+    run_build_cold "hello_world" "$HELLO_DIR" "$COLD_RUNS" "${HELLO_BUILD_CMD[@]}"
+  fi
+  if scenario_enabled "build.warm_noop"; then
+    run_build_warm_noop "hello_world" "$HELLO_DIR" "$RUNS" "${HELLO_BUILD_CMD[@]}"
+  fi
+  if scenario_enabled "build.warm_edit"; then
+    run_build_warm_edit "hello_world" "$HELLO_DIR" "$HELLO_DIR/src/lib.cairo" "$RUNS" "${HELLO_BUILD_CMD[@]}"
+  fi
 
-  run_build_cold "workspaces" "$WS_DIR" "$COLD_RUNS" "${WS_BUILD_CMD[@]}"
-  run_build_warm_noop "workspaces" "$WS_DIR" "$RUNS" "${WS_BUILD_CMD[@]}"
-  run_build_warm_edit "workspaces" "$WS_DIR" "$WS_DIR/crates/fibonacci/src/lib.cairo" "$RUNS" "${WS_BUILD_CMD[@]}"
+  if scenario_enabled "build.cold"; then
+    run_build_cold "workspaces" "$WS_DIR" "$COLD_RUNS" "${WS_BUILD_CMD[@]}"
+  fi
+  if scenario_enabled "build.warm_noop"; then
+    run_build_warm_noop "workspaces" "$WS_DIR" "$RUNS" "${WS_BUILD_CMD[@]}"
+  fi
+  if scenario_enabled "build.warm_edit"; then
+    run_build_warm_edit "workspaces" "$WS_DIR" "$WS_DIR/crates/fibonacci/src/lib.cairo" "$RUNS" "${WS_BUILD_CMD[@]}"
+  fi
 
-  DEPS_CACHE_DIR="$TMP_DIR/deps-cache"
-  metadata_online_command_for_manifest "$DEPS_MANIFEST" "$DEPS_CACHE_DIR"
-  DEPS_META_WARM_CMD=("${CMD_REPLY[@]}")
-  metadata_offline_command_for_manifest "$DEPS_MANIFEST" "$DEPS_CACHE_DIR"
-  DEPS_META_OFFLINE_CMD=("${CMD_REPLY[@]}")
+  if scenario_enabled "metadata.online_cold" || scenario_enabled "metadata.offline_warm"; then
+    DEPS_CACHE_DIR="$TMP_DIR/deps-cache"
+    metadata_online_command_for_manifest "$DEPS_MANIFEST" "$DEPS_CACHE_DIR"
+    DEPS_META_WARM_CMD=("${CMD_REPLY[@]}")
+    metadata_offline_command_for_manifest "$DEPS_MANIFEST" "$DEPS_CACHE_DIR"
+    DEPS_META_OFFLINE_CMD=("${CMD_REPLY[@]}")
+  fi
 
-  run_metadata_online_cold "dependencies" "$DEPS_DIR" "$DEPS_CACHE_DIR" "$COLD_RUNS" "${DEPS_META_WARM_CMD[@]}"
-  run_metadata_offline_warm "dependencies" "$DEPS_DIR" "$DEPS_CACHE_DIR" "$RUNS" "${DEPS_META_WARM_CMD[@]}" -- "${DEPS_META_OFFLINE_CMD[@]}"
+  if scenario_enabled "metadata.online_cold"; then
+    run_metadata_online_cold "dependencies" "$DEPS_DIR" "$DEPS_CACHE_DIR" "$COLD_RUNS" "${DEPS_META_WARM_CMD[@]}"
+  fi
+  if scenario_enabled "metadata.offline_warm"; then
+    run_metadata_offline_warm "dependencies" "$DEPS_DIR" "$DEPS_CACHE_DIR" "$RUNS" "${DEPS_META_WARM_CMD[@]}" -- "${DEPS_META_OFFLINE_CMD[@]}"
+  fi
 elif [[ "$MATRIX" == "smoke" ]]; then
   SMOKE_SRC="$ROOT_DIR/benchmarks/fixtures/scarb_smoke"
   SMOKE_DIR="$(prepare_workload_copy "scarb_smoke" "$SMOKE_SRC")"
@@ -998,12 +1076,22 @@ elif [[ "$MATRIX" == "smoke" ]]; then
   build_command_for_manifest "$SMOKE_MANIFEST"
   SMOKE_BUILD_CMD=("${CMD_REPLY[@]}")
 
-  prime_build_dependencies_if_needed "scarb_smoke" "$SMOKE_MANIFEST"
+  if scenario_enabled "build.cold" || scenario_enabled "build.warm_noop" || scenario_enabled "build.warm_edit" || scenario_enabled "build.warm_edit_semantic"; then
+    prime_build_dependencies_if_needed "scarb_smoke" "$SMOKE_MANIFEST"
+  fi
 
-  run_build_cold "scarb_smoke" "$SMOKE_DIR" "$COLD_RUNS" "${SMOKE_BUILD_CMD[@]}"
-  run_build_warm_noop "scarb_smoke" "$SMOKE_DIR" "$RUNS" "${SMOKE_BUILD_CMD[@]}"
-  run_build_warm_edit "scarb_smoke" "$SMOKE_DIR" "$SMOKE_DIR/src/lib.cairo" "$RUNS" "${SMOKE_BUILD_CMD[@]}"
-  run_build_warm_edit_semantic "scarb_smoke" "$SMOKE_DIR" "$SMOKE_DIR/src/lib.cairo" "$RUNS" "${SMOKE_BUILD_CMD[@]}"
+  if scenario_enabled "build.cold"; then
+    run_build_cold "scarb_smoke" "$SMOKE_DIR" "$COLD_RUNS" "${SMOKE_BUILD_CMD[@]}"
+  fi
+  if scenario_enabled "build.warm_noop"; then
+    run_build_warm_noop "scarb_smoke" "$SMOKE_DIR" "$RUNS" "${SMOKE_BUILD_CMD[@]}"
+  fi
+  if scenario_enabled "build.warm_edit"; then
+    run_build_warm_edit "scarb_smoke" "$SMOKE_DIR" "$SMOKE_DIR/src/lib.cairo" "$RUNS" "${SMOKE_BUILD_CMD[@]}"
+  fi
+  if scenario_enabled "build.warm_edit_semantic"; then
+    run_build_warm_edit_semantic "scarb_smoke" "$SMOKE_DIR" "$SMOKE_DIR/src/lib.cairo" "$RUNS" "${SMOKE_BUILD_CMD[@]}"
+  fi
 else
   echo "Unsupported matrix: $MATRIX" >&2
   exit 1

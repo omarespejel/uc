@@ -56,6 +56,9 @@ Stability runs default to `--host-preflight require` and fail fast if noisy host
 ./benchmarks/scripts/run_fast_perf_check.sh
 # or:
 make perf-fast
+
+# target only one hotspot scenario for faster iteration:
+./benchmarks/scripts/run_fast_perf_check.sh --scenario build.warm_edit_semantic
 ```
 
 This lane is optimized for iteration speed (default `--runs 4 --cold-runs 4`, smoke matrix) and applies lightweight p95 gates for early signal. Use it while developing and keep the full stability lane (`12/12`, paired cycles, pinned host) as the final merge/nightly proof.

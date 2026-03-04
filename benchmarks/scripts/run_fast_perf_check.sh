@@ -17,6 +17,7 @@ ALLOW_NOISY_HOST="${ALLOW_NOISY_HOST:-0}"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 TMP_DIR="$(mktemp -d)"
+declare -a SCENARIO_FILTERS=()
 
 # Fast-lane defaults for quick local iteration; full stability gate remains authoritative.
 MIN_WARM_NOOP_P95_DELTA_PERCENT="${MIN_WARM_NOOP_P95_DELTA_PERCENT:-10}"
@@ -44,6 +45,7 @@ Options:
   --nice-level <n>               Optional nice level (default: 0)
   --strict-pinning               Require requested pinning to apply
   --host-preflight <mode>        Host preflight mode (off|warn|require, default: warn)
+  --scenario <name[,name...]>    Restrict to specific scenario(s); repeatable
   --allow-noisy-host             Disable host preflight checks
   --help                         Show this help
 
@@ -63,6 +65,20 @@ require_option_value() {
     usage
     exit 1
   fi
+}
+
+add_scenario_filters() {
+  local raw="$1"
+  local item trimmed
+  local -a items=()
+  IFS=',' read -r -a items <<< "$raw"
+  for item in "${items[@]}"; do
+    trimmed="${item#"${item%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    if [[ -n "$trimmed" ]]; then
+      SCENARIO_FILTERS+=("$trimmed")
+    fi
+  done
 }
 
 while [[ $# -gt 0 ]]; do
@@ -115,6 +131,11 @@ while [[ $# -gt 0 ]]; do
       HOST_PREFLIGHT_MODE="$2"
       shift 2
       ;;
+    --scenario)
+      require_option_value "$1" "${2-}"
+      add_scenario_filters "$2"
+      shift 2
+      ;;
     --allow-noisy-host)
       ALLOW_NOISY_HOST=1
       shift
@@ -159,6 +180,17 @@ if [[ "$ALLOW_NOISY_HOST" != "0" && "$ALLOW_NOISY_HOST" != "1" ]]; then
   echo "ALLOW_NOISY_HOST must be 0 or 1, got: $ALLOW_NOISY_HOST" >&2
   exit 1
 fi
+if [[ "${#SCENARIO_FILTERS[@]}" -gt 0 ]]; then
+  declare -A _scenario_seen=()
+  declare -a _scenario_deduped=()
+  for scenario in "${SCENARIO_FILTERS[@]}"; do
+    if [[ -z "${_scenario_seen[$scenario]:-}" ]]; then
+      _scenario_seen[$scenario]=1
+      _scenario_deduped+=("$scenario")
+    fi
+  done
+  SCENARIO_FILTERS=("${_scenario_deduped[@]}")
+fi
 if [[ "$MATRIX" == "research" && -z "$WORKSPACE_ROOT" ]]; then
   echo "--workspace-root is required for research matrix" >&2
   exit 1
@@ -196,6 +228,11 @@ run_tool_benchmark() {
   fi
   if [[ -n "$WORKSPACE_ROOT" ]]; then
     cmd+=(--workspace-root "$WORKSPACE_ROOT")
+  fi
+  if [[ "${#SCENARIO_FILTERS[@]}" -gt 0 ]]; then
+    for scenario in "${SCENARIO_FILTERS[@]}"; do
+      cmd+=(--scenario "$scenario")
+    done
   fi
 
   echo "== Running $tool benchmark ($MATRIX, runs=$RUNS, cold-runs=$COLD_RUNS) ==" >&2

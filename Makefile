@@ -1,6 +1,6 @@
 SHELL := /bin/zsh
 
-.PHONY: bootstrap benchmark-local benchmark-uc benchmark-smoke benchmark-delta perf-fast compare-local gh-bootstrap
+.PHONY: bootstrap benchmark-local benchmark-uc benchmark-smoke benchmark-delta perf-fast perf-fast-semantic compare-local gh-bootstrap
 
 bootstrap:
 	@mkdir -p benchmarks/results benchmarks/baselines
@@ -21,6 +21,9 @@ benchmark-delta:
 
 perf-fast:
 	@./benchmarks/scripts/run_fast_perf_check.sh
+
+perf-fast-semantic:
+	@./benchmarks/scripts/run_fast_perf_check.sh --scenario build.warm_edit_semantic
 
 compare-local:
 	@./benchmarks/scripts/run_dual_run_comparator.sh
