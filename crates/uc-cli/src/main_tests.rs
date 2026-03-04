@@ -315,6 +315,26 @@ fn daemon_request_protocol_validation_accepts_current_protocol() {
     assert!(validate_daemon_request_protocol_version(&metadata).is_ok());
 }
 
+#[test]
+fn read_line_limited_reads_up_to_newline() {
+    let data = b"hello-world\nnext";
+    let mut reader = std::io::BufReader::new(std::io::Cursor::new(data.as_slice()));
+    let line = read_line_limited(&mut reader, 64, "test line").expect("line read should succeed");
+    assert_eq!(line, "hello-world");
+}
+
+#[test]
+fn read_line_limited_rejects_oversized_line() {
+    let payload = vec![b'a'; 32];
+    let mut reader = std::io::BufReader::new(std::io::Cursor::new(payload));
+    let err = read_line_limited(&mut reader, 8, "test line")
+        .expect_err("oversized line should be rejected");
+    assert!(
+        format!("{err:#}").contains("exceeds size limit"),
+        "unexpected error: {err:#}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn try_uc_build_via_daemon_auto_mode_falls_back_on_daemon_error() {

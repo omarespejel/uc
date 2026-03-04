@@ -103,19 +103,28 @@ pub(super) fn read_line_limited<R: BufRead>(
 ) -> Result<String> {
     let mut bytes = Vec::with_capacity(128);
     loop {
-        let mut byte = [0_u8; 1];
-        let read = reader
-            .read(&mut byte)
+        let chunk = reader
+            .fill_buf()
             .with_context(|| format!("failed to read {label}"))?;
-        if read == 0 {
+        if chunk.is_empty() {
             break;
         }
-        if byte[0] == b'\n' {
-            break;
-        }
-        bytes.push(byte[0]);
+
+        let newline_pos = chunk.iter().position(|byte| *byte == b'\n');
+        let take_len = newline_pos.unwrap_or(chunk.len());
+        bytes.extend_from_slice(&chunk[..take_len]);
         if bytes.len() > max_bytes {
             bail!("{label} exceeds size limit ({max_bytes} bytes)");
+        }
+
+        let consumed = if newline_pos.is_some() {
+            take_len + 1
+        } else {
+            take_len
+        };
+        reader.consume(consumed);
+        if newline_pos.is_some() {
+            break;
         }
     }
     if bytes.is_empty() {
