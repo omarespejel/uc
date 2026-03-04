@@ -51,6 +51,15 @@ Stability runs default to `--host-preflight require` and fail fast if noisy host
 ./benchmarks/scripts/compare_benchmark_results.sh --baseline <scarb.json> --candidate <uc.json> --out <delta.md>
 ```
 
+## Fast Iteration Loop (Developer Lane)
+```bash
+./benchmarks/scripts/run_fast_perf_check.sh
+# or:
+make perf-fast
+```
+
+This lane is optimized for iteration speed (default `--runs 4 --cold-runs 4`, smoke matrix) and applies lightweight p95 gates for early signal. Use it while developing and keep the full stability lane (`12/12`, paired cycles, pinned host) as the final merge/nightly proof.
+
 ## Modes
 - `research` (default): uses external sibling repos (`scarb/examples/*`) under `--workspace-root` or `WORKSPACE_ROOT`.
 - default fallback for `research` is the parent directory of this repo; if manifests are not found, pass `--workspace-root` explicitly.

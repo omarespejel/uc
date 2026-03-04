@@ -1,10 +1,10 @@
 SHELL := /bin/zsh
 
-.PHONY: bootstrap benchmark-local benchmark-uc benchmark-smoke benchmark-delta compare-local gh-bootstrap
+.PHONY: bootstrap benchmark-local benchmark-uc benchmark-smoke benchmark-delta perf-fast compare-local gh-bootstrap
 
 bootstrap:
 	@mkdir -p benchmarks/results benchmarks/baselines
-	@chmod +x benchmarks/scripts/run_local_benchmarks.sh benchmarks/scripts/run_dual_run_comparator.sh scripts/github/bootstrap_github_stack.sh
+	@chmod +x benchmarks/scripts/run_local_benchmarks.sh benchmarks/scripts/run_dual_run_comparator.sh benchmarks/scripts/run_fast_perf_check.sh scripts/github/bootstrap_github_stack.sh
 	@echo "Bootstrap complete."
 
 benchmark-local:
@@ -18,6 +18,9 @@ benchmark-smoke:
 
 benchmark-delta:
 	@echo "Use benchmarks/scripts/compare_benchmark_results.sh with explicit baseline/candidate JSON files."
+
+perf-fast:
+	@./benchmarks/scripts/run_fast_perf_check.sh
 
 compare-local:
 	@./benchmarks/scripts/run_dual_run_comparator.sh
