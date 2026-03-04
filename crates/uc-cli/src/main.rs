@@ -2544,10 +2544,12 @@ fn build_native_compile_context(
     )?;
     let manifest_content_hash = compute_manifest_content_hash_bytes(manifest_text.as_bytes());
     validate_manifest_dependency_sanity_from_manifest(manifest_path, &manifest)?;
-    let package_name = manifest
+    let package_table = manifest
         .get("package")
         .and_then(TomlValue::as_table)
-        .and_then(|tbl| tbl.get("name"))
+        .context("native compile requires [package] section in Scarb.toml")?;
+    let package_name = package_table
+        .get("name")
         .and_then(TomlValue::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -2612,7 +2614,9 @@ fn build_native_compile_context(
     let cairo_project_path = cairo_project_dir.join("cairo_project.toml");
     let source_root_string = normalize_fingerprint_path(&source_root);
     let escaped_source_root = toml_escape_basic_string(&source_root_string);
-    let cairo_project_toml = format!("[crate_roots]\n{crate_name} = \"{escaped_source_root}\"\n");
+    let (cairo_edition, _) = resolve_manifest_cairo_settings_from_manifest(&manifest);
+    let cairo_project_toml =
+        native_cairo_project_toml(&crate_name, &escaped_source_root, cairo_edition.as_deref());
     write_text_file_if_changed(
         &cairo_project_path,
         &cairo_project_toml,
@@ -2644,6 +2648,25 @@ fn write_text_file_if_changed(path: &Path, contents: &str, label: &str) -> Resul
     fs::write(path, contents)
         .with_context(|| format!("failed to write {} {}", label, path.display()))?;
     Ok(())
+}
+
+fn native_cairo_project_toml(
+    crate_name: &str,
+    escaped_source_root: &str,
+    cairo_edition: Option<&str>,
+) -> String {
+    let mut content = format!("[crate_roots]\n{crate_name} = \"{escaped_source_root}\"\n");
+    if let Some(edition) = cairo_edition
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let escaped_edition = toml_escape_basic_string(edition);
+        content.push_str("\n[config.global]\n");
+        content.push_str("edition = \"");
+        content.push_str(&escaped_edition);
+        content.push_str("\"\n");
+    }
+    content
 }
 
 fn prune_native_target_outputs(

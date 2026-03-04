@@ -2528,9 +2528,26 @@ edition = "2024_07"
         cairo_project.contains("demo_native"),
         "crate name should be normalized in cairo_project.toml: {cairo_project}"
     );
+    assert!(
+        cairo_project.contains("[config.global]\nedition = \"2024_07\""),
+        "manifest edition should be propagated into cairo_project.toml: {cairo_project}"
+    );
 
     std::env::remove_var("UC_NATIVE_CORELIB_SRC");
     fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_cairo_project_toml_prefers_explicit_cairo_edition() {
+    let rendered = native_cairo_project_toml("demo_native", "/tmp/demo/src", Some("2023_10"));
+    assert!(
+        rendered.contains("[crate_roots]\ndemo_native = \"/tmp/demo/src\""),
+        "crate roots stanza should be present"
+    );
+    assert!(
+        rendered.contains("[config.global]\nedition = \"2023_10\""),
+        "explicit cairo edition should be rendered"
+    );
 }
 
 #[test]
