@@ -10,8 +10,14 @@ pub struct DiagnosticsComparison {
 }
 
 pub fn compare_diagnostics(baseline: &[String], candidate: &[String]) -> DiagnosticsComparison {
-    let left: BTreeSet<String> = baseline.iter().map(normalize_diagnostic_line).collect();
-    let right: BTreeSet<String> = candidate.iter().map(normalize_diagnostic_line).collect();
+    let left: BTreeSet<String> = baseline
+        .iter()
+        .map(|line| normalize_diagnostic_line(line.as_str()))
+        .collect();
+    let right: BTreeSet<String> = candidate
+        .iter()
+        .map(|line| normalize_diagnostic_line(line.as_str()))
+        .collect();
 
     let intersection_count = left.intersection(&right).count();
     let union_count = left.union(&right).count();
@@ -63,7 +69,7 @@ pub fn extract_diagnostic_lines(stderr: &str) -> Vec<String> {
     extracted
 }
 
-fn normalize_diagnostic_line(line: &String) -> String {
+fn normalize_diagnostic_line(line: &str) -> String {
     line.lines()
         .map(str::trim_end)
         .filter(|value| !value.trim().is_empty())

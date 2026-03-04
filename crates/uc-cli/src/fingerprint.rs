@@ -285,7 +285,7 @@ pub(super) fn build_fingerprint_context_digest(
     let mut hasher = Hasher::new();
     hasher.update(b"uc-build-fingerprint-context-v1");
     hasher.update(scarb_version.as_bytes());
-    hasher.update(compute_build_env_fingerprint().as_bytes());
+    hasher.update(current_build_env_fingerprint().as_bytes());
     hasher.update(normalize_fingerprint_path(canonical_manifest).as_bytes());
     hasher.update(profile.as_bytes());
     hasher.update(common.package.as_deref().unwrap_or("*").as_bytes());

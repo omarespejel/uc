@@ -75,6 +75,9 @@ const ASYNC_PERSIST_QUEUE_LIMIT: usize = 128;
 const CACHE_LOCK_STALE_AFTER_SECONDS: u64 = 300;
 const DEFAULT_CACHE_BUDGET_ENFORCE_EVERY: u64 = 8;
 const DEFAULT_MIN_SCARB_VERSION: &str = "2.14.0";
+const TOOLCHAIN_CHECK_CACHE_SCHEMA_VERSION: u32 = 1;
+const MAX_TOOLCHAIN_CHECK_CACHE_BYTES: u64 = 64 * 1024;
+const DEFAULT_SCARB_TOOLCHAIN_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
 const DAEMON_PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CACHEABLE_ARTIFACT_SUFFIXES: [&str; 5] = [
     ".sierra.json",
@@ -310,6 +313,13 @@ struct BuildPhaseTelemetry {
     cache_persist_scheduled: bool,
 }
 
+#[derive(Copy, Clone)]
+struct BuildRunOptions {
+    capture_output: bool,
+    inherit_output_when_uncaptured: bool,
+    async_cache_persist: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct BuildReport {
     generated_at_epoch_ms: u128,
@@ -398,6 +408,13 @@ struct SessionInputCacheEntry {
     manifest_size_bytes: u64,
     manifest_modified_unix_ms: u64,
     input: SessionInput,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolchainCheckCacheEntry {
+    schema_version: u32,
+    checked_epoch_ms: u64,
+    version_line: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -780,7 +797,7 @@ fn should_enforce_cache_size_budget_for_persist_index(
     if enforce_every <= 1 {
         return true;
     }
-    persist_index % enforce_every == 0
+    persist_index.is_multiple_of(enforce_every)
 }
 
 fn should_enforce_cache_size_budget_for_state(
@@ -1207,7 +1224,6 @@ fn run_session_key(args: SessionKeyArgs) -> Result<()> {
 }
 
 fn run_build(args: BuildArgs) -> Result<()> {
-    validate_scarb_toolchain()?;
     let common = args.common;
     let report_path = args.report_path;
     let write_report = report_path.is_some();
@@ -1225,6 +1241,7 @@ fn run_build(args: BuildArgs) -> Result<()> {
     let mut phase_telemetry: Option<BuildPhaseTelemetry> = None;
     let (run, cache_hit, fingerprint) = match engine {
         EngineArg::Scarb => {
+            validate_scarb_toolchain()?;
             let (command, command_vec) = scarb_build_command(&common, &manifest_path);
             let run = run_command(command, command_vec, write_report)?;
             let fingerprint = if write_report {
@@ -1237,6 +1254,8 @@ fn run_build(args: BuildArgs) -> Result<()> {
         EngineArg::Uc => {
             let run_local =
                 || -> Result<(CommandRun, bool, String, String, BuildPhaseTelemetry)> {
+                    // Local UC builds execute Scarb directly in-process and must enforce the toolchain gate.
+                    validate_scarb_toolchain()?;
                     let local_session_key = build_session_input(&common, &manifest_path, &profile)?
                         .deterministic_key_hex();
                     let (run, cache_hit, fingerprint, telemetry) = run_build_with_uc_cache(
@@ -1245,8 +1264,11 @@ fn run_build(args: BuildArgs) -> Result<()> {
                         &workspace_root,
                         &profile,
                         &local_session_key,
-                        false,
-                        false,
+                        BuildRunOptions {
+                            capture_output: false,
+                            inherit_output_when_uncaptured: true,
+                            async_cache_persist: false,
+                        },
                     )?;
                     Ok((run, cache_hit, fingerprint, local_session_key, telemetry))
                 };
@@ -1513,6 +1535,9 @@ fn metadata_args_from_daemon_request(request: &DaemonMetadataRequest) -> Metadat
 fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildResponse> {
     validate_daemon_protocol_version(&request.protocol_version)
         .context("daemon build request protocol mismatch")?;
+    // Daemon mode validates the Scarb toolchain in the daemon process so clients avoid repeated
+    // `scarb --version` subprocess overhead per request.
+    validate_scarb_toolchain()?;
     let common = common_args_from_daemon_request(&request);
     let manifest_path = resolve_manifest_path(&common.manifest_path)?;
     let workspace_root = manifest_path
@@ -1529,8 +1554,11 @@ fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildRespon
         &workspace_root,
         &profile,
         &session_key,
-        request.capture_output,
-        request.async_cache_persist,
+        BuildRunOptions {
+            capture_output: request.capture_output,
+            inherit_output_when_uncaptured: request.capture_output,
+            async_cache_persist: request.async_cache_persist,
+        },
     )?;
 
     Ok(DaemonBuildResponse {
@@ -1807,8 +1835,7 @@ fn run_build_with_uc_cache(
     workspace_root: &Path,
     profile: &str,
     session_key: &str,
-    capture_output: bool,
-    async_cache_persist: bool,
+    options: BuildRunOptions,
 ) -> Result<(CommandRun, bool, String, BuildPhaseTelemetry)> {
     let async_errors = take_async_persist_errors();
     if !async_errors.is_empty() {
@@ -1824,12 +1851,7 @@ fn run_build_with_uc_cache(
         }
     }
     let mut telemetry = BuildPhaseTelemetry::default();
-    let canonical_workspace_root = workspace_root.canonicalize().with_context(|| {
-        format!(
-            "failed to resolve workspace root for cache path {}",
-            workspace_root.display()
-        )
-    })?;
+    let canonical_workspace_root = workspace_root.to_path_buf();
     validate_hex_digest("session key", session_key, SESSION_KEY_LEN)?;
     let cache_root = canonical_workspace_root.join(".uc/cache");
     ensure_path_within_root(&canonical_workspace_root, &cache_root, "cache root")?;
@@ -1903,11 +1925,17 @@ fn run_build_with_uc_cache(
     }
 
     let (command, command_vec) = scarb_build_command(common, manifest_path);
-    let run = run_command(command, command_vec, capture_output)?;
+    let run = if options.capture_output {
+        run_command_capture(command, command_vec)?
+    } else if options.inherit_output_when_uncaptured {
+        run_command_status(command, command_vec)?
+    } else {
+        run_command_status_silent(command, command_vec)?
+    };
     telemetry.compile_ms = run.elapsed_ms;
 
     if run.exit_code == 0 {
-        if async_cache_persist {
+        if options.async_cache_persist {
             telemetry.cache_persist_async = true;
             let persist_scope_key = async_persist_scope_key(&canonical_workspace_root, profile);
             if try_mark_async_persist_in_flight(&persist_scope_key) {
@@ -2151,6 +2179,20 @@ fn join_stream_thread(handle: thread::JoinHandle<Result<Vec<u8>>>, label: &str) 
 fn run_command_status(mut command: Command, command_vec: Vec<String>) -> Result<CommandRun> {
     let start = Instant::now();
     command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    let status = command.status().context("failed to run command")?;
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    Ok(CommandRun {
+        command: command_vec,
+        exit_code: exit_code_from_status(&status),
+        elapsed_ms,
+        stdout: String::new(),
+        stderr: String::new(),
+    })
+}
+
+fn run_command_status_silent(mut command: Command, command_vec: Vec<String>) -> Result<CommandRun> {
+    let start = Instant::now();
+    command.stdout(Stdio::null()).stderr(Stdio::null());
     let status = command.status().context("failed to run command")?;
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
     Ok(CommandRun {
@@ -2541,7 +2583,7 @@ fn build_session_input(
     profile: &str,
 ) -> Result<SessionInput> {
     let scarb_version = scarb_version_line()?;
-    let build_env_fingerprint = compute_build_env_fingerprint();
+    let build_env_fingerprint = current_build_env_fingerprint();
     let manifest_metadata = fs::metadata(manifest_path)
         .with_context(|| format!("failed to stat {}", manifest_path.display()))?;
     let manifest_size_bytes = manifest_metadata.len();
@@ -2680,6 +2722,17 @@ fn compute_build_env_fingerprint() -> String {
         hasher.update(b"\n");
     }
     hasher.finalize().to_hex().to_string()
+}
+
+#[cfg(test)]
+fn current_build_env_fingerprint() -> String {
+    compute_build_env_fingerprint()
+}
+
+#[cfg(not(test))]
+fn current_build_env_fingerprint() -> String {
+    static VALUE: OnceLock<String> = OnceLock::new();
+    VALUE.get_or_init(compute_build_env_fingerprint).clone()
 }
 
 #[cfg(test)]
@@ -3069,7 +3122,7 @@ fn parse_semver_triplet(value: &str) -> Result<(u64, u64, u64)> {
 fn parse_scarb_semver(version_line: &str) -> Result<(u64, u64, u64)> {
     let mut parts = version_line.split_whitespace();
     let tool = parts.next().unwrap_or_default();
-    if tool.to_ascii_lowercase() != "scarb" {
+    if !tool.eq_ignore_ascii_case("scarb") {
         bail!("unexpected `scarb --version` output: {version_line}");
     }
     let semver = parts
@@ -3091,9 +3144,77 @@ fn min_scarb_version() -> String {
         .clone()
 }
 
-fn validate_scarb_toolchain() -> Result<()> {
-    let version = scarb_version_line()?;
-    let current = parse_scarb_semver(&version)
+fn scarb_toolchain_cache_ttl_ms() -> u64 {
+    parse_env_u64(
+        "UC_SCARB_TOOLCHAIN_CACHE_TTL_MS",
+        DEFAULT_SCARB_TOOLCHAIN_CACHE_TTL_MS,
+    )
+}
+
+fn scarb_toolchain_cache_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("UC_SCARB_TOOLCHAIN_CACHE_PATH") {
+        let path = PathBuf::from(path);
+        if !path.as_os_str().is_empty() {
+            return Some(path);
+        }
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".uc/toolchain-check-v1.json"))
+}
+
+fn load_cached_scarb_toolchain_version_line() -> Option<String> {
+    let path = scarb_toolchain_cache_path()?;
+    if !path.exists() {
+        return None;
+    }
+    let bytes = read_bytes_with_limit(
+        &path,
+        MAX_TOOLCHAIN_CHECK_CACHE_BYTES,
+        "scarb toolchain cache",
+    )
+    .ok()?;
+    let cache: ToolchainCheckCacheEntry = serde_json::from_slice(&bytes).ok()?;
+    if cache.schema_version != TOOLCHAIN_CHECK_CACHE_SCHEMA_VERSION {
+        return None;
+    }
+    let now_ms = epoch_ms_u64().ok()?;
+    if now_ms.saturating_sub(cache.checked_epoch_ms) > scarb_toolchain_cache_ttl_ms() {
+        return None;
+    }
+    let version_line = cache.version_line.trim();
+    if version_line.is_empty() {
+        return None;
+    }
+    Some(version_line.to_string())
+}
+
+fn store_cached_scarb_toolchain_version_line(version_line: &str) {
+    let Some(path) = scarb_toolchain_cache_path() else {
+        return;
+    };
+    let checked_epoch_ms = match epoch_ms_u64() {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    let cache = ToolchainCheckCacheEntry {
+        schema_version: TOOLCHAIN_CHECK_CACHE_SCHEMA_VERSION,
+        checked_epoch_ms,
+        version_line: version_line.to_string(),
+    };
+    let bytes = match serde_json::to_vec(&cache) {
+        Ok(bytes) => bytes,
+        Err(_) => return,
+    };
+    if let Some(parent) = path.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let _ = atomic_write_bytes(&path, &bytes, "scarb toolchain cache");
+}
+
+fn validate_scarb_version_constraints(version: &str) -> Result<()> {
+    let current = parse_scarb_semver(version)
         .with_context(|| format!("failed to parse scarb semantic version from `{version}`"))?;
     let minimum_text = min_scarb_version();
     let minimum = parse_semver_triplet(&minimum_text).with_context(|| {
@@ -3113,6 +3234,28 @@ fn validate_scarb_toolchain() -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+fn validate_scarb_toolchain() -> Result<()> {
+    static VALIDATED_THIS_PROCESS: OnceLock<()> = OnceLock::new();
+    if VALIDATED_THIS_PROCESS.get().is_some() {
+        return Ok(());
+    }
+    if parse_env_bool("UC_SKIP_SCARB_TOOLCHAIN_CHECK", false) {
+        let _ = VALIDATED_THIS_PROCESS.set(());
+        return Ok(());
+    }
+    if let Some(cached) = load_cached_scarb_toolchain_version_line() {
+        validate_scarb_version_constraints(&cached)?;
+        let _ = VALIDATED_THIS_PROCESS.set(());
+        return Ok(());
+    }
+
+    let version = scarb_version_line()?;
+    validate_scarb_version_constraints(&version)?;
+    store_cached_scarb_toolchain_version_line(&version);
+    let _ = VALIDATED_THIS_PROCESS.set(());
     Ok(())
 }
 

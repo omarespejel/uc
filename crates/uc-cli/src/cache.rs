@@ -367,17 +367,18 @@ pub(super) fn restore_cached_artifacts(
                         matches_cached_artifact = true;
                     }
                 }
-                if !matches_cached_artifact && existing_metadata.len() == artifact.size_bytes {
-                    if hash_file_blake3(&out_path)? == *expected_hash {
-                        upsert_artifact_index_entry_from_metadata(
-                            &mut artifact_index,
-                            &relative_path_key,
-                            &existing_metadata,
-                            expected_hash,
-                        )?;
-                        artifact_index_changed = true;
-                        matches_cached_artifact = true;
-                    }
+                if !matches_cached_artifact
+                    && existing_metadata.len() == artifact.size_bytes
+                    && hash_file_blake3(&out_path)? == *expected_hash
+                {
+                    upsert_artifact_index_entry_from_metadata(
+                        &mut artifact_index,
+                        &relative_path_key,
+                        &existing_metadata,
+                        expected_hash,
+                    )?;
+                    artifact_index_changed = true;
+                    matches_cached_artifact = true;
                 }
             }
             if matches_cached_artifact {
@@ -444,7 +445,7 @@ pub(super) fn try_reflink_file(source: &Path, destination: &Path) -> io::Result<
         if result == 0 {
             return Ok(());
         }
-        return Err(io::Error::last_os_error());
+        Err(io::Error::last_os_error())
     }
 
     #[cfg(target_os = "macos")]
@@ -458,7 +459,7 @@ pub(super) fn try_reflink_file(source: &Path, destination: &Path) -> io::Result<
         if result == 0 {
             return Ok(());
         }
-        return Err(io::Error::last_os_error());
+        Err(io::Error::last_os_error())
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]

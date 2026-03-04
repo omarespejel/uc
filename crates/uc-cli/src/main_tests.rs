@@ -83,8 +83,11 @@ fn run_smoke_cached_build(
         workspace_root,
         profile,
         session_key,
-        true,
-        false,
+        BuildRunOptions {
+            capture_output: true,
+            inherit_output_when_uncaptured: true,
+            async_cache_persist: false,
+        },
     )
 }
 
@@ -297,6 +300,57 @@ fn scarb_version_line_uses_env_override() {
 }
 
 #[test]
+fn validate_scarb_version_constraints_respects_minimum_and_expected() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::env::set_var("UC_MIN_SCARB_VERSION", "2.14.0");
+    std::env::remove_var("UC_EXPECT_SCARB_VERSION");
+    assert!(validate_scarb_version_constraints("scarb 2.14.1 (local)").is_ok());
+    assert!(validate_scarb_version_constraints("scarb 2.13.9 (local)").is_err());
+
+    std::env::set_var("UC_MIN_SCARB_VERSION", "2.14.0");
+    std::env::set_var("UC_EXPECT_SCARB_VERSION", "2.14.1");
+    assert!(validate_scarb_version_constraints("scarb 2.14.1 (local)").is_ok());
+    std::env::set_var("UC_EXPECT_SCARB_VERSION", "2.14.9");
+    assert!(validate_scarb_version_constraints("scarb 2.14.1 (local)").is_err());
+
+    std::env::remove_var("UC_MIN_SCARB_VERSION");
+    std::env::remove_var("UC_EXPECT_SCARB_VERSION");
+}
+
+#[test]
+fn scarb_toolchain_cache_load_rejects_stale_entries() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = unique_test_dir("uc-toolchain-cache");
+    let cache_path = dir.join("scarb-toolchain.json");
+    std::env::set_var("UC_SCARB_TOOLCHAIN_CACHE_PATH", &cache_path);
+    std::env::set_var("UC_SCARB_TOOLCHAIN_CACHE_TTL_MS", "600000");
+
+    store_cached_scarb_toolchain_version_line("scarb 2.14.2 (cached)");
+    let loaded = load_cached_scarb_toolchain_version_line();
+    assert_eq!(loaded.as_deref(), Some("scarb 2.14.2 (cached)"));
+
+    let stale = ToolchainCheckCacheEntry {
+        schema_version: TOOLCHAIN_CHECK_CACHE_SCHEMA_VERSION,
+        checked_epoch_ms: 0,
+        version_line: "scarb 2.14.2 (cached)".to_string(),
+    };
+    fs::write(&cache_path, serde_json::to_vec(&stale).unwrap())
+        .expect("failed to write stale toolchain cache");
+    assert!(
+        load_cached_scarb_toolchain_version_line().is_none(),
+        "stale toolchain cache should be ignored"
+    );
+
+    std::env::remove_var("UC_SCARB_TOOLCHAIN_CACHE_PATH");
+    std::env::remove_var("UC_SCARB_TOOLCHAIN_CACHE_TTL_MS");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn build_env_fingerprint_tracks_prefixed_vars_only() {
     let _guard = integration_env_lock()
         .lock()
@@ -456,9 +510,7 @@ fn parse_metadata_format_version_accepts_supported_values() {
 
 #[test]
 fn validate_daemon_protocol_version_rejects_mismatch() {
-    let err = validate_daemon_protocol_version("0.0.0")
-        .err()
-        .expect("expected mismatch");
+    let err = validate_daemon_protocol_version("0.0.0").expect_err("expected mismatch");
     assert!(
         format!("{err:#}").contains("daemon protocol mismatch"),
         "unexpected error: {err:#}"
