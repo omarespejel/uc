@@ -29,44 +29,137 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             (run, false, fingerprint)
         }
         EngineArg::Uc => {
-            let local_session_key =
-                build_session_input(&common, &manifest_path, &profile)?.deterministic_key_hex();
-            let run_local =
-                |session_key: &str| -> Result<(CommandRun, bool, String, BuildPhaseTelemetry)> {
-                    // Local UC builds execute Scarb directly in-process and must enforce the toolchain gate.
-                    validate_scarb_toolchain()?;
+            let run_local_with_backend =
+                |session_key: &str,
+                 compiler_version: &str,
+                 backend: BuildCompileBackend|
+                 -> Result<(CommandRun, bool, String, BuildPhaseTelemetry)> {
+                    if backend == BuildCompileBackend::Scarb {
+                        // Local Scarb-backed UC builds execute Scarb directly in-process and must enforce the toolchain gate.
+                        validate_scarb_toolchain()?;
+                    }
                     let (run, cache_hit, fingerprint, telemetry) = run_build_with_uc_cache(
                         &common,
-                        &manifest_path,
-                        &workspace_root,
-                        &profile,
-                        session_key,
-                        BuildRunOptions {
-                            capture_output: false,
-                            inherit_output_when_uncaptured: true,
-                            async_cache_persist: false,
-                            use_daemon_shared_cache: false,
+                        BuildCacheRunContext {
+                            manifest_path: &manifest_path,
+                            workspace_root: &workspace_root,
+                            profile: &profile,
+                            session_key,
+                            compiler_version,
+                            compile_backend: backend,
+                            options: BuildRunOptions {
+                                capture_output: false,
+                                inherit_output_when_uncaptured: true,
+                                async_cache_persist: false,
+                                use_daemon_shared_cache: false,
+                            },
                         },
                     )?;
                     Ok((run, cache_hit, fingerprint, telemetry))
                 };
 
             match daemon_mode {
-                DaemonModeArg::Off => {
-                    let (run, cache_hit, fingerprint, telemetry) = run_local(&local_session_key)?;
-                    session_key = local_session_key.clone();
-                    phase_telemetry = Some(telemetry);
-                    (run, cache_hit, fingerprint)
-                }
+                DaemonModeArg::Off => match native_build_mode() {
+                    NativeBuildMode::Off => {
+                        let compiler_version = scarb_version_line()?;
+                        let local_session_key = build_session_input_with_compiler_version(
+                            &common,
+                            &manifest_path,
+                            &profile,
+                            &compiler_version,
+                        )?
+                        .deterministic_key_hex();
+                        let (run, cache_hit, fingerprint, telemetry) = run_local_with_backend(
+                            &local_session_key,
+                            &compiler_version,
+                            BuildCompileBackend::Scarb,
+                        )?;
+                        session_key = local_session_key;
+                        phase_telemetry = Some(telemetry);
+                        (run, cache_hit, fingerprint)
+                    }
+                    NativeBuildMode::Auto => {
+                        let native_compiler_version = native_compiler_version_line();
+                        let native_session_key = build_session_input_with_compiler_version(
+                            &common,
+                            &manifest_path,
+                            &profile,
+                            &native_compiler_version,
+                        )?
+                        .deterministic_key_hex();
+                        match run_local_with_backend(
+                            &native_session_key,
+                            &native_compiler_version,
+                            BuildCompileBackend::Native,
+                        ) {
+                            Ok((run, cache_hit, fingerprint, telemetry)) => {
+                                session_key = native_session_key;
+                                phase_telemetry = Some(telemetry);
+                                (run, cache_hit, fingerprint)
+                            }
+                            Err(native_err) => {
+                                eprintln!(
+                                        "uc: native compile unavailable ({}), falling back to scarb backend",
+                                        native_err
+                                    );
+                                let compiler_version = scarb_version_line()?;
+                                let local_session_key = build_session_input_with_compiler_version(
+                                    &common,
+                                    &manifest_path,
+                                    &profile,
+                                    &compiler_version,
+                                )?
+                                .deterministic_key_hex();
+                                let (run, cache_hit, fingerprint, telemetry) =
+                                    run_local_with_backend(
+                                        &local_session_key,
+                                        &compiler_version,
+                                        BuildCompileBackend::Scarb,
+                                    )?;
+                                session_key = local_session_key;
+                                phase_telemetry = Some(telemetry);
+                                (run, cache_hit, fingerprint)
+                            }
+                        }
+                    }
+                    NativeBuildMode::Require => {
+                        let native_compiler_version = native_compiler_version_line();
+                        let native_session_key = build_session_input_with_compiler_version(
+                            &common,
+                            &manifest_path,
+                            &profile,
+                            &native_compiler_version,
+                        )?
+                        .deterministic_key_hex();
+                        let (run, cache_hit, fingerprint, telemetry) = run_local_with_backend(
+                            &native_session_key,
+                            &native_compiler_version,
+                            BuildCompileBackend::Native,
+                        )
+                        .context("native compile mode is require but native backend failed")?;
+                        session_key = native_session_key;
+                        phase_telemetry = Some(telemetry);
+                        (run, cache_hit, fingerprint)
+                    }
+                },
                 DaemonModeArg::Auto => {
+                    let compiler_version = scarb_version_line()?;
+                    let local_session_key = build_session_input_with_compiler_version(
+                        &common,
+                        &manifest_path,
+                        &profile,
+                        &compiler_version,
+                    )?
+                    .deterministic_key_hex();
                     if let Some((run, fingerprint, telemetry)) = try_local_uc_cache_hit(
                         &common,
                         &manifest_path,
                         &workspace_root,
                         &profile,
                         &local_session_key,
+                        &compiler_version,
                     )? {
-                        session_key = local_session_key.clone();
+                        session_key = local_session_key;
                         phase_telemetry = Some(telemetry);
                         (run, true, fingerprint)
                     } else if let Some(response) =
@@ -77,22 +170,34 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                         phase_telemetry = Some(response.telemetry);
                         (response.run, response.cache_hit, response.fingerprint)
                     } else {
-                        let (run, cache_hit, fingerprint, telemetry) =
-                            run_local(&local_session_key)?;
-                        session_key = local_session_key.clone();
+                        let (run, cache_hit, fingerprint, telemetry) = run_local_with_backend(
+                            &local_session_key,
+                            &compiler_version,
+                            BuildCompileBackend::Scarb,
+                        )?;
+                        session_key = local_session_key;
                         phase_telemetry = Some(telemetry);
                         (run, cache_hit, fingerprint)
                     }
                 }
                 DaemonModeArg::Require => {
+                    let compiler_version = scarb_version_line()?;
+                    let local_session_key = build_session_input_with_compiler_version(
+                        &common,
+                        &manifest_path,
+                        &profile,
+                        &compiler_version,
+                    )?
+                    .deterministic_key_hex();
                     if let Some((run, fingerprint, telemetry)) = try_local_uc_cache_hit(
                         &common,
                         &manifest_path,
                         &workspace_root,
                         &profile,
                         &local_session_key,
+                        &compiler_version,
                     )? {
-                        session_key = local_session_key.clone();
+                        session_key = local_session_key;
                         phase_telemetry = Some(telemetry);
                         (run, true, fingerprint)
                     } else {

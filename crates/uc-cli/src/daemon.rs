@@ -182,13 +182,39 @@ pub(super) fn daemon_request_with_timeouts(
     if response_line.trim().is_empty() {
         bail!("daemon returned empty response");
     }
-    serde_json::from_str(response_line.trim_end()).context("failed to decode daemon response")
+    match decode_daemon_response(response_line.trim_end()) {
+        Ok(response) => Ok(response),
+        Err(err) => {
+            if matches!(
+                std::env::var("UC_DEBUG_DAEMON_RESPONSE")
+                    .ok()
+                    .map(|value| value.trim().to_ascii_lowercase()),
+                Some(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on")
+            ) {
+                eprintln!(
+                    "uc: debug raw daemon response: {}",
+                    response_line.trim_end()
+                );
+            }
+            Err(err).context("failed to decode daemon response")
+        }
+    }
+}
+
+pub(super) fn decode_daemon_request(line: &str) -> serde_json::Result<DaemonRequest> {
+    let value: serde_json::Value = serde_json::from_str(line)?;
+    serde_json::from_value(value)
+}
+
+pub(super) fn decode_daemon_response(line: &str) -> serde_json::Result<DaemonResponse> {
+    let value: serde_json::Value = serde_json::from_str(line)?;
+    serde_json::from_value(value)
 }
 
 #[cfg(unix)]
 pub(super) fn daemon_ping(socket_path: &Path) -> Result<DaemonStatusPayload> {
     match daemon_request(socket_path, &DaemonRequest::Ping)? {
-        DaemonResponse::Pong(status) => Ok(status),
+        DaemonResponse::Pong { payload } => Ok(payload),
         DaemonResponse::Error { message } => bail!("daemon ping failed: {message}"),
         _ => bail!("unexpected daemon response to ping"),
     }
@@ -196,8 +222,8 @@ pub(super) fn daemon_ping(socket_path: &Path) -> Result<DaemonStatusPayload> {
 
 pub(super) fn daemon_request_protocol_version(request: &DaemonRequest) -> Option<&str> {
     match request {
-        DaemonRequest::Build(payload) => Some(payload.protocol_version.as_str()),
-        DaemonRequest::Metadata(payload) => Some(payload.protocol_version.as_str()),
+        DaemonRequest::Build { payload } => Some(payload.protocol_version.as_str()),
+        DaemonRequest::Metadata { payload } => Some(payload.protocol_version.as_str()),
         DaemonRequest::Ping | DaemonRequest::Shutdown => None,
     }
 }
@@ -335,7 +361,7 @@ pub(super) fn handle_daemon_connection(
         return Ok(());
     }
 
-    let request: DaemonRequest = match serde_json::from_str(request_line.trim_end()) {
+    let request: DaemonRequest = match decode_daemon_request(request_line.trim_end()) {
         Ok(request) => request,
         Err(err) => {
             let message = format!("failed to parse daemon request: {err}");
@@ -372,17 +398,19 @@ pub(super) fn handle_daemon_connection(
     let response = match request {
         DaemonRequest::Ping => {
             record_daemon_success(health);
-            DaemonResponse::Pong(daemon_status_snapshot(status, health))
+            DaemonResponse::Pong {
+                payload: daemon_status_snapshot(status, health),
+            }
         }
         DaemonRequest::Shutdown => {
             record_daemon_success(health);
             should_shutdown.store(true, Ordering::Relaxed);
             DaemonResponse::Ack
         }
-        DaemonRequest::Build(request) => match execute_daemon_build(request) {
+        DaemonRequest::Build { payload } => match execute_daemon_build(payload) {
             Ok(result) => {
                 record_daemon_success(health);
-                DaemonResponse::Build(result)
+                DaemonResponse::Build { payload: result }
             }
             Err(err) => {
                 let message = format!("{err:#}");
@@ -390,10 +418,10 @@ pub(super) fn handle_daemon_connection(
                 DaemonResponse::Error { message }
             }
         },
-        DaemonRequest::Metadata(request) => match execute_daemon_metadata(request) {
+        DaemonRequest::Metadata { payload } => match execute_daemon_metadata(payload) {
             Ok(result) => {
                 record_daemon_success(health);
-                DaemonResponse::Metadata(result)
+                DaemonResponse::Metadata { payload: result }
             }
             Err(err) => {
                 let message = format!("{err:#}");

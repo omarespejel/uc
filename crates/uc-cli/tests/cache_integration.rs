@@ -20,6 +20,14 @@ struct TestWorkspace {
     root: PathBuf,
 }
 
+#[derive(Default)]
+struct BuildEnvOverrides<'a> {
+    path_override: Option<&'a Path>,
+    scarb_version_override: Option<&'a str>,
+    native_mode_override: Option<&'a str>,
+    native_corelib_override: Option<&'a Path>,
+}
+
 impl Drop for TestWorkspace {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
@@ -146,8 +154,10 @@ fn run_uc_build_for_root_with_path_override(
         report_tag,
         daemon_mode,
         daemon_socket_path,
-        path_override,
-        None,
+        BuildEnvOverrides {
+            path_override,
+            ..BuildEnvOverrides::default()
+        },
     )
 }
 
@@ -157,8 +167,7 @@ fn run_uc_build_for_root_with_env_overrides(
     report_tag: &str,
     daemon_mode: &str,
     daemon_socket_path: Option<&Path>,
-    path_override: Option<&Path>,
-    scarb_version_override: Option<&str>,
+    overrides: BuildEnvOverrides<'_>,
 ) -> (Output, BuildReport) {
     let report_path = root.join(".uc").join(format!("report-{report_tag}.json"));
     if let Some(parent) = report_path.parent() {
@@ -182,13 +191,23 @@ fn run_uc_build_for_root_with_env_overrides(
     } else {
         command.env_remove("UC_DAEMON_SOCKET_PATH");
     }
-    if let Some(path) = path_override {
+    if let Some(path) = overrides.path_override {
         command.env("PATH", path);
     }
-    if let Some(version) = scarb_version_override {
+    if let Some(version) = overrides.scarb_version_override {
         command.env("UC_SCARB_VERSION_LINE", version);
     } else {
         command.env_remove("UC_SCARB_VERSION_LINE");
+    }
+    if let Some(mode) = overrides.native_mode_override {
+        command.env("UC_NATIVE_BUILD_MODE", mode);
+    } else {
+        command.env_remove("UC_NATIVE_BUILD_MODE");
+    }
+    if let Some(corelib_src) = overrides.native_corelib_override {
+        command.env("UC_NATIVE_CORELIB_SRC", corelib_src);
+    } else {
+        command.env_remove("UC_NATIVE_CORELIB_SRC");
     }
     let output = command.output().expect("failed to execute uc build");
     let report_bytes = fs::read(&report_path).unwrap_or_else(|err| {
@@ -210,6 +229,24 @@ fn run_uc_build_output_only(
     daemon_mode: &str,
     daemon_socket_path: Option<&Path>,
 ) -> Output {
+    run_uc_build_output_only_with_env_overrides(
+        root,
+        manifest_path,
+        daemon_mode,
+        daemon_socket_path,
+        None,
+        None,
+    )
+}
+
+fn run_uc_build_output_only_with_env_overrides(
+    root: &Path,
+    manifest_path: &Path,
+    daemon_mode: &str,
+    daemon_socket_path: Option<&Path>,
+    native_mode_override: Option<&str>,
+    native_corelib_override: Option<&Path>,
+) -> Output {
     let mut command = Command::new(uc_bin());
     command
         .current_dir(root)
@@ -225,6 +262,16 @@ fn run_uc_build_output_only(
         command.env("UC_DAEMON_SOCKET_PATH", socket_path);
     } else {
         command.env_remove("UC_DAEMON_SOCKET_PATH");
+    }
+    if let Some(mode) = native_mode_override {
+        command.env("UC_NATIVE_BUILD_MODE", mode);
+    } else {
+        command.env_remove("UC_NATIVE_BUILD_MODE");
+    }
+    if let Some(corelib_src) = native_corelib_override {
+        command.env("UC_NATIVE_CORELIB_SRC", corelib_src);
+    } else {
+        command.env_remove("UC_NATIVE_CORELIB_SRC");
     }
     command.output().expect("failed to execute uc build")
 }
@@ -726,8 +773,11 @@ fn integration_daemon_auto_mode_local_hit_skips_daemon_and_missing_scarb() {
         "auto-local-hit",
         "auto",
         Some(&missing_socket),
-        Some(&no_scarb_path),
-        Some(&scarb_version),
+        BuildEnvOverrides {
+            path_override: Some(&no_scarb_path),
+            scarb_version_override: Some(&scarb_version),
+            ..BuildEnvOverrides::default()
+        },
     );
     assert_success(&probe_output, "daemon auto local-hit probe");
     assert!(
@@ -782,8 +832,11 @@ fn integration_daemon_require_mode_local_hit_skips_missing_daemon_and_scarb() {
         "require-local-hit",
         "require",
         Some(&missing_socket),
-        Some(&no_scarb_path),
-        Some(&scarb_version),
+        BuildEnvOverrides {
+            path_override: Some(&no_scarb_path),
+            scarb_version_override: Some(&scarb_version),
+            ..BuildEnvOverrides::default()
+        },
     );
     assert_success(&probe_output, "daemon require local-hit probe");
     assert!(
@@ -794,5 +847,87 @@ fn integration_daemon_require_mode_local_hit_skips_missing_daemon_and_scarb() {
     assert!(
         !combined.contains("daemon mode is require but daemon is unavailable"),
         "local probe hit should bypass daemon unavailability failure: {combined}"
+    );
+}
+
+#[test]
+fn integration_native_auto_mode_falls_back_when_native_backend_unavailable() {
+    let _guard = serial_guard();
+    if !scarb_available() {
+        eprintln!(
+            "skipping integration_native_auto_mode_falls_back_when_native_backend_unavailable: scarb not available"
+        );
+        return;
+    }
+    let workspace = make_test_workspace("native-auto-fallback");
+    let manifest = workspace.root.join("Scarb.toml");
+    let missing_corelib = std::env::temp_dir().join(format!(
+        "uc-it-missing-corelib-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos()
+    ));
+    let _ = fs::remove_dir_all(&missing_corelib);
+
+    let (output, report) = run_uc_build_for_root_with_env_overrides(
+        &workspace.root,
+        &manifest,
+        "native-auto-fallback",
+        "off",
+        None,
+        BuildEnvOverrides {
+            native_mode_override: Some("auto"),
+            native_corelib_override: Some(&missing_corelib),
+            ..BuildEnvOverrides::default()
+        },
+    );
+    assert_success(&output, "native auto fallback build");
+    assert_eq!(report.exit_code, 0);
+    let combined = output_to_utf8(&output);
+    assert!(
+        combined.contains("native compile unavailable"),
+        "native auto mode should log fallback reason: {combined}"
+    );
+}
+
+#[test]
+fn integration_native_require_mode_fails_when_native_backend_unavailable() {
+    let _guard = serial_guard();
+    if !scarb_available() {
+        eprintln!(
+            "skipping integration_native_require_mode_fails_when_native_backend_unavailable: scarb not available"
+        );
+        return;
+    }
+    let workspace = make_test_workspace("native-require-missing");
+    let manifest = workspace.root.join("Scarb.toml");
+    let missing_corelib = std::env::temp_dir().join(format!(
+        "uc-it-missing-corelib-require-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos()
+    ));
+    let _ = fs::remove_dir_all(&missing_corelib);
+
+    let output = run_uc_build_output_only_with_env_overrides(
+        &workspace.root,
+        &manifest,
+        "off",
+        None,
+        Some("require"),
+        Some(&missing_corelib),
+    );
+    assert!(
+        !output.status.success(),
+        "native require mode should fail when native backend cannot initialize"
+    );
+    let combined = output_to_utf8(&output);
+    assert!(
+        combined.contains("native compile mode is require but native backend failed"),
+        "unexpected native require failure output: {combined}"
     );
 }

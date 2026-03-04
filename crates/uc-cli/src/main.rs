@@ -1,5 +1,15 @@
 use anyhow::{bail, Context, Result};
 use blake3::Hasher;
+use cairo_lang_compiler::db::RootDatabase;
+use cairo_lang_compiler::project::setup_project;
+use cairo_lang_compiler::{compile_cairo_project_at_path, CompilerConfig};
+use cairo_lang_defs::ids::TopLevelLanguageElementId;
+use cairo_lang_filesystem::ids::CrateInput;
+use cairo_lang_lowering::optimizations::config::Optimizations;
+use cairo_lang_lowering::utils::InliningStrategy;
+use cairo_lang_starknet::compile::compile_prepared_db as compile_starknet_prepared_db;
+use cairo_lang_starknet::contract::find_contracts;
+use cairo_lang_starknet::starknet_plugin_suite;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -92,6 +102,7 @@ const DEFAULT_DAEMON_LOCK_HASH_CACHE_MAX_ENTRIES: usize = 512;
 const DEFAULT_DAEMON_SHARED_CACHE_ENABLED: bool = true;
 const DEFAULT_DAEMON_SHARED_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const DEFAULT_UC_DISABLE_SCARB_ARTIFACTS_FINGERPRINT: bool = false;
+const DEFAULT_UC_NATIVE_BUILD_MODE: &str = "off";
 const TOOLCHAIN_CHECK_CACHE_SCHEMA_VERSION: u32 = 1;
 const MAX_TOOLCHAIN_CHECK_CACHE_BYTES: u64 = 64 * 1024;
 const DEFAULT_SCARB_TOOLCHAIN_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
@@ -182,6 +193,19 @@ impl EngineArg {
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum DaemonModeArg {
+    Off,
+    Auto,
+    Require,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum BuildCompileBackend {
+    Scarb,
+    Native,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum NativeBuildMode {
     Off,
     Auto,
     Require,
@@ -336,6 +360,46 @@ struct BuildRunOptions {
     inherit_output_when_uncaptured: bool,
     async_cache_persist: bool,
     use_daemon_shared_cache: bool,
+}
+
+#[derive(Copy, Clone)]
+struct BuildCacheRunContext<'a> {
+    manifest_path: &'a Path,
+    workspace_root: &'a Path,
+    profile: &'a str,
+    session_key: &'a str,
+    compiler_version: &'a str,
+    compile_backend: BuildCompileBackend,
+    options: BuildRunOptions,
+}
+
+#[derive(Debug, Clone)]
+struct NativeCompileContext {
+    package_name: String,
+    crate_name: String,
+    cairo_project_dir: PathBuf,
+    corelib_root: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct StarknetArtifactsManifest {
+    version: u32,
+    contracts: Vec<StarknetArtifactEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct StarknetArtifactEntry {
+    id: String,
+    package_name: String,
+    contract_name: String,
+    module_path: String,
+    artifacts: StarknetArtifactFiles,
+}
+
+#[derive(Debug, Serialize)]
+struct StarknetArtifactFiles {
+    sierra: String,
+    casm: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -538,18 +602,35 @@ struct DaemonMetadataResponse {
 enum DaemonRequest {
     Ping,
     Shutdown,
-    Build(DaemonBuildRequest),
-    Metadata(DaemonMetadataRequest),
+    Build {
+        #[serde(flatten)]
+        payload: DaemonBuildRequest,
+    },
+    Metadata {
+        #[serde(flatten)]
+        payload: DaemonMetadataRequest,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum DaemonResponse {
-    Pong(DaemonStatusPayload),
+    Pong {
+        #[serde(flatten)]
+        payload: DaemonStatusPayload,
+    },
     Ack,
-    Build(DaemonBuildResponse),
-    Metadata(DaemonMetadataResponse),
-    Error { message: String },
+    Build {
+        #[serde(flatten)]
+        payload: DaemonBuildResponse,
+    },
+    Metadata {
+        #[serde(flatten)]
+        payload: DaemonMetadataResponse,
+    },
+    Error {
+        message: String,
+    },
 }
 
 struct CacheLockGuard {
@@ -762,6 +843,29 @@ fn parse_env_bool(name: &str, default: bool) -> bool {
         }
         Err(_) => default,
     }
+}
+
+fn native_build_mode() -> NativeBuildMode {
+    let raw = std::env::var("UC_NATIVE_BUILD_MODE")
+        .unwrap_or_else(|_| DEFAULT_UC_NATIVE_BUILD_MODE.to_string());
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "off" => NativeBuildMode::Off,
+        "auto" => NativeBuildMode::Auto,
+        "require" => NativeBuildMode::Require,
+        _ => {
+            tracing::warn!(
+                env = "UC_NATIVE_BUILD_MODE",
+                value = %raw,
+                default = DEFAULT_UC_NATIVE_BUILD_MODE,
+                "invalid native build mode; using default"
+            );
+            NativeBuildMode::Off
+        }
+    }
+}
+
+fn native_compiler_version_line() -> String {
+    format!("uc-native {}", env!("CARGO_PKG_VERSION"))
 }
 
 fn max_fingerprint_files() -> usize {
@@ -1092,7 +1196,7 @@ fn daemon_client_write_timeout() -> Option<Duration> {
 
 fn daemon_request_read_timeout(request: &DaemonRequest) -> Option<Duration> {
     match request {
-        DaemonRequest::Build(_) => daemon_build_read_timeout(),
+        DaemonRequest::Build { .. } => daemon_build_read_timeout(),
         _ => daemon_control_read_timeout(),
     }
 }
@@ -1470,12 +1574,14 @@ fn try_uc_build_via_daemon(
             return Ok(None);
         }
 
-        let request = DaemonRequest::Build(daemon_build_request_from_common(
-            common,
-            manifest_path,
-            daemon_async_cache_persist_enabled(),
-            daemon_capture_output_enabled(),
-        ));
+        let request = DaemonRequest::Build {
+            payload: daemon_build_request_from_common(
+                common,
+                manifest_path,
+                daemon_async_cache_persist_enabled(),
+                daemon_capture_output_enabled(),
+            ),
+        };
         let response = match daemon_request(&socket_path, &request) {
             Ok(response) => response,
             Err(err) => {
@@ -1491,7 +1597,7 @@ fn try_uc_build_via_daemon(
         };
 
         match response {
-            DaemonResponse::Build(result) => Ok(Some(result)),
+            DaemonResponse::Build { payload } => Ok(Some(payload)),
             DaemonResponse::Error { message } => {
                 if fallback_to_local {
                     if daemon_response_protocol_mismatch(&message) {
@@ -1541,11 +1647,9 @@ fn try_uc_metadata_via_daemon(
             return Ok(None);
         }
 
-        let request = DaemonRequest::Metadata(daemon_metadata_request_from_args(
-            args,
-            manifest_path,
-            capture_output,
-        ));
+        let request = DaemonRequest::Metadata {
+            payload: daemon_metadata_request_from_args(args, manifest_path, capture_output),
+        };
         let response = match daemon_request(&socket_path, &request) {
             Ok(response) => response,
             Err(err) => {
@@ -1561,7 +1665,7 @@ fn try_uc_metadata_via_daemon(
         };
 
         match response {
-            DaemonResponse::Metadata(result) => Ok(Some(result.run)),
+            DaemonResponse::Metadata { payload } => Ok(Some(payload.run)),
             DaemonResponse::Error { message } => {
                 if fallback_to_local {
                     if daemon_response_protocol_mismatch(&message) {
@@ -1671,17 +1775,22 @@ fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildRespon
         );
     }
 
+    let compiler_version = scarb_version_line()?;
     let (run, cache_hit, fingerprint, telemetry) = run_build_with_uc_cache(
         &common,
-        &plan.manifest_path,
-        &plan.workspace_root,
-        &plan.profile,
-        &plan.session_key,
-        BuildRunOptions {
-            capture_output: request.capture_output,
-            inherit_output_when_uncaptured: request.capture_output,
-            async_cache_persist: request.async_cache_persist,
-            use_daemon_shared_cache: true,
+        BuildCacheRunContext {
+            manifest_path: &plan.manifest_path,
+            workspace_root: &plan.workspace_root,
+            profile: &plan.profile,
+            session_key: &plan.session_key,
+            compiler_version: &compiler_version,
+            compile_backend: BuildCompileBackend::Scarb,
+            options: BuildRunOptions {
+                capture_output: request.capture_output,
+                inherit_output_when_uncaptured: request.capture_output,
+                async_cache_persist: request.async_cache_persist,
+                use_daemon_shared_cache: true,
+            },
         },
     )?;
 
@@ -1711,6 +1820,7 @@ fn try_local_uc_cache_hit(
     workspace_root: &Path,
     profile: &str,
     session_key: &str,
+    compiler_version: &str,
 ) -> Result<Option<(CommandRun, String, BuildPhaseTelemetry)>> {
     let mut telemetry = BuildPhaseTelemetry::default();
     let canonical_workspace_root = workspace_root.to_path_buf();
@@ -1727,12 +1837,13 @@ fn try_local_uc_cache_hit(
     ensure_path_within_root(&canonical_workspace_root, &entry_path, "cache entry path")?;
 
     let fingerprint_start = Instant::now();
-    let fingerprint = compute_build_fingerprint(
+    let fingerprint = compute_build_fingerprint_with_scarb_version(
         &canonical_workspace_root,
         manifest_path,
         common,
         profile,
         Some(&cache_root),
+        compiler_version,
     )?;
     telemetry.fingerprint_ms = fingerprint_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -1796,12 +1907,17 @@ fn try_local_uc_cache_hit(
 
 fn run_build_with_uc_cache(
     common: &BuildCommonArgs,
-    manifest_path: &Path,
-    workspace_root: &Path,
-    profile: &str,
-    session_key: &str,
-    options: BuildRunOptions,
+    context: BuildCacheRunContext<'_>,
 ) -> Result<(CommandRun, bool, String, BuildPhaseTelemetry)> {
+    let BuildCacheRunContext {
+        manifest_path,
+        workspace_root,
+        profile,
+        session_key,
+        compiler_version,
+        compile_backend,
+        options,
+    } = context;
     let async_errors = take_async_persist_errors();
     if !async_errors.is_empty() {
         if fail_on_async_cache_error() {
@@ -1830,12 +1946,13 @@ fn run_build_with_uc_cache(
     )?;
     ensure_path_within_root(&canonical_workspace_root, &entry_path, "cache entry path")?;
     let fingerprint_start = Instant::now();
-    let fingerprint = compute_build_fingerprint(
+    let fingerprint = compute_build_fingerprint_with_scarb_version(
         &canonical_workspace_root,
         manifest_path,
         common,
         profile,
         Some(&cache_root),
+        compiler_version,
     )?;
     telemetry.fingerprint_ms = fingerprint_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -1922,13 +2039,20 @@ fn run_build_with_uc_cache(
         }
     }
 
-    let (command, command_vec) = scarb_build_command(common, manifest_path);
-    let run = if options.capture_output {
-        run_command_capture(command, command_vec)?
-    } else if options.inherit_output_when_uncaptured {
-        run_command_status(command, command_vec)?
-    } else {
-        run_command_status_silent(command, command_vec)?
+    let run = match compile_backend {
+        BuildCompileBackend::Scarb => {
+            let (command, command_vec) = scarb_build_command(common, manifest_path);
+            if options.capture_output {
+                run_command_capture(command, command_vec)?
+            } else if options.inherit_output_when_uncaptured {
+                run_command_status(command, command_vec)?
+            } else {
+                run_command_status_silent(command, command_vec)?
+            }
+        }
+        BuildCompileBackend::Native => {
+            run_native_build(common, manifest_path, &canonical_workspace_root, profile)?
+        }
     };
     telemetry.compile_ms = run.elapsed_ms;
 
@@ -2012,6 +2136,344 @@ fn run_build_with_uc_cache(
     }
 
     Ok((run, false, fingerprint, telemetry))
+}
+
+fn normalize_package_name_for_cairo_crate(package_name: &str) -> String {
+    package_name.replace('-', "_")
+}
+
+fn sanitize_artifact_component(raw: &str) -> String {
+    let mut value = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            value.push(ch);
+        } else {
+            value.push('_');
+        }
+    }
+    if value.is_empty() {
+        return "contract".to_string();
+    }
+    value
+}
+
+fn resolve_native_corelib_src(workspace_root: &Path) -> Result<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = std::env::var_os("UC_NATIVE_CORELIB_SRC") {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Some(parent) = workspace_root.parent() {
+        candidates.push(parent.join("cairo/corelib/src"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(PathBuf::from(home).join(".cairo/corelib/src"));
+    }
+
+    for candidate in candidates {
+        if candidate.exists() {
+            return candidate.canonicalize().with_context(|| {
+                format!(
+                    "failed to canonicalize native corelib path {}",
+                    candidate.display()
+                )
+            });
+        }
+    }
+
+    bail!(
+        "native compile requires a Cairo corelib source path; set UC_NATIVE_CORELIB_SRC=<.../corelib/src>"
+    )
+}
+
+fn build_native_compile_context(
+    common: &BuildCommonArgs,
+    manifest_path: &Path,
+    workspace_root: &Path,
+) -> Result<NativeCompileContext> {
+    if common.workspace {
+        bail!("native compile does not support --workspace yet");
+    }
+    if !common.features.is_empty() {
+        bail!("native compile does not support --features yet");
+    }
+
+    let manifest_text = read_text_file_with_limit(manifest_path, MAX_MANIFEST_BYTES, "manifest")?;
+    let manifest = parse_manifest_toml(
+        &manifest_text,
+        manifest_path,
+        "failed to parse manifest for native compile",
+    )?;
+    validate_manifest_dependency_sanity_from_manifest(manifest_path, &manifest)?;
+    let package_name = manifest
+        .get("package")
+        .and_then(TomlValue::as_table)
+        .and_then(|tbl| tbl.get("name"))
+        .and_then(TomlValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .context("native compile requires [package].name in Scarb.toml")?;
+
+    if let Some(requested_package) = common.package.as_ref() {
+        if requested_package != &package_name {
+            bail!(
+                "native compile only supports the manifest package `{}` (got --package `{}`)",
+                package_name,
+                requested_package
+            );
+        }
+    }
+
+    for section_name in ["dependencies", "dev-dependencies"] {
+        if let Some(table) = manifest.get(section_name).and_then(TomlValue::as_table) {
+            for dependency_name in table.keys() {
+                if dependency_name != "starknet" {
+                    bail!(
+                        "native compile does not support [{}].{} yet",
+                        section_name,
+                        dependency_name
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(lib_table) = manifest.get("lib").and_then(TomlValue::as_table) {
+        if let Some(path) = lib_table.get("path").and_then(TomlValue::as_str) {
+            if path.trim() != "src/lib.cairo" {
+                bail!("native compile only supports [lib].path = \"src/lib.cairo\"");
+            }
+        }
+    }
+
+    let source_root = workspace_root.join("src");
+    let lib_path = source_root.join("lib.cairo");
+    if !lib_path.is_file() {
+        bail!(
+            "native compile expects src/lib.cairo (missing at {})",
+            lib_path.display()
+        );
+    }
+
+    let crate_name = normalize_package_name_for_cairo_crate(&package_name);
+    let cairo_project_dir = workspace_root.join(".uc/native-project");
+    ensure_path_within_root(
+        workspace_root,
+        &cairo_project_dir,
+        "native project directory",
+    )?;
+    fs::create_dir_all(&cairo_project_dir).with_context(|| {
+        format!(
+            "failed to create native project directory {}",
+            cairo_project_dir.display()
+        )
+    })?;
+    let cairo_project_path = cairo_project_dir.join("cairo_project.toml");
+    let source_root_string = normalize_fingerprint_path(&source_root);
+    let cairo_project_toml = format!("[crate_roots]\n{crate_name} = \"{source_root_string}\"\n");
+    fs::write(&cairo_project_path, cairo_project_toml).with_context(|| {
+        format!(
+            "failed to write native cairo project {}",
+            cairo_project_path.display()
+        )
+    })?;
+
+    let corelib_src = resolve_native_corelib_src(workspace_root)?;
+    let corelib_root = corelib_src
+        .parent()
+        .map(Path::to_path_buf)
+        .context("native corelib path must end in /corelib/src")?;
+
+    Ok(NativeCompileContext {
+        package_name,
+        crate_name,
+        cairo_project_dir,
+        corelib_root,
+    })
+}
+
+fn prune_native_target_outputs(target_dir: &Path, package_name: &str) -> Result<()> {
+    if !target_dir.exists() {
+        return Ok(());
+    }
+    let sierra_name = format!("{package_name}.sierra");
+    let artifacts_name = format!("{package_name}.starknet_artifacts.json");
+    for entry in fs::read_dir(target_dir)
+        .with_context(|| format!("failed to read {}", target_dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to read {}", target_dir.display()))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to stat {}", entry.path().display()))?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        let should_remove = file_name == sierra_name
+            || file_name == artifacts_name
+            || (file_name.starts_with(&format!("{package_name}_"))
+                && file_name.ends_with(".contract_class.json"));
+        if should_remove {
+            fs::remove_file(entry.path())
+                .with_context(|| format!("failed to remove {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn run_native_build(
+    common: &BuildCommonArgs,
+    manifest_path: &Path,
+    workspace_root: &Path,
+    profile: &str,
+) -> Result<CommandRun> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_native_build_inner(common, manifest_path, workspace_root, profile)
+    }));
+    match result {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = if let Some(text) = payload.downcast_ref::<&str>() {
+                (*text).to_string()
+            } else if let Some(text) = payload.downcast_ref::<String>() {
+                text.clone()
+            } else {
+                "unknown panic payload".to_string()
+            };
+            bail!("native compiler panicked: {message}")
+        }
+    }
+}
+
+fn run_native_build_inner(
+    common: &BuildCommonArgs,
+    manifest_path: &Path,
+    workspace_root: &Path,
+    profile: &str,
+) -> Result<CommandRun> {
+    let started = Instant::now();
+    let context = build_native_compile_context(common, manifest_path, workspace_root)?;
+    let target_dir = workspace_root.join("target").join(profile);
+    fs::create_dir_all(&target_dir)
+        .with_context(|| format!("failed to create {}", target_dir.display()))?;
+    prune_native_target_outputs(&target_dir, &context.package_name)?;
+
+    let corelib_parent = context
+        .corelib_root
+        .parent()
+        .map(Path::to_path_buf)
+        .context("native corelib root must have a parent directory")?;
+    let detect_manifest_hint = corelib_parent.join(".uc-native/detect");
+    let _env_guard = EnvVarRestore::set("CARGO_MANIFEST_DIR", &detect_manifest_hint);
+
+    let mut db = RootDatabase::builder()
+        .with_optimizations(Optimizations::enabled_with_default_movable_functions(
+            InliningStrategy::Default,
+        ))
+        .detect_corelib()
+        .with_default_plugin_suite(starknet_plugin_suite())
+        .build()
+        .context("failed to initialize native cairo compiler database")?;
+    let main_crate_inputs =
+        setup_project(&mut db, &context.cairo_project_dir).with_context(|| {
+            format!(
+                "failed to setup native cairo project {}",
+                context.cairo_project_dir.display()
+            )
+        })?;
+    let crate_ids = CrateInput::into_crate_ids(&db, main_crate_inputs.clone());
+    let contracts = find_contracts(&db, &crate_ids);
+
+    let mut compiler_config = CompilerConfig::default();
+    compiler_config.diagnostics_reporter = compiler_config
+        .diagnostics_reporter
+        .with_crates(&main_crate_inputs);
+
+    let artifact_count = if contracts.is_empty() {
+        let program = compile_cairo_project_at_path(
+            &context.cairo_project_dir,
+            CompilerConfig::default(),
+            InliningStrategy::Default,
+        )
+        .context("native cairo compile failed")?;
+        let output_name = format!("{}.sierra", context.package_name);
+        fs::write(target_dir.join(&output_name), program.to_string())
+            .with_context(|| format!("failed to write native artifact {}", output_name))?;
+        1
+    } else {
+        let contract_refs: Vec<_> = contracts.iter().collect();
+        let contract_classes = compile_starknet_prepared_db(&db, &contract_refs, compiler_config)
+            .context("native starknet compile failed")?;
+        if contract_classes.len() != contracts.len() {
+            bail!(
+                "native compile returned mismatched contract classes (expected {}, got {})",
+                contracts.len(),
+                contract_classes.len()
+            );
+        }
+        let mut contracts_manifest = Vec::with_capacity(contract_classes.len());
+        for (contract, contract_class) in contracts.iter().zip(contract_classes.into_iter()) {
+            let module_path = contract.submodule_id.full_path(&db);
+            let contract_name = module_path
+                .rsplit("::")
+                .next()
+                .unwrap_or("contract")
+                .to_string();
+            let artifact_stem = sanitize_artifact_component(&contract_name);
+            let artifact_file = format!(
+                "{}_{}.contract_class.json",
+                context.package_name, artifact_stem
+            );
+            let artifact_path = target_dir.join(&artifact_file);
+            let encoded = serde_json::to_vec_pretty(&contract_class)
+                .context("failed to encode native contract class JSON")?;
+            fs::write(&artifact_path, encoded)
+                .with_context(|| format!("failed to write {}", artifact_path.display()))?;
+
+            let mut id_hasher = Hasher::new();
+            id_hasher.update(module_path.as_bytes());
+            let digest = id_hasher.finalize().to_hex();
+            let id = digest[..13].to_string();
+
+            contracts_manifest.push(StarknetArtifactEntry {
+                id,
+                package_name: context.package_name.clone(),
+                contract_name,
+                module_path,
+                artifacts: StarknetArtifactFiles {
+                    sierra: artifact_file,
+                    casm: None,
+                },
+            });
+        }
+        let contract_artifact_count = contracts_manifest.len();
+        let manifest = StarknetArtifactsManifest {
+            version: 1,
+            contracts: contracts_manifest,
+        };
+        let manifest_name = format!("{}.starknet_artifacts.json", context.package_name);
+        let manifest_path = target_dir.join(&manifest_name);
+        let encoded = serde_json::to_vec(&manifest)
+            .context("failed to encode native starknet artifacts manifest")?;
+        fs::write(&manifest_path, encoded)
+            .with_context(|| format!("failed to write {}", manifest_path.display()))?;
+        contract_artifact_count + 1
+    };
+
+    Ok(CommandRun {
+        command: vec![
+            "uc-native".to_string(),
+            "build".to_string(),
+            "--manifest-path".to_string(),
+            manifest_path.display().to_string(),
+            "--crate".to_string(),
+            context.crate_name,
+        ],
+        exit_code: 0,
+        elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+        stdout: format!("uc: native compile produced {} artifacts\n", artifact_count),
+        stderr: String::new(),
+    })
 }
 
 fn scarb_build_command(common: &BuildCommonArgs, manifest_path: &Path) -> (Command, Vec<String>) {
@@ -2211,6 +2673,29 @@ fn join_stream_thread(handle: thread::JoinHandle<Result<Vec<u8>>>, label: &str) 
     match handle.join() {
         Ok(result) => result,
         Err(_) => bail!("command {label} reader thread panicked"),
+    }
+}
+
+struct EnvVarRestore {
+    key: &'static str,
+    original: Option<std::ffi::OsString>,
+}
+
+impl EnvVarRestore {
+    fn set(key: &'static str, value: &Path) -> Self {
+        let original = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, original }
+    }
+}
+
+impl Drop for EnvVarRestore {
+    fn drop(&mut self) {
+        if let Some(value) = &self.original {
+            std::env::set_var(self.key, value);
+        } else {
+            std::env::remove_var(self.key);
+        }
     }
 }
 
@@ -2604,13 +3089,13 @@ fn session_input_cache_key(
     common: &BuildCommonArgs,
     manifest_path: &Path,
     profile: &str,
-    scarb_version: &str,
+    compiler_version: &str,
     build_env_fingerprint: &str,
 ) -> String {
     let mut hasher = Hasher::new();
     hasher.update(b"uc-session-input-cache-v1");
     hasher.update(normalize_fingerprint_path(manifest_path).as_bytes());
-    hasher.update(scarb_version.as_bytes());
+    hasher.update(compiler_version.as_bytes());
     hasher.update(build_env_fingerprint.as_bytes());
     hasher.update(profile.as_bytes());
     hasher.update(common.package.as_deref().unwrap_or("*").as_bytes());
@@ -2640,7 +3125,16 @@ fn build_session_input(
     manifest_path: &Path,
     profile: &str,
 ) -> Result<SessionInput> {
-    let scarb_version = scarb_version_line()?;
+    let compiler_version = scarb_version_line()?;
+    build_session_input_with_compiler_version(common, manifest_path, profile, &compiler_version)
+}
+
+fn build_session_input_with_compiler_version(
+    common: &BuildCommonArgs,
+    manifest_path: &Path,
+    profile: &str,
+    compiler_version: &str,
+) -> Result<SessionInput> {
     let build_env_fingerprint = current_build_env_fingerprint();
     let manifest_metadata = fs::metadata(manifest_path)
         .with_context(|| format!("failed to stat {}", manifest_path.display()))?;
@@ -2650,7 +3144,7 @@ fn build_session_input(
         common,
         manifest_path,
         profile,
-        &scarb_version,
+        compiler_version,
         &build_env_fingerprint,
     );
     let cache_now_ms = epoch_ms_u64().unwrap_or_default();
@@ -2682,7 +3176,7 @@ fn build_session_input(
     cfg_set.push(format!("workspace:{}", common.workspace));
     cfg_set.push(format!("release:{}", common.release));
     let input = SessionInput {
-        compiler_version: scarb_version,
+        compiler_version: compiler_version.to_string(),
         profile: profile.to_string(),
         offline: common.offline,
         package: common.package.clone(),

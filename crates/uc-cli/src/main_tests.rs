@@ -108,17 +108,22 @@ fn run_smoke_cached_build(
     profile: &str,
     session_key: &str,
 ) -> Result<(CommandRun, bool, String, BuildPhaseTelemetry)> {
+    let compiler_version = scarb_version_line()?;
     run_build_with_uc_cache(
         common,
-        manifest_path,
-        workspace_root,
-        profile,
-        session_key,
-        BuildRunOptions {
-            capture_output: true,
-            inherit_output_when_uncaptured: true,
-            async_cache_persist: false,
-            use_daemon_shared_cache: false,
+        BuildCacheRunContext {
+            manifest_path,
+            workspace_root,
+            profile,
+            session_key,
+            compiler_version: &compiler_version,
+            compile_backend: BuildCompileBackend::Scarb,
+            options: BuildRunOptions {
+                capture_output: true,
+                inherit_output_when_uncaptured: true,
+                async_cache_persist: false,
+                use_daemon_shared_cache: false,
+            },
         },
     )
 }
@@ -187,18 +192,20 @@ fn daemon_build_request_roundtrip_preserves_async_cache_persist() {
 
 #[test]
 fn daemon_build_request_serialization_supports_async_cache_persist_wire_field() {
-    let request = DaemonRequest::Build(DaemonBuildRequest {
-        protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
-        manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
-        package: None,
-        workspace: false,
-        features: vec!["feature_a".to_string()],
-        offline: false,
-        release: false,
-        profile: None,
-        async_cache_persist: true,
-        capture_output: true,
-    });
+    let request = DaemonRequest::Build {
+        payload: DaemonBuildRequest {
+            protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+            manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
+            package: None,
+            workspace: false,
+            features: vec!["feature_a".to_string()],
+            offline: false,
+            release: false,
+            profile: None,
+            async_cache_persist: true,
+            capture_output: true,
+        },
+    };
     let json = serde_json::to_string(&request).expect("failed to encode request");
     assert!(json.contains("\"type\":\"build\""));
     assert!(json.contains("\"async_cache_persist\":true"));
@@ -207,7 +214,7 @@ fn daemon_build_request_serialization_supports_async_cache_persist_wire_field() 
     let decoded: DaemonRequest =
         serde_json::from_str(&json).expect("failed to decode daemon request");
     match decoded {
-        DaemonRequest::Build(payload) => {
+        DaemonRequest::Build { payload } => {
             assert!(payload.async_cache_persist);
             assert!(payload.capture_output);
             assert_eq!(payload.protocol_version, DAEMON_PROTOCOL_VERSION);
@@ -227,7 +234,7 @@ fn daemon_build_request_defaults_capture_output_when_missing_from_wire() {
     let decoded: DaemonRequest =
         serde_json::from_str(&json).expect("failed to decode daemon request");
     match decoded {
-        DaemonRequest::Build(payload) => {
+        DaemonRequest::Build { payload } => {
             assert!(payload.capture_output);
             assert_eq!(payload.protocol_version, DAEMON_PROTOCOL_VERSION);
         }
@@ -236,22 +243,100 @@ fn daemon_build_request_defaults_capture_output_when_missing_from_wire() {
 }
 
 #[test]
+fn daemon_build_response_roundtrip_preserves_telemetry_fields() {
+    let response = DaemonResponse::Build {
+        payload: DaemonBuildResponse {
+            run: CommandRun {
+                command: vec!["scarb".to_string(), "build".to_string()],
+                exit_code: 0,
+                elapsed_ms: 123.4,
+                stdout: "ok".to_string(),
+                stderr: String::new(),
+            },
+            cache_hit: true,
+            fingerprint: "abc123".to_string(),
+            session_key: "session".to_string(),
+            telemetry: BuildPhaseTelemetry {
+                fingerprint_ms: 1.0,
+                cache_lookup_ms: 2.0,
+                cache_restore_ms: 3.0,
+                compile_ms: 4.0,
+                cache_persist_ms: 5.0,
+                cache_persist_async: true,
+                cache_persist_scheduled: false,
+            },
+        },
+    };
+
+    let json = serde_json::to_string(&response).expect("failed to encode daemon response");
+    let decoded = decode_daemon_response(&json).expect("failed to decode daemon response");
+    match decoded {
+        DaemonResponse::Build { payload } => {
+            assert_eq!(payload.run.exit_code, 0);
+            assert!(payload.cache_hit);
+            assert_eq!(payload.fingerprint, "abc123");
+            assert_eq!(payload.session_key, "session");
+            assert_eq!(payload.telemetry.compile_ms, 4.0);
+            assert!(payload.telemetry.cache_persist_async);
+            assert!(!payload.telemetry.cache_persist_scheduled);
+        }
+        _ => panic!("expected build response"),
+    }
+}
+
+#[test]
+fn daemon_build_response_deserializes_with_nested_telemetry_object() {
+    let json = r#"{
+        "type":"build",
+        "run":{
+            "command":["scarb","build"],
+            "exit_code":0,
+            "elapsed_ms":12.5,
+            "stdout":"",
+            "stderr":""
+        },
+        "cache_hit":false,
+        "fingerprint":"f",
+        "session_key":"s",
+        "telemetry":{
+            "fingerprint_ms":0.1,
+            "cache_lookup_ms":0.2,
+            "cache_restore_ms":0.3,
+            "compile_ms":10.0,
+            "cache_persist_ms":0.4,
+            "cache_persist_async":false,
+            "cache_persist_scheduled":false
+        }
+    }"#;
+    let decoded = decode_daemon_response(json).expect("failed to decode daemon response");
+    match decoded {
+        DaemonResponse::Build { payload } => {
+            assert_eq!(payload.run.elapsed_ms, 12.5);
+            assert_eq!(payload.telemetry.compile_ms, 10.0);
+        }
+        _ => panic!("expected build response"),
+    }
+}
+
+#[test]
 fn daemon_metadata_request_serialization_supports_wire_format() {
-    let request = DaemonRequest::Metadata(DaemonMetadataRequest {
-        protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
-        manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
-        format_version: 1,
-        offline: false,
-        global_cache_dir: None,
-        capture_output: false,
-    });
+    let request = DaemonRequest::Metadata {
+        payload: DaemonMetadataRequest {
+            protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+            manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
+            format_version: 1,
+            offline: false,
+            global_cache_dir: None,
+            capture_output: false,
+        },
+    };
     let json = serde_json::to_string(&request).expect("failed to encode request");
     assert!(json.contains("\"type\":\"metadata\""));
 
     let decoded: DaemonRequest =
         serde_json::from_str(&json).expect("failed to decode daemon request");
     match decoded {
-        DaemonRequest::Metadata(payload) => {
+        DaemonRequest::Metadata { payload } => {
             assert_eq!(payload.protocol_version, DAEMON_PROTOCOL_VERSION);
             assert_eq!(payload.manifest_path, "/tmp/workspace/Scarb.toml");
             assert_eq!(payload.format_version, 1);
@@ -271,26 +356,30 @@ fn daemon_request_protocol_validation_skips_ping_and_shutdown() {
 
 #[test]
 fn daemon_request_protocol_validation_rejects_mismatch_for_build_and_metadata() {
-    let build = DaemonRequest::Build(DaemonBuildRequest {
-        protocol_version: "0.0.0".to_string(),
-        manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
-        package: None,
-        workspace: false,
-        features: Vec::new(),
-        offline: false,
-        release: false,
-        profile: None,
-        async_cache_persist: false,
-        capture_output: true,
-    });
-    let metadata = DaemonRequest::Metadata(DaemonMetadataRequest {
-        protocol_version: "0.0.0".to_string(),
-        manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
-        format_version: 1,
-        offline: false,
-        global_cache_dir: None,
-        capture_output: false,
-    });
+    let build = DaemonRequest::Build {
+        payload: DaemonBuildRequest {
+            protocol_version: "0.0.0".to_string(),
+            manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
+            package: None,
+            workspace: false,
+            features: Vec::new(),
+            offline: false,
+            release: false,
+            profile: None,
+            async_cache_persist: false,
+            capture_output: true,
+        },
+    };
+    let metadata = DaemonRequest::Metadata {
+        payload: DaemonMetadataRequest {
+            protocol_version: "0.0.0".to_string(),
+            manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
+            format_version: 1,
+            offline: false,
+            global_cache_dir: None,
+            capture_output: false,
+        },
+    };
 
     let build_err = validate_daemon_request_protocol_version(&build)
         .expect_err("build request protocol mismatch should fail");
@@ -309,26 +398,30 @@ fn daemon_request_protocol_validation_rejects_mismatch_for_build_and_metadata() 
 
 #[test]
 fn daemon_request_protocol_validation_accepts_current_protocol() {
-    let build = DaemonRequest::Build(DaemonBuildRequest {
-        protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
-        manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
-        package: None,
-        workspace: false,
-        features: Vec::new(),
-        offline: false,
-        release: false,
-        profile: None,
-        async_cache_persist: false,
-        capture_output: true,
-    });
-    let metadata = DaemonRequest::Metadata(DaemonMetadataRequest {
-        protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
-        manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
-        format_version: 1,
-        offline: false,
-        global_cache_dir: None,
-        capture_output: false,
-    });
+    let build = DaemonRequest::Build {
+        payload: DaemonBuildRequest {
+            protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+            manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
+            package: None,
+            workspace: false,
+            features: Vec::new(),
+            offline: false,
+            release: false,
+            profile: None,
+            async_cache_persist: false,
+            capture_output: true,
+        },
+    };
+    let metadata = DaemonRequest::Metadata {
+        payload: DaemonMetadataRequest {
+            protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+            manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
+            format_version: 1,
+            offline: false,
+            global_cache_dir: None,
+            capture_output: false,
+        },
+    };
 
     assert!(validate_daemon_request_protocol_version(&build).is_ok());
     assert!(validate_daemon_request_protocol_version(&metadata).is_ok());
@@ -833,6 +926,53 @@ fn session_input_cache_key_changes_with_build_env_fingerprint() {
         "env-b",
     );
     assert_ne!(key_a, key_b);
+}
+
+#[test]
+fn session_input_cache_key_changes_with_compiler_version() {
+    let common = BuildCommonArgs {
+        manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
+        package: Some("demo".to_string()),
+        workspace: false,
+        features: vec!["a".to_string()],
+        offline: false,
+        release: false,
+        profile: None,
+    };
+    let key_a = session_input_cache_key(
+        &common,
+        Path::new("/tmp/workspace/Scarb.toml"),
+        "dev",
+        "scarb 2.14.0",
+        "env-a",
+    );
+    let key_b = session_input_cache_key(
+        &common,
+        Path::new("/tmp/workspace/Scarb.toml"),
+        "dev",
+        "uc-native 0.1.0",
+        "env-a",
+    );
+    assert_ne!(key_a, key_b);
+}
+
+#[test]
+fn native_build_mode_parses_expected_values() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::env::remove_var("UC_NATIVE_BUILD_MODE");
+    assert_eq!(native_build_mode(), NativeBuildMode::Off);
+
+    std::env::set_var("UC_NATIVE_BUILD_MODE", "auto");
+    assert_eq!(native_build_mode(), NativeBuildMode::Auto);
+
+    std::env::set_var("UC_NATIVE_BUILD_MODE", "require");
+    assert_eq!(native_build_mode(), NativeBuildMode::Require);
+
+    std::env::set_var("UC_NATIVE_BUILD_MODE", "invalid-mode");
+    assert_eq!(native_build_mode(), NativeBuildMode::Off);
+    std::env::remove_var("UC_NATIVE_BUILD_MODE");
 }
 
 #[test]
@@ -1397,18 +1537,20 @@ fn daemon_request_read_timeout_prefers_build_override_for_build_requests() {
     std::env::set_var("UC_DAEMON_CLIENT_READ_TIMEOUT_SECS", "7");
     std::env::set_var("UC_DAEMON_BUILD_READ_TIMEOUT_SECS", "13");
 
-    let build_request = DaemonRequest::Build(DaemonBuildRequest {
-        protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
-        manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
-        package: None,
-        workspace: false,
-        features: Vec::new(),
-        offline: true,
-        release: false,
-        profile: None,
-        async_cache_persist: false,
-        capture_output: true,
-    });
+    let build_request = DaemonRequest::Build {
+        payload: DaemonBuildRequest {
+            protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+            manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
+            package: None,
+            workspace: false,
+            features: Vec::new(),
+            offline: true,
+            release: false,
+            profile: None,
+            async_cache_persist: false,
+            capture_output: true,
+        },
+    };
 
     assert_eq!(
         daemon_request_read_timeout(&DaemonRequest::Ping),
@@ -2060,15 +2202,19 @@ edition = "2024_07"
 
     let (run, cache_hit, returned_fingerprint, telemetry) = run_build_with_uc_cache(
         &common,
-        &manifest_path,
-        &workspace_root,
-        profile,
-        &session_key,
-        BuildRunOptions {
-            capture_output: false,
-            inherit_output_when_uncaptured: true,
-            async_cache_persist: false,
-            use_daemon_shared_cache: true,
+        BuildCacheRunContext {
+            manifest_path: &manifest_path,
+            workspace_root: &workspace_root,
+            profile,
+            session_key: &session_key,
+            compiler_version: &scarb_version_line().expect("failed to resolve compiler version"),
+            compile_backend: BuildCompileBackend::Scarb,
+            options: BuildRunOptions {
+                capture_output: false,
+                inherit_output_when_uncaptured: true,
+                async_cache_persist: false,
+                use_daemon_shared_cache: true,
+            },
         },
     )
     .expect("shared cache restore should succeed");
@@ -2109,6 +2255,90 @@ demo = "1.0.0"
 
     let result = validate_manifest_dependency_sanity(&manifest_path);
     assert!(result.is_err());
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn build_native_compile_context_rejects_non_starknet_dependencies() {
+    let dir = unique_test_dir("uc-native-context-reject-dep");
+    let manifest_path = dir.join("Scarb.toml");
+    fs::create_dir_all(dir.join("src")).expect("failed to create src directory");
+    fs::write(dir.join("src/lib.cairo"), "fn main() {}\n").expect("failed to write lib.cairo");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+
+[dependencies]
+alexandria = "0.9.0"
+"#,
+    )
+    .expect("failed to write manifest");
+
+    let common = BuildCommonArgs {
+        manifest_path: Some(manifest_path.clone()),
+        package: None,
+        workspace: false,
+        features: Vec::new(),
+        offline: true,
+        release: false,
+        profile: None,
+    };
+    let err = build_native_compile_context(&common, &manifest_path, &dir)
+        .expect_err("unsupported dependency should fail native context resolution");
+    assert!(
+        format!("{err:#}")
+            .contains("native compile does not support [dependencies].alexandria yet"),
+        "unexpected error: {err:#}"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn build_native_compile_context_writes_cairo_project_and_normalizes_crate_name() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = unique_test_dir("uc-native-context-project");
+    let manifest_path = dir.join("Scarb.toml");
+    fs::create_dir_all(dir.join("src")).expect("failed to create src directory");
+    fs::write(dir.join("src/lib.cairo"), "fn main() {}\n").expect("failed to write lib.cairo");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo-native"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("failed to write manifest");
+
+    let fake_corelib_src = dir.join("toolchain/corelib/src");
+    fs::create_dir_all(&fake_corelib_src).expect("failed to create fake corelib path");
+    std::env::set_var("UC_NATIVE_CORELIB_SRC", &fake_corelib_src);
+
+    let common = BuildCommonArgs {
+        manifest_path: Some(manifest_path.clone()),
+        package: None,
+        workspace: false,
+        features: Vec::new(),
+        offline: true,
+        release: false,
+        profile: None,
+    };
+    let context =
+        build_native_compile_context(&common, &manifest_path, &dir).expect("context should build");
+    assert_eq!(context.crate_name, "demo_native");
+    let cairo_project = fs::read_to_string(context.cairo_project_dir.join("cairo_project.toml"))
+        .expect("failed to read cairo project");
+    assert!(
+        cairo_project.contains("demo_native"),
+        "crate name should be normalized in cairo_project.toml: {cairo_project}"
+    );
+
+    std::env::remove_var("UC_NATIVE_CORELIB_SRC");
     fs::remove_dir_all(&dir).ok();
 }
 
