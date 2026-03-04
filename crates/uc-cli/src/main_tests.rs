@@ -31,6 +31,24 @@ fn integration_env_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+struct CurrentDirRestore {
+    original: PathBuf,
+}
+
+impl CurrentDirRestore {
+    fn capture() -> Self {
+        Self {
+            original: std::env::current_dir().expect("failed to read current directory"),
+        }
+    }
+}
+
+impl Drop for CurrentDirRestore {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.original);
+    }
+}
+
 fn scarb_available() -> bool {
     Command::new("scarb")
         .arg("--version")
@@ -313,6 +331,54 @@ fn daemon_request_protocol_validation_accepts_current_protocol() {
 
     assert!(validate_daemon_request_protocol_version(&build).is_ok());
     assert!(validate_daemon_request_protocol_version(&metadata).is_ok());
+}
+
+#[test]
+fn resolve_manifest_path_accepts_absolute_manifest() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _cwd_guard = CurrentDirRestore::capture();
+    let workspace = unique_test_dir("uc-resolve-manifest-abs");
+    let manifest = workspace.join("Scarb.toml");
+    fs::write(
+        &manifest,
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("failed to write manifest");
+    let resolved =
+        resolve_manifest_path(&Some(manifest.clone())).expect("absolute manifest should resolve");
+    assert_eq!(
+        resolved,
+        manifest
+            .canonicalize()
+            .expect("failed to canonicalize manifest")
+    );
+}
+
+#[test]
+fn resolve_manifest_path_rejects_relative_escape() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _cwd_guard = CurrentDirRestore::capture();
+    let root = unique_test_dir("uc-resolve-manifest-escape");
+    let cwd = root.join("workspace");
+    let outside = root.join("outside");
+    fs::create_dir_all(&cwd).expect("failed to create test cwd");
+    fs::create_dir_all(&outside).expect("failed to create outside directory");
+    fs::write(
+        outside.join("Scarb.toml"),
+        "[package]\nname = \"escape\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("failed to write outside manifest");
+    std::env::set_current_dir(&cwd).expect("failed to set test cwd");
+    let err = resolve_manifest_path(&Some(PathBuf::from("../outside/Scarb.toml")))
+        .expect_err("relative manifest escape should fail");
+    assert!(
+        format!("{err:#}").contains("escapes current working directory"),
+        "unexpected error: {err:#}"
+    );
 }
 
 #[test]

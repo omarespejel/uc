@@ -1249,9 +1249,6 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
         remove_socket_if_exists(&socket_path)?;
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("failed to bind daemon socket {}", socket_path.display()))?;
-        listener
-            .set_nonblocking(true)
-            .context("failed to set daemon listener non-blocking mode")?;
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).with_context(
             || {
                 format!(
@@ -1302,9 +1299,7 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
                         }
                     });
                 }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(20));
-                }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(err) => {
                     if should_shutdown.load(Ordering::Relaxed) {
                         break;
@@ -2178,26 +2173,28 @@ fn remove_build_outputs(workspace_root: &Path) -> Result<()> {
 }
 
 fn resolve_manifest_path(manifest_path: &Option<PathBuf>) -> Result<PathBuf> {
-    let cwd = std::env::current_dir()?.canonicalize()?;
     let requested = manifest_path
         .as_ref()
         .cloned()
         .unwrap_or_else(|| PathBuf::from("Scarb.toml"));
-    let candidate = if requested.is_absolute() {
-        requested.clone()
+    let resolved = if requested.is_absolute() {
+        requested
+            .canonicalize()
+            .with_context(|| format!("failed to resolve manifest path {}", requested.display()))?
     } else {
-        cwd.join(&requested)
+        let cwd = std::env::current_dir()?.canonicalize()?;
+        let candidate = cwd.join(&requested);
+        let resolved = candidate
+            .canonicalize()
+            .with_context(|| format!("failed to resolve manifest path {}", candidate.display()))?;
+        if !resolved.starts_with(&cwd) {
+            bail!(
+                "manifest path escapes current working directory: {}",
+                requested.display()
+            );
+        }
+        resolved
     };
-    let resolved = candidate
-        .canonicalize()
-        .with_context(|| format!("failed to resolve manifest path {}", candidate.display()))?;
-
-    if !requested.is_absolute() && !resolved.starts_with(&cwd) {
-        bail!(
-            "manifest path escapes current working directory: {}",
-            requested.display()
-        );
-    }
 
     if resolved.file_name().and_then(|s| s.to_str()) != Some("Scarb.toml") {
         bail!(
