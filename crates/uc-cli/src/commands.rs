@@ -58,7 +58,8 @@ pub(super) fn run_build(args: BuildArgs) -> Result<()> {
                     (run, cache_hit, fingerprint)
                 }
                 DaemonModeArg::Auto => {
-                    if let Some(response) = try_uc_build_via_daemon(&common, &manifest_path)? {
+                    if let Some(response) = try_uc_build_via_daemon(&common, &manifest_path, true)?
+                    {
                         daemon_used = true;
                         session_key = response.session_key;
                         phase_telemetry = Some(response.telemetry);
@@ -72,7 +73,7 @@ pub(super) fn run_build(args: BuildArgs) -> Result<()> {
                     }
                 }
                 DaemonModeArg::Require => {
-                    let response = try_uc_build_via_daemon(&common, &manifest_path)?
+                    let response = try_uc_build_via_daemon(&common, &manifest_path, false)?
                         .context("daemon mode is require but daemon is unavailable")?;
                     daemon_used = true;
                     session_key = response.session_key;

@@ -13,6 +13,19 @@ fn unique_test_dir(prefix: &str) -> PathBuf {
     dir
 }
 
+#[cfg(unix)]
+fn unique_unix_socket_path(prefix: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before UNIX_EPOCH")
+        .as_nanos();
+    PathBuf::from("/tmp").join(format!(
+        "{prefix}-{}-{}.sock",
+        std::process::id(),
+        nanos % 1_000_000
+    ))
+}
+
 fn integration_env_lock() -> &'static Mutex<()> {
     static LOCK: TestOnceLock<Mutex<()>> = TestOnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -229,6 +242,145 @@ fn daemon_metadata_request_serialization_supports_wire_format() {
         }
         _ => panic!("expected metadata request"),
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn try_uc_build_via_daemon_auto_mode_falls_back_on_daemon_error() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let socket_path = unique_unix_socket_path("uc-daemon-auto-fallback");
+    let _ = fs::remove_file(&socket_path);
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+        .expect("failed to bind test daemon socket");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("failed to accept daemon request");
+        let mut line = String::new();
+        {
+            let mut reader = std::io::BufReader::new(
+                stream
+                    .try_clone()
+                    .expect("failed to clone daemon test stream"),
+            );
+            let _ = std::io::BufRead::read_line(&mut reader, &mut line)
+                .expect("failed to read daemon request");
+        }
+        assert!(
+            !line.trim().is_empty(),
+            "daemon request payload should not be empty"
+        );
+        stream
+            .write_all(br#"{"type":"error","message":"simulated daemon failure"}"#)
+            .expect("failed to write daemon response");
+        stream
+            .write_all(b"\n")
+            .expect("failed to write daemon response delimiter");
+        stream.flush().expect("failed to flush daemon response");
+    });
+    std::env::set_var("UC_DAEMON_SOCKET_PATH", &socket_path);
+
+    let common = BuildCommonArgs {
+        manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
+        package: None,
+        workspace: false,
+        features: Vec::new(),
+        offline: false,
+        release: false,
+        profile: None,
+    };
+    let result = try_uc_build_via_daemon(&common, Path::new("/tmp/workspace/Scarb.toml"), true)
+        .expect("auto mode should not fail hard when daemon returns error");
+    assert!(result.is_none());
+
+    server.join().expect("daemon test server panicked");
+    std::env::remove_var("UC_DAEMON_SOCKET_PATH");
+    let _ = fs::remove_file(&socket_path);
+}
+
+#[cfg(unix)]
+#[test]
+fn try_uc_build_via_daemon_require_mode_surfaces_daemon_error() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let socket_path = unique_unix_socket_path("uc-daemon-require-error");
+    let _ = fs::remove_file(&socket_path);
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+        .expect("failed to bind test daemon socket");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("failed to accept daemon request");
+        let mut line = String::new();
+        {
+            let mut reader = std::io::BufReader::new(
+                stream
+                    .try_clone()
+                    .expect("failed to clone daemon test stream"),
+            );
+            let _ = std::io::BufRead::read_line(&mut reader, &mut line)
+                .expect("failed to read daemon request");
+        }
+        assert!(
+            !line.trim().is_empty(),
+            "daemon request payload should not be empty"
+        );
+        stream
+            .write_all(br#"{"type":"error","message":"simulated daemon failure"}"#)
+            .expect("failed to write daemon response");
+        stream
+            .write_all(b"\n")
+            .expect("failed to write daemon response delimiter");
+        stream.flush().expect("failed to flush daemon response");
+    });
+    std::env::set_var("UC_DAEMON_SOCKET_PATH", &socket_path);
+
+    let common = BuildCommonArgs {
+        manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
+        package: None,
+        workspace: false,
+        features: Vec::new(),
+        offline: false,
+        release: false,
+        profile: None,
+    };
+    let err = try_uc_build_via_daemon(&common, Path::new("/tmp/workspace/Scarb.toml"), false)
+        .expect_err("require mode should fail when daemon returns an error");
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("daemon build request failed: simulated daemon failure"),
+        "unexpected error: {text}"
+    );
+
+    server.join().expect("daemon test server panicked");
+    std::env::remove_var("UC_DAEMON_SOCKET_PATH");
+    let _ = fs::remove_file(&socket_path);
+}
+
+#[cfg(unix)]
+#[test]
+fn remove_socket_if_exists_rejects_non_socket_file() {
+    let dir = unique_test_dir("uc-remove-socket-guard");
+    let path = dir.join("not-a-socket");
+    fs::write(&path, b"file").expect("failed to write non-socket marker");
+    let err = remove_socket_if_exists(&path).expect_err("non-socket path should be rejected");
+    assert!(
+        format!("{err:#}").contains("refusing to remove non-socket path"),
+        "unexpected error: {err:#}"
+    );
+    assert!(path.exists(), "non-socket file should remain on disk");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn remove_socket_if_exists_removes_socket_file() {
+    let path = unique_unix_socket_path("uc-remove-socket-ok");
+    let _ = fs::remove_file(&path);
+    let listener =
+        std::os::unix::net::UnixListener::bind(&path).expect("failed to create socket file");
+    drop(listener);
+    remove_socket_if_exists(&path).expect("socket path should be removable");
+    assert!(!path.exists(), "socket file should be removed");
 }
 
 #[test]
@@ -639,6 +791,95 @@ fn restore_cached_artifacts_restores_when_target_mismatch() {
     assert!(restored);
     assert_eq!(
         fs::read(&output).expect("failed to read restored artifact"),
+        b"fresh-artifact"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn restore_cached_artifacts_returns_false_when_cache_object_hash_mismatch() {
+    let dir = unique_test_dir("uc-restore-object-hash-mismatch");
+    let workspace = dir.join("workspace");
+    let target_root = workspace.join("target/dev");
+    let cache_root = workspace.join(".uc/cache");
+    let objects_dir = cache_root.join("objects/aa");
+    fs::create_dir_all(&target_root).expect("failed to create target root");
+    fs::create_dir_all(&objects_dir).expect("failed to create objects root");
+
+    let output = target_root.join("demo.sierra.json");
+    fs::write(&output, b"stale-artifact").expect("failed to write stale artifact");
+    let object = objects_dir.join("fresh-object.bin");
+    fs::write(&object, b"fresh-artifact").expect("failed to write cache object");
+    let expected_hash = hash_file_blake3(&object).expect("failed to hash cache object");
+    let object_len = fs::metadata(&object)
+        .expect("failed to stat cache object")
+        .len();
+    // Keep same size as the valid object to ensure integrity guard verifies hash, not only size.
+    fs::write(&object, vec![b'X'; object_len as usize]).expect("failed to corrupt cache object");
+    assert_eq!(
+        fs::metadata(&object)
+            .expect("failed to stat corrupted cache object")
+            .len(),
+        object_len
+    );
+
+    let artifacts = vec![CachedArtifact {
+        relative_path: "demo.sierra.json".to_string(),
+        blake3_hex: expected_hash,
+        size_bytes: object_len,
+        object_rel_path: "aa/fresh-object.bin".to_string(),
+    }];
+
+    let restored = restore_cached_artifacts(
+        &workspace,
+        "dev",
+        &cache_root,
+        &cache_root.join("objects"),
+        &artifacts,
+    )
+    .expect("restore should return result");
+    assert!(
+        !restored,
+        "corrupted cache object should force cache miss recovery path"
+    );
+    assert!(
+        !object.exists(),
+        "corrupted cache object should be evicted from cache"
+    );
+    assert_eq!(
+        fs::read(&output).expect("failed to read target after cache miss"),
+        b"stale-artifact"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn collect_cached_artifacts_for_entry_rebuilds_corrupted_existing_object() {
+    let dir = unique_test_dir("uc-collect-repair-object");
+    let workspace = dir.join("workspace");
+    let target_root = workspace.join("target/dev");
+    let cache_root = workspace.join(".uc/cache");
+    let objects_root = cache_root.join("objects");
+    fs::create_dir_all(&target_root).expect("failed to create target root");
+    fs::create_dir_all(&objects_root).expect("failed to create object root");
+
+    let artifact_path = target_root.join("demo.sierra.json");
+    fs::write(&artifact_path, b"fresh-artifact").expect("failed to write source artifact");
+    let expected_hash = hash_file_blake3(&artifact_path).expect("failed to hash source artifact");
+    let object_path = objects_root.join(format!("{}/{}.bin", &expected_hash[0..2], expected_hash));
+    fs::create_dir_all(
+        object_path
+            .parent()
+            .expect("object path should have parent directory"),
+    )
+    .expect("failed to create object subdir");
+    fs::write(&object_path, b"broken-artifact").expect("failed to write corrupted cache object");
+
+    let cached = collect_cached_artifacts_for_entry(&workspace, "dev", &cache_root, &objects_root)
+        .expect("failed to collect cached artifacts");
+    assert_eq!(cached.len(), 1, "expected one cached artifact");
+    assert_eq!(
+        fs::read(&object_path).expect("failed to read repaired cache object"),
         b"fresh-artifact"
     );
     fs::remove_dir_all(&dir).ok();

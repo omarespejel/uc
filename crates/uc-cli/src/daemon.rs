@@ -16,11 +16,57 @@ pub(super) fn daemon_log_path(socket_path: &Path) -> PathBuf {
 }
 
 pub(super) fn remove_socket_if_exists(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err).with_context(|| format!("failed to remove {}", path.display())),
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", path.display()));
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if !metadata.file_type().is_socket() {
+            bail!(
+                "refusing to remove non-socket path {}; provide a unix socket path",
+                path.display()
+            );
+        }
     }
+
+    #[cfg(not(unix))]
+    {
+        if !metadata.file_type().is_file() {
+            bail!(
+                "refusing to remove non-file path {}; provide a socket file path",
+                path.display()
+            );
+        }
+    }
+
+    fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))
+}
+
+pub(super) fn open_daemon_log_file(log_path: &Path) -> Result<(File, File)> {
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .with_context(|| format!("failed to open daemon log {}", log_path.display()))?;
+    #[cfg(unix)]
+    {
+        fs::set_permissions(log_path, fs::Permissions::from_mode(0o600)).with_context(|| {
+            format!(
+                "failed to set daemon log permissions for {}",
+                log_path.display()
+            )
+        })?;
+    }
+    let log_file_err = log_file
+        .try_clone()
+        .with_context(|| format!("failed to clone log file {}", log_path.display()))?;
+    Ok((log_file, log_file_err))
 }
 
 pub(super) fn rotate_daemon_log_if_needed(log_path: &Path) -> Result<()> {

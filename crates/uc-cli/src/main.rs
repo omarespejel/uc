@@ -999,14 +999,7 @@ fn run_daemon_start(args: DaemonSocketArgs) -> Result<()> {
 
         let log_path = daemon_log_path(&socket_path);
         rotate_daemon_log_if_needed(&log_path)?;
-        let log_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .with_context(|| format!("failed to open daemon log {}", log_path.display()))?;
-        let log_file_err = log_file
-            .try_clone()
-            .with_context(|| format!("failed to clone log file {}", log_path.display()))?;
+        let (log_file, log_file_err) = open_daemon_log_file(&log_path)?;
 
         let exe = std::env::current_exe().context("failed to resolve uc binary path")?;
         let mut command = Command::new(exe);
@@ -1245,10 +1238,11 @@ fn run_session_key(args: SessionKeyArgs) -> Result<()> {
 fn try_uc_build_via_daemon(
     common: &BuildCommonArgs,
     manifest_path: &Path,
+    fallback_to_local: bool,
 ) -> Result<Option<DaemonBuildResponse>> {
     #[cfg(not(unix))]
     {
-        let _ = (common, manifest_path);
+        let _ = (common, manifest_path, fallback_to_local);
         return Ok(None);
     }
     #[cfg(unix)]
@@ -1267,30 +1261,46 @@ fn try_uc_build_via_daemon(
         let response = match daemon_request(&socket_path, &request) {
             Ok(response) => response,
             Err(err) => {
-                eprintln!(
-                    "uc: daemon request failed ({}), falling back to local engine",
-                    err
-                );
-                return Ok(None);
+                if fallback_to_local {
+                    eprintln!(
+                        "uc: daemon request failed ({}), falling back to local engine",
+                        err
+                    );
+                    return Ok(None);
+                }
+                return Err(err).context("daemon build request failed");
             }
         };
 
         match response {
             DaemonResponse::Build(result) => Ok(Some(result)),
             DaemonResponse::Error { message } => {
-                if daemon_response_protocol_mismatch(&message) {
-                    eprintln!(
-                        "uc: daemon protocol mismatch ({message}), falling back to local engine"
-                    );
+                if fallback_to_local {
+                    if daemon_response_protocol_mismatch(&message) {
+                        eprintln!(
+                            "uc: daemon protocol mismatch ({message}), falling back to local engine"
+                        );
+                    } else {
+                        eprintln!(
+                            "uc: daemon returned error ({}), falling back to local engine",
+                            message
+                        );
+                    }
+                    Ok(None)
                 } else {
-                    eprintln!(
-                        "uc: daemon returned error ({}), falling back to local engine",
-                        message
-                    );
+                    if daemon_response_protocol_mismatch(&message) {
+                        bail!("{message}");
+                    }
+                    bail!("daemon build request failed: {message}");
                 }
-                Ok(None)
             }
-            _ => Ok(None),
+            _ => {
+                if fallback_to_local {
+                    Ok(None)
+                } else {
+                    bail!("daemon build request failed: unexpected response type");
+                }
+            }
         }
     }
 }
@@ -1935,7 +1945,8 @@ fn collect_cached_artifacts_for_entry(
 
         let object_rel_path = format!("{}/{}.bin", &canonical_hash[0..2], canonical_hash);
         let object_path = objects_dir.join(&object_rel_path);
-        if !object_path.exists() {
+        if !cache_object_matches_expected(&object_path, &canonical_hash, metadata.len())? {
+            let _ = fs::remove_file(&object_path);
             if let Some(parent) = object_path.parent() {
                 fs::create_dir_all(parent)
                     .with_context(|| format!("failed to create {}", parent.display()))?;

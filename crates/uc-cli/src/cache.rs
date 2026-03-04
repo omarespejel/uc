@@ -398,6 +398,25 @@ pub(super) fn upsert_artifact_index_entry_from_metadata(
     Ok(())
 }
 
+pub(super) fn cache_object_matches_expected(
+    object_path: &Path,
+    expected_hash: &str,
+    expected_size: u64,
+) -> Result<bool> {
+    let metadata = match fs::metadata(object_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", object_path.display()))
+        }
+    };
+    if !metadata.is_file() || metadata.len() != expected_size {
+        return Ok(false);
+    }
+    let actual_hash = hash_file_blake3(object_path)?;
+    Ok(actual_hash.eq_ignore_ascii_case(expected_hash))
+}
+
 pub(super) fn restore_cached_artifacts(
     workspace_root: &Path,
     profile: &str,
@@ -462,6 +481,14 @@ pub(super) fn restore_cached_artifacts(
         let object_path = objects_dir.join(&artifact.object_rel_path);
         ensure_path_within_root(objects_dir, &object_path, "cache object path")?;
         if !object_path.exists() {
+            return Ok(false);
+        }
+        if !cache_object_matches_expected(&object_path, expected_hash, artifact.size_bytes)? {
+            eprintln!(
+                "uc: warning: cache object integrity mismatch for {}; evicting object and treating as cache miss",
+                object_path.display()
+            );
+            let _ = fs::remove_file(&object_path);
             return Ok(false);
         }
         if let Some(parent) = out_path.parent() {
