@@ -2953,13 +2953,18 @@ fn try_restore_daemon_shared_cache(
     let Some(entry) = matching_entry else {
         return Ok(None);
     };
-    if !restore_cached_artifacts(
+    if !(cached_artifacts_already_materialized(
+        workspace_root,
+        profile,
+        &shared_cache_root,
+        &entry.artifacts,
+    )? || restore_cached_artifacts(
         workspace_root,
         profile,
         &shared_cache_root,
         &shared_objects_dir,
         &entry.artifacts,
-    )? {
+    )?) {
         return Ok(None);
     }
     Ok(Some(entry.artifacts.len()))
