@@ -1,6 +1,8 @@
 use super::*;
 
 const DAEMON_LOCAL_PROBE_HINT_SUFFIX: &str = ".fallback-session-key";
+const DAEMON_LOCAL_PROBE_HINT_MAX_ENTRIES: usize = 256;
+const DAEMON_LOCAL_PROBE_HINT_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 
 fn daemon_local_probe_hint_path(
     workspace_root: &Path,
@@ -33,21 +35,66 @@ fn load_daemon_local_probe_hint(
         Ok(contents) => contents,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
-            return Err(err).with_context(|| {
-                format!("failed to read daemon probe hint {}", hint_path.display())
-            });
+            tracing::warn!(
+                error = %err,
+                hint_path = %hint_path.display(),
+                "failed to read daemon probe hint; treating as cache miss"
+            );
+            return Ok(None);
         }
     };
     let hinted_session_key = contents.trim();
     if hinted_session_key.is_empty() || hinted_session_key == primary_session_key {
         return Ok(None);
     }
-    validate_hex_digest(
+    if let Err(err) = validate_hex_digest(
         "daemon local probe hinted session key",
         hinted_session_key,
         SESSION_KEY_LEN,
-    )?;
+    ) {
+        tracing::warn!(
+            error = %format!("{err:#}"),
+            hint_path = %hint_path.display(),
+            "invalid daemon probe hint value; ignoring"
+        );
+        return Ok(None);
+    }
     Ok(Some(hinted_session_key.to_string()))
+}
+
+fn prune_daemon_local_probe_hints(hint_dir: &Path) -> Result<()> {
+    if !hint_dir.exists() {
+        return Ok(());
+    }
+    let now = SystemTime::now();
+    let max_age = Duration::from_secs(DAEMON_LOCAL_PROBE_HINT_MAX_AGE_SECS);
+    let mut entries = Vec::new();
+    for entry in
+        fs::read_dir(hint_dir).with_context(|| format!("failed to read {}", hint_dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to read {}", hint_dir.display()))?;
+        let path = entry.path();
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        if !file_name.ends_with(DAEMON_LOCAL_PROBE_HINT_SUFFIX) {
+            continue;
+        }
+        let metadata =
+            fs::metadata(&path).with_context(|| format!("failed to stat {}", path.display()))?;
+        let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+        if now.duration_since(modified).unwrap_or_default() > max_age {
+            let _ = fs::remove_file(&path);
+            continue;
+        }
+        entries.push((path, modified));
+    }
+    entries.sort_by_key(|(_, modified)| *modified);
+    while entries.len() > DAEMON_LOCAL_PROBE_HINT_MAX_ENTRIES {
+        if let Some((path, _)) = entries.first() {
+            let _ = fs::remove_file(path);
+        }
+        entries.remove(0);
+    }
+    Ok(())
 }
 
 fn persist_daemon_local_probe_hint(
@@ -75,6 +122,13 @@ fn persist_daemon_local_probe_hint(
     })?;
     fs::write(&hint_path, format!("{hinted_session_key}\n"))
         .with_context(|| format!("failed to write daemon probe hint {}", hint_path.display()))?;
+    if let Err(err) = prune_daemon_local_probe_hints(parent) {
+        tracing::warn!(
+            error = %format!("{err:#}"),
+            hint_dir = %parent.display(),
+            "failed to prune daemon probe hints"
+        );
+    }
     Ok(())
 }
 

@@ -2830,6 +2830,25 @@ fn native_contract_file_stems_expand_duplicate_contract_names() {
     );
 }
 
+#[test]
+fn native_contract_file_stems_disambiguate_non_injective_module_path_collisions() {
+    let stems = native_contract_file_stems(&[
+        "foo::bar::Transfer".to_string(),
+        "foo_bar::Transfer".to_string(),
+    ]);
+    assert_eq!(stems.len(), 2);
+    assert_ne!(
+        stems[0], stems[1],
+        "module path expansions must remain unique to prevent artifact overwrite"
+    );
+    assert!(
+        stems
+            .iter()
+            .all(|stem| stem.starts_with("foo_bar_Transfer_")),
+        "colliding stems should carry a deterministic disambiguation suffix: {stems:?}"
+    );
+}
+
 #[cfg(feature = "native-compile")]
 #[test]
 fn write_native_sierra_artifact_does_not_prune_when_write_fails() {

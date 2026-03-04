@@ -3183,7 +3183,7 @@ fn native_contract_file_stems(module_paths: &[String]) -> Vec<String> {
         .map(|path| native_contract_name(path).to_string())
         .filter(|contract_name| !seen_names.insert(contract_name.clone()))
         .collect();
-    module_paths
+    let mut stems: Vec<String> = module_paths
         .iter()
         .map(|path| {
             let contract_name = native_contract_name(path);
@@ -3193,7 +3193,37 @@ fn native_contract_file_stems(module_paths: &[String]) -> Vec<String> {
                 contract_name.to_string()
             }
         })
-        .collect()
+        .collect();
+    let mut stem_counts = HashMap::new();
+    for stem in &stems {
+        *stem_counts.entry(stem.clone()).or_insert(0_usize) += 1;
+    }
+    let mut occupied = HashSet::new();
+    for (index, stem) in stems.iter_mut().enumerate() {
+        let original = stem.clone();
+        if stem_counts.get(&original).copied().unwrap_or_default() <= 1
+            && occupied.insert(original.clone())
+        {
+            continue;
+        }
+        let mut candidate = format!(
+            "{}_{}",
+            original,
+            short_hash((module_paths[index].as_str(), "native-stem"))
+        );
+        let mut disambiguator = 0_u32;
+        while !occupied.insert(candidate.clone()) {
+            disambiguator = disambiguator.saturating_add(1);
+            candidate = format!(
+                "{}_{}_{}",
+                original,
+                short_hash((module_paths[index].as_str(), disambiguator)),
+                disambiguator
+            );
+        }
+        *stem = candidate;
+    }
+    stems
 }
 
 #[cfg(feature = "native-compile")]
