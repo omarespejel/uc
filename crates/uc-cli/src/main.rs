@@ -102,6 +102,7 @@ const DEFAULT_BUILD_ENTRY_CACHE_MAX_ENTRIES: usize = 1024;
 const DEFAULT_ARTIFACT_INDEX_CACHE_MAX_ENTRIES: usize = 512;
 const DEFAULT_DAEMON_BUILD_PLAN_CACHE_MAX_ENTRIES: usize = 512;
 const DEFAULT_DAEMON_LOCK_HASH_CACHE_MAX_ENTRIES: usize = 512;
+const DEFAULT_NATIVE_COMPILE_SESSION_CACHE_MAX_ENTRIES: usize = 16;
 const DEFAULT_DAEMON_SHARED_CACHE_ENABLED: bool = true;
 const DEFAULT_DAEMON_SHARED_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const DEFAULT_UC_DISABLE_SCARB_ARTIFACTS_FINGERPRINT: bool = false;
@@ -409,12 +410,20 @@ struct BuildCacheRunContext<'a> {
     options: BuildRunOptions,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 struct NativeCompileContext {
     package_name: String,
     crate_name: String,
     cairo_project_dir: PathBuf,
     corelib_src: PathBuf,
+    manifest_content_hash: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeCompileSessionSignature {
+    manifest_path: PathBuf,
+    manifest_content_hash: String,
+    context: NativeCompileContext,
 }
 
 #[derive(Debug, Serialize)]
@@ -568,6 +577,18 @@ struct LockfileHashCacheEntry {
     change_unix_ms: Option<u64>,
     lock_hash: String,
     last_access_epoch_ms: u64,
+}
+
+#[derive(Clone)]
+struct NativeCompileSessionCacheEntry {
+    session: Arc<Mutex<NativeCompileSessionState>>,
+    last_access_epoch_ms: u64,
+}
+
+struct NativeCompileSessionState {
+    signature: NativeCompileSessionSignature,
+    db: RootDatabase,
+    main_crate_inputs: Vec<CrateInput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1098,6 +1119,17 @@ fn daemon_lock_hash_cache_max_entries() -> usize {
         parse_env_usize(
             "UC_DAEMON_LOCK_HASH_CACHE_MAX_ENTRIES",
             DEFAULT_DAEMON_LOCK_HASH_CACHE_MAX_ENTRIES,
+        )
+        .max(1)
+    })
+}
+
+fn native_compile_session_cache_max_entries() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_env_usize(
+            "UC_NATIVE_COMPILE_SESSION_CACHE_MAX_ENTRIES",
+            DEFAULT_NATIVE_COMPILE_SESSION_CACHE_MAX_ENTRIES,
         )
         .max(1)
     })
@@ -2448,6 +2480,7 @@ fn build_native_compile_context(
         manifest_path,
         "failed to parse manifest for native compile",
     )?;
+    let manifest_content_hash = compute_manifest_content_hash_bytes(manifest_text.as_bytes());
     validate_manifest_dependency_sanity_from_manifest(manifest_path, &manifest)?;
     let package_name = manifest
         .get("package")
@@ -2518,12 +2551,11 @@ fn build_native_compile_context(
     let source_root_string = normalize_fingerprint_path(&source_root);
     let escaped_source_root = toml_escape_basic_string(&source_root_string);
     let cairo_project_toml = format!("[crate_roots]\n{crate_name} = \"{escaped_source_root}\"\n");
-    fs::write(&cairo_project_path, cairo_project_toml).with_context(|| {
-        format!(
-            "failed to write native cairo project {}",
-            cairo_project_path.display()
-        )
-    })?;
+    write_text_file_if_changed(
+        &cairo_project_path,
+        &cairo_project_toml,
+        "native cairo project",
+    )?;
 
     let corelib_src = resolve_native_corelib_src(workspace_root)?;
 
@@ -2532,7 +2564,23 @@ fn build_native_compile_context(
         crate_name,
         cairo_project_dir,
         corelib_src,
+        manifest_content_hash,
     })
+}
+
+fn write_text_file_if_changed(path: &Path, contents: &str, label: &str) -> Result<()> {
+    match fs::read_to_string(path) {
+        Ok(existing) if existing == contents => return Ok(()),
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to read {} {}", label, path.display()));
+        }
+    }
+    fs::write(path, contents)
+        .with_context(|| format!("failed to write {} {}", label, path.display()))?;
+    Ok(())
 }
 
 fn prune_native_target_outputs(
@@ -2588,6 +2636,105 @@ fn compile_native_casm_contract(
     .context("failed to compile native CASM contract class")
 }
 
+fn native_compile_session_cache_key(workspace_root: &Path) -> String {
+    normalize_fingerprint_path(workspace_root)
+}
+
+fn native_compile_session_signature(
+    manifest_path: &Path,
+    context: &NativeCompileContext,
+) -> NativeCompileSessionSignature {
+    NativeCompileSessionSignature {
+        manifest_path: manifest_path.to_path_buf(),
+        manifest_content_hash: context.manifest_content_hash.clone(),
+        context: context.clone(),
+    }
+}
+
+fn build_native_compile_session_state(
+    signature: NativeCompileSessionSignature,
+) -> Result<NativeCompileSessionState> {
+    let mut db = RootDatabase::builder()
+        .with_optimizations(Optimizations::enabled_with_default_movable_functions(
+            InliningStrategy::Default,
+        ))
+        .with_default_plugin_suite(starknet_plugin_suite())
+        .build()
+        .context("failed to initialize native cairo compiler database")?;
+    init_dev_corelib(&mut db, signature.context.corelib_src.clone());
+    let main_crate_inputs = setup_project(&mut db, &signature.context.cairo_project_dir)
+        .with_context(|| {
+            format!(
+                "failed to setup native cairo project {}",
+                signature.context.cairo_project_dir.display()
+            )
+        })?;
+    Ok(NativeCompileSessionState {
+        signature,
+        db,
+        main_crate_inputs,
+    })
+}
+
+fn native_compile_session_handle(
+    workspace_root: &Path,
+    signature: &NativeCompileSessionSignature,
+) -> Result<Arc<Mutex<NativeCompileSessionState>>> {
+    let cache_key = native_compile_session_cache_key(workspace_root);
+    let now_ms = epoch_ms_u64().unwrap_or_default();
+    {
+        let mut cache = native_compile_session_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = cache.get_mut(&cache_key) {
+            entry.last_access_epoch_ms = now_ms;
+            return Ok(entry.session.clone());
+        }
+    }
+    let session = Arc::new(Mutex::new(build_native_compile_session_state(
+        signature.clone(),
+    )?));
+    let mut cache = native_compile_session_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = cache
+        .entry(cache_key)
+        .or_insert_with(|| NativeCompileSessionCacheEntry {
+            session: session.clone(),
+            last_access_epoch_ms: now_ms,
+        });
+    entry.last_access_epoch_ms = now_ms;
+    let session = entry.session.clone();
+    evict_oldest_native_compile_session_cache_entries(
+        &mut cache,
+        native_compile_session_cache_max_entries(),
+    );
+    Ok(session)
+}
+
+fn clear_native_compile_session(workspace_root: &Path) {
+    let cache_key = native_compile_session_cache_key(workspace_root);
+    let mut cache = native_compile_session_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.remove(&cache_key);
+}
+
+fn with_native_compile_session<T>(
+    workspace_root: &Path,
+    signature: &NativeCompileSessionSignature,
+    f: impl FnOnce(&NativeCompileSessionState) -> Result<T>,
+) -> Result<T> {
+    let session_handle = native_compile_session_handle(workspace_root, signature)?;
+    let mut session = session_handle
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if session.signature != *signature {
+        *session = build_native_compile_session_state(signature.clone())?;
+    }
+    f(&session)
+}
+
 fn run_native_build(
     common: &BuildCommonArgs,
     manifest_path: &Path,
@@ -2600,6 +2747,7 @@ fn run_native_build(
     match result {
         Ok(result) => result,
         Err(payload) => {
+            clear_native_compile_session(workspace_root);
             let message = if let Some(text) = payload.downcast_ref::<&str>() {
                 (*text).to_string()
             } else if let Some(text) = payload.downcast_ref::<String>() {
@@ -2642,46 +2790,33 @@ fn run_native_build_inner(
     let target_dir = native_target_dir(workspace_root, profile)?;
     fs::create_dir_all(&target_dir)
         .with_context(|| format!("failed to create {}", target_dir.display()))?;
+    let signature = native_compile_session_signature(manifest_path, &context);
+    let artifact_count = with_native_compile_session(workspace_root, &signature, |session| {
+        let mut compiler_config = CompilerConfig::default();
+        compiler_config.diagnostics_reporter = compiler_config
+            .diagnostics_reporter
+            .with_crates(&session.main_crate_inputs);
+        let crate_ids = CrateInput::into_crate_ids(&session.db, session.main_crate_inputs.clone());
+        let contracts = find_contracts(&session.db, &crate_ids);
 
-    let mut db = RootDatabase::builder()
-        .with_optimizations(Optimizations::enabled_with_default_movable_functions(
-            InliningStrategy::Default,
-        ))
-        .with_default_plugin_suite(starknet_plugin_suite())
-        .build()
-        .context("failed to initialize native cairo compiler database")?;
-    init_dev_corelib(&mut db, context.corelib_src.clone());
+        if contracts.is_empty() {
+            let program = compile_prepared_db_program(&session.db, crate_ids, compiler_config)
+                .context("native cairo compile failed")?;
+            let output_name = format!("{}.sierra", context.package_name);
+            let output_path = target_dir.join(&output_name);
+            ensure_path_within_root(&target_dir, &output_path, "native sierra artifact path")?;
+            fs::write(&output_path, program.to_string())
+                .with_context(|| format!("failed to write native artifact {}", output_name))?;
+            let mut keep_files = BTreeSet::new();
+            keep_files.insert(output_name);
+            prune_native_target_outputs(&target_dir, &context.package_name, &keep_files)?;
+            return Ok(1);
+        }
 
-    let main_crate_inputs =
-        setup_project(&mut db, &context.cairo_project_dir).with_context(|| {
-            format!(
-                "failed to setup native cairo project {}",
-                context.cairo_project_dir.display()
-            )
-        })?;
-    let mut compiler_config = CompilerConfig::default();
-    compiler_config.diagnostics_reporter = compiler_config
-        .diagnostics_reporter
-        .with_crates(&main_crate_inputs);
-    let crate_ids = CrateInput::into_crate_ids(&db, main_crate_inputs);
-    let contracts = find_contracts(&db, &crate_ids);
-
-    let artifact_count = if contracts.is_empty() {
-        let program = compile_prepared_db_program(&db, crate_ids, compiler_config)
-            .context("native cairo compile failed")?;
-        let output_name = format!("{}.sierra", context.package_name);
-        let output_path = target_dir.join(&output_name);
-        ensure_path_within_root(&target_dir, &output_path, "native sierra artifact path")?;
-        fs::write(&output_path, program.to_string())
-            .with_context(|| format!("failed to write native artifact {}", output_name))?;
-        let mut keep_files = BTreeSet::new();
-        keep_files.insert(output_name);
-        prune_native_target_outputs(&target_dir, &context.package_name, &keep_files)?;
-        1
-    } else {
         let contract_refs: Vec<_> = contracts.iter().collect();
-        let contract_classes = compile_starknet_prepared_db(&db, &contract_refs, compiler_config)
-            .context("native starknet compile failed")?;
+        let contract_classes =
+            compile_starknet_prepared_db(&session.db, &contract_refs, compiler_config)
+                .context("native starknet compile failed")?;
         if contract_classes.len() != contracts.len() {
             bail!(
                 "native compile returned mismatched contract classes (expected {}, got {})",
@@ -2692,14 +2827,17 @@ fn run_native_build_inner(
         #[cfg(debug_assertions)]
         {
             for (index, contract) in contracts.iter().enumerate() {
-                let mut single_class =
-                    compile_starknet_prepared_db(&db, &[contract], CompilerConfig::default())
-                        .with_context(|| {
-                            format!(
-                                "failed to validate native contract ordering for {}",
-                                contract.submodule_id.full_path(&db)
-                            )
-                        })?;
+                let mut single_class = compile_starknet_prepared_db(
+                    &session.db,
+                    &[contract],
+                    CompilerConfig::default(),
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to validate native contract ordering for {}",
+                        contract.submodule_id.full_path(&session.db)
+                    )
+                })?;
                 let expected_class = single_class
                     .pop()
                     .context("single-contract native compile returned no output")?;
@@ -2715,7 +2853,7 @@ fn run_native_build_inner(
         // `compile_prepared_db` currently preserves input order (`contracts.par_iter().collect()`).
         // Keep this zipped mapping explicit so a future upstream change is easy to audit here.
         for (contract, contract_class) in contracts.iter().zip(contract_classes.into_iter()) {
-            let module_path = contract.submodule_id.full_path(&db);
+            let module_path = contract.submodule_id.full_path(&session.db);
             let contract_name = module_path
                 .rsplit("::")
                 .next()
@@ -2779,8 +2917,8 @@ fn run_native_build_inner(
         write_json_file_compact(&manifest_path, &manifest)
             .with_context(|| format!("failed to write {}", manifest_path.display()))?;
         prune_native_target_outputs(&target_dir, &context.package_name, &keep_files)?;
-        contract_artifact_count + 1
-    };
+        Ok(contract_artifact_count + 1)
+    })?;
 
     Ok(CommandRun {
         command: vec![
@@ -3548,8 +3686,31 @@ fn daemon_lock_hash_cache() -> &'static Mutex<HashMap<String, LockfileHashCacheE
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn native_compile_session_cache() -> &'static Mutex<HashMap<String, NativeCompileSessionCacheEntry>>
+{
+    static CACHE: OnceLock<Mutex<HashMap<String, NativeCompileSessionCacheEntry>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn evict_oldest_daemon_lock_hash_cache_entries(
     cache: &mut HashMap<String, LockfileHashCacheEntry>,
+    max_entries: usize,
+) {
+    while cache.len() > max_entries {
+        let Some(oldest_key) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_access_epoch_ms)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest_key);
+    }
+}
+
+fn evict_oldest_native_compile_session_cache_entries(
+    cache: &mut HashMap<String, NativeCompileSessionCacheEntry>,
     max_entries: usize,
 ) {
     while cache.len() > max_entries {
