@@ -103,7 +103,6 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             .deterministic_key_hex();
                             Ok((compiler_version, session_key))
                         };
-                        let mut precomputed_scarb_fallback = build_scarb_fallback_context().ok();
                         match run_local_with_backend(
                             &native_session_key,
                             &native_compiler_version,
@@ -118,12 +117,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                         native_err
                                     );
                                 let (compiler_version, local_session_key) =
-                                    if let Some((version, key)) = precomputed_scarb_fallback.take()
-                                    {
-                                        (version, key)
-                                    } else {
-                                        build_scarb_fallback_context()?
-                                    };
+                                    build_scarb_fallback_context()?;
                                 let (run, cache_hit, fingerprint, telemetry) =
                                     run_local_with_backend(
                                         &local_session_key,

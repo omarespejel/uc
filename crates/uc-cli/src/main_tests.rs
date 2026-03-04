@@ -2543,6 +2543,22 @@ fn toml_escape_basic_string_escapes_backslashes_and_quotes() {
 }
 
 #[test]
+fn toml_escape_basic_string_escapes_control_characters() {
+    assert_eq!(
+        toml_escape_basic_string("line1\nline2\t\u{0007}\u{007F}"),
+        r#"line1\nline2\t\u0007\u007F"#
+    );
+}
+
+#[test]
+fn cacheable_artifact_suffixes_include_native_compiled_contract_class() {
+    assert!(
+        CACHEABLE_ARTIFACT_SUFFIXES.contains(&".compiled_contract_class.json"),
+        "native CASM artifact suffix must be cacheable for warm restores"
+    );
+}
+
+#[test]
 fn resolve_native_corelib_src_prefers_explicit_env_override() {
     let _guard = integration_env_lock()
         .lock()

@@ -108,13 +108,15 @@ const DEFAULT_UC_NATIVE_BUILD_MODE: &str = "off";
 const TOOLCHAIN_CHECK_CACHE_SCHEMA_VERSION: u32 = 1;
 const MAX_TOOLCHAIN_CHECK_CACHE_BYTES: u64 = 64 * 1024;
 const NATIVE_ARTIFACT_ID_TRUNC_HEX_LEN: usize = 13;
+const DEFAULT_NATIVE_MAX_CASM_BYTECODE_SIZE: usize = 81_290;
 const DEFAULT_SCARB_TOOLCHAIN_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
 const DAEMON_PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
-const CACHEABLE_ARTIFACT_SUFFIXES: [&str; 5] = [
+const CACHEABLE_ARTIFACT_SUFFIXES: [&str; 6] = [
     ".sierra.json",
     ".sierra",
     ".casm",
     ".contract_class.json",
+    ".compiled_contract_class.json",
     ".executable.json",
 ];
 
@@ -878,9 +880,7 @@ fn parse_env_bool(name: &str, default: bool) -> bool {
     }
 }
 
-fn native_build_mode() -> NativeBuildMode {
-    let raw = std::env::var("UC_NATIVE_BUILD_MODE")
-        .unwrap_or_else(|_| DEFAULT_UC_NATIVE_BUILD_MODE.to_string());
+fn parse_native_build_mode(raw: &str) -> NativeBuildMode {
     match raw.trim().to_ascii_lowercase().as_str() {
         "off" => NativeBuildMode::Off,
         "auto" => NativeBuildMode::Auto,
@@ -897,8 +897,35 @@ fn native_build_mode() -> NativeBuildMode {
     }
 }
 
+#[cfg(test)]
+fn native_build_mode() -> NativeBuildMode {
+    let raw = std::env::var("UC_NATIVE_BUILD_MODE")
+        .unwrap_or_else(|_| DEFAULT_UC_NATIVE_BUILD_MODE.to_string());
+    parse_native_build_mode(&raw)
+}
+
+#[cfg(not(test))]
+fn native_build_mode() -> NativeBuildMode {
+    static VALUE: OnceLock<NativeBuildMode> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        let raw = std::env::var("UC_NATIVE_BUILD_MODE")
+            .unwrap_or_else(|_| DEFAULT_UC_NATIVE_BUILD_MODE.to_string());
+        parse_native_build_mode(&raw)
+    })
+}
+
 fn native_compiler_version_line() -> String {
     format!("uc-native {}", env!("CARGO_PKG_VERSION"))
+}
+
+fn native_max_casm_bytecode_size() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_env_usize(
+            "UC_NATIVE_MAX_CASM_BYTECODE_SIZE",
+            DEFAULT_NATIVE_MAX_CASM_BYTECODE_SIZE,
+        )
+    })
 }
 
 fn max_fingerprint_files() -> usize {
@@ -2316,7 +2343,23 @@ fn native_corelib_layout_looks_compatible(corelib_src: &Path) -> bool {
 }
 
 fn toml_escape_basic_string(raw: &str) -> String {
-    raw.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut escaped = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\u{08}' => escaped.push_str("\\b"),
+            '\u{0C}' => escaped.push_str("\\f"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            c if c.is_control() => {
+                escaped.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => escaped.push(c),
+        }
+    }
+    escaped
 }
 
 fn resolve_native_corelib_src(workspace_root: &Path) -> Result<PathBuf> {
@@ -2615,10 +2658,10 @@ fn run_native_build_inner(
                 .extract_sierra_program(false)
                 .context("failed to extract native Sierra program for CASM emission")?;
             let casm_contract = CasmContractClass::from_contract_class(
-                contract_class.clone(),
+                contract_class,
                 extracted_program,
                 false,
-                usize::MAX,
+                native_max_casm_bytecode_size(),
             )
             .context("failed to compile native CASM contract class")?;
             let casm_file = format!(
