@@ -2454,6 +2454,98 @@ edition = "2024_07"
 }
 
 #[test]
+fn try_local_uc_cache_hit_skips_fingerprint_when_entry_is_missing() {
+    let dir = unique_test_dir("uc-local-cache-probe-missing-entry");
+    let workspace = dir.join("workspace");
+    fs::create_dir_all(&workspace).expect("failed to create workspace");
+    let manifest_path = workspace.join("Scarb.toml");
+    let common = BuildCommonArgs {
+        manifest_path: Some(manifest_path.clone()),
+        package: None,
+        workspace: false,
+        features: Vec::new(),
+        offline: false,
+        release: false,
+        profile: None,
+    };
+    let session_key = "a".repeat(SESSION_KEY_LEN);
+    let probe = try_local_uc_cache_hit(
+        &common,
+        &manifest_path,
+        &workspace,
+        "dev",
+        &session_key,
+        "scarb 2.14.0 (local-cache-probe-test)",
+    )
+    .expect("missing cache entry should return None without fingerprint failure");
+    assert!(
+        probe.is_none(),
+        "missing local cache entry should produce a clean cache miss"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn run_build_with_uc_cache_defers_fingerprint_when_entry_is_missing() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !scarb_available() {
+        return;
+    }
+    let dir = unique_test_dir("uc-run-build-deferred-fingerprint");
+    let workspace = dir.join("workspace");
+    fs::create_dir_all(&workspace).expect("failed to create workspace");
+    let manifest_path = workspace.join("Scarb.toml");
+    let common = BuildCommonArgs {
+        manifest_path: Some(manifest_path.clone()),
+        package: None,
+        workspace: false,
+        features: Vec::new(),
+        offline: false,
+        release: false,
+        profile: None,
+    };
+    let session_key = "b".repeat(SESSION_KEY_LEN);
+    let compiler_version = scarb_version_line().expect("failed to resolve scarb version");
+    let (run, cache_hit, fingerprint, telemetry) = run_build_with_uc_cache(
+        &common,
+        BuildCacheRunContext {
+            manifest_path: &manifest_path,
+            workspace_root: &workspace,
+            profile: "dev",
+            session_key: &session_key,
+            compiler_version: &compiler_version,
+            compile_backend: BuildCompileBackend::Scarb,
+            options: BuildRunOptions {
+                capture_output: true,
+                inherit_output_when_uncaptured: true,
+                async_cache_persist: false,
+                use_daemon_shared_cache: false,
+            },
+        },
+    )
+    .expect("compile miss path should return command result, not fingerprint error");
+    assert!(
+        !cache_hit,
+        "missing local cache entry with missing manifest must remain a cache miss"
+    );
+    assert_ne!(
+        run.exit_code, 0,
+        "missing manifest should fail the compile command"
+    );
+    assert!(
+        fingerprint.is_empty(),
+        "compile failures should not force fingerprint computation on startup miss path"
+    );
+    assert_eq!(
+        telemetry.fingerprint_ms, 0.0,
+        "deferred startup path should avoid fingerprint work when compile fails"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn validate_manifest_dependency_sanity_rejects_self_dependency() {
     let dir = unique_test_dir("uc-self-dependency");
     let manifest_path = dir.join("Scarb.toml");
@@ -2588,6 +2680,111 @@ edition = "2024_07"
     assert!(
         cairo_project.contains("[config.global]\nedition = \"2024_07\""),
         "manifest edition should be propagated into cairo_project.toml: {cairo_project}"
+    );
+
+    std::env::remove_var("UC_NATIVE_CORELIB_SRC");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn build_native_compile_context_cache_revalidates_requested_package_on_cache_hit() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = unique_test_dir("uc-native-context-cache-package");
+    let manifest_path = dir.join("Scarb.toml");
+    fs::create_dir_all(dir.join("src")).expect("failed to create src directory");
+    fs::write(dir.join("src/lib.cairo"), "fn main() {}\n").expect("failed to write lib.cairo");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo-native"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("failed to write manifest");
+
+    let fake_corelib_src = dir.join("toolchain/corelib/src");
+    create_mock_native_corelib(&fake_corelib_src);
+    std::env::set_var("UC_NATIVE_CORELIB_SRC", &fake_corelib_src);
+
+    let common_ok = BuildCommonArgs {
+        manifest_path: Some(manifest_path.clone()),
+        package: None,
+        workspace: false,
+        features: Vec::new(),
+        offline: true,
+        release: false,
+        profile: None,
+    };
+    build_native_compile_context(&common_ok, &manifest_path, &dir)
+        .expect("initial native context build should succeed");
+
+    let common_mismatch = BuildCommonArgs {
+        manifest_path: Some(manifest_path.clone()),
+        package: Some("other-package".to_string()),
+        workspace: false,
+        features: Vec::new(),
+        offline: true,
+        release: false,
+        profile: None,
+    };
+    let err = build_native_compile_context(&common_mismatch, &manifest_path, &dir)
+        .expect_err("cache hit path should still enforce --package matching");
+    assert!(
+        format!("{err:#}").contains("native compile only supports the manifest package"),
+        "unexpected error: {err:#}"
+    );
+
+    std::env::remove_var("UC_NATIVE_CORELIB_SRC");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn build_native_compile_context_cache_tracks_corelib_override_changes() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = unique_test_dir("uc-native-context-cache-corelib");
+    let manifest_path = dir.join("Scarb.toml");
+    fs::create_dir_all(dir.join("src")).expect("failed to create src directory");
+    fs::write(dir.join("src/lib.cairo"), "fn main() {}\n").expect("failed to write lib.cairo");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo-native"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("failed to write manifest");
+
+    let corelib_a = dir.join("corelib-a/src");
+    let corelib_b = dir.join("corelib-b/src");
+    create_mock_native_corelib(&corelib_a);
+    create_mock_native_corelib(&corelib_b);
+
+    let common = BuildCommonArgs {
+        manifest_path: Some(manifest_path.clone()),
+        package: None,
+        workspace: false,
+        features: Vec::new(),
+        offline: true,
+        release: false,
+        profile: None,
+    };
+
+    std::env::set_var("UC_NATIVE_CORELIB_SRC", &corelib_a);
+    let context_a = build_native_compile_context(&common, &manifest_path, &dir)
+        .expect("context A should build");
+
+    std::env::set_var("UC_NATIVE_CORELIB_SRC", &corelib_b);
+    let context_b = build_native_compile_context(&common, &manifest_path, &dir)
+        .expect("context B should build");
+    assert_ne!(
+        context_a.corelib_src, context_b.corelib_src,
+        "cache key should include corelib override so override changes invalidate cache"
     );
 
     std::env::remove_var("UC_NATIVE_CORELIB_SRC");

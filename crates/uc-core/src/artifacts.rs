@@ -33,6 +33,7 @@ const DEFAULT_SUFFIXES: [&str; 7] = [
 ];
 const MAX_ARTIFACT_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 const SIERRA_NORMALIZATION_SCHEMA_TAG: &str = "sierra-normalization-v3";
+const CONTRACT_CLASS_NORMALIZATION_SCHEMA_TAG: &str = "contract-class-normalization-v1";
 
 pub fn collect_artifact_digests(target_root: &Path) -> Result<Vec<ArtifactDigest>> {
     if !target_root.exists() {
@@ -63,6 +64,8 @@ pub fn collect_artifact_digests(target_root: &Path) -> Result<Vec<ArtifactDigest
 
         let (blake3_hex, size_bytes) = if name.ends_with(".sierra.json") {
             hash_sierra_json_semantic(path)?
+        } else if name.ends_with(".contract_class.json") {
+            hash_contract_class_json_semantic(path)?
         } else {
             hash_file_with_limit(path)?
         };
@@ -195,6 +198,85 @@ fn hash_sierra_json_semantic(path: &Path) -> Result<(String, u64)> {
     hasher.update(SIERRA_NORMALIZATION_SCHEMA_TAG.as_bytes());
     hasher.update(&canonical_bytes);
     Ok((hasher.finalize().to_hex().to_string(), metadata.len()))
+}
+
+fn hash_contract_class_json_semantic(path: &Path) -> Result<(String, u64)> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    if metadata.len() > MAX_ARTIFACT_SIZE_BYTES {
+        bail!(
+            "artifact {} exceeds size limit ({} bytes > {} bytes)",
+            path.display(),
+            metadata.len(),
+            MAX_ARTIFACT_SIZE_BYTES
+        );
+    }
+
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut value: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse JSON {}", path.display()))?;
+    validate_supported_sierra_schema(&value, path)?;
+    normalize_contract_class_compiler_version_triplet(&mut value);
+    normalize_sierra_json_ids(&mut value);
+    let canonical = canonicalize_json(&value);
+    let canonical_bytes = serde_json::to_vec(&canonical)
+        .with_context(|| format!("failed to serialize normalized JSON {}", path.display()))?;
+    let mut hasher = Hasher::new();
+    hasher.update(CONTRACT_CLASS_NORMALIZATION_SCHEMA_TAG.as_bytes());
+    hasher.update(&canonical_bytes);
+    Ok((hasher.finalize().to_hex().to_string(), metadata.len()))
+}
+
+fn normalize_contract_class_compiler_version_triplet(value: &mut Value) {
+    let Some(program) = value
+        .get_mut("sierra_program")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    if program.len() < 6 {
+        return;
+    }
+    let Some(sierra_major) = value_hex_u64(&program[0]) else {
+        return;
+    };
+    if sierra_major != 1 {
+        return;
+    }
+    if value_hex_u64(&program[1]).is_none()
+        || value_hex_u64(&program[2]).is_none()
+        || value_hex_u64(&program[3]).is_none()
+        || value_hex_u64(&program[4]).is_none()
+        || value_hex_u64(&program[5]).is_none()
+    {
+        return;
+    }
+    for index in 3..=5 {
+        match program.get(index) {
+            Some(Value::String(_)) => program[index] = Value::String("0x0".to_string()),
+            Some(Value::Number(_)) => program[index] = Value::Number(serde_json::Number::from(0)),
+            _ => return,
+        }
+    }
+}
+
+fn value_hex_u64(value: &Value) -> Option<u64> {
+    match value {
+        Value::String(text) => parse_hex_u64(text),
+        Value::Number(number) => number.as_u64(),
+        _ => None,
+    }
+}
+
+fn parse_hex_u64(value: &str) -> Option<u64> {
+    let trimmed = value.trim();
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        return u64::from_str_radix(hex, 16).ok();
+    }
+    trimmed.parse::<u64>().ok()
 }
 
 fn validate_supported_sierra_schema(value: &Value, path: &Path) -> Result<()> {
@@ -491,8 +573,8 @@ fn canonicalize_json(value: &Value) -> Value {
 mod tests {
     use super::{
         canonicalize_json, collect_artifact_digests, compare_artifact_sets,
-        hash_sierra_json_semantic, normalize_sierra_json_ids, validate_supported_sierra_schema,
-        ArtifactDigest,
+        hash_contract_class_json_semantic, hash_sierra_json_semantic, normalize_sierra_json_ids,
+        validate_supported_sierra_schema, ArtifactDigest,
     };
     use serde_json::json;
     use std::fs;
@@ -850,6 +932,90 @@ mod tests {
         assert_ne!(
             hash_a, hash_b,
             "semantic hash must change when declaration semantics change"
+        );
+
+        let _ = fs::remove_file(&path_a);
+        let _ = fs::remove_file(&path_b);
+    }
+
+    #[test]
+    fn contract_class_semantic_hash_ignores_compiler_version_triplet() {
+        let path_a = unique_test_path("contract-hash-a");
+        let path_b = unique_test_path("contract-hash-b");
+        let body_a = json!({
+            "sierra_format_version": "1.0.0",
+            "sierra_program": ["0x1", "0x7", "0x0", "0x2", "0xe", "0x0", "0x2b9"],
+            "type_declarations": [{"id": {"id": 11, "debug_name": "felt252"}}],
+            "libfunc_declarations": [{"id": {"id": 41, "debug_name": "store_temp<felt252>"}}],
+        });
+        let body_b = json!({
+            "sierra_format_version": "1.0.0",
+            "sierra_program": ["0x1", "0x7", "0x0", "0x2", "0x10", "0x0", "0x2b9"],
+            "type_declarations": [{"id": {"id": 11, "debug_name": "felt252"}}],
+            "libfunc_declarations": [{"id": {"id": 41, "debug_name": "store_temp<felt252>"}}],
+        });
+        fs::write(
+            &path_a,
+            serde_json::to_vec(&body_a).expect("failed to encode contract hash a"),
+        )
+        .expect("failed to write contract hash a");
+        fs::write(
+            &path_b,
+            serde_json::to_vec(&body_b).expect("failed to encode contract hash b"),
+        )
+        .expect("failed to write contract hash b");
+
+        let hash_a = hash_contract_class_json_semantic(&path_a)
+            .expect("failed to hash contract a")
+            .0;
+        let hash_b = hash_contract_class_json_semantic(&path_b)
+            .expect("failed to hash contract b")
+            .0;
+        assert_eq!(
+            hash_a, hash_b,
+            "contract-class semantic hash should ignore compiler version triplet differences"
+        );
+
+        let _ = fs::remove_file(&path_a);
+        let _ = fs::remove_file(&path_b);
+    }
+
+    #[test]
+    fn contract_class_semantic_hash_changes_on_program_semantics() {
+        let path_a = unique_test_path("contract-semantic-a");
+        let path_b = unique_test_path("contract-semantic-b");
+        let body_a = json!({
+            "sierra_format_version": "1.0.0",
+            "sierra_program": ["0x1", "0x7", "0x0", "0x2", "0x10", "0x0", "0x2b9"],
+            "type_declarations": [{"id": {"id": 11, "debug_name": "felt252"}}],
+            "libfunc_declarations": [{"id": {"id": 41, "debug_name": "store_temp<felt252>"}}],
+        });
+        let body_b = json!({
+            "sierra_format_version": "1.0.0",
+            "sierra_program": ["0x1", "0x7", "0x0", "0x2", "0x10", "0x0", "0x2ba"],
+            "type_declarations": [{"id": {"id": 11, "debug_name": "felt252"}}],
+            "libfunc_declarations": [{"id": {"id": 41, "debug_name": "store_temp<felt252>"}}],
+        });
+        fs::write(
+            &path_a,
+            serde_json::to_vec(&body_a).expect("failed to encode semantic contract a"),
+        )
+        .expect("failed to write semantic contract a");
+        fs::write(
+            &path_b,
+            serde_json::to_vec(&body_b).expect("failed to encode semantic contract b"),
+        )
+        .expect("failed to write semantic contract b");
+
+        let hash_a = hash_contract_class_json_semantic(&path_a)
+            .expect("failed to hash semantic contract a")
+            .0;
+        let hash_b = hash_contract_class_json_semantic(&path_b)
+            .expect("failed to hash semantic contract b")
+            .0;
+        assert_ne!(
+            hash_a, hash_b,
+            "contract-class semantic hash must change on Sierra program semantic changes"
         );
 
         let _ = fs::remove_file(&path_a);

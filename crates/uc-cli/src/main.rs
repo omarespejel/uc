@@ -104,6 +104,7 @@ const DEFAULT_ARTIFACT_INDEX_CACHE_MAX_ENTRIES: usize = 512;
 const DEFAULT_DAEMON_BUILD_PLAN_CACHE_MAX_ENTRIES: usize = 512;
 const DEFAULT_DAEMON_LOCK_HASH_CACHE_MAX_ENTRIES: usize = 512;
 const DEFAULT_NATIVE_COMPILE_SESSION_CACHE_MAX_ENTRIES: usize = 16;
+const DEFAULT_NATIVE_COMPILE_CONTEXT_CACHE_MAX_ENTRIES: usize = 256;
 const DEFAULT_DAEMON_SHARED_CACHE_ENABLED: bool = true;
 const DEFAULT_DAEMON_SHARED_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const DEFAULT_UC_DISABLE_SCARB_ARTIFACTS_FINGERPRINT: bool = false;
@@ -637,6 +638,15 @@ struct LockfileHashCacheEntry {
 #[derive(Clone)]
 struct NativeCompileSessionCacheEntry {
     session: Arc<Mutex<NativeCompileSessionState>>,
+    last_access_epoch_ms: u64,
+}
+
+#[derive(Clone)]
+struct NativeCompileContextCacheEntry {
+    manifest_size_bytes: u64,
+    manifest_modified_unix_ms: u64,
+    manifest_change_unix_ms: Option<u64>,
+    context: NativeCompileContext,
     last_access_epoch_ms: u64,
 }
 
@@ -1239,6 +1249,17 @@ fn native_compile_session_cache_max_entries() -> usize {
         parse_env_usize(
             "UC_NATIVE_COMPILE_SESSION_CACHE_MAX_ENTRIES",
             DEFAULT_NATIVE_COMPILE_SESSION_CACHE_MAX_ENTRIES,
+        )
+        .max(1)
+    })
+}
+
+fn native_compile_context_cache_max_entries() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_env_usize(
+            "UC_NATIVE_COMPILE_CONTEXT_CACHE_MAX_ENTRIES",
+            DEFAULT_NATIVE_COMPILE_CONTEXT_CACHE_MAX_ENTRIES,
         )
         .max(1)
     })
@@ -2141,6 +2162,17 @@ fn try_local_uc_cache_hit(
     )?;
     ensure_path_within_root(&canonical_workspace_root, &entry_path, "cache entry path")?;
 
+    let cache_lookup_start = Instant::now();
+    let cached_entry = load_cache_entry_cached(&entry_path)?;
+    telemetry.cache_lookup_ms = cache_lookup_start.elapsed().as_secs_f64() * 1000.0;
+
+    let Some(entry) = cached_entry else {
+        return Ok(None);
+    };
+    if entry.schema_version != BUILD_CACHE_SCHEMA_VERSION || entry.profile != profile {
+        return Ok(None);
+    }
+
     let fingerprint_start = Instant::now();
     let fingerprint = compute_build_fingerprint_with_scarb_version(
         &canonical_workspace_root,
@@ -2151,25 +2183,9 @@ fn try_local_uc_cache_hit(
         compiler_version,
     )?;
     telemetry.fingerprint_ms = fingerprint_start.elapsed().as_secs_f64() * 1000.0;
-
-    let cache_lookup_start = Instant::now();
-    let cached_entry = if let Some(entry) = load_cache_entry_cached(&entry_path)? {
-        if entry.schema_version == BUILD_CACHE_SCHEMA_VERSION
-            && entry.profile == profile
-            && entry.fingerprint == fingerprint
-        {
-            Some(entry)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    telemetry.cache_lookup_ms = cache_lookup_start.elapsed().as_secs_f64() * 1000.0;
-
-    let Some(entry) = cached_entry else {
+    if entry.fingerprint != fingerprint {
         return Ok(None);
-    };
+    }
 
     let restore_start = Instant::now();
     let restored = cached_artifacts_already_materialized(
@@ -2250,77 +2266,86 @@ fn run_build_with_uc_cache(
         "cache objects directory",
     )?;
     ensure_path_within_root(&canonical_workspace_root, &entry_path, "cache entry path")?;
-    let fingerprint_start = Instant::now();
-    let fingerprint = compute_build_fingerprint_with_scarb_version(
-        &canonical_workspace_root,
-        manifest_path,
-        common,
-        profile,
-        Some(&cache_root),
-        compiler_version,
-    )?;
-    telemetry.fingerprint_ms = fingerprint_start.elapsed().as_secs_f64() * 1000.0;
-
     let cache_lookup_start = Instant::now();
-    let cached_entry = if let Some(entry) = load_cache_entry_cached(&entry_path)? {
-        if entry.schema_version == BUILD_CACHE_SCHEMA_VERSION
-            && entry.profile == profile
-            && entry.fingerprint == fingerprint
-        {
-            Some(entry)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let cached_entry = load_cache_entry_cached(&entry_path)?;
     telemetry.cache_lookup_ms = cache_lookup_start.elapsed().as_secs_f64() * 1000.0;
 
-    if let Some(entry) = cached_entry {
-        let restore_start = Instant::now();
-        if cached_artifacts_already_materialized(
-            &canonical_workspace_root,
-            profile,
-            &cache_root,
-            &entry.artifacts,
-        )? || restore_cached_artifacts(
-            &canonical_workspace_root,
-            profile,
-            &cache_root,
-            &objects_dir,
-            &entry.artifacts,
-        )? {
+    let mut fingerprint: Option<String> = None;
+    let ensure_fingerprint =
+        |fingerprint: &mut Option<String>, telemetry: &mut BuildPhaseTelemetry| -> Result<()> {
+            if fingerprint.is_some() {
+                return Ok(());
+            }
+            let fingerprint_start = Instant::now();
+            *fingerprint = Some(compute_build_fingerprint_with_scarb_version(
+                &canonical_workspace_root,
+                manifest_path,
+                common,
+                profile,
+                Some(&cache_root),
+                compiler_version,
+            )?);
+            telemetry.fingerprint_ms += fingerprint_start.elapsed().as_secs_f64() * 1000.0;
+            Ok(())
+        };
+
+    if let Some(entry) = cached_entry.filter(|entry| {
+        entry.schema_version == BUILD_CACHE_SCHEMA_VERSION && entry.profile == profile
+    }) {
+        ensure_fingerprint(&mut fingerprint, &mut telemetry)?;
+        if entry.fingerprint == fingerprint.as_deref().unwrap_or_default() {
+            let restore_start = Instant::now();
+            if cached_artifacts_already_materialized(
+                &canonical_workspace_root,
+                profile,
+                &cache_root,
+                &entry.artifacts,
+            )? || restore_cached_artifacts(
+                &canonical_workspace_root,
+                profile,
+                &cache_root,
+                &objects_dir,
+                &entry.artifacts,
+            )? {
+                telemetry.cache_restore_ms = restore_start.elapsed().as_secs_f64() * 1000.0;
+                let total_elapsed_ms = telemetry.fingerprint_ms
+                    + telemetry.cache_lookup_ms
+                    + telemetry.cache_restore_ms;
+                let run = CommandRun {
+                    command: vec![
+                        "uc".to_string(),
+                        "build".to_string(),
+                        "--engine".to_string(),
+                        "uc".to_string(),
+                        "--cache-hit".to_string(),
+                    ],
+                    exit_code: 0,
+                    elapsed_ms: total_elapsed_ms,
+                    stdout: format!(
+                        "uc: cache hit, restored {} artifacts\n",
+                        entry.artifacts.len()
+                    ),
+                    stderr: String::new(),
+                };
+                return Ok((
+                    run,
+                    true,
+                    fingerprint.clone().unwrap_or_default(),
+                    telemetry,
+                ));
+            }
             telemetry.cache_restore_ms = restore_start.elapsed().as_secs_f64() * 1000.0;
-            let total_elapsed_ms =
-                telemetry.fingerprint_ms + telemetry.cache_lookup_ms + telemetry.cache_restore_ms;
-            let run = CommandRun {
-                command: vec![
-                    "uc".to_string(),
-                    "build".to_string(),
-                    "--engine".to_string(),
-                    "uc".to_string(),
-                    "--cache-hit".to_string(),
-                ],
-                exit_code: 0,
-                elapsed_ms: total_elapsed_ms,
-                stdout: format!(
-                    "uc: cache hit, restored {} artifacts\n",
-                    entry.artifacts.len()
-                ),
-                stderr: String::new(),
-            };
-            return Ok((run, true, fingerprint, telemetry));
         }
-        telemetry.cache_restore_ms = restore_start.elapsed().as_secs_f64() * 1000.0;
     }
 
     if options.use_daemon_shared_cache {
+        ensure_fingerprint(&mut fingerprint, &mut telemetry)?;
         let shared_lookup_start = Instant::now();
         let shared_restore = try_restore_daemon_shared_cache(
             &canonical_workspace_root,
             profile,
             session_key,
-            &fingerprint,
+            fingerprint.as_deref().unwrap_or_default(),
         )?;
         telemetry.cache_lookup_ms += shared_lookup_start.elapsed().as_secs_f64() * 1000.0;
         if let Some(restored_count) = shared_restore {
@@ -2340,7 +2365,12 @@ fn run_build_with_uc_cache(
                 stdout: format!("uc: cache hit, restored {} artifacts\n", restored_count),
                 stderr: String::new(),
             };
-            return Ok((run, true, fingerprint, telemetry));
+            return Ok((
+                run,
+                true,
+                fingerprint.clone().unwrap_or_default(),
+                telemetry,
+            ));
         }
     }
 
@@ -2366,6 +2396,8 @@ fn run_build_with_uc_cache(
     telemetry.compile_ms = run.elapsed_ms;
 
     if run.exit_code == 0 {
+        ensure_fingerprint(&mut fingerprint, &mut telemetry)?;
+        let fingerprint_value = fingerprint.as_deref().unwrap_or_default();
         if options.async_cache_persist {
             telemetry.cache_persist_async = true;
             let persist_scope_key = async_persist_scope_key(&canonical_workspace_root, profile);
@@ -2375,7 +2407,7 @@ fn run_build_with_uc_cache(
                     scope_key: persist_scope_key.clone(),
                     workspace_root: canonical_workspace_root.clone(),
                     profile: profile.to_string(),
-                    fingerprint: fingerprint.clone(),
+                    fingerprint: fingerprint_value.to_string(),
                     cache_root: cache_root.clone(),
                     objects_dir: objects_dir.clone(),
                     entry_path: entry_path.clone(),
@@ -2408,7 +2440,7 @@ fn run_build_with_uc_cache(
                     &canonical_workspace_root,
                     profile,
                     session_key,
-                    &fingerprint,
+                    fingerprint_value,
                 ) {
                     tracing::warn!(
                         error = %format!("{err:#}"),
@@ -2425,7 +2457,7 @@ fn run_build_with_uc_cache(
             let cached_artifacts = persist_cache_entry_for_build_with_artifacts(
                 &canonical_workspace_root,
                 profile,
-                &fingerprint,
+                fingerprint_value,
                 &cache_root,
                 &objects_dir,
                 &entry_path,
@@ -2435,7 +2467,7 @@ fn run_build_with_uc_cache(
                     &canonical_workspace_root,
                     profile,
                     session_key,
-                    &fingerprint,
+                    fingerprint_value,
                     &objects_dir,
                     &cached_artifacts,
                 )?;
@@ -2444,7 +2476,8 @@ fn run_build_with_uc_cache(
         }
     }
 
-    Ok((run, false, fingerprint, telemetry))
+    let reported_fingerprint = fingerprint.unwrap_or_default();
+    Ok((run, false, reported_fingerprint, telemetry))
 }
 
 /// Maps Scarb package names into a safe Cairo crate key used in `cairo_project.toml`.
@@ -2601,6 +2634,92 @@ fn build_native_compile_context(
         ));
     }
 
+    let manifest_metadata = fs::metadata(manifest_path)
+        .with_context(|| format!("failed to stat {}", manifest_path.display()))?;
+    let manifest_size_bytes = manifest_metadata.len();
+    let manifest_modified_unix_ms = metadata_modified_unix_ms(&manifest_metadata)?;
+    let manifest_change_unix_ms = metadata_change_unix_ms(&manifest_metadata);
+    let corelib_override = normalized_env_var("UC_NATIVE_CORELIB_SRC");
+    let home_dir = normalized_env_var("HOME");
+    let cache_key = native_compile_context_cache_key(
+        manifest_path,
+        workspace_root,
+        corelib_override.as_deref(),
+        home_dir.as_deref(),
+    );
+    let cache_now_ms = epoch_ms_u64().unwrap_or_default();
+    {
+        let mut cache = native_compile_context_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = cache.get_mut(&cache_key) {
+            entry.last_access_epoch_ms = cache_now_ms;
+            let cairo_project_path = entry.context.cairo_project_dir.join("cairo_project.toml");
+            if entry.manifest_size_bytes == manifest_size_bytes
+                && entry.manifest_modified_unix_ms == manifest_modified_unix_ms
+                && entry.manifest_change_unix_ms == manifest_change_unix_ms
+                && cairo_project_path.is_file()
+                && native_corelib_layout_looks_compatible(&entry.context.corelib_src)
+            {
+                validate_native_requested_package(
+                    common.package.as_deref(),
+                    &entry.context.package_name,
+                )?;
+                return Ok(entry.context.clone());
+            }
+        }
+    }
+
+    let context = build_native_compile_context_uncached(manifest_path, workspace_root)?;
+    validate_native_requested_package(common.package.as_deref(), &context.package_name)?;
+    {
+        let mut cache = native_compile_context_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.insert(
+            cache_key,
+            NativeCompileContextCacheEntry {
+                manifest_size_bytes,
+                manifest_modified_unix_ms,
+                manifest_change_unix_ms,
+                context: context.clone(),
+                last_access_epoch_ms: cache_now_ms,
+            },
+        );
+        evict_oldest_native_compile_context_cache_entries(
+            &mut cache,
+            native_compile_context_cache_max_entries(),
+        );
+    }
+    Ok(context)
+}
+
+fn normalized_env_var(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn validate_native_requested_package(
+    requested_package: Option<&str>,
+    package_name: &str,
+) -> Result<()> {
+    if let Some(requested_package) = requested_package {
+        if requested_package != package_name {
+            return Err(native_fallback_eligible_error(format!(
+                "native compile only supports the manifest package `{}` (got --package `{}`)",
+                package_name, requested_package
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn build_native_compile_context_uncached(
+    manifest_path: &Path,
+    workspace_root: &Path,
+) -> Result<NativeCompileContext> {
     let manifest_text = read_text_file_with_limit(manifest_path, MAX_MANIFEST_BYTES, "manifest")?;
     let manifest = parse_manifest_toml(
         &manifest_text,
@@ -2622,15 +2741,6 @@ fn build_native_compile_context(
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .context("native compile requires [package].name in Scarb.toml")?;
-
-    if let Some(requested_package) = common.package.as_ref() {
-        if requested_package != &package_name {
-            return Err(native_fallback_eligible_error(format!(
-                "native compile only supports the manifest package `{}` (got --package `{}`)",
-                package_name, requested_package
-            )));
-        }
-    }
 
     for section_name in ["dependencies", "dev-dependencies"] {
         if let Some(table) = manifest.get(section_name).and_then(TomlValue::as_table) {
@@ -3927,6 +4037,28 @@ fn native_compile_session_cache() -> &'static Mutex<HashMap<String, NativeCompil
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn native_compile_context_cache() -> &'static Mutex<HashMap<String, NativeCompileContextCacheEntry>>
+{
+    static CACHE: OnceLock<Mutex<HashMap<String, NativeCompileContextCacheEntry>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn native_compile_context_cache_key(
+    manifest_path: &Path,
+    workspace_root: &Path,
+    corelib_override: Option<&str>,
+    home_dir: Option<&str>,
+) -> String {
+    let mut hasher = Hasher::new();
+    hasher.update(b"uc-native-context-cache-v1");
+    hasher.update(normalize_fingerprint_path(manifest_path).as_bytes());
+    hasher.update(normalize_fingerprint_path(workspace_root).as_bytes());
+    hasher.update(corelib_override.unwrap_or("*").as_bytes());
+    hasher.update(home_dir.unwrap_or("*").as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
 fn evict_oldest_daemon_lock_hash_cache_entries(
     cache: &mut HashMap<String, LockfileHashCacheEntry>,
     max_entries: usize,
@@ -3945,6 +4077,22 @@ fn evict_oldest_daemon_lock_hash_cache_entries(
 
 fn evict_oldest_native_compile_session_cache_entries(
     cache: &mut HashMap<String, NativeCompileSessionCacheEntry>,
+    max_entries: usize,
+) {
+    while cache.len() > max_entries {
+        let Some(oldest_key) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_access_epoch_ms)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest_key);
+    }
+}
+
+fn evict_oldest_native_compile_context_cache_entries(
+    cache: &mut HashMap<String, NativeCompileContextCacheEntry>,
     max_entries: usize,
 ) {
     while cache.len() > max_entries {
