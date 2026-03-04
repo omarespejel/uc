@@ -1,0 +1,39 @@
+{
+  "rules": [
+    {
+      "scenario": "build.warm_noop",
+      "workload": "hello_world",
+      "min_median_p95_delta_percent": 25.0
+    },
+    {
+      "scenario": "build.warm_noop",
+      "workload": "workspaces",
+      "min_median_p95_delta_percent": 25.0
+    },
+    {
+      "scenario": "build.warm_edit",
+      "workload": "hello_world",
+      "min_median_p95_delta_percent": 0.0
+    },
+    {
+      "scenario": "build.warm_edit",
+      "workload": "workspaces",
+      "min_median_p95_delta_percent": 0.0
+    },
+    {
+      "scenario": "build.cold",
+      "workload": "workspaces",
+      "min_median_p95_delta_percent": 0.0
+    },
+    {
+      "scenario": "metadata.online_cold",
+      "workload": "dependencies",
+      "min_median_p95_delta_percent": 0.0
+    },
+    {
+      "scenario": "metadata.offline_warm",
+      "workload": "dependencies",
+      "min_median_p95_delta_percent": -25.0
+    }
+  ]
+}

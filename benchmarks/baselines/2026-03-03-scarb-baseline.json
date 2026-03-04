@@ -1,0 +1,168 @@
+{
+  "generated_at": "2026-03-03T10:25:10Z",
+  "matrix": "research",
+  "host": "<redacted>",
+  "uname": "<redacted>",
+  "tool": "scarb",
+  "tool_version": "scarb 2.14.0 (682b29e13 2025-11-25)",
+  "scarb_version": "scarb 2.14.0 (682b29e13 2025-11-25)",
+  "workspace_root": "<workspace-root>",
+  "runs": 5,
+  "cold_runs": 3,
+  "scenarios": [
+    {
+      "scenario": "build.cold",
+      "workload": "hello_world",
+      "command": "scarb --manifest-path '<workspace-root>/scarb/examples/hello_world/Scarb.toml' build",
+      "runs": 3,
+      "samples_ms": [
+        3363.971,
+        2140.786,
+        1227.342
+      ],
+      "stats": {
+        "min_ms": 1227.342,
+        "max_ms": 3363.971,
+        "mean_ms": 2244.033,
+        "p50_ms": 2140.786,
+        "p95_ms": 3363.971
+      }
+    },
+    {
+      "scenario": "build.warm_noop",
+      "workload": "hello_world",
+      "command": "scarb --manifest-path '<workspace-root>/scarb/examples/hello_world/Scarb.toml' build",
+      "runs": 5,
+      "samples_ms": [
+        25.610,
+        22.468,
+        23.249,
+        51.707,
+        36.271
+      ],
+      "stats": {
+        "min_ms": 22.468,
+        "max_ms": 51.707,
+        "mean_ms": 31.861,
+        "p50_ms": 25.610,
+        "p95_ms": 51.707
+      }
+    },
+    {
+      "scenario": "build.warm_edit",
+      "workload": "hello_world",
+      "command": "scarb --manifest-path '<workspace-root>/scarb/examples/hello_world/Scarb.toml' build",
+      "runs": 5,
+      "samples_ms": [
+        2547.850,
+        527.639,
+        575.733,
+        462.139,
+        516.453
+      ],
+      "stats": {
+        "min_ms": 462.139,
+        "max_ms": 2547.850,
+        "mean_ms": 925.9628,
+        "p50_ms": 527.639,
+        "p95_ms": 2547.850
+      }
+    },
+    {
+      "scenario": "build.cold",
+      "workload": "workspaces",
+      "command": "scarb --manifest-path '<workspace-root>/scarb/examples/workspaces/Scarb.toml' build",
+      "runs": 3,
+      "samples_ms": [
+        960.396,
+        866.872,
+        889.514
+      ],
+      "stats": {
+        "min_ms": 866.872,
+        "max_ms": 960.396,
+        "mean_ms": 905.594,
+        "p50_ms": 889.514,
+        "p95_ms": 960.396
+      }
+    },
+    {
+      "scenario": "build.warm_noop",
+      "workload": "workspaces",
+      "command": "scarb --manifest-path '<workspace-root>/scarb/examples/workspaces/Scarb.toml' build",
+      "runs": 5,
+      "samples_ms": [
+        28.650,
+        27.934,
+        29.370,
+        29.115,
+        26.545
+      ],
+      "stats": {
+        "min_ms": 26.545,
+        "max_ms": 29.370,
+        "mean_ms": 28.3228,
+        "p50_ms": 28.650,
+        "p95_ms": 29.370
+      }
+    },
+    {
+      "scenario": "build.warm_edit",
+      "workload": "workspaces",
+      "command": "scarb --manifest-path '<workspace-root>/scarb/examples/workspaces/Scarb.toml' build",
+      "runs": 5,
+      "samples_ms": [
+        362.695,
+        334.174,
+        316.571,
+        317.624,
+        337.213
+      ],
+      "stats": {
+        "min_ms": 316.571,
+        "max_ms": 362.695,
+        "mean_ms": 333.6554,
+        "p50_ms": 334.174,
+        "p95_ms": 362.695
+      }
+    },
+    {
+      "scenario": "metadata.online_cold",
+      "workload": "dependencies",
+      "command": "scarb --manifest-path '<workspace-root>/scarb/examples/dependencies/Scarb.toml' --global-cache-dir '<tmp-dir>/deps-cache' metadata --format-version 1",
+      "runs": 3,
+      "samples_ms": [
+        1567.474,
+        1591.516,
+        1497.380
+      ],
+      "stats": {
+        "min_ms": 1497.380,
+        "max_ms": 1591.516,
+        "mean_ms": 1552.1233333333332,
+        "p50_ms": 1567.474,
+        "p95_ms": 1591.516
+      }
+    },
+    {
+      "scenario": "metadata.offline_warm",
+      "workload": "dependencies",
+      "command": "scarb --manifest-path '<workspace-root>/scarb/examples/dependencies/Scarb.toml' --global-cache-dir '<tmp-dir>/deps-cache' --offline metadata --format-version 1",
+      "runs": 5,
+      "samples_ms": [
+        21.856,
+        17.674,
+        17.775,
+        22.075,
+        20.268
+      ],
+      "stats": {
+        "min_ms": 17.674,
+        "max_ms": 22.075,
+        "mean_ms": 19.9296,
+        "p50_ms": 20.268,
+        "p95_ms": 22.075
+      }
+    }
+  ]
+}

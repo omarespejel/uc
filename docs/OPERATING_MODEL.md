@@ -1,27 +1,32 @@
 # Operating Model
 
-## Cadence
-- Weekly planning: Monday.
-- Mid-week checkpoint: Wednesday.
-- Weekly review: Friday.
+## Planning Cadence
+- Monday: planning and commit window.
+- Wednesday: risk checkpoint.
+- Friday: gate/status review.
 
-## Backlog Structure
+## Work Breakdown
 - Epic -> Feature -> Task/Bug.
-- Every issue mapped to exactly one milestone.
-- Every in-flight item tracked in project board.
+- Every issue tied to a milestone.
+- Every feature has measurable acceptance criteria.
+
+## Default Delivery Flow
+1. Define hypothesis and KPI target.
+2. Implement with instrumentation.
+3. Run benchmark/comparator matrix.
+4. Merge only if gate criteria are met.
 
 ## Definition of Ready
-- Problem statement.
-- Measurable acceptance criteria.
-- Owner and milestone assigned.
+- Clear problem statement.
+- Quantified acceptance criteria.
+- Milestone assignment and owner.
 
 ## Definition of Done
 - Code + tests merged.
-- Benchmarks updated if performance-affecting.
-- Docs updated.
-- Project board state moved to Done.
+- Benchmark or comparator evidence attached.
+- Docs and ADR updated.
+- Issue/project state updated.
 
-## Escalation
-- KPI breach => create blocker issue same day.
-- Two consecutive missed milestone targets => formal replan.
-
+## Escalation Rules
+- Any correctness mismatch creates P0 blocker.
+- Two consecutive missed gate targets trigger replan within 48h.

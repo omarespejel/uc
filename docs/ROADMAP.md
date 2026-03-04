@@ -1,34 +1,33 @@
 # Roadmap
 
-## Milestone 0: Program Foundations (2 weeks)
-- Benchmark baseline harness.
-- KPI dashboard schema.
-- GitHub operating stack (labels, milestones, seeded issues, project).
-- Architecture decision records (ADRs) scaffold.
+## Milestone 0: Foundations (2 weeks)
+- Benchmark harness finalized with Scarb baseline report.
+- KPI scorecard and gate criteria locked.
+- PR/issue templates and milestone governance running.
+- Architecture decisions documented (ADR series).
 
-## Milestone 1: Core Build Engine MVP (6 weeks)
-- Sessionized compile daemon.
-- Stable compile API (no process-local IDs over wire).
-- Local content-addressed artifact cache.
-- Dual-run comparator vs baseline.
+## Milestone 1: Performance Proof MVP (4-6 weeks)
+- `uc` compile service MVP with session lifecycle.
+- Dual-run comparator for artifact and diagnostics parity.
+- Performance gate run across benchmark matrix.
+- Go/No-Go decision for platform continuation.
 
-## Milestone 2: Migration Tooling + Command Surface (6 weeks)
-- `uc migrate` for existing projects.
-- Build/check/test primary workflows.
+## Milestone 2: Command Surface Expansion (6 weeks)
+- Add `check`, `test`, `lint`, `metadata` on `uc` core path.
+- Resolver and source-fetch fast path (lockfile-first, bounded concurrency).
 - Error taxonomy and troubleshooting docs.
 
 ## Milestone 3: CI and Proving Acceleration (6 weeks)
-- Remote cache.
-- Cache policy controls and invalidation.
-- Prove path acceleration and trace artifact reuse.
+- Remote cache with policy controls and invalidation.
+- `execute`/`prove` acceleration path integration.
+- CI default lane pilot with rollback controls.
 
-## Milestone 4: Cutover + Sunset (4 weeks)
-- Org-level CI default switch.
-- Migration completion dashboard.
-- Legacy tooling deprecation plan.
+## Milestone 4: Cutover and Sunset (4 weeks)
+- `uc` default in org CI.
+- Workspace migration completion dashboard.
+- Legacy compatibility lane deprecation and sunset.
 
 ## Stage Gates
-- Gate A: p95 warm build improvement >=40% with correctness parity on MVP matrix.
-- Gate B: migration success >=90% auto-convert on corpus.
-- Gate C: CI cache-hit >=70% on mainline and PR runs.
-
+- Gate A: warm p95 improvement >= 40% with correctness parity.
+- Gate B: migration automation success >= 90% on corpus.
+- Gate C: CI cache hit >= 70% and stable for one full milestone.

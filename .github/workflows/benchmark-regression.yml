@@ -7,23 +7,139 @@ on:
     branches: [main]
 
 jobs:
-  benchmark:
+  benchmark-smoke:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install hyperfine
-        run: sudo apt-get update && sudo apt-get install -y hyperfine
+      - name: Install Scarb
+        uses: software-mansion/setup-scarb@v1
 
-      - name: Run local benchmark harness
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Build uc CLI
+        run: cargo build -p uc-cli
+
+      - name: Run smoke stability benchmark cycles
         run: |
           chmod +x benchmarks/scripts/run_local_benchmarks.sh
-          ./benchmarks/scripts/run_local_benchmarks.sh
+          chmod +x benchmarks/scripts/run_stability_benchmarks.sh
+          chmod +x benchmarks/scripts/gate_benchmark_summary.sh
+          ./benchmarks/scripts/run_stability_benchmarks.sh \
+            --matrix smoke \
+            --runs 12 \
+            --cold-runs 12 \
+            --cycles 3 \
+            --allow-unpinned \
+            --host-preflight warn \
+            --gate-config benchmarks/gates/perf-gate-smoke.json
+
+      - name: Run smoke compare-build gate
+        run: |
+          ./target/debug/uc compare-build \
+            --manifest-path benchmarks/fixtures/scarb_smoke/Scarb.toml \
+            --clean-before-each true \
+            --output-path benchmarks/results/compare-smoke.json
 
       - name: Upload benchmark artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results
           path: benchmarks/results/
 
+  determinism-matrix:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      # Lock context inputs so cross-platform checks compare equivalent conditions.
+      UC_SCARB_VERSION_LINE: scarb 2.14.0 (determinism-lane)
+      UC_BUILD_ENV_PREFIXES: ""
+      UC_SKIP_SCARB_TOOLCHAIN_CHECK: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Scarb
+        uses: software-mansion/setup-scarb@v1
+
+      - name: Build uc CLI
+        run: cargo build -p uc-cli
+
+      - name: Capture fingerprint/session key
+        shell: bash
+        run: |
+          mkdir -p benchmarks/results determinism
+          UC_BIN="./target/debug/uc"
+          PYTHON_BIN="python3"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            UC_BIN="./target/debug/uc.exe"
+          fi
+          if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+            PYTHON_BIN="python"
+          fi
+
+          "$UC_BIN" build \
+            --engine uc \
+            --daemon-mode off \
+            --manifest-path benchmarks/fixtures/scarb_smoke/Scarb.toml \
+            --report-path benchmarks/results/cross-platform-${{ matrix.os }}.json
+
+          "$PYTHON_BIN" - <<'PY'
+import json
+from pathlib import Path
+
+report_path = Path("benchmarks/results/cross-platform-${{ matrix.os }}.json")
+report = json.loads(report_path.read_text(encoding="utf-8"))
+Path("determinism/${{ matrix.os }}.fingerprint.txt").write_text(report["fingerprint"] + "\n", encoding="utf-8")
+Path("determinism/${{ matrix.os }}.session-key.txt").write_text(report["session_key"] + "\n", encoding="utf-8")
+PY
+
+      - name: Upload determinism sample
+        uses: actions/upload-artifact@v4
+        with:
+          name: determinism-${{ matrix.os }}
+          path: determinism/
+
+  determinism-verify:
+    runs-on: ubuntu-latest
+    needs: determinism-matrix
+    steps:
+      - name: Download determinism samples
+        uses: actions/download-artifact@v4
+        with:
+          pattern: determinism-*
+          merge-multiple: true
+          path: determinism
+
+      - name: Assert cross-platform determinism
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la determinism
+
+          fp_unique_count="$(cat determinism/*.fingerprint.txt | sort -u | wc -l | tr -d ' ')"
+          sk_unique_count="$(cat determinism/*.session-key.txt | sort -u | wc -l | tr -d ' ')"
+
+          if [[ "$fp_unique_count" != "1" ]]; then
+            echo "Fingerprint mismatch across OS lanes:" >&2
+            for f in determinism/*.fingerprint.txt; do
+              echo "$(basename "$f"): $(cat "$f")" >&2
+            done
+            exit 1
+          fi
+
+          if [[ "$sk_unique_count" != "1" ]]; then
+            echo "Session key mismatch across OS lanes:" >&2
+            for f in determinism/*.session-key.txt; do
+              echo "$(basename "$f"): $(cat "$f")" >&2
+            done
+            exit 1
+          fi
+
+          echo "Cross-platform fingerprint and session key are deterministic."

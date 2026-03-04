@@ -1,0 +1,43 @@
+{
+  "generated_at_epoch_ms": 1772533530750,
+  "manifest_path": "<workspace-root>/scarb/examples/hello_world/Scarb.toml",
+  "workspace_root": "<workspace-root>/scarb/examples/hello_world",
+  "clean_before_each": true,
+  "baseline": {
+    "label": "scarb-direct",
+    "command": [
+      "scarb",
+      "--manifest-path",
+      "<workspace-root>/scarb/examples/hello_world/Scarb.toml",
+      "build"
+    ],
+    "exit_code": 0,
+    "elapsed_ms": 1116.2055,
+    "artifact_count": 1,
+    "diagnostics": []
+  },
+  "candidate": {
+    "label": "uc-engine",
+    "command": [
+      "<workspace-root>/uc/target/debug/uc",
+      "build",
+      "--manifest-path",
+      "<workspace-root>/scarb/examples/hello_world/Scarb.toml",
+      "--engine",
+      "uc"
+    ],
+    "exit_code": 0,
+    "elapsed_ms": 2380.465333,
+    "artifact_count": 1,
+    "diagnostics": []
+  },
+  "diagnostics": {
+    "baseline_count": 0,
+    "candidate_count": 0,
+    "intersection_count": 0,
+    "similarity_percent": 100.0
+  },
+  "artifact_mismatch_count": 0,
+  "artifact_mismatches": [],
+  "passed": true
+}

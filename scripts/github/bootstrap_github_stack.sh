@@ -49,7 +49,7 @@ create_milestone "M0 Foundations" "Program setup, benchmark harness, KPI stack."
 create_milestone "M1 Core Engine MVP" "Daemonized build MVP and dual-run comparator."
 create_milestone "M2 Migration Tooling" "Project migration path and core command surface."
 create_milestone "M3 CI and Proving" "Remote cache and proving acceleration."
-create_milestone "M4 Cutover" "Org-wide cutover and legacy sunset."
+create_milestone "M4 Cutover" "Org-wide rollout and legacy lane deprecation."
 
 echo "Seeding core issues"
 
@@ -60,6 +60,9 @@ milestone_exists() {
 
 M0="M0 Foundations"
 M1="M1 Core Engine MVP"
+M2="M2 Migration Tooling"
+M3="M3 CI and Proving"
+M4="M4 Cutover"
 
 if ! milestone_exists "$M0"; then
   echo "Required milestone missing: $M0" >&2
@@ -67,6 +70,18 @@ if ! milestone_exists "$M0"; then
 fi
 if ! milestone_exists "$M1"; then
   echo "Required milestone missing: $M1" >&2
+  exit 1
+fi
+if ! milestone_exists "$M2"; then
+  echo "Required milestone missing: $M2" >&2
+  exit 1
+fi
+if ! milestone_exists "$M3"; then
+  echo "Required milestone missing: $M3" >&2
+  exit 1
+fi
+if ! milestone_exists "$M4"; then
+  echo "Required milestone missing: $M4" >&2
   exit 1
 fi
 
@@ -111,6 +126,42 @@ create_issue_if_missing \
   "Sessionized compile daemon, stable API, local CAS, fallback path." \
   "type:epic,priority:p0,area:compiler" \
   "$M1"
+
+create_issue_if_missing \
+  "feat: Define session key model and deterministic cache keys" \
+  "Lock session identity to workspace/compiler/profile/features/cfg/plugin signatures and document invariants." \
+  "type:feature,priority:p0,area:compiler" \
+  "$M1"
+
+create_issue_if_missing \
+  "epic: Command surface expansion for uc core paths" \
+  "Implement check/test/lint/metadata on uc core execution path." \
+  "type:epic,priority:p1,area:compiler" \
+  "$M2"
+
+create_issue_if_missing \
+  "feat: Implement migration command and conversion diagnostics" \
+  "Build uc migrate with actionable conversion output and failure taxonomy." \
+  "type:feature,priority:p1,area:migration" \
+  "$M2"
+
+create_issue_if_missing \
+  "epic: CI acceleration and prove path integration" \
+  "Remote cache integration and prove/execute acceleration." \
+  "type:epic,priority:p1,area:ci" \
+  "$M3"
+
+create_issue_if_missing \
+  "feat: Add remote cache policy controls and invalidation API" \
+  "Support cache namespaces, TTL, and explicit invalidation controls for CI reliability." \
+  "type:feature,priority:p1,area:ci" \
+  "$M3"
+
+create_issue_if_missing \
+  "epic: Platform cutover execution" \
+  "Drive uc default switch in CI and manage legacy compatibility lane retirement." \
+  "type:epic,priority:p1,area:migration" \
+  "$M4"
 
 echo "Attempting Project setup"
 
