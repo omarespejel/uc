@@ -3869,6 +3869,27 @@ fn native_session_refresh_action_prefers_incremental_for_changed_sets() {
 
 #[cfg(feature = "native-compile")]
 #[test]
+fn native_impacted_subset_used_requires_partial_compile() {
+    assert!(
+        !native_impacted_subset_used(0, 0),
+        "empty contract sets should not be marked as subset compiles"
+    );
+    assert!(
+        !native_impacted_subset_used(4, 0),
+        "zero compiled contracts should not be marked as subset compiles"
+    );
+    assert!(
+        !native_impacted_subset_used(4, 4),
+        "full compiles should not be marked as subset compiles"
+    );
+    assert!(
+        native_impacted_subset_used(4, 2),
+        "partial compiles should be marked as impacted-subset compiles"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
 fn native_diff_tracked_sources_detects_changed_and_removed_files() {
     let previous = BTreeMap::from([
         (
