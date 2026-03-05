@@ -947,17 +947,19 @@ run_build_warm_edit() {
   append_result "build.warm_edit" "$workload" "$command_string" "$samples_file" "$runs" "$phase_file"
 }
 
-rewrite_smoke_semantic_edit() {
+rewrite_semantic_edit() {
   local file="$1"
   local value="$2"
   local tmp_file="$TMP_DIR/semantic-edit-$$.tmp"
   sed -E "s/(const BENCH_EDIT_SEED_BIAS: felt252 = )[0-9]+;/\\1${value};/" "$file" > "$tmp_file"
-  if cmp -s "$file" "$tmp_file"; then
-    echo "Failed to apply semantic benchmark edit marker in $file" >&2
-    rm -f "$tmp_file"
-    exit 1
+  if ! cmp -s "$file" "$tmp_file"; then
+    mv "$tmp_file" "$file"
+    return
   fi
-  mv "$tmp_file" "$file"
+  rm -f "$tmp_file"
+  # Fallback for fixtures without BENCH_EDIT_SEED_BIAS marker: append a tiny
+  # semantic edit so warm_edit_semantic is still measurable.
+  printf "\nconst UC_BENCH_SEMANTIC_EDIT_%s: felt252 = %s;\n" "$value" "$value" >> "$file"
 }
 
 run_build_warm_edit_semantic() {
@@ -984,7 +986,7 @@ run_build_warm_edit_semantic() {
     sleep "$WARM_SETTLE_SECONDS"
     for i in $(seq 1 "$runs"); do
       cp "$backup_file" "$edit_file"
-      rewrite_smoke_semantic_edit "$edit_file" "$i"
+      rewrite_semantic_edit "$edit_file" "$i"
       if ! measure_command_ms "$cwd" "${command[@]}" >> "$samples_file"; then
         failed=1
         break

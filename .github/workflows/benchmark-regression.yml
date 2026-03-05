@@ -265,13 +265,13 @@ jobs:
           set -euo pipefail
           ls -la determinism
 
-          fp_unique_count="$(cat determinism/*.fingerprint.txt | sort -u | wc -l | tr -d ' ')"
-          sk_unique_count="$(cat determinism/*.session-key.txt | sort -u | wc -l | tr -d ' ')"
+          fp_unique_count="$(cat determinism/*.fingerprint.txt | tr -d '\r' | sort -u | wc -l | tr -d ' ')"
+          sk_unique_count="$(cat determinism/*.session-key.txt | tr -d '\r' | sort -u | wc -l | tr -d ' ')"
 
           if [[ "$fp_unique_count" != "1" ]]; then
             echo "Fingerprint mismatch across OS lanes:" >&2
             for f in determinism/*.fingerprint.txt; do
-              echo "$(basename "$f"): $(cat "$f")" >&2
+              echo "$(basename "$f"): $(tr -d '\r' < "$f")" >&2
             done
             exit 1
           fi
@@ -279,7 +279,7 @@ jobs:
           if [[ "$sk_unique_count" != "1" ]]; then
             echo "Session key mismatch across OS lanes:" >&2
             for f in determinism/*.session-key.txt; do
-              echo "$(basename "$f"): $(cat "$f")" >&2
+              echo "$(basename "$f"): $(tr -d '\r' < "$f")" >&2
             done
             exit 1
           fi
