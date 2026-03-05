@@ -159,6 +159,22 @@ fn debug_daemon_response_enabled() -> bool {
     })
 }
 
+fn flatten_payload_wrapped_wire_shape(value: &mut serde_json::Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    let Some(payload) = root.remove("payload") else {
+        return;
+    };
+    let serde_json::Value::Object(payload_map) = payload else {
+        root.insert("payload".to_string(), payload);
+        return;
+    };
+    for (key, item) in payload_map {
+        root.entry(key).or_insert(item);
+    }
+}
+
 #[cfg(unix)]
 pub(super) fn daemon_request_with_timeouts(
     socket_path: &Path,
@@ -215,7 +231,8 @@ pub(super) fn decode_daemon_request(line: &str) -> serde_json::Result<DaemonRequ
     match serde_json::from_str::<DaemonRequest>(line) {
         Ok(request) => Ok(request),
         Err(_) => {
-            let value: serde_json::Value = serde_json::from_str(line)?;
+            let mut value: serde_json::Value = serde_json::from_str(line)?;
+            flatten_payload_wrapped_wire_shape(&mut value);
             serde_json::from_value(value)
         }
     }
@@ -227,7 +244,8 @@ pub(super) fn decode_daemon_response(line: &str) -> serde_json::Result<DaemonRes
     match serde_json::from_str::<DaemonResponse>(line) {
         Ok(response) => Ok(response),
         Err(_) => {
-            let value: serde_json::Value = serde_json::from_str(line)?;
+            let mut value: serde_json::Value = serde_json::from_str(line)?;
+            flatten_payload_wrapped_wire_shape(&mut value);
             serde_json::from_value(value)
         }
     }

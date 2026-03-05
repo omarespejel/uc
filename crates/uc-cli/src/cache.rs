@@ -429,15 +429,17 @@ pub(super) fn evict_oldest_cache_object_hash_memo_entries(
     cache: &mut HashMap<String, CacheObjectHashMemoEntry>,
     max_entries: usize,
 ) {
-    while cache.len() > max_entries {
-        let Some(oldest_key) = cache
-            .iter()
-            .min_by_key(|(_, entry)| entry.last_access_epoch_ms)
-            .map(|(key, _)| key.clone())
-        else {
-            break;
-        };
-        cache.remove(&oldest_key);
+    if cache.len() <= max_entries {
+        return;
+    }
+    let remove_count = cache.len().saturating_sub(max_entries);
+    let mut keys_by_age: Vec<(u64, String)> = cache
+        .iter()
+        .map(|(key, entry)| (entry.last_access_epoch_ms, key.clone()))
+        .collect();
+    keys_by_age.sort_unstable_by_key(|(age, _)| *age);
+    for (_, key) in keys_by_age.into_iter().take(remove_count) {
+        cache.remove(&key);
     }
 }
 

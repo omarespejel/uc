@@ -217,7 +217,14 @@ fn hash_contract_class_json_semantic(path: &Path) -> Result<(String, u64)> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let mut value: Value = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed to parse JSON {}", path.display()))?;
-    validate_supported_sierra_schema(&value, path)?;
+    if let Err(schema_err) = validate_supported_contract_class_schema(&value, path) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %format!("{schema_err:#}"),
+            "unsupported contract-class schema; falling back to raw hash"
+        );
+        return hash_file_with_limit(path);
+    }
     normalize_contract_class_compiler_version_triplet(&mut value);
     normalize_sierra_json_ids(&mut value);
     let canonical = canonicalize_json(&value);
@@ -227,6 +234,38 @@ fn hash_contract_class_json_semantic(path: &Path) -> Result<(String, u64)> {
     hasher.update(CONTRACT_CLASS_NORMALIZATION_SCHEMA_TAG.as_bytes());
     hasher.update(&canonical_bytes);
     Ok((hasher.finalize().to_hex().to_string(), metadata.len()))
+}
+
+fn validate_supported_contract_class_schema(value: &Value, path: &Path) -> Result<()> {
+    let Some(version_value) = value
+        .get("contract_class_version")
+        .or_else(|| value.get("sierra_format_version"))
+        .or_else(|| value.get("sierra_version"))
+    else {
+        // Older/stub fixtures may omit explicit schema markers; keep hashing enabled.
+        return Ok(());
+    };
+
+    let version = match version_value {
+        Value::String(text) => text.trim().to_string(),
+        Value::Number(num) => num.to_string(),
+        _ => bail!(
+            "unsupported contract-class schema marker type in {} (expected string/number)",
+            path.display()
+        ),
+    };
+    let major = version.split('.').next().unwrap_or_default();
+    if major != "0" && major != "1" {
+        bail!(
+            "unsupported contract-class schema version `{}` in {} (expected major version 0 or 1)",
+            version,
+            path.display()
+        );
+    }
+    validate_declaration_section_ids(value, "type_declarations", path)?;
+    validate_declaration_section_ids(value, "libfunc_declarations", path)?;
+    validate_declaration_id_uniqueness(value, path)?;
+    Ok(())
 }
 
 fn normalize_contract_class_compiler_version_triplet(value: &mut Value) {
@@ -579,8 +618,8 @@ fn canonicalize_json(value: &Value) -> Value {
 mod tests {
     use super::{
         canonicalize_json, collect_artifact_digests, compare_artifact_sets,
-        hash_contract_class_json_semantic, hash_sierra_json_semantic, normalize_sierra_json_ids,
-        validate_supported_sierra_schema, ArtifactDigest,
+        hash_contract_class_json_semantic, hash_file_with_limit, hash_sierra_json_semantic,
+        normalize_sierra_json_ids, validate_supported_sierra_schema, ArtifactDigest,
     };
     use serde_json::json;
     use std::fs;
@@ -628,6 +667,18 @@ mod tests {
             br#"{"contracts":[]}"#,
         )
         .expect("failed to write starknet artifacts manifest");
+        fs::write(
+            dir.join("pkg_token.contract_class.json"),
+            br#"{
+                "contract_class_version":"0.1.0",
+                "sierra_program":["0x1","0x7","0x0","0x2","0x10","0x0","0x2b9"],
+                "type_declarations":[{"id":{"id":11,"debug_name":"felt252"}}],
+                "libfunc_declarations":[{"id":{"id":41,"debug_name":"store_temp<felt252>"}}],
+                "entry_points_by_type":{},
+                "abi":""
+            }"#,
+        )
+        .expect("failed to write contract class artifact");
         fs::write(dir.join("ignored.meta.json"), br#"{"ignored":true}"#)
             .expect("failed to write ignored artifact");
 
@@ -644,9 +695,13 @@ mod tests {
             relative_paths.contains(&"pkg.starknet_artifacts.json"),
             "starknet artifacts manifest suffix should be included"
         );
+        assert!(
+            relative_paths.contains(&"pkg_token.contract_class.json"),
+            "contract class suffix should be included"
+        );
         assert_eq!(
             digests.len(),
-            2,
+            3,
             "unexpected digest set: {relative_paths:?}"
         );
 
@@ -949,13 +1004,13 @@ mod tests {
         let path_a = unique_test_path("contract-hash-a");
         let path_b = unique_test_path("contract-hash-b");
         let body_a = json!({
-            "sierra_format_version": "1.0.0",
+            "contract_class_version": "0.1.0",
             "sierra_program": ["0x1", "0x7", "0x0", "0x2", "0xe", "0x0", "0x2b9"],
             "type_declarations": [{"id": {"id": 11, "debug_name": "felt252"}}],
             "libfunc_declarations": [{"id": {"id": 41, "debug_name": "store_temp<felt252>"}}],
         });
         let body_b = json!({
-            "sierra_format_version": "1.0.0",
+            "contract_class_version": "0.1.0",
             "sierra_program": ["0x1", "0x7", "0x0", "0x2", "0x10", "0x0", "0x2b9"],
             "type_declarations": [{"id": {"id": 11, "debug_name": "felt252"}}],
             "libfunc_declarations": [{"id": {"id": 41, "debug_name": "store_temp<felt252>"}}],
@@ -991,13 +1046,13 @@ mod tests {
         let path_a = unique_test_path("contract-semantic-a");
         let path_b = unique_test_path("contract-semantic-b");
         let body_a = json!({
-            "sierra_format_version": "1.0.0",
+            "contract_class_version": "0.1.0",
             "sierra_program": ["0x1", "0x7", "0x0", "0x2", "0x10", "0x0", "0x2b9"],
             "type_declarations": [{"id": {"id": 11, "debug_name": "felt252"}}],
             "libfunc_declarations": [{"id": {"id": 41, "debug_name": "store_temp<felt252>"}}],
         });
         let body_b = json!({
-            "sierra_format_version": "1.0.0",
+            "contract_class_version": "0.1.0",
             "sierra_program": ["0x1", "0x7", "0x0", "0x2", "0x10", "0x0", "0x2ba"],
             "type_declarations": [{"id": {"id": 11, "debug_name": "felt252"}}],
             "libfunc_declarations": [{"id": {"id": 41, "debug_name": "store_temp<felt252>"}}],
@@ -1026,5 +1081,31 @@ mod tests {
 
         let _ = fs::remove_file(&path_a);
         let _ = fs::remove_file(&path_b);
+    }
+
+    #[test]
+    fn contract_class_semantic_hash_falls_back_to_raw_hash_for_unknown_schema_major() {
+        let path = unique_test_path("contract-schema-fallback");
+        let body = json!({
+            "contract_class_version": "9.0.0",
+            "sierra_program": ["0x1", "0x7", "0x0", "0x2", "0x10", "0x0", "0x2b9"],
+            "type_declarations": [{"id": {"id": 11, "debug_name": "felt252"}}],
+            "libfunc_declarations": [{"id": {"id": 41, "debug_name": "store_temp<felt252"}}],
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec(&body).expect("failed to encode fallback contract"),
+        )
+        .expect("failed to write fallback contract");
+
+        let semantic = hash_contract_class_json_semantic(&path)
+            .expect("semantic hashing should fall back instead of failing");
+        let raw = hash_file_with_limit(&path).expect("raw hash should succeed");
+        assert_eq!(
+            semantic, raw,
+            "unsupported contract-class schema should fall back to raw hashing"
+        );
+
+        let _ = fs::remove_file(&path);
     }
 }

@@ -263,6 +263,41 @@ fn daemon_build_request_defaults_capture_output_when_missing_from_wire() {
     }
 }
 
+#[test]
+fn daemon_build_request_payload_wrapped_wire_format_is_decoded() {
+    let json = format!(
+        r#"{{
+            "type":"build",
+            "payload":{{
+                "protocol_version":"{}",
+                "manifest_path":"/tmp/workspace/Scarb.toml",
+                "package":null,
+                "workspace":false,
+                "features":["feature_a"],
+                "offline":false,
+                "release":false,
+                "profile":null,
+                "async_cache_persist":true,
+                "capture_output":true,
+                "compile_backend":"native",
+                "native_fallback_to_scarb":true
+            }}
+        }}"#,
+        DAEMON_PROTOCOL_VERSION
+    );
+    let decoded = decode_daemon_request(&json).expect("failed to decode wrapped daemon request");
+    match decoded {
+        DaemonRequest::Build { payload } => {
+            assert_eq!(payload.protocol_version, DAEMON_PROTOCOL_VERSION);
+            assert_eq!(payload.features, vec!["feature_a".to_string()]);
+            assert_eq!(payload.compile_backend, DaemonBuildBackend::Native);
+            assert!(payload.async_cache_persist);
+            assert!(payload.native_fallback_to_scarb);
+        }
+        _ => panic!("expected build request"),
+    }
+}
+
 #[cfg(feature = "native-compile")]
 #[test]
 fn starknet_artifact_files_omits_casm_when_none() {
@@ -327,7 +362,8 @@ fn daemon_build_response_roundtrip_preserves_telemetry_fields() {
 }
 
 #[test]
-fn daemon_build_response_deserializes_with_nested_telemetry_object() {
+fn daemon_build_response_legacy_flat_format_is_decoded() {
+    // Legacy daemon wire format (flat fields, no top-level `payload` wrapper).
     let json = r#"{
         "type":"build",
         "run":{
@@ -358,6 +394,44 @@ fn daemon_build_response_deserializes_with_nested_telemetry_object() {
             assert_eq!(payload.telemetry.compile_ms, 10.0);
             assert_eq!(payload.telemetry.native_context_ms, 0.0);
             assert_eq!(payload.telemetry.native_target_dir_ms, 0.0);
+            assert_eq!(payload.compile_backend, DaemonBuildBackend::Scarb);
+        }
+        _ => panic!("expected build response"),
+    }
+}
+
+#[test]
+fn daemon_build_response_payload_wrapped_wire_format_is_decoded() {
+    let json = r#"{
+        "type":"build",
+        "payload":{
+            "run":{
+                "command":["scarb","build"],
+                "exit_code":0,
+                "elapsed_ms":11.5,
+                "stdout":"",
+                "stderr":""
+            },
+            "cache_hit":false,
+            "fingerprint":"f",
+            "session_key":"s",
+            "compile_backend":"scarb",
+            "telemetry":{
+                "fingerprint_ms":0.1,
+                "cache_lookup_ms":0.2,
+                "cache_restore_ms":0.3,
+                "compile_ms":9.0,
+                "cache_persist_ms":0.4,
+                "cache_persist_async":false,
+                "cache_persist_scheduled":false
+            }
+        }
+    }"#;
+    let decoded = decode_daemon_response(json).expect("failed to decode wrapped daemon response");
+    match decoded {
+        DaemonResponse::Build { payload } => {
+            assert_eq!(payload.run.elapsed_ms, 11.5);
+            assert_eq!(payload.telemetry.compile_ms, 9.0);
             assert_eq!(payload.compile_backend, DaemonBuildBackend::Scarb);
         }
         _ => panic!("expected build response"),
