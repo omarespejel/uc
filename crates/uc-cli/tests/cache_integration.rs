@@ -65,6 +65,12 @@ fn fixture_source() -> PathBuf {
 }
 
 fn local_native_corelib_src() -> Option<PathBuf> {
+    if let Ok(raw) = std::env::var("UC_NATIVE_CORELIB_SRC") {
+        let candidate = PathBuf::from(raw);
+        if candidate.is_dir() {
+            return candidate.canonicalize().ok().or(Some(candidate));
+        }
+    }
     let candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../cairo/corelib/src");
     candidate.canonicalize().ok().filter(|path| path.is_dir())
 }
