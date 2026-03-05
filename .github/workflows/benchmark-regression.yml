@@ -11,10 +11,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Scarb
-        uses: software-mansion/setup-scarb@v1
+        uses: software-mansion/setup-scarb@9d86a1616deecc95e8e8435daf902c5d025dc8b8 # v1
 
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
@@ -45,7 +45,7 @@ jobs:
 
       - name: Upload benchmark artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: benchmark-results
           path: benchmarks/results/
@@ -55,10 +55,10 @@ jobs:
     timeout-minutes: 120
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Scarb
-        uses: software-mansion/setup-scarb@v1
+        uses: software-mansion/setup-scarb@9d86a1616deecc95e8e8435daf902c5d025dc8b8 # v1
 
       - name: Install benchmark tools
         run: sudo apt-get update && sudo apt-get install -y jq util-linux
@@ -93,7 +93,7 @@ jobs:
 
       - name: Upload research benchmark artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: benchmark-results-research
           path: benchmarks/results/
@@ -111,10 +111,10 @@ jobs:
       UC_SKIP_SCARB_TOOLCHAIN_CHECK: "1"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Scarb
-        uses: software-mansion/setup-scarb@v1
+        uses: software-mansion/setup-scarb@9d86a1616deecc95e8e8435daf902c5d025dc8b8 # v1
 
       - name: Build uc CLI
         run: cargo build -p uc-cli
@@ -149,7 +149,7 @@ Path("determinism/${{ matrix.os }}.session-key.txt").write_text(report["session_
 PY
 
       - name: Upload determinism sample
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: determinism-${{ matrix.os }}
           path: determinism/
@@ -159,7 +159,7 @@ PY
     needs: determinism-matrix
     steps:
       - name: Download determinism samples
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: determinism-*
           merge-multiple: true

@@ -1362,21 +1362,10 @@ fn parse_native_build_mode(raw: &str) -> NativeBuildMode {
     }
 }
 
-#[cfg(test)]
 fn native_build_mode() -> NativeBuildMode {
     let raw = std::env::var("UC_NATIVE_BUILD_MODE")
         .unwrap_or_else(|_| DEFAULT_UC_NATIVE_BUILD_MODE.to_string());
     parse_native_build_mode(&raw)
-}
-
-#[cfg(not(test))]
-fn native_build_mode() -> NativeBuildMode {
-    static VALUE: OnceLock<NativeBuildMode> = OnceLock::new();
-    *VALUE.get_or_init(|| {
-        let raw = std::env::var("UC_NATIVE_BUILD_MODE")
-            .unwrap_or_else(|_| DEFAULT_UC_NATIVE_BUILD_MODE.to_string());
-        parse_native_build_mode(&raw)
-    })
 }
 
 fn parse_lockfile_dependency_version(lockfile: &str, dependency_name: &str) -> Option<String> {
@@ -1406,15 +1395,28 @@ fn parse_lockfile_dependency_version(lockfile: &str, dependency_name: &str) -> O
     None
 }
 
+fn native_lockfile_fallback_version(lockfile: &str) -> String {
+    let mut hasher = Hasher::new();
+    hasher.update(lockfile.as_bytes());
+    let digest = hasher.finalize().to_hex().to_string();
+    format!("lockhash-{}", &digest[..16])
+}
+
 fn native_cairo_lang_compiler_version() -> &'static str {
     static VALUE: OnceLock<String> = OnceLock::new();
     VALUE
         .get_or_init(|| {
-            parse_lockfile_dependency_version(
-                include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock")),
-                "cairo-lang-compiler",
+            let lockfile = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"));
+            parse_lockfile_dependency_version(lockfile, "cairo-lang-compiler").unwrap_or_else(
+                || {
+                    let fallback = native_lockfile_fallback_version(lockfile);
+                    tracing::warn!(
+                        fallback = %fallback,
+                        "cairo-lang-compiler version missing in embedded Cargo.lock; using lock-hash fallback namespace"
+                    );
+                    fallback
+                },
             )
-            .unwrap_or_else(|| "unknown".to_string())
         })
         .as_str()
 }

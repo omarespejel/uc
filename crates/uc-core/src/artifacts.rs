@@ -217,6 +217,13 @@ fn hash_contract_class_json_semantic(path: &Path) -> Result<(String, u64)> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let mut value: Value = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed to parse JSON {}", path.display()))?;
+    if contract_class_schema_marker(&value).is_none() {
+        tracing::debug!(
+            path = %path.display(),
+            "contract class missing schema marker; falling back to raw hash"
+        );
+        return hash_file_with_limit(path);
+    }
     if let Err(schema_err) = validate_supported_contract_class_schema(&value, path) {
         tracing::warn!(
             path = %path.display(),
@@ -236,14 +243,16 @@ fn hash_contract_class_json_semantic(path: &Path) -> Result<(String, u64)> {
     Ok((hasher.finalize().to_hex().to_string(), metadata.len()))
 }
 
-fn validate_supported_contract_class_schema(value: &Value, path: &Path) -> Result<()> {
-    let Some(version_value) = value
+fn contract_class_schema_marker(value: &Value) -> Option<&Value> {
+    value
         .get("contract_class_version")
         .or_else(|| value.get("sierra_format_version"))
         .or_else(|| value.get("sierra_version"))
-    else {
-        // Older/stub fixtures may omit explicit schema markers; keep hashing enabled.
-        return Ok(());
+}
+
+fn validate_supported_contract_class_schema(value: &Value, path: &Path) -> Result<()> {
+    let Some(version_value) = contract_class_schema_marker(value) else {
+        bail!("missing contract-class schema marker in {}", path.display());
     };
 
     let version = match version_value {
@@ -1104,6 +1113,31 @@ mod tests {
         assert_eq!(
             semantic, raw,
             "unsupported contract-class schema should fall back to raw hashing"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn contract_class_semantic_hash_falls_back_to_raw_hash_when_schema_marker_missing() {
+        let path = unique_test_path("contract-schema-marker-missing");
+        let body = json!({
+            "sierra_program": ["0x1", "0x7", "0x0", "0x2", "0x10", "0x0", "0x2b9"],
+            "type_declarations": [{"id": {"id": 11, "debug_name": "felt252"}}],
+            "libfunc_declarations": [{"id": {"id": 41, "debug_name": "store_temp<felt252>"}}],
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec(&body).expect("failed to encode marker-missing contract"),
+        )
+        .expect("failed to write marker-missing contract");
+
+        let semantic = hash_contract_class_json_semantic(&path)
+            .expect("semantic hashing should fall back when schema marker is missing");
+        let raw = hash_file_with_limit(&path).expect("raw hash should succeed");
+        assert_eq!(
+            semantic, raw,
+            "missing schema marker should fall back to raw hashing"
         );
 
         let _ = fs::remove_file(&path);

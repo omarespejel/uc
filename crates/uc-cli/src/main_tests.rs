@@ -1365,6 +1365,36 @@ version = "2.16.0"
 }
 
 #[test]
+fn native_lockfile_fallback_version_is_stable_and_not_unknown() {
+    let lock_a = r#"
+[[package]]
+name = "foo"
+version = "1.0.0"
+"#;
+    let lock_b = r#"
+[[package]]
+name = "foo"
+version = "2.0.0"
+"#;
+    let fallback_a = native_lockfile_fallback_version(lock_a);
+    let fallback_a_repeat = native_lockfile_fallback_version(lock_a);
+    let fallback_b = native_lockfile_fallback_version(lock_b);
+
+    assert_eq!(
+        fallback_a, fallback_a_repeat,
+        "lock-hash fallback should be stable for identical lockfile input"
+    );
+    assert_ne!(
+        fallback_a, fallback_b,
+        "lock-hash fallback should change when lockfile contents differ"
+    );
+    assert!(
+        fallback_a.starts_with("lockhash-"),
+        "fallback marker should be namespaced and explicit: {fallback_a}"
+    );
+}
+
+#[test]
 fn native_compiler_version_line_includes_cairo_lang_version() {
     let line = native_compiler_version_line();
     assert!(
