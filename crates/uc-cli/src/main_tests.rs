@@ -1378,6 +1378,75 @@ fn metadata_result_cache_eviction_respects_entry_and_byte_budgets() {
     assert!(cache.contains_key("newest"));
 }
 
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_compile_context_cache_ttl_eviction_prunes_stale_entries() {
+    let context = NativeCompileContext {
+        package_name: "demo".to_string(),
+        crate_name: "demo".to_string(),
+        cairo_project_dir: PathBuf::from("/tmp/demo/.uc/native-project"),
+        corelib_src: PathBuf::from("/tmp/demo/corelib/src"),
+        starknet_target: NativeStarknetTargetProps {
+            sierra: true,
+            casm: true,
+        },
+        manifest_content_hash: "manifest-blake3:demo".to_string(),
+    };
+    let mut cache = HashMap::new();
+    cache.insert(
+        "stale".to_string(),
+        NativeCompileContextCacheEntry {
+            manifest_size_bytes: 1,
+            manifest_modified_unix_ms: 1,
+            manifest_change_unix_ms: Some(1),
+            context: context.clone(),
+            last_access_epoch_ms: 10,
+            estimated_bytes: 1024,
+        },
+    );
+    cache.insert(
+        "fresh".to_string(),
+        NativeCompileContextCacheEntry {
+            manifest_size_bytes: 1,
+            manifest_modified_unix_ms: 1,
+            manifest_change_unix_ms: Some(1),
+            context,
+            last_access_epoch_ms: 120,
+            estimated_bytes: 1024,
+        },
+    );
+
+    evict_expired_native_compile_context_cache_entries(&mut cache, 150, 40);
+    assert_eq!(cache.len(), 1);
+    assert!(!cache.contains_key("stale"));
+    assert!(cache.contains_key("fresh"));
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_refresh_telemetry_counters_accumulate_events() {
+    let before = native_refresh_telemetry_snapshot();
+    record_native_refresh_telemetry(NativeSessionRefreshAction::None, 0, 0);
+    record_native_refresh_telemetry(NativeSessionRefreshAction::IncrementalChangedSet, 3, 1);
+    record_native_refresh_telemetry(NativeSessionRefreshAction::FullRebuild, 2, 2);
+    let after = native_refresh_telemetry_snapshot();
+
+    assert!(after.0 > before.0, "none refresh counter should increase");
+    assert!(
+        after.1 > before.1,
+        "incremental refresh counter should increase"
+    );
+    assert!(after.2 > before.2, "full rebuild counter should increase");
+    assert!(
+        after.3 >= before.3 + 5,
+        "changed file counter should accumulate recorded deltas"
+    );
+    assert!(
+        after.4 >= before.4 + 3,
+        "removed file counter should accumulate recorded deltas"
+    );
+}
+
 #[test]
 fn daemon_lock_state_reuses_cache_when_metadata_is_unchanged() {
     let _guard = integration_env_lock()
@@ -2958,6 +3027,45 @@ alexandria = "0.9.0"
 }
 
 #[test]
+fn build_native_compile_context_rejects_target_cfg_non_starknet_dependencies() {
+    let dir = unique_test_dir("uc-native-context-reject-target-cfg-dep");
+    let manifest_path = dir.join("Scarb.toml");
+    fs::create_dir_all(dir.join("src")).expect("failed to create src directory");
+    fs::write(dir.join("src/lib.cairo"), "fn main() {}\n").expect("failed to write lib.cairo");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+alexandria = "0.9.0"
+"#,
+    )
+    .expect("failed to write manifest");
+
+    let common = BuildCommonArgs {
+        manifest_path: Some(manifest_path.clone()),
+        package: None,
+        workspace: false,
+        features: Vec::new(),
+        offline: true,
+        release: false,
+        profile: None,
+    };
+    let err = build_native_compile_context(&common, &manifest_path, &dir)
+        .expect_err("unsupported target cfg dependency should fail native context resolution");
+    assert!(
+        format!("{err:#}").contains(
+            "native compile does not support [target.cfg(target_os = \"linux\").dependencies].alexandria yet"
+        ),
+        "unexpected error: {err:#}"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn native_target_dir_rejects_profile_traversal_escape() {
     let workspace_root = PathBuf::from("/tmp/uc-native-target-dir");
     let err = native_target_dir(&workspace_root, "../../escape")
@@ -3289,20 +3397,25 @@ fn native_compile_session_build_lock_is_per_key_and_released_when_idle() {
 #[test]
 fn native_session_refresh_action_prefers_incremental_for_changed_sets() {
     assert_eq!(
-        native_session_refresh_action(false, false),
+        native_session_refresh_action(false, false, 0, 0),
         NativeSessionRefreshAction::None
     );
     assert_eq!(
-        native_session_refresh_action(false, true),
+        native_session_refresh_action(false, true, 1, 0),
         NativeSessionRefreshAction::IncrementalChangedSet
     );
     assert_eq!(
-        native_session_refresh_action(true, false),
+        native_session_refresh_action(true, false, 0, 0),
         NativeSessionRefreshAction::FullRebuild
     );
     assert_eq!(
-        native_session_refresh_action(true, true),
+        native_session_refresh_action(true, true, 1, 1),
         NativeSessionRefreshAction::FullRebuild
+    );
+    assert_eq!(
+        native_session_refresh_action(false, true, 10_000, 0),
+        NativeSessionRefreshAction::FullRebuild,
+        "large changed-file sets should force a full rebuild to keep daemon latency predictable"
     );
 }
 

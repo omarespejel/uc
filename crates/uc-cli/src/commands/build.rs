@@ -1,6 +1,7 @@
 use super::*;
 
 const DAEMON_LOCAL_PROBE_HINT_SUFFIX: &str = ".fallback-session-key";
+const DAEMON_LOCAL_NATIVE_SUPPORTED_HINT_SUFFIX: &str = ".native-supported";
 const DAEMON_LOCAL_PROBE_HINT_MAX_ENTRIES: usize = 256;
 const DAEMON_LOCAL_PROBE_HINT_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 
@@ -21,6 +22,28 @@ fn daemon_local_probe_hint_path(
     )?;
     let hint_path = hint_dir.join(format!(
         "{primary_session_key}{DAEMON_LOCAL_PROBE_HINT_SUFFIX}"
+    ));
+    ensure_path_within_root(workspace_root, &hint_path, "daemon local probe hint path")?;
+    Ok(hint_path)
+}
+
+fn daemon_local_native_supported_hint_path(
+    workspace_root: &Path,
+    primary_session_key: &str,
+) -> Result<PathBuf> {
+    validate_hex_digest(
+        "daemon local probe primary session key",
+        primary_session_key,
+        SESSION_KEY_LEN,
+    )?;
+    let hint_dir = workspace_root.join(".uc/cache/probe-hints");
+    ensure_path_within_root(
+        workspace_root,
+        &hint_dir,
+        "daemon local probe hint directory",
+    )?;
+    let hint_path = hint_dir.join(format!(
+        "{primary_session_key}{DAEMON_LOCAL_NATIVE_SUPPORTED_HINT_SUFFIX}"
     ));
     ensure_path_within_root(workspace_root, &hint_path, "daemon local probe hint path")?;
     Ok(hint_path)
@@ -75,7 +98,9 @@ fn prune_daemon_local_probe_hints(hint_dir: &Path) -> Result<()> {
         let entry = entry.with_context(|| format!("failed to read {}", hint_dir.display()))?;
         let path = entry.path();
         let file_name = entry.file_name().to_string_lossy().to_string();
-        if !file_name.ends_with(DAEMON_LOCAL_PROBE_HINT_SUFFIX) {
+        if !file_name.ends_with(DAEMON_LOCAL_PROBE_HINT_SUFFIX)
+            && !file_name.ends_with(DAEMON_LOCAL_NATIVE_SUPPORTED_HINT_SUFFIX)
+        {
             continue;
         }
         let metadata =
@@ -139,6 +164,74 @@ fn clear_daemon_local_probe_hint(workspace_root: &Path, primary_session_key: &st
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err)
             .with_context(|| format!("failed to remove daemon probe hint {}", hint_path.display())),
+    }
+}
+
+fn daemon_local_native_supported_hint(
+    workspace_root: &Path,
+    primary_session_key: &str,
+) -> Result<bool> {
+    let hint_path = daemon_local_native_supported_hint_path(workspace_root, primary_session_key)?;
+    let contents = match fs::read_to_string(&hint_path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                hint_path = %hint_path.display(),
+                "failed to read native-supported hint; treating as unknown support"
+            );
+            return Ok(false);
+        }
+    };
+    let value = contents.trim().to_ascii_lowercase();
+    Ok(!value.is_empty() && !matches!(value.as_str(), "0" | "false" | "no" | "off"))
+}
+
+fn persist_daemon_local_native_supported_hint(
+    workspace_root: &Path,
+    primary_session_key: &str,
+) -> Result<()> {
+    let hint_path = daemon_local_native_supported_hint_path(workspace_root, primary_session_key)?;
+    let parent = hint_path
+        .parent()
+        .context("native-supported hint path has no parent directory")?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create native-supported hint dir {}",
+            parent.display()
+        )
+    })?;
+    fs::write(&hint_path, "1\n").with_context(|| {
+        format!(
+            "failed to write native-supported hint {}",
+            hint_path.display()
+        )
+    })?;
+    if let Err(err) = prune_daemon_local_probe_hints(parent) {
+        tracing::warn!(
+            error = %format!("{err:#}"),
+            hint_dir = %parent.display(),
+            "failed to prune daemon probe hints"
+        );
+    }
+    Ok(())
+}
+
+fn clear_daemon_local_native_supported_hint(
+    workspace_root: &Path,
+    primary_session_key: &str,
+) -> Result<()> {
+    let hint_path = daemon_local_native_supported_hint_path(workspace_root, primary_session_key)?;
+    match fs::remove_file(&hint_path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "failed to remove native-supported hint {}",
+                hint_path.display()
+            )
+        }),
     }
 }
 
@@ -262,6 +355,10 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                     &local_session_key,
                                 );
                             }
+                            let _ = clear_daemon_local_native_supported_hint(
+                                &workspace_root,
+                                &native_session_key,
+                            );
                             return Ok((run, cache_hit, fingerprint, local_session_key, telemetry));
                         }
                         match run_local_with_backend(
@@ -271,6 +368,10 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                         ) {
                             Ok((run, cache_hit, fingerprint, telemetry)) => {
                                 let _ = clear_daemon_local_probe_hint(
+                                    &workspace_root,
+                                    &native_session_key,
+                                );
+                                let _ = persist_daemon_local_native_supported_hint(
                                     &workspace_root,
                                     &native_session_key,
                                 );
@@ -296,6 +397,10 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                     &workspace_root,
                                     &native_session_key,
                                     &local_session_key,
+                                );
+                                let _ = clear_daemon_local_native_supported_hint(
+                                    &workspace_root,
+                                    &native_session_key,
                                 );
                                 Ok((run, cache_hit, fingerprint, local_session_key, telemetry))
                             }
@@ -366,7 +471,12 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                     scarb_probe_context = Some((compiler_version.clone(), session_key.clone()));
                     Ok((compiler_version, session_key))
                 };
-                if include_scarb_fallback_probe {
+                let native_supported_hint = if include_scarb_fallback_probe {
+                    daemon_local_native_supported_hint(&workspace_root, primary_session_key)?
+                } else {
+                    false
+                };
+                if include_scarb_fallback_probe && !native_supported_hint {
                     if let Some(hinted_session_key) =
                         load_daemon_local_probe_hint(&workspace_root, primary_session_key)?
                     {
@@ -393,6 +503,10 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                 )? {
                     if include_scarb_fallback_probe {
                         let _ = clear_daemon_local_probe_hint(&workspace_root, primary_session_key);
+                        let _ = persist_daemon_local_native_supported_hint(
+                            &workspace_root,
+                            primary_session_key,
+                        );
                     }
                     return Ok(Some((
                         run,
@@ -401,7 +515,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                         primary_session_key.to_string(),
                     )));
                 }
-                if include_scarb_fallback_probe {
+                if include_scarb_fallback_probe && !native_supported_hint {
                     let (scarb_compiler_version, scarb_session_key) =
                         resolve_scarb_probe_context()?;
                     if scarb_session_key != primary_session_key {
@@ -417,6 +531,10 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                 &workspace_root,
                                 primary_session_key,
                                 &scarb_session_key,
+                            );
+                            let _ = clear_daemon_local_native_supported_hint(
+                                &workspace_root,
+                                primary_session_key,
                             );
                             return Ok(Some((run, fingerprint, telemetry, scarb_session_key)));
                         }
@@ -466,9 +584,19 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                 &local_session_key,
                                 &response.session_key,
                             );
+                            let _ = clear_daemon_local_native_supported_hint(
+                                &workspace_root,
+                                &local_session_key,
+                            );
                         } else if response.session_key == local_session_key {
                             let _ =
                                 clear_daemon_local_probe_hint(&workspace_root, &local_session_key);
+                            if response.compile_backend == DaemonBuildBackend::Native {
+                                let _ = persist_daemon_local_native_supported_hint(
+                                    &workspace_root,
+                                    &local_session_key,
+                                );
+                            }
                         }
                         daemon_used = true;
                         session_key = response.session_key;
@@ -517,9 +645,19 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                 &local_session_key,
                                 &response.session_key,
                             );
+                            let _ = clear_daemon_local_native_supported_hint(
+                                &workspace_root,
+                                &local_session_key,
+                            );
                         } else if response.session_key == local_session_key {
                             let _ =
                                 clear_daemon_local_probe_hint(&workspace_root, &local_session_key);
+                            if response.compile_backend == DaemonBuildBackend::Native {
+                                let _ = persist_daemon_local_native_supported_hint(
+                                    &workspace_root,
+                                    &local_session_key,
+                                );
+                            }
                         }
                         daemon_used = true;
                         session_key = response.session_key;
@@ -616,6 +754,30 @@ mod tests {
         assert!(
             cleared.is_none(),
             "probe hint should be removed after clear operation"
+        );
+
+        fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[test]
+    fn daemon_local_native_supported_hint_roundtrip_and_clear() {
+        let workspace = unique_test_dir("uc-daemon-native-supported-hint");
+        let primary_session_key = "c".repeat(SESSION_KEY_LEN);
+
+        persist_daemon_local_native_supported_hint(&workspace, &primary_session_key)
+            .expect("failed to persist native-supported hint");
+        assert!(
+            daemon_local_native_supported_hint(&workspace, &primary_session_key)
+                .expect("failed to read native-supported hint"),
+            "persisted native-supported hint should be readable"
+        );
+
+        clear_daemon_local_native_supported_hint(&workspace, &primary_session_key)
+            .expect("failed to clear native-supported hint");
+        assert!(
+            !daemon_local_native_supported_hint(&workspace, &primary_session_key)
+                .expect("failed to read native-supported hint after clear"),
+            "native-supported hint should be removed after clear operation"
         );
 
         fs::remove_dir_all(&workspace).ok();
