@@ -82,6 +82,7 @@ mod daemon;
 mod fingerprint;
 use cache::*;
 use commands::{run_build, run_compare_build, run_metadata, run_migrate};
+#[allow(unused_imports)]
 use daemon::*;
 use fingerprint::*;
 
@@ -7380,7 +7381,7 @@ fn is_process_alive(pid: u32) -> bool {
 
     let mut system = System::new();
     let target = Pid::from_u32(pid);
-    let _ = system.refresh_processes(ProcessesToUpdate::Some(&[target]), true);
+    let _ = system.refresh_processes(ProcessesToUpdate::Some(&[target]));
     system.process(target).is_some()
 }
 

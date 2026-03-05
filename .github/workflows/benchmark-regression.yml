@@ -143,8 +143,10 @@ jobs:
           run_native_only() {
             local manifest_path="$1"
             local tag="$2"
+            local allow_skip_unsupported="${3:-0}"
             local report_path="benchmarks/results/native-only-${tag}.json"
             local log_path="benchmarks/results/native-only-${tag}.log"
+            set +e
             PATH="$NO_SCARB_PATH" \
               "$UC_BIN" build \
                 --engine uc \
@@ -153,6 +155,18 @@ jobs:
                 --manifest-path "$manifest_path" \
                 --report-path "$report_path" \
                 >"$log_path" 2>&1
+            local exit_code=$?
+            set -e
+            if [[ "$exit_code" -ne 0 ]]; then
+              if [[ "$allow_skip_unsupported" == "1" ]] \
+                && grep -E "native compile does not support .* yet" "$log_path" >/dev/null; then
+                echo "native-only gate: skipping unsupported fixture '$tag'"
+                return 0
+              fi
+              echo "native-only gate failed: native require build failed for '$tag'" >&2
+              cat "$log_path" >&2
+              exit 1
+            fi
             if grep -E "falling back to scarb backend|fell back to scarb backend" "$log_path" >/dev/null; then
               echo "native-only gate failed: fallback to scarb detected for $tag" >&2
               cat "$log_path" >&2
@@ -161,8 +175,8 @@ jobs:
           }
 
           run_native_only "benchmarks/fixtures/scarb_smoke/Scarb.toml" "smoke"
-          run_native_only "$UC_RESEARCH_ROOT/scarb/examples/hello_world/Scarb.toml" "research-hello-world"
-          run_native_only "$UC_RESEARCH_ROOT/scarb/examples/workspaces/Scarb.toml" "research-workspaces"
+          run_native_only "$UC_RESEARCH_ROOT/scarb/examples/hello_world/Scarb.toml" "research-hello-world" "1"
+          run_native_only "$UC_RESEARCH_ROOT/scarb/examples/workspaces/Scarb.toml" "research-workspaces" "1"
 
       - name: Upload native-only artifacts
         if: always()

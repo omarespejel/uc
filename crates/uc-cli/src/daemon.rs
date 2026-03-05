@@ -1,5 +1,4 @@
 use super::*;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(super) fn daemon_socket_path(override_path: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = override_path {
