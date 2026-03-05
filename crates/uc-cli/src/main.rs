@@ -15,6 +15,8 @@ use cairo_lang_defs::ids::TopLevelLanguageElementId;
 #[cfg(feature = "native-compile")]
 use cairo_lang_filesystem::db::{init_dev_corelib, FilesGroup};
 #[cfg(feature = "native-compile")]
+use cairo_lang_filesystem::detect::detect_corelib;
+#[cfg(feature = "native-compile")]
 use cairo_lang_filesystem::ids::CrateInput;
 #[cfg(feature = "native-compile")]
 use cairo_lang_filesystem::ids::{FileId, FileLongId};
@@ -3552,6 +3554,65 @@ fn native_corelib_layout_looks_compatible(corelib_src: &Path) -> bool {
 }
 
 #[cfg(feature = "native-compile")]
+fn native_corelib_manifest_version(corelib_src: &Path) -> Option<String> {
+    let manifest_path = corelib_src.parent()?.join("Scarb.toml");
+    let manifest_text = fs::read_to_string(manifest_path).ok()?;
+    let manifest: TomlValue = toml::from_str(&manifest_text).ok()?;
+    manifest
+        .get("package")
+        .and_then(TomlValue::as_table)
+        .and_then(|table| table.get("version"))
+        .and_then(TomlValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+#[cfg(feature = "native-compile")]
+fn native_corelib_version_matches_compiler(corelib_src: &Path) -> bool {
+    let Some(found) = native_corelib_manifest_version(corelib_src) else {
+        // Some dev layouts do not include Scarb.toml near corelib/src; treat as best-effort.
+        return true;
+    };
+    let expected = native_cairo_lang_compiler_version();
+    if found == expected {
+        return true;
+    }
+    tracing::debug!(
+        corelib_src = %corelib_src.display(),
+        found_version = %found,
+        expected_version = %expected,
+        "skipping corelib candidate due to cairo-lang version mismatch"
+    );
+    false
+}
+
+#[cfg(feature = "native-compile")]
+fn native_corelib_candidate_paths(workspace_root: &Path) -> Vec<(&'static str, PathBuf)> {
+    let mut candidates: Vec<(&'static str, PathBuf)> = Vec::new();
+
+    if let Some(parent) = workspace_root.parent() {
+        candidates.push(("workspace-parent", parent.join("cairo/corelib/src")));
+    }
+    for ancestor in workspace_root.ancestors().skip(1).take(6) {
+        candidates.push(("workspace-ancestor", ancestor.join("cairo/corelib/src")));
+    }
+    if let Some(path) = detect_corelib() {
+        candidates.push(("cairo-detect", path));
+    }
+    if let Ok(current_exe) = std::env::current_exe() {
+        for ancestor in current_exe.ancestors().skip(1).take(8) {
+            candidates.push(("exe-ancestor", ancestor.join("corelib/src")));
+            candidates.push(("exe-ancestor", ancestor.join("cairo/corelib/src")));
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(("home", PathBuf::from(home).join(".cairo/corelib/src")));
+    }
+    candidates
+}
+
+#[cfg(feature = "native-compile")]
 fn toml_escape_basic_string(raw: &str) -> String {
     let mut escaped = String::with_capacity(raw.len());
     for ch in raw.chars() {
@@ -3588,6 +3649,13 @@ fn resolve_native_corelib_src(workspace_root: &Path) -> Result<PathBuf> {
             )
         })?;
         if native_corelib_layout_looks_compatible(&canonical) {
+            if !native_corelib_version_matches_compiler(&canonical) {
+                return Err(native_fallback_eligible_error(format!(
+                    "native corelib override {} version does not match cairo-lang {}; set UC_NATIVE_CORELIB_SRC to a compatible corelib/src",
+                    canonical.display(),
+                    native_cairo_lang_compiler_version()
+                )));
+            }
             tracing::debug!(
                 source = "env",
                 corelib_src = %canonical.display(),
@@ -3602,13 +3670,9 @@ fn resolve_native_corelib_src(workspace_root: &Path) -> Result<PathBuf> {
         )));
     }
 
-    let mut candidates: Vec<(&str, PathBuf)> = Vec::new();
-    if let Some(parent) = workspace_root.parent() {
-        candidates.push(("workspace-parent", parent.join("cairo/corelib/src")));
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        candidates.push(("home", PathBuf::from(home).join(".cairo/corelib/src")));
-    }
+    let candidates = native_corelib_candidate_paths(workspace_root);
+    let mut seen = HashSet::new();
+    let mut attempted = Vec::new();
 
     for (source, candidate) in candidates {
         if !candidate.exists() {
@@ -3620,7 +3684,14 @@ fn resolve_native_corelib_src(workspace_root: &Path) -> Result<PathBuf> {
                 candidate.display()
             )
         })?;
-        if native_corelib_layout_looks_compatible(&canonical) {
+        let canonical_key = normalize_fingerprint_path(&canonical);
+        if !seen.insert(canonical_key) {
+            continue;
+        }
+        attempted.push(canonical.display().to_string());
+        if native_corelib_layout_looks_compatible(&canonical)
+            && native_corelib_version_matches_compiler(&canonical)
+        {
             tracing::debug!(
                 source,
                 corelib_src = %canonical.display(),
@@ -3637,8 +3708,9 @@ fn resolve_native_corelib_src(workspace_root: &Path) -> Result<PathBuf> {
 
     Err(native_fallback_eligible_error(
         format!(
-            "native compile requires a Cairo corelib source path compatible with cairo-lang {}; set UC_NATIVE_CORELIB_SRC=<.../corelib/src>",
-            native_cairo_lang_compiler_version()
+            "native compile requires a Cairo corelib source path compatible with cairo-lang {}; set UC_NATIVE_CORELIB_SRC=<.../corelib/src> (tried {} candidates)",
+            native_cairo_lang_compiler_version(),
+            attempted.len()
         ),
     ))
 }

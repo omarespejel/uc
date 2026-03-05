@@ -13,6 +13,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      - name: Prepare native corelib source
+        run: |
+          set -euo pipefail
+          CAIRO_ROOT="$RUNNER_TEMP/cairo-workspace"
+          git clone --depth 1 --branch v2.16.0 \
+            https://github.com/starkware-libs/cairo.git "$CAIRO_ROOT/cairo"
+          echo "UC_NATIVE_CORELIB_SRC=$CAIRO_ROOT/cairo/corelib/src" >> "$GITHUB_ENV"
+
       - name: Install Scarb
         uses: software-mansion/setup-scarb@9d86a1616deecc95e8e8435daf902c5d025dc8b8 # v1
 
@@ -23,6 +31,10 @@ jobs:
         run: cargo build --release -p uc-cli
 
       - name: Run smoke stability benchmark cycles
+        env:
+          UC_NATIVE_BUILD_MODE: require
+          UC_NATIVE_DISALLOW_SCARB_FALLBACK: "1"
+          UC_NATIVE_CORELIB_SRC: ${{ env.UC_NATIVE_CORELIB_SRC }}
         run: |
           chmod +x benchmarks/scripts/run_local_benchmarks.sh
           chmod +x benchmarks/scripts/run_stability_benchmarks.sh

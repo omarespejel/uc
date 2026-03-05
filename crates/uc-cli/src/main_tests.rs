@@ -98,6 +98,18 @@ fn create_mock_native_corelib(corelib_src: &Path) {
     fs::write(corelib_src.join("ops.cairo"), "").expect("failed to write mock ops");
 }
 
+fn write_mock_native_corelib_manifest(corelib_src: &Path, version: &str) {
+    let manifest_path = corelib_src
+        .parent()
+        .expect("corelib src should have parent")
+        .join("Scarb.toml");
+    fs::write(
+        manifest_path,
+        format!("[package]\nname = \"core\"\nversion = \"{version}\"\nedition = \"2024_07\"\n"),
+    )
+    .expect("failed to write mock corelib manifest");
+}
+
 fn smoke_common_args(manifest_path: &Path) -> BuildCommonArgs {
     BuildCommonArgs {
         manifest_path: Some(manifest_path.to_path_buf()),
@@ -4816,6 +4828,43 @@ fn resolve_native_corelib_src_skips_incompatible_home_and_uses_workspace_sibling
     fs::create_dir_all(&home_corelib).expect("failed to create home corelib");
     fs::write(home_corelib.join("lib.cairo"), "fn main() {}\n")
         .expect("failed to write incompatible home corelib");
+
+    let sibling_corelib = dir.join("cairo/corelib/src");
+    create_mock_native_corelib(&sibling_corelib);
+
+    let original_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", &home);
+    std::env::remove_var("UC_NATIVE_CORELIB_SRC");
+
+    let resolved = resolve_native_corelib_src(&workspace_root).expect("resolve should succeed");
+    assert_eq!(
+        resolved,
+        sibling_corelib
+            .canonicalize()
+            .expect("failed to canonicalize sibling corelib")
+    );
+
+    if let Some(value) = original_home {
+        std::env::set_var("HOME", value);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn resolve_native_corelib_src_skips_version_mismatched_home_candidate() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = unique_test_dir("uc-native-corelib-version-mismatch");
+    let workspace_root = dir.join("workspace");
+    fs::create_dir_all(&workspace_root).expect("failed to create workspace root");
+
+    let home = dir.join("home");
+    let home_corelib = home.join(".cairo/corelib/src");
+    create_mock_native_corelib(&home_corelib);
+    write_mock_native_corelib_manifest(&home_corelib, "0.0.1");
 
     let sibling_corelib = dir.join("cairo/corelib/src");
     create_mock_native_corelib(&sibling_corelib);
