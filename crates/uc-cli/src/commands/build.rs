@@ -132,6 +132,21 @@ fn prune_daemon_local_probe_hints(hint_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn write_hint_file_if_changed(path: &Path, contents: &str) -> Result<()> {
+    match fs::read_to_string(path) {
+        Ok(existing) if existing == contents => return Ok(()),
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to read existing hint {}", path.display()));
+        }
+    }
+    fs::write(path, contents)
+        .with_context(|| format!("failed to write hint file {}", path.display()))?;
+    Ok(())
+}
+
 fn persist_daemon_local_probe_hint(
     workspace_root: &Path,
     primary_session_key: &str,
@@ -155,8 +170,7 @@ fn persist_daemon_local_probe_hint(
             parent.display()
         )
     })?;
-    fs::write(&hint_path, format!("{hinted_session_key}\n"))
-        .with_context(|| format!("failed to write daemon probe hint {}", hint_path.display()))?;
+    write_hint_file_if_changed(&hint_path, &format!("{hinted_session_key}\n"))?;
     if let Err(err) = prune_daemon_local_probe_hints(parent) {
         tracing::warn!(
             error = %format!("{err:#}"),
@@ -212,12 +226,7 @@ fn persist_daemon_local_native_supported_hint(
             parent.display()
         )
     })?;
-    fs::write(&hint_path, "1\n").with_context(|| {
-        format!(
-            "failed to write native-supported hint {}",
-            hint_path.display()
-        )
-    })?;
+    write_hint_file_if_changed(&hint_path, "1\n")?;
     if let Err(err) = prune_daemon_local_probe_hints(parent) {
         tracing::warn!(
             error = %format!("{err:#}"),
@@ -509,8 +518,8 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                 }
                                 record_native_fallback(NativeFallbackReason::LocalNativeError);
                                 eprintln!(
-                                    "uc: native compile unavailable ({:#}), falling back to scarb backend",
-                                    native_err
+                                    "uc: native compile unavailable ({}), falling back to scarb backend",
+                                    native_err.root_cause()
                                 );
                                 let (compiler_version, local_session_key) =
                                     build_scarb_fallback_context()?;
@@ -976,6 +985,63 @@ mod tests {
             !daemon_local_native_supported_hint(&workspace, &primary_session_key)
                 .expect("failed to read native-supported hint after clear"),
             "native-supported hint should be removed after clear operation"
+        );
+
+        fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[test]
+    fn persist_native_supported_hint_keeps_mtime_when_contents_unchanged() {
+        let workspace = unique_test_dir("uc-daemon-native-supported-hint-mtime");
+        let primary_session_key = "9".repeat(SESSION_KEY_LEN);
+
+        persist_daemon_local_native_supported_hint(&workspace, &primary_session_key)
+            .expect("failed to persist native-supported hint");
+        let hint_path = daemon_local_native_supported_hint_path(&workspace, &primary_session_key)
+            .expect("failed to compute native-supported hint path");
+        let first_modified = fs::metadata(&hint_path)
+            .and_then(|metadata| metadata.modified())
+            .expect("failed to read native-supported hint mtime");
+
+        std::thread::sleep(Duration::from_millis(1_100));
+        persist_daemon_local_native_supported_hint(&workspace, &primary_session_key)
+            .expect("failed to persist native-supported hint a second time");
+        let second_modified = fs::metadata(&hint_path)
+            .and_then(|metadata| metadata.modified())
+            .expect("failed to read native-supported hint mtime after second persist");
+
+        assert_eq!(
+            first_modified, second_modified,
+            "persisting identical native-supported hint should not rewrite and refresh mtime"
+        );
+
+        fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[test]
+    fn persist_probe_hint_keeps_mtime_when_contents_unchanged() {
+        let workspace = unique_test_dir("uc-daemon-probe-hint-mtime");
+        let primary_session_key = "0".repeat(SESSION_KEY_LEN);
+        let hinted_session_key = "1".repeat(SESSION_KEY_LEN);
+
+        persist_daemon_local_probe_hint(&workspace, &primary_session_key, &hinted_session_key)
+            .expect("failed to persist probe hint");
+        let hint_path = daemon_local_probe_hint_path(&workspace, &primary_session_key)
+            .expect("failed to compute probe hint path");
+        let first_modified = fs::metadata(&hint_path)
+            .and_then(|metadata| metadata.modified())
+            .expect("failed to read probe hint mtime");
+
+        std::thread::sleep(Duration::from_millis(1_100));
+        persist_daemon_local_probe_hint(&workspace, &primary_session_key, &hinted_session_key)
+            .expect("failed to persist probe hint a second time");
+        let second_modified = fs::metadata(&hint_path)
+            .and_then(|metadata| metadata.modified())
+            .expect("failed to read probe hint mtime after second persist");
+
+        assert_eq!(
+            first_modified, second_modified,
+            "persisting identical probe hint should not rewrite and refresh mtime"
         );
 
         fs::remove_dir_all(&workspace).ok();

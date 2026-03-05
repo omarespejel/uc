@@ -112,6 +112,9 @@ pub(super) fn read_line_limited<R: BufRead>(
         let newline_pos = chunk.iter().position(|byte| *byte == b'\n');
         let take_len = newline_pos.unwrap_or(chunk.len());
         let remaining = max_bytes.saturating_sub(bytes.len());
+        // Allow reading exactly `max_bytes` bytes (without newline) so callers can
+        // accept payloads up to the documented limit. If no newline is found,
+        // the next non-empty read will fail once `remaining == 0`.
         if take_len > remaining {
             bail!("{label} exceeds size limit ({max_bytes} bytes)");
         }

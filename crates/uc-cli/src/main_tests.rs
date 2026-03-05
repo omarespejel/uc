@@ -774,6 +774,18 @@ fn read_line_limited_rejects_oversized_line() {
 }
 
 #[test]
+fn read_line_limited_rejects_extra_bytes_after_exact_limit_without_newline() {
+    let payload = [vec![b'a'; 8], vec![b'b']].concat();
+    let mut reader = std::io::BufReader::with_capacity(8, std::io::Cursor::new(payload));
+    let err = read_line_limited(&mut reader, 8, "test line")
+        .expect_err("line should fail once bytes arrive after reaching the exact size limit");
+    assert!(
+        format!("{err:#}").contains("exceeds size limit"),
+        "unexpected error: {err:#}"
+    );
+}
+
+#[test]
 fn daemon_response_size_limit_exceeds_request_and_capture_budget() {
     let limit = daemon_response_size_limit_bytes();
     let minimum = max_capture_stdout_bytes()

@@ -6,6 +6,7 @@ use cairo_lang_compiler::db::RootDatabase;
 use cairo_lang_compiler::project::setup_project;
 #[cfg(feature = "native-compile")]
 use cairo_lang_compiler::{compile_prepared_db_program, CompilerConfig};
+#[cfg(feature = "native-compile")]
 use cairo_lang_defs::db::DefsGroup;
 #[cfg(feature = "native-compile")]
 use cairo_lang_defs::ids::ModuleId;
