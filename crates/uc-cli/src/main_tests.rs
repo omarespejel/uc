@@ -624,6 +624,78 @@ fn read_line_limited_rejects_oversized_line() {
     );
 }
 
+#[test]
+fn daemon_response_size_limit_exceeds_request_and_capture_budget() {
+    let limit = daemon_response_size_limit_bytes();
+    let minimum = max_capture_stdout_bytes()
+        .saturating_add(max_capture_stderr_bytes())
+        .saturating_add(DAEMON_RESPONSE_SIZE_OVERHEAD_BYTES as u64)
+        .min(usize::MAX as u64) as usize;
+    assert!(
+        limit >= DAEMON_REQUEST_SIZE_LIMIT_BYTES,
+        "daemon response limit must never be below request limit"
+    );
+    assert!(
+        limit >= minimum,
+        "daemon response limit must cover configured capture budgets"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_request_accepts_large_response_payload() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let socket_path = unique_unix_socket_path("uc-daemon-large-response");
+    let _ = fs::remove_file(&socket_path);
+    let listener =
+        std::os::unix::net::UnixListener::bind(&socket_path).expect("failed to bind socket");
+    let expected_len = 2 * 1024 * 1024;
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("failed to accept request");
+        let mut line = String::new();
+        {
+            let mut reader = std::io::BufReader::new(
+                stream
+                    .try_clone()
+                    .expect("failed to clone daemon test stream"),
+            );
+            let _ = std::io::BufRead::read_line(&mut reader, &mut line)
+                .expect("failed to read daemon request");
+        }
+        assert!(
+            !line.trim().is_empty(),
+            "daemon request payload should not be empty"
+        );
+        let message = "x".repeat(expected_len);
+        let payload = format!(r#"{{"type":"error","message":"{message}"}}"#);
+        stream
+            .write_all(payload.as_bytes())
+            .expect("failed to write daemon response");
+        stream
+            .write_all(b"\n")
+            .expect("failed to write daemon response delimiter");
+        stream.flush().expect("failed to flush daemon response");
+    });
+
+    let response =
+        daemon_request(&socket_path, &DaemonRequest::Ping).expect("daemon request should succeed");
+    match response {
+        DaemonResponse::Error { message } => {
+            assert_eq!(
+                message.len(),
+                expected_len,
+                "daemon client should accept responses larger than request size limit"
+            );
+        }
+        other => panic!("expected error response, got {other:?}"),
+    }
+
+    server.join().expect("daemon test server panicked");
+    let _ = fs::remove_file(&socket_path);
+}
+
 #[cfg(unix)]
 #[test]
 fn try_uc_build_via_daemon_auto_mode_falls_back_on_daemon_error() {

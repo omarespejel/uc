@@ -100,6 +100,10 @@ const FINGERPRINT_INDEX_SCHEMA_VERSION: u32 = 2;
 const ARTIFACT_INDEX_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_DIAGNOSTICS_SIMILARITY_THRESHOLD: f64 = 99.5;
 const DAEMON_REQUEST_SIZE_LIMIT_BYTES: usize = 1024 * 1024;
+const DAEMON_RESPONSE_SIZE_OVERHEAD_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_DAEMON_RESPONSE_SIZE_LIMIT_BYTES: usize = (MAX_CAPTURE_STDOUT_BYTES as usize)
+    + (MAX_CAPTURE_STDERR_BYTES as usize)
+    + DAEMON_RESPONSE_SIZE_OVERHEAD_BYTES;
 const DAEMON_RATE_WINDOW_SECONDS: u64 = 1;
 const DAEMON_MAX_REQUESTS_PER_WINDOW: usize = 32;
 const DAEMON_LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
@@ -1808,6 +1812,27 @@ fn daemon_client_write_timeout() -> Option<Duration> {
         "UC_DAEMON_CLIENT_WRITE_TIMEOUT_SECS",
         DEFAULT_DAEMON_CLIENT_WRITE_TIMEOUT_SECS,
     ))
+}
+
+fn daemon_response_size_limit_bytes() -> usize {
+    let compute = || {
+        let configured = parse_env_usize(
+            "UC_DAEMON_RESPONSE_SIZE_LIMIT_BYTES",
+            DEFAULT_DAEMON_RESPONSE_SIZE_LIMIT_BYTES,
+        );
+        let minimum = max_capture_stdout_bytes()
+            .saturating_add(max_capture_stderr_bytes())
+            .saturating_add(DAEMON_RESPONSE_SIZE_OVERHEAD_BYTES as u64)
+            .min(usize::MAX as u64) as usize;
+        configured.max(minimum).max(DAEMON_REQUEST_SIZE_LIMIT_BYTES)
+    };
+
+    if cfg!(test) {
+        return compute();
+    }
+
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(compute)
 }
 
 fn daemon_request_read_timeout(request: &DaemonRequest) -> Option<Duration> {

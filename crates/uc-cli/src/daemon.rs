@@ -188,7 +188,7 @@ pub(super) fn daemon_request_with_timeouts(
         let mut reader = BufReader::new(&mut stream);
         read_line_limited(
             &mut reader,
-            DAEMON_REQUEST_SIZE_LIMIT_BYTES,
+            daemon_response_size_limit_bytes(),
             "daemon response",
         )?
     };
