@@ -220,7 +220,7 @@ jobs:
         uses: software-mansion/setup-scarb@9d86a1616deecc95e8e8435daf902c5d025dc8b8 # v1
 
       - name: Build uc CLI
-        run: cargo build -p uc-cli
+        run: cargo build --release -p uc-cli
 
       - name: Normalize checkout text mode on Windows
         if: runner.os == 'Windows'
@@ -233,10 +233,10 @@ jobs:
         shell: bash
         run: |
           mkdir -p benchmarks/results determinism
-          UC_BIN="./target/debug/uc"
+          UC_BIN="./target/release/uc"
           PYTHON_BIN="python3"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
-            UC_BIN="./target/debug/uc.exe"
+            UC_BIN="./target/release/uc.exe"
           fi
           if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
             PYTHON_BIN="python"

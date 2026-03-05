@@ -176,8 +176,9 @@ fn flatten_payload_wrapped_wire_shape(value: &mut serde_json::Value) {
         if key == "type" {
             continue;
         }
-        // Prefer payload values in hybrid/legacy shapes so wrapper content is
-        // authoritative while preserving the root discriminant (`type`).
+        // Payload fields overwrite same-named root fields, making `payload`
+        // authoritative while preserving the root `type` discriminant.
+        // This keeps payload-wrapped and legacy/hybrid flat shapes compatible.
         root.insert(key, item);
     }
 }
@@ -232,30 +233,20 @@ pub(super) fn daemon_request_with_timeouts(
     }
 }
 
-// Prefer single-pass decode; keep a Value fallback for tagged+flattened compatibility quirks
-// observed across serde versions.
+// Daemon wire payloads can be wrapped (`payload`) or flat (legacy/hybrid).
+// Normalize through `Value` once and decode from the normalized shape.
 pub(super) fn decode_daemon_request(line: &str) -> serde_json::Result<DaemonRequest> {
-    match serde_json::from_str::<DaemonRequest>(line) {
-        Ok(request) => Ok(request),
-        Err(_) => {
-            let mut value: serde_json::Value = serde_json::from_str(line)?;
-            flatten_payload_wrapped_wire_shape(&mut value);
-            serde_json::from_value(value)
-        }
-    }
+    let mut value: serde_json::Value = serde_json::from_str(line)?;
+    flatten_payload_wrapped_wire_shape(&mut value);
+    serde_json::from_value(value)
 }
 
-// Prefer single-pass decode; keep a Value fallback for tagged+flattened compatibility quirks
-// observed across serde versions.
+// Daemon wire payloads can be wrapped (`payload`) or flat (legacy/hybrid).
+// Normalize through `Value` once and decode from the normalized shape.
 pub(super) fn decode_daemon_response(line: &str) -> serde_json::Result<DaemonResponse> {
-    match serde_json::from_str::<DaemonResponse>(line) {
-        Ok(response) => Ok(response),
-        Err(_) => {
-            let mut value: serde_json::Value = serde_json::from_str(line)?;
-            flatten_payload_wrapped_wire_shape(&mut value);
-            serde_json::from_value(value)
-        }
-    }
+    let mut value: serde_json::Value = serde_json::from_str(line)?;
+    flatten_payload_wrapped_wire_shape(&mut value);
+    serde_json::from_value(value)
 }
 
 #[cfg(unix)]

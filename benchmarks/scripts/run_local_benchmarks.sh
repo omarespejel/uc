@@ -808,6 +808,19 @@ ensure_isolated_workload_dir() {
   esac
 }
 
+resolve_path_for_guard() {
+  local raw_path="$1"
+  local parent
+  local base
+  local resolved_parent
+  parent="$(dirname -- "$raw_path")"
+  base="$(basename -- "$raw_path")"
+  if ! resolved_parent="$(cd "$parent" 2>/dev/null && pwd -P)"; then
+    return 1
+  fi
+  printf "%s/%s" "$resolved_parent" "$base"
+}
+
 reset_workload_outputs() {
   local cwd="$1"
   ensure_isolated_workload_dir "$cwd"
@@ -822,14 +835,21 @@ reset_daemon_shared_cache_for_cold_run() {
   if [[ -z "${UC_DAEMON_SHARED_CACHE_DIR:-}" ]]; then
     return 0
   fi
-  case "$UC_DAEMON_SHARED_CACHE_DIR" in
-    "$TMP_DIR"/*) ;;
+  local resolved_cache_dir
+  if ! resolved_cache_dir="$(resolve_path_for_guard "$UC_DAEMON_SHARED_CACHE_DIR")"; then
+    echo "Refusing cold-run shared-cache reset with unresolvable path: $UC_DAEMON_SHARED_CACHE_DIR" >&2
+    exit 1
+  fi
+  local resolved_tmp_dir
+  resolved_tmp_dir="$(cd "$TMP_DIR" && pwd -P)"
+  case "$resolved_cache_dir" in
+    "$resolved_tmp_dir"/*) ;;
     *)
       echo "Refusing cold-run shared-cache reset outside benchmark tmp dir: $UC_DAEMON_SHARED_CACHE_DIR" >&2
       exit 1
       ;;
   esac
-  rm -rf "$UC_DAEMON_SHARED_CACHE_DIR"
+  rm -rf "$resolved_cache_dir"
 }
 
 prime_build_dependencies_if_needed() {

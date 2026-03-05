@@ -425,6 +425,14 @@ fn cache_object_hash_memo_key(path: &Path) -> String {
     normalize_fingerprint_path(path)
 }
 
+#[cfg(test)]
+fn clear_cache_object_hash_memo_for_test() {
+    cache_object_hash_memo()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
 pub(super) fn evict_oldest_cache_object_hash_memo_entries(
     cache: &mut HashMap<String, CacheObjectHashMemoEntry>,
     max_entries: usize,
@@ -981,6 +989,7 @@ mod tests {
 
     #[test]
     fn stale_hash_lookup_does_not_refresh_access_age() {
+        clear_cache_object_hash_memo_for_test();
         let dir = unique_test_dir("uc-cache-object-hash-stale-age");
         let object_path = dir.join("cache/object.bin");
         if let Some(parent) = object_path.parent() {
@@ -1009,13 +1018,16 @@ mod tests {
             .expect("fresh lookup should not fail");
         assert!(hit.is_none(), "stale metadata should miss");
 
-        let cache = cache_object_hash_memo()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let entry = cache.get(&key).expect("cache entry should still exist");
-        assert_eq!(
-            entry.last_access_epoch_ms, 7,
-            "stale cache lookup must not refresh access age"
-        );
+        {
+            let cache = cache_object_hash_memo()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let entry = cache.get(&key).expect("cache entry should still exist");
+            assert_eq!(
+                entry.last_access_epoch_ms, 7,
+                "stale cache lookup must not refresh access age"
+            );
+        }
+        clear_cache_object_hash_memo_for_test();
     }
 }

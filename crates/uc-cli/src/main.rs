@@ -572,6 +572,7 @@ struct NativeCompileContext {
     manifest_content_hash: String,
     external_non_starknet_dependencies: Vec<String>,
     path_dependency_roots: Vec<NativePathDependencyRoot>,
+    crate_dependency_configs: Vec<NativeCrateDependencyConfig>,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -586,6 +587,22 @@ struct NativeStarknetTargetProps {
 struct NativePathDependencyRoot {
     crate_name: String,
     source_root: PathBuf,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+#[cfg(feature = "native-compile")]
+struct NativeCrateDependencyConfig {
+    crate_name: String,
+    cairo_edition: Option<String>,
+    dependencies: Vec<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+#[cfg(feature = "native-compile")]
+struct NativeDependencySurface {
+    external_non_starknet_dependencies: Vec<String>,
+    path_dependency_roots: Vec<NativePathDependencyRoot>,
+    crate_dependency_configs: Vec<NativeCrateDependencyConfig>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1503,6 +1520,7 @@ fn native_lockfile_fallback_version(lockfile: &str) -> String {
     format!("lockhash-{}", &digest[..16])
 }
 
+#[cfg(feature = "native-compile")]
 fn native_cairo_lang_compiler_version() -> &'static str {
     static VALUE: OnceLock<String> = OnceLock::new();
     VALUE
@@ -1522,6 +1540,26 @@ fn native_cairo_lang_compiler_version() -> &'static str {
         .as_str()
 }
 
+#[cfg(not(feature = "native-compile"))]
+fn native_cairo_lang_compiler_version() -> &'static str {
+    "disabled"
+}
+
+#[cfg(feature = "native-compile")]
+fn native_compiler_version_line() -> String {
+    static VALUE: OnceLock<String> = OnceLock::new();
+    VALUE
+        .get_or_init(|| {
+            format!(
+                "uc-native {} cairo-lang {}",
+                env!("CARGO_PKG_VERSION"),
+                native_cairo_lang_compiler_version()
+            )
+        })
+        .clone()
+}
+
+#[cfg(not(feature = "native-compile"))]
 fn native_compiler_version_line() -> String {
     static VALUE: OnceLock<String> = OnceLock::new();
     VALUE
@@ -3850,7 +3888,7 @@ fn validate_native_requested_package(
 }
 
 #[cfg(feature = "native-compile")]
-fn native_workspace_dependency_entry<'a>(
+fn native_workspace_dependency_entry_from_manifest<'a>(
     manifest: &'a TomlValue,
     dependency_name: &str,
 ) -> Option<&'a TomlValue> {
@@ -3863,8 +3901,22 @@ fn native_workspace_dependency_entry<'a>(
 }
 
 #[cfg(feature = "native-compile")]
+fn native_workspace_dependency_entry<'a>(
+    manifest: &'a TomlValue,
+    workspace_manifest_fallback: Option<&'a TomlValue>,
+    dependency_name: &str,
+) -> Option<&'a TomlValue> {
+    native_workspace_dependency_entry_from_manifest(manifest, dependency_name).or_else(|| {
+        workspace_manifest_fallback.and_then(|fallback| {
+            native_workspace_dependency_entry_from_manifest(fallback, dependency_name)
+        })
+    })
+}
+
+#[cfg(feature = "native-compile")]
 fn native_dependency_path_from_value(
     manifest: &TomlValue,
+    workspace_manifest_fallback: Option<&TomlValue>,
     dependency_name: &str,
     dependency_value: &TomlValue,
 ) -> Option<(String, bool)> {
@@ -3880,7 +3932,11 @@ fn native_dependency_path_from_value(
         .and_then(TomlValue::as_bool)
         .is_some_and(|value| value)
     {
-        let workspace_entry = native_workspace_dependency_entry(manifest, dependency_name)?;
+        let workspace_entry = native_workspace_dependency_entry(
+            manifest,
+            workspace_manifest_fallback,
+            dependency_name,
+        )?;
         if let Some(path) = workspace_entry
             .as_table()
             .and_then(|entry| entry.get("path"))
@@ -3896,12 +3952,19 @@ fn native_dependency_path_from_value(
 }
 
 #[cfg(feature = "native-compile")]
+struct NativeDependencyCollectionContext<'a> {
+    dependency_label_prefix: &'a str,
+    manifest: &'a TomlValue,
+    workspace_manifest_fallback: Option<&'a TomlValue>,
+    manifest_dir: &'a Path,
+    workspace_root: &'a Path,
+}
+
+#[cfg(feature = "native-compile")]
 fn collect_native_dependency_table_surface(
+    context: &NativeDependencyCollectionContext<'_>,
     section_label: &str,
     table: &toml::map::Map<String, TomlValue>,
-    manifest: &TomlValue,
-    manifest_dir: &Path,
-    workspace_root: &Path,
     external: &mut BTreeSet<String>,
     path_roots: &mut BTreeMap<String, PathBuf>,
 ) {
@@ -3909,21 +3972,27 @@ fn collect_native_dependency_table_surface(
         if dependency_name == "starknet" {
             continue;
         }
-        let dependency_label = format!("{section_label}.{dependency_name}");
-        let Some((raw_path, workspace_relative)) =
-            native_dependency_path_from_value(manifest, dependency_name, dependency_value)
-        else {
+        let dependency_label = format!(
+            "{}{section_label}.{dependency_name}",
+            context.dependency_label_prefix
+        );
+        let Some((raw_path, workspace_relative)) = native_dependency_path_from_value(
+            context.manifest,
+            context.workspace_manifest_fallback,
+            dependency_name,
+            dependency_value,
+        ) else {
             external.insert(dependency_label);
             continue;
         };
 
         let dependency_root = if workspace_relative {
-            workspace_root.join(&raw_path)
+            context.workspace_root.join(&raw_path)
         } else {
-            manifest_dir.join(&raw_path)
+            context.manifest_dir.join(&raw_path)
         };
         if ensure_path_within_root(
-            workspace_root,
+            context.workspace_root,
             &dependency_root,
             "native path dependency root",
         )
@@ -3955,24 +4024,30 @@ fn collect_native_dependency_table_surface(
 }
 
 #[cfg(feature = "native-compile")]
-fn collect_native_dependency_surface(
+fn collect_native_manifest_dependency_surface(
     manifest: &TomlValue,
-    manifest_path: &Path,
+    workspace_manifest_fallback: Option<&TomlValue>,
+    manifest_dir: &Path,
     workspace_root: &Path,
-) -> (Vec<String>, Vec<NativePathDependencyRoot>) {
+    dependency_label_prefix: &str,
+) -> (BTreeSet<String>, BTreeMap<String, PathBuf>) {
     let mut external = BTreeSet::new();
     let mut path_roots = BTreeMap::new();
-    let manifest_dir = manifest_path.parent().unwrap_or(workspace_root);
+    let context = NativeDependencyCollectionContext {
+        dependency_label_prefix,
+        manifest,
+        workspace_manifest_fallback,
+        manifest_dir,
+        workspace_root,
+    };
 
     for section_name in ["dependencies", "dev-dependencies"] {
         if let Some(table) = manifest.get(section_name).and_then(TomlValue::as_table) {
             let section_label = format!("[{}]", section_name);
             collect_native_dependency_table_surface(
+                &context,
                 &section_label,
                 table,
-                manifest,
-                manifest_dir,
-                workspace_root,
                 &mut external,
                 &mut path_roots,
             );
@@ -3991,14 +4066,151 @@ fn collect_native_dependency_surface(
                 {
                     let section_label = format!("[target.{}.{}]", target_name, section_name);
                     collect_native_dependency_table_surface(
+                        &context,
                         &section_label,
                         table,
-                        manifest,
-                        manifest_dir,
-                        workspace_root,
                         &mut external,
                         &mut path_roots,
                     );
+                }
+            }
+        }
+    }
+    (external, path_roots)
+}
+
+#[cfg(feature = "native-compile")]
+fn native_dependency_manifest_path(source_root: &Path) -> PathBuf {
+    source_root
+        .parent()
+        .unwrap_or(source_root)
+        .join("Scarb.toml")
+}
+
+#[cfg(feature = "native-compile")]
+fn collect_native_dependency_surface(
+    manifest: &TomlValue,
+    manifest_path: &Path,
+    workspace_root: &Path,
+) -> NativeDependencySurface {
+    let manifest_dir = manifest_path.parent().unwrap_or(workspace_root);
+    let (mut external, mut path_roots) = collect_native_manifest_dependency_surface(
+        manifest,
+        Some(manifest),
+        manifest_dir,
+        workspace_root,
+        "",
+    );
+    let root_crate_name = manifest
+        .get("package")
+        .and_then(TomlValue::as_table)
+        .and_then(|table| table.get("name"))
+        .and_then(TomlValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(normalize_package_name_for_cairo_crate)
+        .unwrap_or_else(|| "root".to_string());
+    let (root_cairo_edition, _) = resolve_manifest_cairo_settings_from_manifest(manifest);
+    let mut crate_dependency_configs =
+        BTreeMap::<String, (Option<String>, BTreeSet<String>)>::new();
+    crate_dependency_configs.insert(
+        root_crate_name,
+        (root_cairo_edition, path_roots.keys().cloned().collect()),
+    );
+
+    let mut dependency_queue: VecDeque<(String, PathBuf)> = path_roots
+        .iter()
+        .map(|(crate_name, source_root)| (crate_name.clone(), source_root.clone()))
+        .collect();
+    let mut visited_dependency_manifests = HashSet::new();
+    while let Some((dependency_crate_name, dependency_source_root)) = dependency_queue.pop_front() {
+        let dependency_manifest_path = native_dependency_manifest_path(&dependency_source_root);
+        let dependency_manifest_key = normalize_fingerprint_path(&dependency_manifest_path);
+        if !visited_dependency_manifests.insert(dependency_manifest_key) {
+            continue;
+        }
+        let dependency_manifest_text = match read_text_file_with_limit(
+            &dependency_manifest_path,
+            MAX_MANIFEST_BYTES,
+            "manifest",
+        ) {
+            Ok(text) => text,
+            Err(err) => {
+                tracing::debug!(
+                    dependency = %dependency_crate_name,
+                    manifest_path = %dependency_manifest_path.display(),
+                    error = %err,
+                    "skipping native dependency manifest parsing due to read failure"
+                );
+                continue;
+            }
+        };
+        let dependency_manifest = match parse_manifest_toml(
+            &dependency_manifest_text,
+            &dependency_manifest_path,
+            "failed to parse path dependency manifest for native compile",
+        ) {
+            Ok(manifest) => manifest,
+            Err(err) => {
+                tracing::debug!(
+                    dependency = %dependency_crate_name,
+                    manifest_path = %dependency_manifest_path.display(),
+                    error = %err,
+                    "skipping native dependency manifest parsing due to parse failure"
+                );
+                continue;
+            }
+        };
+        if let Err(err) = validate_manifest_dependency_sanity_from_manifest(
+            &dependency_manifest_path,
+            &dependency_manifest,
+        ) {
+            tracing::debug!(
+                dependency = %dependency_crate_name,
+                manifest_path = %dependency_manifest_path.display(),
+                error = %err,
+                "path dependency manifest has invalid dependency table entries"
+            );
+            continue;
+        }
+        let (dependency_cairo_edition, _) =
+            resolve_manifest_cairo_settings_from_manifest(&dependency_manifest);
+        let dependency_manifest_dir = dependency_manifest_path.parent().unwrap_or(workspace_root);
+        let dependency_label_prefix = format!("[dependency.{dependency_crate_name}]");
+        let (dependency_external, dependency_path_roots) =
+            collect_native_manifest_dependency_surface(
+                &dependency_manifest,
+                Some(manifest),
+                dependency_manifest_dir,
+                workspace_root,
+                &dependency_label_prefix,
+            );
+        external.extend(dependency_external);
+
+        let dependency_entry = crate_dependency_configs
+            .entry(dependency_crate_name.clone())
+            .or_insert_with(|| (dependency_cairo_edition.clone(), BTreeSet::new()));
+        if dependency_entry.0.is_none() {
+            dependency_entry.0 = dependency_cairo_edition;
+        }
+        dependency_entry
+            .1
+            .extend(dependency_path_roots.keys().cloned());
+
+        for (nested_crate_name, nested_source_root) in dependency_path_roots {
+            match path_roots.entry(nested_crate_name.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(nested_source_root.clone());
+                    dependency_queue.push_back((nested_crate_name, nested_source_root));
+                }
+                std::collections::btree_map::Entry::Occupied(existing)
+                    if existing.get() == &nested_source_root => {}
+                std::collections::btree_map::Entry::Occupied(existing) => {
+                    external.insert(format!(
+                        "[dependency.{dependency_crate_name}] conflicting path roots for `{nested_crate_name}` ({} vs {})",
+                        existing.get().display(),
+                        nested_source_root.display()
+                    ));
                 }
             }
         }
@@ -4011,7 +4223,21 @@ fn collect_native_dependency_surface(
             source_root,
         })
         .collect();
-    (external.into_iter().collect(), path_dependency_roots)
+    let crate_dependency_configs = crate_dependency_configs
+        .into_iter()
+        .map(
+            |(crate_name, (cairo_edition, dependencies))| NativeCrateDependencyConfig {
+                crate_name,
+                cairo_edition,
+                dependencies: dependencies.into_iter().collect(),
+            },
+        )
+        .collect();
+    NativeDependencySurface {
+        external_non_starknet_dependencies: external.into_iter().collect(),
+        path_dependency_roots,
+        crate_dependency_configs,
+    }
 }
 
 #[cfg(feature = "native-compile")]
@@ -4040,8 +4266,11 @@ fn build_native_compile_context_uncached(
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .context("native compile requires [package].name in Scarb.toml")?;
-    let (external_non_starknet_dependencies, path_dependency_roots) =
+    let dependency_surface =
         collect_native_dependency_surface(&manifest, manifest_path, workspace_root);
+    let external_non_starknet_dependencies = dependency_surface.external_non_starknet_dependencies;
+    let path_dependency_roots = dependency_surface.path_dependency_roots;
+    let crate_dependency_configs = dependency_surface.crate_dependency_configs;
     if !path_dependency_roots.is_empty() {
         tracing::debug!(
             roots = ?path_dependency_roots
@@ -4113,8 +4342,11 @@ fn build_native_compile_context_uncached(
         })
         .collect::<Vec<_>>();
     let (cairo_edition, _) = resolve_manifest_cairo_settings_from_manifest(&manifest);
-    let cairo_project_toml =
-        native_cairo_project_toml(&escaped_crate_roots, cairo_edition.as_deref());
+    let cairo_project_toml = native_cairo_project_toml(
+        &escaped_crate_roots,
+        &crate_dependency_configs,
+        cairo_edition.as_deref(),
+    );
     write_text_file_if_changed(
         &cairo_project_path,
         &cairo_project_toml,
@@ -4133,6 +4365,7 @@ fn build_native_compile_context_uncached(
         manifest_content_hash,
         external_non_starknet_dependencies,
         path_dependency_roots,
+        crate_dependency_configs,
     })
 }
 
@@ -4173,6 +4406,15 @@ fn native_compile_context_estimated_bytes(context: &NativeCompileContext) -> u64
             .path_dependency_roots
             .iter()
             .map(|root| root.crate_name.len())
+            .sum::<usize>()
+        + context
+            .crate_dependency_configs
+            .iter()
+            .map(|config| {
+                config.crate_name.len()
+                    + config.cairo_edition.as_ref().map_or(0, String::len)
+                    + config.dependencies.iter().map(String::len).sum::<usize>()
+            })
             .sum::<usize>()
         + path_bytes;
     u64::try_from(scalar_bytes).unwrap_or(u64::MAX)
@@ -4335,6 +4577,7 @@ fn update_native_compile_session_cached_estimated_bytes(
 #[cfg(feature = "native-compile")]
 fn native_cairo_project_toml(
     crate_roots: &[(String, String)],
+    crate_dependency_configs: &[NativeCrateDependencyConfig],
     cairo_edition: Option<&str>,
 ) -> String {
     let mut content = String::from("[crate_roots]\n");
@@ -4344,15 +4587,47 @@ fn native_cairo_project_toml(
         content.push_str(escaped_source_root);
         content.push_str("\"\n");
     }
-    if let Some(edition) = cairo_edition
+    let normalized_global_edition = cairo_edition
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
+        .filter(|value| !value.is_empty());
+    if let Some(edition) = normalized_global_edition {
         let escaped_edition = toml_escape_basic_string(edition);
         content.push_str("\n[config.global]\n");
         content.push_str("edition = \"");
         content.push_str(&escaped_edition);
         content.push_str("\"\n");
+    }
+    for crate_config in crate_dependency_configs
+        .iter()
+        .filter(|config| !config.dependencies.is_empty())
+    {
+        content.push_str("\n[config.override.");
+        content.push_str(&crate_config.crate_name);
+        content.push_str("]\n");
+
+        let effective_edition = crate_config
+            .cairo_edition
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or(normalized_global_edition);
+        if let Some(edition) = effective_edition {
+            let escaped_edition = toml_escape_basic_string(edition);
+            content.push_str("edition = \"");
+            content.push_str(&escaped_edition);
+            content.push_str("\"\n");
+        }
+
+        content.push_str("\n[config.override.");
+        content.push_str(&crate_config.crate_name);
+        content.push_str(".dependencies]\n");
+        for dependency_name in &crate_config.dependencies {
+            let escaped_dependency_name = toml_escape_basic_string(dependency_name);
+            content.push_str(dependency_name);
+            content.push_str(" = { discriminator = \"");
+            content.push_str(&escaped_dependency_name);
+            content.push_str("\" }\n");
+        }
     }
     content
 }

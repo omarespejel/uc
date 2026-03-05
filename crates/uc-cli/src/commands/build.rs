@@ -2,10 +2,43 @@ use super::*;
 
 const DAEMON_LOCAL_PROBE_HINT_SUFFIX: &str = ".fallback-session-key";
 const DAEMON_LOCAL_NATIVE_SUPPORTED_HINT_SUFFIX: &str = ".native-supported";
+const DAEMON_LOCAL_PROBE_HINT_DIR: &str = "fallback-keys";
+const DAEMON_LOCAL_NATIVE_SUPPORTED_HINT_DIR: &str = "native-supported";
 const DAEMON_LOCAL_PROBE_HINT_MAX_ENTRIES: usize = 256;
 const DAEMON_LOCAL_PROBE_HINT_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 
-fn daemon_local_probe_hint_path(
+fn daemon_probe_hint_root_dir(workspace_root: &Path) -> Result<PathBuf> {
+    let hint_dir = workspace_root.join(".uc/cache/probe-hints");
+    ensure_path_within_root(
+        workspace_root,
+        &hint_dir,
+        "daemon local probe hint directory",
+    )?;
+    Ok(hint_dir)
+}
+
+fn daemon_local_probe_hint_dir(workspace_root: &Path) -> Result<PathBuf> {
+    let hint_dir = daemon_probe_hint_root_dir(workspace_root)?.join(DAEMON_LOCAL_PROBE_HINT_DIR);
+    ensure_path_within_root(
+        workspace_root,
+        &hint_dir,
+        "daemon local probe fallback hint directory",
+    )?;
+    Ok(hint_dir)
+}
+
+fn daemon_local_native_supported_hint_dir(workspace_root: &Path) -> Result<PathBuf> {
+    let hint_dir =
+        daemon_probe_hint_root_dir(workspace_root)?.join(DAEMON_LOCAL_NATIVE_SUPPORTED_HINT_DIR);
+    ensure_path_within_root(
+        workspace_root,
+        &hint_dir,
+        "daemon local native-supported hint directory",
+    )?;
+    Ok(hint_dir)
+}
+
+fn daemon_local_probe_hint_legacy_path(
     workspace_root: &Path,
     primary_session_key: &str,
 ) -> Result<PathBuf> {
@@ -14,12 +47,7 @@ fn daemon_local_probe_hint_path(
         primary_session_key,
         SESSION_KEY_LEN,
     )?;
-    let hint_dir = workspace_root.join(".uc/cache/probe-hints");
-    ensure_path_within_root(
-        workspace_root,
-        &hint_dir,
-        "daemon local probe hint directory",
-    )?;
+    let hint_dir = daemon_probe_hint_root_dir(workspace_root)?;
     let hint_path = hint_dir.join(format!(
         "{primary_session_key}{DAEMON_LOCAL_PROBE_HINT_SUFFIX}"
     ));
@@ -36,12 +64,41 @@ fn daemon_local_native_supported_hint_path(
         primary_session_key,
         SESSION_KEY_LEN,
     )?;
-    let hint_dir = workspace_root.join(".uc/cache/probe-hints");
-    ensure_path_within_root(
-        workspace_root,
-        &hint_dir,
-        "daemon local probe hint directory",
+    let hint_dir = daemon_local_native_supported_hint_dir(workspace_root)?;
+    let hint_path = hint_dir.join(format!(
+        "{primary_session_key}{DAEMON_LOCAL_NATIVE_SUPPORTED_HINT_SUFFIX}"
+    ));
+    ensure_path_within_root(workspace_root, &hint_path, "daemon local probe hint path")?;
+    Ok(hint_path)
+}
+
+fn daemon_local_probe_hint_path(
+    workspace_root: &Path,
+    primary_session_key: &str,
+) -> Result<PathBuf> {
+    validate_hex_digest(
+        "daemon local probe primary session key",
+        primary_session_key,
+        SESSION_KEY_LEN,
     )?;
+    let hint_dir = daemon_local_probe_hint_dir(workspace_root)?;
+    let hint_path = hint_dir.join(format!(
+        "{primary_session_key}{DAEMON_LOCAL_PROBE_HINT_SUFFIX}"
+    ));
+    ensure_path_within_root(workspace_root, &hint_path, "daemon local probe hint path")?;
+    Ok(hint_path)
+}
+
+fn daemon_local_native_supported_hint_legacy_path(
+    workspace_root: &Path,
+    primary_session_key: &str,
+) -> Result<PathBuf> {
+    validate_hex_digest(
+        "daemon local probe primary session key",
+        primary_session_key,
+        SESSION_KEY_LEN,
+    )?;
+    let hint_dir = daemon_probe_hint_root_dir(workspace_root)?;
     let hint_path = hint_dir.join(format!(
         "{primary_session_key}{DAEMON_LOCAL_NATIVE_SUPPORTED_HINT_SUFFIX}"
     ));
@@ -56,7 +113,22 @@ fn load_daemon_local_probe_hint(
     let hint_path = daemon_local_probe_hint_path(workspace_root, primary_session_key)?;
     let contents = match fs::read_to_string(&hint_path) {
         Ok(contents) => contents,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            let legacy_hint_path =
+                daemon_local_probe_hint_legacy_path(workspace_root, primary_session_key)?;
+            match fs::read_to_string(&legacy_hint_path) {
+                Ok(contents) => contents,
+                Err(legacy_err) if legacy_err.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(legacy_err) => {
+                    tracing::warn!(
+                        error = %legacy_err,
+                        hint_path = %legacy_hint_path.display(),
+                        "failed to read legacy daemon probe hint; treating as cache miss"
+                    );
+                    return Ok(None);
+                }
+            }
+        }
         Err(err) => {
             tracing::warn!(
                 error = %err,
@@ -182,13 +254,22 @@ fn persist_daemon_local_probe_hint(
 }
 
 fn clear_daemon_local_probe_hint(workspace_root: &Path, primary_session_key: &str) -> Result<()> {
-    let hint_path = daemon_local_probe_hint_path(workspace_root, primary_session_key)?;
-    match fs::remove_file(&hint_path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err)
-            .with_context(|| format!("failed to remove daemon probe hint {}", hint_path.display())),
+    let hint_paths = [
+        daemon_local_probe_hint_path(workspace_root, primary_session_key)?,
+        daemon_local_probe_hint_legacy_path(workspace_root, primary_session_key)?,
+    ];
+    for hint_path in hint_paths {
+        match fs::remove_file(&hint_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to remove daemon probe hint {}", hint_path.display())
+                });
+            }
+        }
     }
+    Ok(())
 }
 
 fn daemon_local_native_supported_hint(
@@ -198,7 +279,26 @@ fn daemon_local_native_supported_hint(
     let hint_path = daemon_local_native_supported_hint_path(workspace_root, primary_session_key)?;
     let contents = match fs::read_to_string(&hint_path) {
         Ok(contents) => contents,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            let legacy_hint_path = daemon_local_native_supported_hint_legacy_path(
+                workspace_root,
+                primary_session_key,
+            )?;
+            match fs::read_to_string(&legacy_hint_path) {
+                Ok(contents) => contents,
+                Err(legacy_err) if legacy_err.kind() == io::ErrorKind::NotFound => {
+                    return Ok(false)
+                }
+                Err(legacy_err) => {
+                    tracing::warn!(
+                        error = %legacy_err,
+                        hint_path = %legacy_hint_path.display(),
+                        "failed to read legacy native-supported hint; treating as unknown support"
+                    );
+                    return Ok(false);
+                }
+            }
+        }
         Err(err) => {
             tracing::warn!(
                 error = %err,
@@ -241,17 +341,25 @@ fn clear_daemon_local_native_supported_hint(
     workspace_root: &Path,
     primary_session_key: &str,
 ) -> Result<()> {
-    let hint_path = daemon_local_native_supported_hint_path(workspace_root, primary_session_key)?;
-    match fs::remove_file(&hint_path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err).with_context(|| {
-            format!(
-                "failed to remove native-supported hint {}",
-                hint_path.display()
-            )
-        }),
+    let hint_paths = [
+        daemon_local_native_supported_hint_path(workspace_root, primary_session_key)?,
+        daemon_local_native_supported_hint_legacy_path(workspace_root, primary_session_key)?,
+    ];
+    for hint_path in hint_paths {
+        match fs::remove_file(&hint_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to remove native-supported hint {}",
+                        hint_path.display()
+                    )
+                });
+            }
+        }
     }
+    Ok(())
 }
 
 fn should_probe_local_before_daemon(
@@ -292,7 +400,8 @@ fn daemon_backend_policy_with_hint_state(
     native_auto_eligible: bool,
     native_supported_hint: bool,
     has_scarb_probe_hint: bool,
-) -> (BuildCompileBackend, bool) {
+    disallow_native_fallback: bool,
+) -> Result<(BuildCompileBackend, bool)> {
     let (backend, native_fallback_to_scarb) =
         daemon_backend_policy(configured_mode, native_auto_eligible);
     if backend == BuildCompileBackend::Native
@@ -300,9 +409,14 @@ fn daemon_backend_policy_with_hint_state(
         && !native_supported_hint
         && has_scarb_probe_hint
     {
-        (BuildCompileBackend::Scarb, false)
+        if disallow_native_fallback {
+            bail!(
+                "native fallback is disallowed (UC_NATIVE_DISALLOW_SCARB_FALLBACK=1): fallback hint present"
+            );
+        }
+        Ok((BuildCompileBackend::Scarb, false))
     } else {
-        (backend, native_fallback_to_scarb)
+        Ok((backend, native_fallback_to_scarb))
     }
 }
 
@@ -600,13 +714,9 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                 native_auto_eligible,
                                 native_supported_hint,
                                 has_scarb_probe_hint,
-                            );
+                                disallow_native_fallback,
+                            )?;
                         if daemon_compile_backend == BuildCompileBackend::Scarb {
-                            if disallow_native_fallback {
-                                bail!(
-                                    "native fallback is disallowed (UC_NATIVE_DISALLOW_SCARB_FALLBACK=1): fallback hint present for session key {local_session_key}"
-                                );
-                            }
                             record_native_fallback(NativeFallbackReason::DaemonBackendDowngrade);
                             tracing::debug!(
                                 session_key = %local_session_key,
@@ -939,6 +1049,65 @@ mod tests {
     }
 
     #[test]
+    fn daemon_hint_paths_are_partitioned_by_hint_type() {
+        let workspace = unique_test_dir("uc-daemon-probe-hint-path-partition");
+        let primary_session_key = "0".repeat(SESSION_KEY_LEN);
+        let probe_path = daemon_local_probe_hint_path(&workspace, &primary_session_key)
+            .expect("failed to compute probe hint path");
+        let native_supported_path =
+            daemon_local_native_supported_hint_path(&workspace, &primary_session_key)
+                .expect("failed to compute native-supported hint path");
+        let probe_components: Vec<String> = probe_path
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().to_string())
+            .collect();
+        let native_components: Vec<String> = native_supported_path
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            probe_components
+                .windows(2)
+                .any(|pair| pair[0] == "probe-hints" && pair[1] == "fallback-keys"),
+            "probe hint should live in dedicated fallback-keys directory: {}",
+            probe_path.display()
+        );
+        assert!(
+            native_components
+                .windows(2)
+                .any(|pair| pair[0] == "probe-hints" && pair[1] == "native-supported"),
+            "native-supported hint should live in dedicated native-supported directory: {}",
+            native_supported_path.display()
+        );
+        fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[test]
+    fn load_daemon_local_probe_hint_reads_legacy_hint_location() {
+        let workspace = unique_test_dir("uc-daemon-probe-hint-legacy-load");
+        let primary_session_key = "a".repeat(SESSION_KEY_LEN);
+        let hinted_session_key = "b".repeat(SESSION_KEY_LEN);
+        let legacy_hint_path =
+            daemon_local_probe_hint_legacy_path(&workspace, &primary_session_key)
+                .expect("failed to compute legacy hint path");
+        if let Some(parent) = legacy_hint_path.parent() {
+            fs::create_dir_all(parent).expect("failed to create legacy hint directory");
+        }
+        fs::write(&legacy_hint_path, format!("{hinted_session_key}\n"))
+            .expect("failed to write legacy hint file");
+
+        let loaded = load_daemon_local_probe_hint(&workspace, &primary_session_key)
+            .expect("failed to load daemon probe hint");
+        assert_eq!(
+            loaded,
+            Some(hinted_session_key),
+            "legacy hint location should remain readable for backward compatibility"
+        );
+
+        fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[test]
     fn daemon_local_probe_hint_roundtrip_and_clear() {
         let workspace = unique_test_dir("uc-daemon-probe-hint");
         let primary_session_key = "a".repeat(SESSION_KEY_LEN);
@@ -1149,15 +1318,18 @@ mod tests {
     #[test]
     fn daemon_backend_policy_with_hint_state_prefers_scarb_after_known_auto_fallback() {
         assert_eq!(
-            daemon_backend_policy_with_hint_state(NativeBuildMode::Auto, true, false, true),
+            daemon_backend_policy_with_hint_state(NativeBuildMode::Auto, true, false, true, false)
+                .expect("hint downgrade should be allowed when fallback is enabled"),
             (BuildCompileBackend::Scarb, false)
         );
         assert_eq!(
-            daemon_backend_policy_with_hint_state(NativeBuildMode::Auto, true, true, true),
+            daemon_backend_policy_with_hint_state(NativeBuildMode::Auto, true, true, true, false)
+                .expect("native-supported hint should keep native backend"),
             (BuildCompileBackend::Native, true)
         );
         assert_eq!(
-            daemon_backend_policy_with_hint_state(NativeBuildMode::Auto, true, false, false),
+            daemon_backend_policy_with_hint_state(NativeBuildMode::Auto, true, false, false, false)
+                .expect("missing fallback hint should keep native backend"),
             (BuildCompileBackend::Native, true)
         );
     }
@@ -1165,12 +1337,31 @@ mod tests {
     #[test]
     fn daemon_backend_policy_with_hint_state_keeps_non_auto_modes_unchanged() {
         assert_eq!(
-            daemon_backend_policy_with_hint_state(NativeBuildMode::Off, false, false, true),
+            daemon_backend_policy_with_hint_state(NativeBuildMode::Off, false, false, true, false)
+                .expect("off mode should bypass hint downgrade logic"),
             (BuildCompileBackend::Scarb, false)
         );
         assert_eq!(
-            daemon_backend_policy_with_hint_state(NativeBuildMode::Require, true, false, true),
+            daemon_backend_policy_with_hint_state(
+                NativeBuildMode::Require,
+                true,
+                false,
+                true,
+                false
+            )
+            .expect("require mode should bypass hint downgrade logic"),
             (BuildCompileBackend::Native, false)
+        );
+    }
+
+    #[test]
+    fn daemon_backend_policy_with_hint_state_rejects_hint_downgrade_when_fallback_disallowed() {
+        let err =
+            daemon_backend_policy_with_hint_state(NativeBuildMode::Auto, true, false, true, true)
+                .expect_err("hint-based downgrade should fail when fallback is disallowed");
+        assert!(
+            format!("{err:#}").contains("native fallback is disallowed"),
+            "unexpected error: {err:#}"
         );
     }
 }
