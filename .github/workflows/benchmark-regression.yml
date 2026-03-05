@@ -20,7 +20,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Build uc CLI
-        run: cargo build -p uc-cli
+        run: cargo build --release -p uc-cli
 
       - name: Run smoke stability benchmark cycles
         run: |
@@ -135,7 +135,7 @@ jobs:
           UC_NATIVE_CORELIB_SRC: ${{ env.UC_NATIVE_CORELIB_SRC }}
         run: |
           set -euo pipefail
-          UC_BIN="./target/debug/uc"
+          UC_BIN="./target/release/uc"
           NO_SCARB_PATH="$RUNNER_TEMP/no-scarb-path"
           mkdir -p "$NO_SCARB_PATH"
           mkdir -p benchmarks/results

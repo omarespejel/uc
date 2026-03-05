@@ -298,6 +298,43 @@ fn daemon_build_request_payload_wrapped_wire_format_is_decoded() {
     }
 }
 
+#[test]
+fn daemon_build_request_payload_fields_override_hybrid_root_fields() {
+    let json = format!(
+        r#"{{
+            "type":"build",
+            "manifest_path":"/tmp/root-overridden/Scarb.toml",
+            "payload":{{
+                "protocol_version":"{}",
+                "manifest_path":"/tmp/payload-authoritative/Scarb.toml",
+                "package":null,
+                "workspace":false,
+                "features":[],
+                "offline":false,
+                "release":false,
+                "profile":null,
+                "async_cache_persist":false,
+                "capture_output":true,
+                "compile_backend":"native",
+                "native_fallback_to_scarb":true
+            }}
+        }}"#,
+        DAEMON_PROTOCOL_VERSION
+    );
+    let decoded = decode_daemon_request(&json).expect("failed to decode hybrid daemon request");
+    match decoded {
+        DaemonRequest::Build { payload } => {
+            assert_eq!(
+                payload.manifest_path,
+                "/tmp/payload-authoritative/Scarb.toml"
+            );
+            assert_eq!(payload.compile_backend, DaemonBuildBackend::Native);
+            assert!(payload.native_fallback_to_scarb);
+        }
+        _ => panic!("expected build request"),
+    }
+}
+
 #[cfg(feature = "native-compile")]
 #[test]
 fn starknet_artifact_files_omits_casm_when_none() {
@@ -433,6 +470,44 @@ fn daemon_build_response_payload_wrapped_wire_format_is_decoded() {
             assert_eq!(payload.run.elapsed_ms, 11.5);
             assert_eq!(payload.telemetry.compile_ms, 9.0);
             assert_eq!(payload.compile_backend, DaemonBuildBackend::Scarb);
+        }
+        _ => panic!("expected build response"),
+    }
+}
+
+#[test]
+fn daemon_build_response_payload_fields_override_hybrid_root_fields() {
+    let json = r#"{
+        "type":"build",
+        "compile_backend":"scarb",
+        "payload":{
+            "run":{
+                "command":["uc","build"],
+                "exit_code":0,
+                "elapsed_ms":7.5,
+                "stdout":"",
+                "stderr":""
+            },
+            "cache_hit":false,
+            "fingerprint":"f",
+            "session_key":"s",
+            "compile_backend":"native",
+            "telemetry":{
+                "fingerprint_ms":0.1,
+                "cache_lookup_ms":0.2,
+                "cache_restore_ms":0.3,
+                "compile_ms":9.0,
+                "cache_persist_ms":0.4,
+                "cache_persist_async":false,
+                "cache_persist_scheduled":false
+            }
+        }
+    }"#;
+    let decoded = decode_daemon_response(json).expect("failed to decode hybrid daemon response");
+    match decoded {
+        DaemonResponse::Build { payload } => {
+            assert_eq!(payload.compile_backend, DaemonBuildBackend::Native);
+            assert_eq!(payload.run.elapsed_ms, 7.5);
         }
         _ => panic!("expected build response"),
     }

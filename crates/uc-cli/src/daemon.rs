@@ -170,7 +170,12 @@ fn flatten_payload_wrapped_wire_shape(value: &mut serde_json::Value) {
         return;
     };
     for (key, item) in payload_map {
-        root.entry(key).or_insert(item);
+        if key == "type" {
+            continue;
+        }
+        // Prefer payload values in hybrid/legacy shapes so wrapper content is
+        // authoritative while preserving the root discriminant (`type`).
+        root.insert(key, item);
     }
 }
 
