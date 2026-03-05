@@ -17,6 +17,7 @@ native-compile = [
   "dep:cairo-lang-lowering",
   "dep:cairo-lang-starknet",
   "dep:cairo-lang-starknet-classes",
+  "dep:notify",
   "dep:scarb-stable-hash",
 ]
 dev-benchmark-command = []
@@ -32,6 +33,7 @@ cairo-lang-starknet = { workspace = true, optional = true }
 cairo-lang-starknet-classes = { workspace = true, optional = true }
 clap.workspace = true
 libc.workspace = true
+notify = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 scarb-stable-hash = { workspace = true, optional = true }

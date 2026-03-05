@@ -1,7 +1,7 @@
 use super::*;
 use std::collections::BTreeMap;
 use std::fs;
-use std::sync::{Mutex, OnceLock as TestOnceLock};
+use std::sync::{Arc, Mutex, OnceLock as TestOnceLock};
 use std::thread;
 
 fn unique_test_dir(prefix: &str) -> PathBuf {
@@ -3936,6 +3936,224 @@ fn native_collect_tracked_sources_tracks_only_cairo_files() {
         "manifest changes are handled by session signature and should not be tracked as source files"
     );
     assert!(total_bytes > 0, "tracked source bytes should be non-zero");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_workspace_relative_cairo_path_accepts_src_cairo_only() {
+    let dir = unique_test_dir("uc-native-source-relpath");
+    fs::create_dir_all(dir.join("src")).expect("failed to create src directory");
+    let cairo_path = dir.join("src/lib.cairo");
+    let txt_path = dir.join("src/readme.txt");
+    fs::write(&cairo_path, "fn main() {}\n").expect("failed to write cairo file");
+    fs::write(&txt_path, "ignore me\n").expect("failed to write txt file");
+
+    assert_eq!(
+        native_workspace_relative_cairo_path(&dir, &cairo_path).as_deref(),
+        Some("src/lib.cairo")
+    );
+    assert!(
+        native_workspace_relative_cairo_path(&dir, &txt_path).is_none(),
+        "non-cairo files must be ignored"
+    );
+    assert!(
+        native_workspace_relative_cairo_path(&dir, &dir.join("../escape.cairo")).is_none(),
+        "paths outside the workspace root must be rejected"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_record_source_change_event_tracks_create_rename_and_remove() {
+    let dir = unique_test_dir("uc-native-source-journal-event");
+    fs::create_dir_all(dir.join("src")).expect("failed to create src directory");
+    let before = dir.join("src/lib.cairo");
+    let after = dir.join("src/new_lib.cairo");
+    let journal = Arc::new(Mutex::new(NativeSourceChangeJournal::default()));
+
+    native_record_source_change_event(
+        &dir,
+        &journal,
+        &NotifyEventKind::Any,
+        std::slice::from_ref(&before),
+    );
+    {
+        let state = journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(state.changed_files.contains("src/lib.cairo"));
+        assert!(state.removed_files.is_empty());
+    }
+
+    native_record_source_change_event(
+        &dir,
+        &journal,
+        &NotifyEventKind::Modify(NotifyModifyKind::Name(NotifyRenameMode::Both)),
+        &[before.clone(), after.clone()],
+    );
+    {
+        let state = journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(state.changed_files.contains("src/new_lib.cairo"));
+        assert!(state.removed_files.contains("src/lib.cairo"));
+    }
+
+    native_record_source_change_event(
+        &dir,
+        &journal,
+        &NotifyEventKind::Remove(notify::event::RemoveKind::File),
+        std::slice::from_ref(&after),
+    );
+    {
+        let state = journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(state.changed_files.is_empty());
+        assert!(state.removed_files.contains("src/new_lib.cairo"));
+    }
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_apply_source_change_journal_delta_updates_snapshot() {
+    let dir = unique_test_dir("uc-native-source-journal-apply");
+    fs::create_dir_all(dir.join("src")).expect("failed to create src directory");
+    fs::write(dir.join("src/lib.cairo"), "fn lib() {}\n").expect("failed to write lib.cairo");
+    fs::write(dir.join("src/new.cairo"), "fn new_file() {}\n").expect("failed to write new.cairo");
+    let previous = BTreeMap::from([
+        (
+            "src/lib.cairo".to_string(),
+            NativeTrackedFileState {
+                size_bytes: 4,
+                modified_unix_ms: 1,
+            },
+        ),
+        (
+            "src/old.cairo".to_string(),
+            NativeTrackedFileState {
+                size_bytes: 3,
+                modified_unix_ms: 1,
+            },
+        ),
+    ]);
+    let (updated, total_bytes) = native_apply_source_change_journal_delta(
+        &dir,
+        &previous,
+        &["src/lib.cairo".to_string(), "src/new.cairo".to_string()],
+        &["src/old.cairo".to_string()],
+    )
+    .expect("journal delta application should succeed");
+    assert!(
+        updated.contains_key("src/lib.cairo"),
+        "updated snapshot must include changed file"
+    );
+    assert!(
+        updated.contains_key("src/new.cairo"),
+        "updated snapshot must include created file"
+    );
+    assert!(
+        !updated.contains_key("src/old.cairo"),
+        "updated snapshot must remove deleted file"
+    );
+    assert!(
+        total_bytes > 0,
+        "tracked source budget should stay non-zero"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_reusable_unaffected_manifest_entries_reuses_only_safe_entries() {
+    let dir = unique_test_dir("uc-native-manifest-reuse");
+    fs::create_dir_all(&dir).expect("failed to create target dir");
+    let plans = vec![
+        NativeContractOutputPlan {
+            module_path: "pkg::token".to_string(),
+            artifact_id: "id-token".to_string(),
+            package_name: "pkg".to_string(),
+            contract_name: "token".to_string(),
+            artifact_file: "pkg_token.contract_class.json".to_string(),
+            casm_file: Some("pkg_token.compiled_contract_class.json".to_string()),
+        },
+        NativeContractOutputPlan {
+            module_path: "pkg::vault".to_string(),
+            artifact_id: "id-vault".to_string(),
+            package_name: "pkg".to_string(),
+            contract_name: "vault".to_string(),
+            artifact_file: "pkg_vault.contract_class.json".to_string(),
+            casm_file: Some("pkg_vault.compiled_contract_class.json".to_string()),
+        },
+    ];
+    let manifest = StarknetArtifactsManifest {
+        version: 1,
+        contracts: vec![
+            StarknetArtifactEntry {
+                id: plans[0].artifact_id.clone(),
+                package_name: plans[0].package_name.clone(),
+                contract_name: plans[0].contract_name.clone(),
+                module_path: plans[0].module_path.clone(),
+                artifacts: StarknetArtifactFiles {
+                    sierra: plans[0].artifact_file.clone(),
+                    casm: plans[0].casm_file.clone(),
+                },
+            },
+            StarknetArtifactEntry {
+                id: plans[1].artifact_id.clone(),
+                package_name: plans[1].package_name.clone(),
+                contract_name: plans[1].contract_name.clone(),
+                module_path: plans[1].module_path.clone(),
+                artifacts: StarknetArtifactFiles {
+                    sierra: plans[1].artifact_file.clone(),
+                    casm: plans[1].casm_file.clone(),
+                },
+            },
+        ],
+    };
+    fs::write(
+        dir.join("pkg.starknet_artifacts.json"),
+        serde_json::to_vec(&manifest).expect("manifest should serialize"),
+    )
+    .expect("failed to write manifest");
+    fs::write(dir.join(&plans[1].artifact_file), "{}\n")
+        .expect("failed to write unaffected sierra");
+    fs::write(
+        dir.join(
+            plans[1]
+                .casm_file
+                .as_ref()
+                .expect("casm file should exist in plan"),
+        ),
+        "{}\n",
+    )
+    .expect("failed to write unaffected casm");
+    let impacted = BTreeSet::from([0_usize]);
+    let result = native_reusable_unaffected_manifest_entries(&dir, "pkg", &plans, &impacted)
+        .expect("manifest reuse evaluation should succeed")
+        .expect("unaffected entries should be reusable");
+    assert_eq!(
+        result.0.len(),
+        1,
+        "one unaffected contract should be reused"
+    );
+    assert_eq!(result.0[0].id, "id-vault");
+    assert!(result.1.contains("pkg_vault.contract_class.json"));
+    assert!(result.1.contains("pkg_vault.compiled_contract_class.json"));
+
+    fs::remove_file(dir.join("pkg_vault.contract_class.json")).expect("failed to remove artifact");
+    let missing = native_reusable_unaffected_manifest_entries(&dir, "pkg", &plans, &impacted)
+        .expect("manifest reuse should still evaluate");
+    assert!(
+        missing.is_none(),
+        "missing unaffected artifact should force full-compile fallback"
+    );
 
     fs::remove_dir_all(&dir).ok();
 }

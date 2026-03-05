@@ -6,6 +6,9 @@ use cairo_lang_compiler::db::RootDatabase;
 use cairo_lang_compiler::project::setup_project;
 #[cfg(feature = "native-compile")]
 use cairo_lang_compiler::{compile_prepared_db_program, CompilerConfig};
+use cairo_lang_defs::db::DefsGroup;
+#[cfg(feature = "native-compile")]
+use cairo_lang_defs::ids::ModuleId;
 #[cfg(feature = "native-compile")]
 use cairo_lang_defs::ids::TopLevelLanguageElementId;
 #[cfg(feature = "native-compile")]
@@ -13,13 +16,15 @@ use cairo_lang_filesystem::db::init_dev_corelib;
 #[cfg(feature = "native-compile")]
 use cairo_lang_filesystem::ids::CrateInput;
 #[cfg(feature = "native-compile")]
+use cairo_lang_filesystem::ids::FileLongId;
+#[cfg(feature = "native-compile")]
 use cairo_lang_lowering::optimizations::config::Optimizations;
 #[cfg(feature = "native-compile")]
 use cairo_lang_lowering::utils::InliningStrategy;
 #[cfg(feature = "native-compile")]
 use cairo_lang_starknet::compile::compile_prepared_db as compile_starknet_prepared_db;
 #[cfg(feature = "native-compile")]
-use cairo_lang_starknet::contract::find_contracts;
+use cairo_lang_starknet::contract::{find_contracts, ContractDeclaration};
 #[cfg(feature = "native-compile")]
 use cairo_lang_starknet::starknet_plugin_suite;
 #[cfg(feature = "native-compile")]
@@ -27,6 +32,10 @@ use cairo_lang_starknet_classes::casm_contract_class::CasmContractClass;
 #[cfg(feature = "native-compile")]
 use cairo_lang_starknet_classes::contract_class::ContractClass;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+#[cfg(feature = "native-compile")]
+use notify::event::{ModifyKind as NotifyModifyKind, RenameMode as NotifyRenameMode};
+#[cfg(feature = "native-compile")]
+use notify::{EventKind as NotifyEventKind, RecommendedWatcher, RecursiveMode, Watcher};
 #[cfg(feature = "native-compile")]
 use salsa::{Database as _, Durability as SalsaDurability};
 #[cfg(feature = "native-compile")]
@@ -549,14 +558,14 @@ struct NativeCompileSessionSignature {
     context: NativeCompileContext,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[cfg(feature = "native-compile")]
 struct StarknetArtifactsManifest {
     version: u32,
     contracts: Vec<StarknetArtifactEntry>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[cfg(feature = "native-compile")]
 struct StarknetArtifactEntry {
     id: String,
@@ -566,7 +575,7 @@ struct StarknetArtifactEntry {
     artifacts: StarknetArtifactFiles,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[cfg(feature = "native-compile")]
 struct StarknetArtifactFiles {
     sierra: String,
@@ -756,6 +765,22 @@ struct NativeCompileSessionState {
 struct NativeCompileSessionSnapshot {
     db: RootDatabase,
     main_crate_inputs: Vec<CrateInput>,
+    changed_files: Vec<String>,
+    removed_files: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+#[cfg(feature = "native-compile")]
+struct NativeSourceChangeJournal {
+    changed_files: BTreeSet<String>,
+    removed_files: BTreeSet<String>,
+    overflowed: bool,
+}
+
+#[cfg(feature = "native-compile")]
+struct NativeSourceChangeWatcher {
+    _watcher: Option<RecommendedWatcher>,
+    journal: Arc<Mutex<NativeSourceChangeJournal>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3056,18 +3081,18 @@ fn run_build_with_uc_cache(
 
     if options.use_daemon_shared_cache {
         let shared_lookup_start = Instant::now();
-        let shared_restore = if daemon_shared_cache_entry_exists(&canonical_workspace_root, session_key)?
-        {
-            ensure_fingerprint(&mut fingerprint, &mut telemetry)?;
-            try_restore_daemon_shared_cache(
-                &canonical_workspace_root,
-                profile,
-                session_key,
-                fingerprint.as_deref().unwrap_or_default(),
-            )?
-        } else {
-            None
-        };
+        let shared_restore =
+            if daemon_shared_cache_entry_exists(&canonical_workspace_root, session_key)? {
+                ensure_fingerprint(&mut fingerprint, &mut telemetry)?;
+                try_restore_daemon_shared_cache(
+                    &canonical_workspace_root,
+                    profile,
+                    session_key,
+                    fingerprint.as_deref().unwrap_or_default(),
+                )?
+            } else {
+                None
+            };
         telemetry.cache_lookup_ms += shared_lookup_start.elapsed().as_secs_f64() * 1000.0;
         if let Some(restored_count) = shared_restore {
             let total_elapsed_ms =
@@ -3949,6 +3974,114 @@ fn native_starknet_artifact_id(package_name: &str, contract_path: &str) -> Strin
 }
 
 #[cfg(feature = "native-compile")]
+#[derive(Debug, Clone)]
+struct NativeContractOutputPlan {
+    module_path: String,
+    artifact_id: String,
+    package_name: String,
+    contract_name: String,
+    artifact_file: String,
+    casm_file: Option<String>,
+}
+
+#[cfg(feature = "native-compile")]
+fn native_contract_source_relative_path(
+    db: &RootDatabase,
+    workspace_root: &Path,
+    contract: &ContractDeclaration<'_>,
+) -> Option<String> {
+    let file_id = db
+        .module_main_file(ModuleId::Submodule(contract.submodule_id))
+        .ok()?;
+    let file_path = match file_id.long(db) {
+        FileLongId::OnDisk(path) => path.as_path(),
+        _ => return None,
+    };
+    let relative = file_path.strip_prefix(workspace_root).ok()?;
+    Some(normalize_fingerprint_path(relative))
+}
+
+#[cfg(feature = "native-compile")]
+fn native_impacted_contract_indices(
+    db: &RootDatabase,
+    workspace_root: &Path,
+    contracts: &[ContractDeclaration<'_>],
+    changed_files: &[String],
+    removed_files: &[String],
+) -> Option<Vec<usize>> {
+    let mut by_source: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, contract) in contracts.iter().enumerate() {
+        let relative = native_contract_source_relative_path(db, workspace_root, contract)?;
+        by_source.entry(relative).or_default().push(index);
+    }
+    let mut impacted = BTreeSet::new();
+    for source in changed_files.iter().chain(removed_files.iter()) {
+        let indices = by_source.get(source)?;
+        for index in indices {
+            impacted.insert(*index);
+        }
+    }
+    Some(impacted.into_iter().collect())
+}
+
+#[cfg(feature = "native-compile")]
+fn native_reusable_unaffected_manifest_entries(
+    target_dir: &Path,
+    package_name: &str,
+    plans: &[NativeContractOutputPlan],
+    impacted_indices: &BTreeSet<usize>,
+) -> Result<Option<(Vec<StarknetArtifactEntry>, BTreeSet<String>)>> {
+    let manifest_path = target_dir.join(format!("{package_name}.starknet_artifacts.json"));
+    let manifest_bytes = match fs::read(&manifest_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", manifest_path.display()));
+        }
+    };
+    let manifest = serde_json::from_slice::<StarknetArtifactsManifest>(&manifest_bytes)
+        .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+    if manifest.version != 1 {
+        return Ok(None);
+    }
+    let entry_by_id: HashMap<String, StarknetArtifactEntry> = manifest
+        .contracts
+        .into_iter()
+        .map(|entry| (entry.id.clone(), entry))
+        .collect();
+    let mut keep_files = BTreeSet::new();
+    let mut reusable_entries = Vec::new();
+    for (index, plan) in plans.iter().enumerate() {
+        if impacted_indices.contains(&index) {
+            continue;
+        }
+        let Some(entry) = entry_by_id.get(&plan.artifact_id) else {
+            return Ok(None);
+        };
+        if entry.module_path != plan.module_path
+            || entry.artifacts.sierra != plan.artifact_file
+            || entry.artifacts.casm != plan.casm_file
+        {
+            return Ok(None);
+        }
+        let sierra_path = target_dir.join(&entry.artifacts.sierra);
+        if !sierra_path.is_file() {
+            return Ok(None);
+        }
+        keep_files.insert(entry.artifacts.sierra.clone());
+        if let Some(casm_file) = &entry.artifacts.casm {
+            let casm_path = target_dir.join(casm_file);
+            if !casm_path.is_file() {
+                return Ok(None);
+            }
+            keep_files.insert(casm_file.clone());
+        }
+        reusable_entries.push(entry.clone());
+    }
+    Ok(Some((reusable_entries, keep_files)))
+}
+
+#[cfg(feature = "native-compile")]
 fn prune_native_target_outputs(
     target_dir: &Path,
     package_name: &str,
@@ -4180,6 +4313,333 @@ fn clear_native_compile_session(workspace_root: &Path) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     cache.remove(&cache_key);
+    clear_native_source_change_watcher(workspace_root);
+}
+
+#[cfg(feature = "native-compile")]
+fn native_source_change_watchers() -> &'static Mutex<HashMap<String, NativeSourceChangeWatcher>> {
+    static VALUE: OnceLock<Mutex<HashMap<String, NativeSourceChangeWatcher>>> = OnceLock::new();
+    VALUE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(feature = "native-compile")]
+fn clear_native_source_change_watcher(workspace_root: &Path) {
+    let cache_key = native_compile_session_cache_key(workspace_root);
+    let mut watchers = native_source_change_watchers()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    watchers.remove(&cache_key);
+}
+
+#[cfg(feature = "native-compile")]
+fn native_workspace_relative_cairo_path(workspace_root: &Path, path: &Path) -> Option<String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace_root.join(path)
+    };
+    let relative = absolute.strip_prefix(workspace_root).ok()?;
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+    let is_src = relative
+        .components()
+        .next()
+        .and_then(|component| match component {
+            Component::Normal(segment) => segment.to_str(),
+            _ => None,
+        })
+        .is_some_and(|segment| segment == "src");
+    if !is_src {
+        return None;
+    }
+    let is_cairo = relative
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("cairo"));
+    if !is_cairo {
+        return None;
+    }
+    Some(normalize_fingerprint_path(relative))
+}
+
+#[cfg(feature = "native-compile")]
+fn native_record_source_change(
+    journal: &Arc<Mutex<NativeSourceChangeJournal>>,
+    relative_path: &str,
+    removed: bool,
+) {
+    let mut state = journal
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if removed {
+        state.changed_files.remove(relative_path);
+        state.removed_files.insert(relative_path.to_string());
+    } else {
+        state.removed_files.remove(relative_path);
+        state.changed_files.insert(relative_path.to_string());
+    }
+}
+
+#[cfg(feature = "native-compile")]
+fn native_record_source_change_event(
+    workspace_root: &Path,
+    journal: &Arc<Mutex<NativeSourceChangeJournal>>,
+    event_kind: &NotifyEventKind,
+    paths: &[PathBuf],
+) {
+    let as_relative = |path: &Path| native_workspace_relative_cairo_path(workspace_root, path);
+    match event_kind {
+        NotifyEventKind::Remove(_)
+        | NotifyEventKind::Modify(NotifyModifyKind::Name(NotifyRenameMode::From)) => {
+            for path in paths {
+                if let Some(relative) = as_relative(path) {
+                    native_record_source_change(journal, &relative, true);
+                }
+            }
+        }
+        NotifyEventKind::Modify(NotifyModifyKind::Name(NotifyRenameMode::Both))
+            if paths.len() >= 2 =>
+        {
+            if let Some(relative) = as_relative(&paths[0]) {
+                native_record_source_change(journal, &relative, true);
+            }
+            if let Some(relative) = as_relative(&paths[1]) {
+                native_record_source_change(journal, &relative, false);
+            }
+        }
+        NotifyEventKind::Modify(NotifyModifyKind::Name(NotifyRenameMode::To))
+        | NotifyEventKind::Create(_)
+        | NotifyEventKind::Modify(_)
+        | NotifyEventKind::Any => {
+            for path in paths {
+                if let Some(relative) = as_relative(path) {
+                    native_record_source_change(journal, &relative, false);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(feature = "native-compile")]
+fn ensure_native_source_change_watcher(
+    workspace_root: &Path,
+) -> Result<Arc<Mutex<NativeSourceChangeJournal>>> {
+    let cache_key = native_compile_session_cache_key(workspace_root);
+    {
+        let mut watchers = native_source_change_watchers()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = watchers.get(&cache_key) {
+            return Ok(existing.journal.clone());
+        }
+        let source_root = workspace_root.join("src");
+        if !source_root.is_dir() {
+            let journal = Arc::new(Mutex::new(NativeSourceChangeJournal::default()));
+            watchers.insert(
+                cache_key,
+                NativeSourceChangeWatcher {
+                    _watcher: None,
+                    journal: journal.clone(),
+                },
+            );
+            return Ok(journal);
+        }
+    }
+
+    let journal = Arc::new(Mutex::new(NativeSourceChangeJournal::default()));
+    let journal_for_events = journal.clone();
+    let workspace_root_for_events = workspace_root.to_path_buf();
+    let mut watcher = RecommendedWatcher::new(
+        move |result: Result<notify::Event, notify::Error>| match result {
+            Ok(event) => native_record_source_change_event(
+                &workspace_root_for_events,
+                &journal_for_events,
+                &event.kind,
+                &event.paths,
+            ),
+            Err(err) => {
+                let mut state = journal_for_events
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.overflowed = true;
+                tracing::warn!(error = %err, "native source watcher received an error event");
+            }
+        },
+        notify::Config::default(),
+    )
+    .context("failed to create native source watcher")?;
+    let source_root = workspace_root.join("src");
+    watcher
+        .watch(&source_root, RecursiveMode::Recursive)
+        .with_context(|| {
+            format!(
+                "failed to watch native source root {}",
+                source_root.display()
+            )
+        })?;
+    let mut watchers = native_source_change_watchers()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(existing) = watchers.get(&cache_key) {
+        return Ok(existing.journal.clone());
+    }
+    watchers.insert(
+        cache_key,
+        NativeSourceChangeWatcher {
+            _watcher: Some(watcher),
+            journal: journal.clone(),
+        },
+    );
+    Ok(journal)
+}
+
+#[cfg(feature = "native-compile")]
+enum NativeSourceJournalDelta {
+    NoChanges,
+    Changed {
+        changed_files: Vec<String>,
+        removed_files: Vec<String>,
+    },
+    FallbackFullScan,
+}
+
+#[cfg(feature = "native-compile")]
+fn native_take_source_journal_delta(workspace_root: &Path) -> NativeSourceJournalDelta {
+    let journal = match ensure_native_source_change_watcher(workspace_root) {
+        Ok(journal) => journal,
+        Err(err) => {
+            tracing::warn!(
+                workspace_root = %workspace_root.display(),
+                error = %format!("{err:#}"),
+                "native source watcher unavailable; falling back to full source scan"
+            );
+            return NativeSourceJournalDelta::FallbackFullScan;
+        }
+    };
+    let mut state = journal
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state.overflowed {
+        state.overflowed = false;
+        state.changed_files.clear();
+        state.removed_files.clear();
+        tracing::warn!(
+            workspace_root = %workspace_root.display(),
+            "native source watcher overflowed; falling back to full source scan"
+        );
+        return NativeSourceJournalDelta::FallbackFullScan;
+    }
+    if state.changed_files.is_empty() && state.removed_files.is_empty() {
+        return NativeSourceJournalDelta::NoChanges;
+    }
+    let changed_files = state.changed_files.iter().cloned().collect::<Vec<_>>();
+    let removed_files = state.removed_files.iter().cloned().collect::<Vec<_>>();
+    state.changed_files.clear();
+    state.removed_files.clear();
+    NativeSourceJournalDelta::Changed {
+        changed_files,
+        removed_files,
+    }
+}
+
+#[cfg(feature = "native-compile")]
+fn native_tracked_sources_total_bytes(
+    tracked_sources: &BTreeMap<String, NativeTrackedFileState>,
+) -> Result<u64> {
+    if tracked_sources.len() > max_fingerprint_files() {
+        bail!(
+            "native source tracker found too many files (>{}); refusing to continue",
+            max_fingerprint_files()
+        );
+    }
+    let mut total_bytes = 0_u64;
+    for state in tracked_sources.values() {
+        total_bytes = total_bytes.saturating_add(state.size_bytes);
+    }
+    if total_bytes > max_fingerprint_total_bytes() {
+        bail!(
+            "native source tracker budget exceeded ({} bytes > {} bytes)",
+            total_bytes,
+            max_fingerprint_total_bytes()
+        );
+    }
+    Ok(total_bytes)
+}
+
+#[cfg(feature = "native-compile")]
+fn native_apply_source_change_journal_delta(
+    workspace_root: &Path,
+    previous_sources: &BTreeMap<String, NativeTrackedFileState>,
+    changed_files: &[String],
+    removed_files: &[String],
+) -> Result<(BTreeMap<String, NativeTrackedFileState>, u64)> {
+    let mut tracked_sources = previous_sources.clone();
+    for relative in removed_files {
+        tracked_sources.remove(relative);
+    }
+    for relative in changed_files {
+        let relative_path = Path::new(relative);
+        if relative_path.is_absolute()
+            || relative_path.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            bail!("native source watcher reported invalid relative path: {relative}");
+        }
+        let absolute_path = workspace_root.join(relative_path);
+        ensure_path_within_root(
+            workspace_root,
+            &absolute_path,
+            "native source watcher changed file path",
+        )?;
+        let metadata = match fs::metadata(&absolute_path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                tracked_sources.remove(relative);
+                continue;
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to stat {}", absolute_path.display()));
+            }
+        };
+        let is_cairo = absolute_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("cairo"));
+        if !metadata.is_file() || !is_cairo {
+            tracked_sources.remove(relative);
+            continue;
+        }
+        let size_bytes = metadata.len();
+        if size_bytes > max_fingerprint_file_bytes() {
+            bail!(
+                "native source tracker file {} exceeds size limit ({} bytes > {} bytes)",
+                absolute_path.display(),
+                size_bytes,
+                max_fingerprint_file_bytes()
+            );
+        }
+        tracked_sources.insert(
+            relative.clone(),
+            NativeTrackedFileState {
+                size_bytes,
+                modified_unix_ms: metadata_modified_unix_ms(&metadata)?,
+            },
+        );
+    }
+    let total_bytes = native_tracked_sources_total_bytes(&tracked_sources)?;
+    Ok((tracked_sources, total_bytes))
 }
 
 #[cfg(feature = "native-compile")]
@@ -4214,6 +4674,7 @@ fn native_session_refresh_action(
 fn with_native_compile_session<T>(
     workspace_root: &Path,
     signature: &NativeCompileSessionSignature,
+    daemon_context: bool,
     f: impl FnOnce(&NativeCompileSessionSnapshot) -> Result<T>,
 ) -> Result<T> {
     let session_handle = native_compile_session_handle(workspace_root, signature)?;
@@ -4227,25 +4688,77 @@ fn with_native_compile_session<T>(
             (false, session.tracked_sources.clone())
         }
     };
-    let source_root_mtime = if needs_full_rebuild {
-        0_u64
-    } else {
-        native_source_root_modified_unix_ms(workspace_root)?
-    };
     let drift_scan_start = Instant::now();
-    let (changed_files, removed_files, current_source_snapshot) = if needs_full_rebuild {
-        (Vec::new(), Vec::new(), None)
-    } else {
-        let (current_sources, current_source_bytes) =
-            native_collect_tracked_sources(workspace_root)?;
-        let (changed_files, removed_files) =
-            native_diff_tracked_sources(&previous_sources, &current_sources);
-        (
-            changed_files,
-            removed_files,
-            Some((current_sources, current_source_bytes)),
-        )
-    };
+    let (changed_files, removed_files, current_source_snapshot, source_root_mtime) =
+        if needs_full_rebuild {
+            (Vec::new(), Vec::new(), None, 0_u64)
+        } else if daemon_context {
+            match native_take_source_journal_delta(workspace_root) {
+                NativeSourceJournalDelta::NoChanges => (Vec::new(), Vec::new(), None, 0_u64),
+                NativeSourceJournalDelta::Changed {
+                    changed_files,
+                    removed_files,
+                } => {
+                    match native_apply_source_change_journal_delta(
+                        workspace_root,
+                        &previous_sources,
+                        &changed_files,
+                        &removed_files,
+                    ) {
+                        Ok((tracked_sources, tracked_source_bytes)) => (
+                            changed_files,
+                            removed_files,
+                            Some((tracked_sources, tracked_source_bytes)),
+                            0_u64,
+                        ),
+                        Err(err) => {
+                            tracing::warn!(
+                                workspace_root = %workspace_root.display(),
+                                error = %format!("{err:#}"),
+                                "native source watcher delta rejected; falling back to full source scan"
+                            );
+                            let (current_sources, current_source_bytes) =
+                                native_collect_tracked_sources(workspace_root)?;
+                            let (changed_files, removed_files) =
+                                native_diff_tracked_sources(&previous_sources, &current_sources);
+                            let source_root_mtime =
+                                native_source_root_modified_unix_ms(workspace_root)?;
+                            (
+                                changed_files,
+                                removed_files,
+                                Some((current_sources, current_source_bytes)),
+                                source_root_mtime,
+                            )
+                        }
+                    }
+                }
+                NativeSourceJournalDelta::FallbackFullScan => {
+                    let (current_sources, current_source_bytes) =
+                        native_collect_tracked_sources(workspace_root)?;
+                    let (changed_files, removed_files) =
+                        native_diff_tracked_sources(&previous_sources, &current_sources);
+                    let source_root_mtime = native_source_root_modified_unix_ms(workspace_root)?;
+                    (
+                        changed_files,
+                        removed_files,
+                        Some((current_sources, current_source_bytes)),
+                        source_root_mtime,
+                    )
+                }
+            }
+        } else {
+            let (current_sources, current_source_bytes) =
+                native_collect_tracked_sources(workspace_root)?;
+            let (changed_files, removed_files) =
+                native_diff_tracked_sources(&previous_sources, &current_sources);
+            let source_root_mtime = native_source_root_modified_unix_ms(workspace_root)?;
+            (
+                changed_files,
+                removed_files,
+                Some((current_sources, current_source_bytes)),
+                source_root_mtime,
+            )
+        };
     let drift_scan_ms = drift_scan_start.elapsed().as_secs_f64() * 1000.0;
 
     let changed_source_set_detected = !changed_files.is_empty() || !removed_files.is_empty();
@@ -4318,6 +4831,8 @@ fn with_native_compile_session<T>(
         NativeCompileSessionSnapshot {
             db: session.db.snapshot(),
             main_crate_inputs: session.main_crate_inputs.clone(),
+            changed_files: changed_files.clone(),
+            removed_files: removed_files.clone(),
         }
     };
     update_native_compile_session_cached_estimated_bytes(workspace_root, estimated_bytes);
@@ -4336,7 +4851,13 @@ fn run_native_build(
         ensure_native_daemon_backend_available()?;
     }
     let result = std::panic::catch_unwind(|| {
-        run_native_build_inner(common, manifest_path, workspace_root, profile)
+        run_native_build_inner(
+            common,
+            manifest_path,
+            workspace_root,
+            profile,
+            daemon_context,
+        )
     });
     match result {
         Ok(result) => result,
@@ -4441,6 +4962,7 @@ fn run_native_build_inner(
     manifest_path: &Path,
     workspace_root: &Path,
     profile: &str,
+    daemon_context: bool,
 ) -> Result<(CommandRun, NativeBuildPhaseTelemetry, Vec<String>)> {
     let started = Instant::now();
     let context_start = Instant::now();
@@ -4455,7 +4977,12 @@ fn run_native_build_inner(
     let compile_start = Instant::now();
     let session_scope_start = Instant::now();
     let (artifact_count, frontend_compile_ms, casm_ms, artifact_write_ms, produced_paths) =
-        with_native_compile_session(workspace_root, &signature, |session| {
+        with_native_compile_session(workspace_root, &signature, daemon_context, |session| {
+            tracing::trace!(
+                changed_files = session.changed_files.len(),
+                removed_files = session.removed_files.len(),
+                "native session snapshot delta"
+            );
             let crate_ids =
                 CrateInput::into_crate_ids(&session.db, session.main_crate_inputs.clone());
             let contracts = find_contracts(&session.db, &crate_ids);
@@ -4487,8 +5014,80 @@ fn run_native_build_inner(
                 ));
             }
 
+            let module_paths: Vec<String> = contracts
+                .iter()
+                .map(|contract| contract.submodule_id.full_path(&session.db))
+                .collect();
+            let contract_stems = native_contract_file_stems(&module_paths);
+            let mut all_plans = Vec::with_capacity(module_paths.len());
+            for (module_path, contract_stem) in module_paths.iter().zip(contract_stems.iter()) {
+                let package_name = native_contract_package_name(module_path).to_string();
+                let contract_name = native_contract_name(module_path).to_string();
+                let artifact_id = native_starknet_artifact_id(&package_name, module_path);
+                let file_stem = format!(
+                    "{}_{}",
+                    context.package_name,
+                    sanitize_artifact_component(contract_stem)
+                );
+                let artifact_file = format!("{file_stem}.contract_class.json");
+                let casm_file = context
+                    .starknet_target
+                    .casm
+                    .then(|| format!("{file_stem}.compiled_contract_class.json"));
+                all_plans.push(NativeContractOutputPlan {
+                    module_path: module_path.clone(),
+                    artifact_id,
+                    package_name,
+                    contract_name,
+                    artifact_file,
+                    casm_file,
+                });
+            }
+
+            let mut selected_indices: Vec<usize> = (0..contracts.len()).collect();
+            let mut reused_contract_entries = Vec::new();
+            let mut reused_keep_files = BTreeSet::new();
+            if daemon_context
+                && (!session.changed_files.is_empty() || !session.removed_files.is_empty())
+            {
+                if let Some(impacted_indices) = native_impacted_contract_indices(
+                    &session.db,
+                    workspace_root,
+                    &contracts,
+                    &session.changed_files,
+                    &session.removed_files,
+                ) {
+                    if !impacted_indices.is_empty() && impacted_indices.len() < contracts.len() {
+                        let impacted_set =
+                            impacted_indices.iter().copied().collect::<BTreeSet<_>>();
+                        if let Some((entries, keep_files)) =
+                            native_reusable_unaffected_manifest_entries(
+                                &target_dir,
+                                &context.package_name,
+                                &all_plans,
+                                &impacted_set,
+                            )?
+                        {
+                            tracing::debug!(
+                                impacted_contracts = impacted_indices.len(),
+                                total_contracts = contracts.len(),
+                                changed_files = session.changed_files.len(),
+                                removed_files = session.removed_files.len(),
+                                "native compile selected impacted contract subset"
+                            );
+                            selected_indices = impacted_indices;
+                            reused_contract_entries = entries;
+                            reused_keep_files = keep_files;
+                        }
+                    }
+                }
+            }
+
             let frontend_compile_start = Instant::now();
-            let contract_refs: Vec<_> = contracts.iter().collect();
+            let contract_refs: Vec<_> = selected_indices
+                .iter()
+                .map(|index| &contracts[*index])
+                .collect();
             let contract_classes = compile_starknet_prepared_db(
                 &session.db,
                 &contract_refs,
@@ -4496,16 +5095,17 @@ fn run_native_build_inner(
             )
             .context("native starknet compile failed")?;
             let frontend_compile_ms = frontend_compile_start.elapsed().as_secs_f64() * 1000.0;
-            if contract_classes.len() != contracts.len() {
+            if contract_classes.len() != selected_indices.len() {
                 bail!(
                     "native compile returned mismatched contract classes (expected {}, got {})",
-                    contracts.len(),
+                    selected_indices.len(),
                     contract_classes.len()
                 );
             }
             #[cfg(debug_assertions)]
             {
-                for (index, contract) in contracts.iter().enumerate() {
+                for (result_index, contract_index) in selected_indices.iter().copied().enumerate() {
+                    let contract = &contracts[contract_index];
                     let mut single_class = compile_starknet_prepared_db(
                         &session.db,
                         &[contract],
@@ -4521,7 +5121,7 @@ fn run_native_build_inner(
                         .pop()
                         .context("single-contract native compile returned no output")?;
                     debug_assert_eq!(
-                        expected_class, contract_classes[index],
+                        expected_class, contract_classes[result_index],
                         "compile_starknet_prepared_db returned classes in unexpected order"
                     );
                 }
@@ -4530,33 +5130,18 @@ fn run_native_build_inner(
             let mut casm_ms = 0.0;
             let mut serialized_artifacts =
                 Vec::with_capacity(contract_classes.len().saturating_mul(2));
-            let mut keep_files = BTreeSet::new();
-            let mut contracts_manifest = Vec::with_capacity(contract_classes.len());
-            let module_paths: Vec<String> = contracts
+            let mut keep_files = reused_keep_files;
+            let mut contracts_manifest = reused_contract_entries;
+            for (contract_index, contract_class) in selected_indices
                 .iter()
-                .map(|contract| contract.submodule_id.full_path(&session.db))
-                .collect();
-            let contract_stems = native_contract_file_stems(&module_paths);
-            // `compile_prepared_db` currently preserves input order (`contracts.par_iter().collect()`).
-            // Keep this zipped mapping explicit so a future upstream change is easy to audit here.
-            for ((module_path, contract_stem), contract_class) in module_paths
-                .into_iter()
-                .zip(contract_stems.into_iter())
+                .copied()
                 .zip(contract_classes.into_iter())
             {
-                let package_name = native_contract_package_name(&module_path).to_string();
-                let contract_name = native_contract_name(&module_path).to_string();
-                let artifact_id = native_starknet_artifact_id(&package_name, &module_path);
-                let file_stem = format!(
-                    "{}_{}",
-                    context.package_name,
-                    sanitize_artifact_component(&contract_stem)
-                );
-                let artifact_file = format!("{file_stem}.contract_class.json");
+                let plan = &all_plans[contract_index];
                 let artifact_bytes = serde_json::to_vec(&contract_class)
-                    .with_context(|| format!("failed to serialize {}", artifact_file))?;
-                serialized_artifacts.push((artifact_file.clone(), artifact_bytes));
-                keep_files.insert(artifact_file.clone());
+                    .with_context(|| format!("failed to serialize {}", plan.artifact_file))?;
+                serialized_artifacts.push((plan.artifact_file.clone(), artifact_bytes));
+                keep_files.insert(plan.artifact_file.clone());
 
                 let casm_file = if context.starknet_target.casm {
                     let casm_compile_start = Instant::now();
@@ -4565,7 +5150,9 @@ fn run_native_build_inner(
                         native_max_casm_bytecode_size(),
                     )?;
                     casm_ms += casm_compile_start.elapsed().as_secs_f64() * 1000.0;
-                    let file_name = format!("{file_stem}.compiled_contract_class.json");
+                    let file_name = plan.casm_file.clone().context(
+                        "native contract output plan missing CASM file while CASM target is enabled",
+                    )?;
                     let casm_bytes = serde_json::to_vec(&casm_contract)
                         .with_context(|| format!("failed to serialize {}", file_name))?;
                     serialized_artifacts.push((file_name.clone(), casm_bytes));
@@ -4576,18 +5163,17 @@ fn run_native_build_inner(
                 };
 
                 contracts_manifest.push(StarknetArtifactEntry {
-                    id: artifact_id,
-                    package_name,
-                    contract_name,
-                    module_path,
+                    id: plan.artifact_id.clone(),
+                    package_name: plan.package_name.clone(),
+                    contract_name: plan.contract_name.clone(),
+                    module_path: plan.module_path.clone(),
                     artifacts: StarknetArtifactFiles {
-                        sierra: artifact_file,
+                        sierra: plan.artifact_file.clone(),
                         casm: casm_file,
                     },
                 });
             }
             contracts_manifest.sort_by(|left, right| left.id.cmp(&right.id));
-            let serialized_artifact_count = serialized_artifacts.len();
             let manifest = StarknetArtifactsManifest {
                 version: 1,
                 contracts: contracts_manifest,
@@ -4617,7 +5203,7 @@ fn run_native_build_inner(
             let artifact_write_ms = (artifact_pipeline_ms - casm_ms).max(0.0);
             let produced_paths = keep_files.iter().cloned().collect::<Vec<_>>();
             Ok((
-                serialized_artifact_count + 1,
+                keep_files.len(),
                 frontend_compile_ms,
                 casm_ms,
                 artifact_write_ms,
@@ -5822,7 +6408,11 @@ fn daemon_lock_metadata_state(manifest_path: &Path) -> Result<(Option<u64>, Opti
     }
     let lock_meta_key = format!("lock-meta:{}", hasher.finalize().to_hex());
 
-    Ok((Some(lock_size_bytes), Some(lock_modified_unix_ms), lock_meta_key))
+    Ok((
+        Some(lock_size_bytes),
+        Some(lock_modified_unix_ms),
+        lock_meta_key,
+    ))
 }
 
 fn daemon_build_plan_invalidation_key(session_input: &SessionInput, lock_hash: &str) -> String {
@@ -5989,8 +6579,9 @@ fn daemon_shared_cache_entry_exists(workspace_root: &Path, session_key: &str) ->
     match fs::metadata(&shared_entry_path) {
         Ok(metadata) => Ok(metadata.is_file()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(err)
-            .with_context(|| format!("failed to stat {}", shared_entry_path.display())),
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to stat {}", shared_entry_path.display()))
+        }
     }
 }
 
