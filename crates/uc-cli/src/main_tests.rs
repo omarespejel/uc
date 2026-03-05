@@ -982,6 +982,18 @@ fn scarb_version_line_uses_env_override() {
 }
 
 #[test]
+fn prewarm_daemon_compiler_version_cache_uses_override() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::env::set_var("UC_SCARB_VERSION_LINE", "scarb 8.8.8 (prewarm-test)");
+    prewarm_daemon_compiler_version_cache();
+    let version = scarb_version_line().expect("override version should remain accessible");
+    assert_eq!(version, "scarb 8.8.8 (prewarm-test)");
+    std::env::remove_var("UC_SCARB_VERSION_LINE");
+}
+
+#[test]
 fn validate_scarb_version_constraints_respects_minimum_and_expected() {
     let _guard = integration_env_lock()
         .lock()

@@ -2172,6 +2172,7 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
         let health = Arc::new(Mutex::new(DaemonHealth::default()));
         let rate_limiter = Arc::new(Mutex::new(DaemonRateLimiter::new()));
         let should_shutdown = Arc::new(AtomicBool::new(false));
+        prewarm_daemon_compiler_version_cache();
 
         loop {
             if should_shutdown.load(Ordering::Relaxed) {
@@ -2213,6 +2214,15 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
         }
         remove_socket_if_exists(&socket_path)?;
         Ok(())
+    }
+}
+
+fn prewarm_daemon_compiler_version_cache() {
+    if let Err(err) = scarb_version_line() {
+        tracing::debug!(
+            error = %format!("{err:#}"),
+            "daemon compiler version prewarm skipped"
+        );
     }
 }
 
