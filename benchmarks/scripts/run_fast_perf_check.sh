@@ -14,6 +14,7 @@ NICE_LEVEL="${NICE_LEVEL:-0}"
 STRICT_PINNING="${STRICT_PINNING:-0}"
 HOST_PREFLIGHT_MODE="${HOST_PREFLIGHT_MODE:-warn}"
 ALLOW_NOISY_HOST="${ALLOW_NOISY_HOST:-0}"
+ALTERNATING_ORDER="${ALTERNATING_ORDER:-1}"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 TMP_DIR="$(mktemp -d)"
@@ -47,6 +48,8 @@ Options:
   --host-preflight <mode>        Host preflight mode (off|warn|require, default: warn)
   --scenario <name[,name...]>    Restrict to specific scenario(s); repeatable
   --allow-noisy-host             Disable host preflight checks
+  --alternating-order            Run paired passes (scarb-first and uc-first)
+  --no-alternating-order         Run a single scarb-first pass
   --help                         Show this help
 
 Fast gate thresholds (env):
@@ -140,6 +143,14 @@ while [[ $# -gt 0 ]]; do
       ALLOW_NOISY_HOST=1
       shift
       ;;
+    --alternating-order)
+      ALTERNATING_ORDER=1
+      shift
+      ;;
+    --no-alternating-order)
+      ALTERNATING_ORDER=0
+      shift
+      ;;
     --help)
       usage
       exit 0
@@ -180,6 +191,10 @@ if [[ "$ALLOW_NOISY_HOST" != "0" && "$ALLOW_NOISY_HOST" != "1" ]]; then
   echo "ALLOW_NOISY_HOST must be 0 or 1, got: $ALLOW_NOISY_HOST" >&2
   exit 1
 fi
+if [[ "$ALTERNATING_ORDER" != "0" && "$ALTERNATING_ORDER" != "1" ]]; then
+  echo "ALTERNATING_ORDER must be 0 or 1, got: $ALTERNATING_ORDER" >&2
+  exit 1
+fi
 if [[ "${#SCENARIO_FILTERS[@]}" -gt 0 ]]; then
   declare -A _scenario_seen=()
   declare -a _scenario_deduped=()
@@ -200,7 +215,8 @@ mkdir -p "$OUT_DIR"
 
 run_tool_benchmark() {
   local tool="$1"
-  local log_file="$TMP_DIR/${tool}.log"
+  local run_label="$2"
+  local log_file="$TMP_DIR/${tool}-${run_label}.log"
   local -a cmd=(
     "$ROOT_DIR/benchmarks/scripts/run_local_benchmarks.sh"
     --matrix "$MATRIX"
@@ -246,19 +262,13 @@ run_tool_benchmark() {
   printf "%s" "$json_path"
 }
 
-SCARB_JSON="$(run_tool_benchmark scarb)"
-UC_JSON="$(run_tool_benchmark uc)"
-DELTA_MD="$OUT_DIR/perf-fast-delta-$STAMP.md"
-
-"$ROOT_DIR/benchmarks/scripts/compare_benchmark_results.sh" \
-  --baseline "$SCARB_JSON" \
-  --candidate "$UC_JSON" \
-  --out "$DELTA_MD" >/dev/null
-
-SUMMARY_JSON="$TMP_DIR/summary.json"
-jq -nr \
-  --slurpfile baseline "$SCARB_JSON" \
-  --slurpfile candidate "$UC_JSON" '
+build_pair_summary() {
+  local baseline_json="$1"
+  local candidate_json="$2"
+  local out_json="$3"
+  jq -nr \
+    --slurpfile baseline "$baseline_json" \
+    --slurpfile candidate "$candidate_json" '
     ($baseline[0].scenarios
       | map({key: (.scenario + "|" + .workload), value: .})
       | from_entries) as $base_map
@@ -288,13 +298,92 @@ jq -nr \
             }
         ]
       end
-  ' > "$SUMMARY_JSON"
+  ' > "$out_json"
+}
+
+declare -a ORDER_LABELS=()
+if [[ "$ALTERNATING_ORDER" == "1" ]]; then
+  ORDER_LABELS=("scarb-first" "uc-first")
+else
+  ORDER_LABELS=("scarb-first")
+fi
+
+PASS_SUMMARY_NDJSON="$TMP_DIR/pass-summaries.ndjson"
+: > "$PASS_SUMMARY_NDJSON"
+declare -a BASELINE_JSONS=()
+declare -a CANDIDATE_JSONS=()
+declare -a DELTA_REPORTS=()
+
+for order in "${ORDER_LABELS[@]}"; do
+  local_scarb_json=""
+  local_uc_json=""
+  if [[ "$order" == "scarb-first" ]]; then
+    local_scarb_json="$(run_tool_benchmark scarb "$order")"
+    local_uc_json="$(run_tool_benchmark uc "$order")"
+  else
+    local_uc_json="$(run_tool_benchmark uc "$order")"
+    local_scarb_json="$(run_tool_benchmark scarb "$order")"
+  fi
+
+  delta_md="$OUT_DIR/perf-fast-delta-$STAMP-$order.md"
+  "$ROOT_DIR/benchmarks/scripts/compare_benchmark_results.sh" \
+    --baseline "$local_scarb_json" \
+    --candidate "$local_uc_json" \
+    --out "$delta_md" >/dev/null
+
+  pair_summary_json="$TMP_DIR/summary-$order.json"
+  build_pair_summary "$local_scarb_json" "$local_uc_json" "$pair_summary_json"
+  jq -c --arg order "$order" '.[] | . + {order: $order}' "$pair_summary_json" >> "$PASS_SUMMARY_NDJSON"
+
+  BASELINE_JSONS+=("$local_scarb_json")
+  CANDIDATE_JSONS+=("$local_uc_json")
+  DELTA_REPORTS+=("$delta_md")
+done
+
+SUMMARY_JSON="$TMP_DIR/summary.json"
+jq -s '
+  def median:
+    if length == 0 then 0
+    else
+      sort as $s
+      | ($s | length) as $n
+      | if ($n % 2) == 1 then
+          $s[($n / 2 | floor)]
+        else
+          (($s[$n / 2 - 1] + $s[$n / 2]) / 2)
+        end
+    end;
+  group_by(.scenario + "|" + .workload)
+  | map({
+      scenario: .[0].scenario,
+      workload: .[0].workload,
+      baseline_p95_ms: (map(.baseline_p95_ms) | median),
+      candidate_p95_ms: (map(.candidate_p95_ms) | median),
+      p95_delta_percent: (map(.p95_delta_percent) | median),
+      per_order: map({
+        order,
+        baseline_p95_ms,
+        candidate_p95_ms,
+        p95_delta_percent
+      })
+    })
+' "$PASS_SUMMARY_NDJSON" > "$SUMMARY_JSON"
 
 echo
-echo "Fast perf summary (p95 deltas; positive means UC faster):"
+echo "Fast perf summary (median p95 deltas; positive means UC faster):"
 jq -r '
   .[]
   | "- \(.scenario) / \(.workload): baseline p95=\(.baseline_p95_ms|round)ms, candidate p95=\(.candidate_p95_ms|round)ms, delta=\(.p95_delta_percent|round)%"
+' "$SUMMARY_JSON"
+
+echo
+echo "Per-order p95 deltas:"
+jq -r '
+  .[]
+  | .scenario as $scenario
+  | .workload as $workload
+  | .per_order[]
+  | "  - \($scenario) / \($workload) [\(.order)]: baseline p95=\(.baseline_p95_ms|round)ms, candidate p95=\(.candidate_p95_ms|round)ms, delta=\(.p95_delta_percent|round)%"
 ' "$SUMMARY_JSON"
 
 violations=0
@@ -325,9 +414,12 @@ done < <(jq -r '.[] | [.scenario, .workload, .p95_delta_percent] | @tsv' "$SUMMA
 
 echo
 echo "Artifacts:"
-echo "- Baseline JSON: $SCARB_JSON"
-echo "- Candidate JSON: $UC_JSON"
-echo "- Delta report: $DELTA_MD"
+for idx in "${!BASELINE_JSONS[@]}"; do
+  pass=$((idx + 1))
+  echo "- Pass $pass baseline JSON: ${BASELINE_JSONS[$idx]}"
+  echo "- Pass $pass candidate JSON: ${CANDIDATE_JSONS[$idx]}"
+  echo "- Pass $pass delta report: ${DELTA_REPORTS[$idx]}"
+done
 
 if [[ "$violations" -gt 0 ]]; then
   echo "Fast perf check failed with $violations gate violation(s)." >&2
