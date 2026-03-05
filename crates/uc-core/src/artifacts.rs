@@ -64,6 +64,8 @@ pub fn collect_artifact_digests(target_root: &Path) -> Result<Vec<ArtifactDigest
 
         let (blake3_hex, size_bytes) = if name.ends_with(".sierra.json") {
             hash_sierra_json_semantic(path)?
+        } else if name.ends_with(".compiled_contract_class.json") {
+            hash_file_with_limit(path)?
         } else if name.ends_with(".contract_class.json") {
             hash_contract_class_json_semantic(path)?
         } else {

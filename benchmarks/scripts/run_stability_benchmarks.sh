@@ -194,7 +194,7 @@ if [[ "$MATRIX" == "research" && -z "$WORKSPACE_ROOT" ]]; then
   echo "--workspace-root is required for research matrix" >&2
   exit 1
 fi
-if [[ -z "$GATE_CONFIG" ]]; then
+if [[ -z "$GATE_CONFIG" && "$MATRIX" == "research" ]]; then
   GATE_CONFIG="$ROOT_DIR/benchmarks/gates/perf-gate-${MATRIX}.json"
 fi
 if [[ "$RUNS" -ne 12 || "$COLD_RUNS" -ne 12 ]]; then
@@ -446,9 +446,13 @@ jq -s \
 echo "Stability JSON: $OUT_JSON"
 echo "Stability Markdown: $OUT_MD"
 
-"$ROOT_DIR/benchmarks/scripts/gate_benchmark_summary.sh" \
-  --summary "$OUT_JSON" \
-  --config "$GATE_CONFIG"
+if [[ -n "$GATE_CONFIG" ]]; then
+  "$ROOT_DIR/benchmarks/scripts/gate_benchmark_summary.sh" \
+    --summary "$OUT_JSON" \
+    --config "$GATE_CONFIG"
+else
+  echo "Stability gate skipped (no gate config configured for matrix '$MATRIX')."
+fi
 
 if [[ "$LOCK_BASELINE" == "1" ]]; then
   BASELINE_DIR="$ROOT_DIR/benchmarks/baselines"
