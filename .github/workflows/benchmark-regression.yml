@@ -68,11 +68,12 @@ jobs:
           set -euo pipefail
           RESEARCH_ROOT="$RUNNER_TEMP/research-workspace"
           mkdir -p "$RESEARCH_ROOT"
-          git clone --depth 1 https://github.com/software-mansion/scarb.git "$RESEARCH_ROOT/scarb"
+          git clone --depth 1 --branch v2.14.0 \
+            https://github.com/software-mansion/scarb.git "$RESEARCH_ROOT/scarb"
           echo "UC_RESEARCH_ROOT=$RESEARCH_ROOT" >> "$GITHUB_ENV"
 
       - name: Build uc CLI
-        run: cargo build -p uc-cli
+        run: cargo build --release -p uc-cli
 
       - name: Run strict-pinned research stability gate
         run: |

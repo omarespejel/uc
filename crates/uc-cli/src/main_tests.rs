@@ -1341,8 +1341,6 @@ fn metadata_result_cache_eviction_respects_entry_and_byte_budgets() {
         MetadataResultCacheEntry {
             manifest_size_bytes: 1,
             manifest_modified_unix_ms: 1,
-            lock_size_bytes: Some(1),
-            lock_modified_unix_ms: Some(1),
             lock_hash: "a".repeat(64),
             run: run("a", 1024),
             last_access_epoch_ms: 1,
@@ -1354,8 +1352,6 @@ fn metadata_result_cache_eviction_respects_entry_and_byte_budgets() {
         MetadataResultCacheEntry {
             manifest_size_bytes: 1,
             manifest_modified_unix_ms: 1,
-            lock_size_bytes: Some(1),
-            lock_modified_unix_ms: Some(1),
             lock_hash: "b".repeat(64),
             run: run("b", 1024),
             last_access_epoch_ms: 2,
@@ -1367,8 +1363,6 @@ fn metadata_result_cache_eviction_respects_entry_and_byte_budgets() {
         MetadataResultCacheEntry {
             manifest_size_bytes: 1,
             manifest_modified_unix_ms: 1,
-            lock_size_bytes: Some(1),
-            lock_modified_unix_ms: Some(1),
             lock_hash: "c".repeat(64),
             run: run("c", 1024),
             last_access_epoch_ms: 3,
@@ -1487,7 +1481,10 @@ fn metadata_result_cache_key_changes_with_metadata_options() {
     let mut offline = base.clone();
     offline.offline = true;
     let offline_key = metadata_result_cache_key(&offline, manifest_path, scarb_version, build_env);
-    assert_ne!(base_key, offline_key);
+    assert_eq!(
+        base_key, offline_key,
+        "metadata cache key should be shared between online/offline modes"
+    );
 
     let mut format_v2 = base.clone();
     format_v2.format_version = 2;
@@ -1500,6 +1497,90 @@ fn metadata_result_cache_key_changes_with_metadata_options() {
     let cache_dir_key =
         metadata_result_cache_key(&cache_dir, manifest_path, scarb_version, build_env);
     assert_ne!(base_key, cache_dir_key);
+}
+
+#[test]
+fn metadata_result_cache_hit_ignores_lock_size_and_mtime_when_hash_matches() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    metadata_result_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+    daemon_lock_hash_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+
+    let workspace = unique_test_dir("uc-metadata-cache-lock-metadata-drift");
+    let manifest_path = workspace.join("Scarb.toml");
+    let lock_path = workspace.join("Scarb.lock");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("failed to write manifest");
+    fs::write(&lock_path, "version = 1\n").expect("failed to write lock file");
+
+    let manifest_metadata = fs::metadata(&manifest_path).expect("failed to stat manifest");
+    let manifest_size_bytes = manifest_metadata.len();
+    let manifest_modified_unix_ms =
+        metadata_modified_unix_ms(&manifest_metadata).expect("failed to read manifest mtime");
+    let (_, _, lock_hash) =
+        daemon_lock_state(&manifest_path).expect("failed to resolve lock state");
+
+    let args = MetadataArgs {
+        manifest_path: Some(manifest_path.clone()),
+        format_version: 1,
+        daemon_mode: DaemonModeArg::Off,
+        offline: false,
+        global_cache_dir: None,
+        report_path: None,
+    };
+    let cache_key = metadata_result_cache_key(
+        &args,
+        &manifest_path,
+        "scarb 2.14.0 (metadata-cache-test)",
+        "env:fingerprint",
+    );
+    let cache_root = workspace.join(".uc/cache");
+    let entry_path = metadata_cache_entry_path(&workspace, &cache_key);
+    let run = CommandRun {
+        command: vec!["scarb".to_string(), "metadata".to_string()],
+        exit_code: 0,
+        elapsed_ms: 42.0,
+        stdout: "{\"packages\":[]}\n".to_string(),
+        stderr: String::new(),
+    };
+    let write_context = MetadataResultCacheWriteContext {
+        cache_key: &cache_key,
+        cache_root: &cache_root,
+        entry_path: &entry_path,
+        manifest_size_bytes,
+        manifest_modified_unix_ms,
+        lock_hash: &lock_hash,
+    };
+    store_metadata_result_cache_entry(&write_context, &run)
+        .expect("failed to store metadata cache entry");
+
+    let hit = try_metadata_result_cache_hit(
+        &cache_key,
+        &entry_path,
+        manifest_size_bytes,
+        manifest_modified_unix_ms,
+        &lock_hash,
+    )
+    .expect("cache lookup should succeed")
+    .expect("cache entry should still hit when lock hash is unchanged");
+    assert_eq!(hit.exit_code, 0);
+    assert_eq!(hit.stdout, run.stdout);
+
+    fs::remove_dir_all(&workspace).ok();
 }
 
 #[test]
@@ -1534,7 +1615,7 @@ edition = "2024_07"
     let manifest_size_bytes = manifest_metadata.len();
     let manifest_modified_unix_ms =
         metadata_modified_unix_ms(&manifest_metadata).expect("failed to read manifest mtime");
-    let (lock_size_bytes, lock_modified_unix_ms, lock_hash) =
+    let (_, _, lock_hash) =
         daemon_lock_state(&manifest_path).expect("failed to resolve lock state");
 
     let args = MetadataArgs {
@@ -1567,8 +1648,6 @@ edition = "2024_07"
         entry_path: &entry_path,
         manifest_size_bytes,
         manifest_modified_unix_ms,
-        lock_size_bytes,
-        lock_modified_unix_ms,
         lock_hash: &lock_hash,
     };
     store_metadata_result_cache_entry(&write_context, &run)
@@ -1580,8 +1659,6 @@ edition = "2024_07"
         &entry_path,
         manifest_size_bytes,
         manifest_modified_unix_ms,
-        lock_size_bytes,
-        lock_modified_unix_ms,
         &lock_hash,
     )
     .expect("cache lookup should succeed")
@@ -1625,7 +1702,7 @@ edition = "2024_07"
     let manifest_size_bytes = manifest_metadata.len();
     let manifest_modified_unix_ms =
         metadata_modified_unix_ms(&manifest_metadata).expect("failed to read manifest mtime");
-    let (lock_size_bytes, lock_modified_unix_ms, lock_hash) =
+    let (_, _, lock_hash) =
         daemon_lock_state(&manifest_path).expect("failed to resolve lock state");
 
     let args = MetadataArgs {
@@ -1657,8 +1734,6 @@ edition = "2024_07"
         entry_path: &entry_path,
         manifest_size_bytes,
         manifest_modified_unix_ms,
-        lock_size_bytes,
-        lock_modified_unix_ms,
         lock_hash: &lock_hash,
     };
     store_metadata_result_cache_entry(&write_context, &run)
@@ -1666,7 +1741,7 @@ edition = "2024_07"
 
     std::thread::sleep(Duration::from_millis(5));
     fs::write(&lock_path, "version = 2\n").expect("failed to mutate lock file");
-    let (new_lock_size_bytes, new_lock_modified_unix_ms, new_lock_hash) =
+    let (_, _, new_lock_hash) =
         daemon_lock_state(&manifest_path).expect("failed to resolve mutated lock state");
     assert_ne!(lock_hash, new_lock_hash);
 
@@ -1675,8 +1750,6 @@ edition = "2024_07"
         &entry_path,
         manifest_size_bytes,
         manifest_modified_unix_ms,
-        new_lock_size_bytes,
-        new_lock_modified_unix_ms,
         &new_lock_hash,
     )
     .expect("cache lookup should succeed");

@@ -677,8 +677,6 @@ struct LockfileHashCacheEntry {
 struct MetadataResultCacheEntry {
     manifest_size_bytes: u64,
     manifest_modified_unix_ms: u64,
-    lock_size_bytes: Option<u64>,
-    lock_modified_unix_ms: Option<u64>,
     lock_hash: String,
     run: CommandRun,
     last_access_epoch_ms: u64,
@@ -739,8 +737,6 @@ struct MetadataResultCacheFile {
     schema_version: u32,
     manifest_size_bytes: u64,
     manifest_modified_unix_ms: u64,
-    lock_size_bytes: Option<u64>,
-    lock_modified_unix_ms: Option<u64>,
     lock_hash: String,
     run: CommandRun,
 }
@@ -2361,8 +2357,6 @@ fn try_metadata_result_cache_hit(
     entry_path: &Path,
     manifest_size_bytes: u64,
     manifest_modified_unix_ms: u64,
-    lock_size_bytes: Option<u64>,
-    lock_modified_unix_ms: Option<u64>,
     lock_hash: &str,
 ) -> Result<Option<CommandRun>> {
     let now_ms = epoch_ms_u64().unwrap_or_default();
@@ -2375,8 +2369,6 @@ fn try_metadata_result_cache_hit(
                 entry,
                 manifest_size_bytes,
                 manifest_modified_unix_ms,
-                lock_size_bytes,
-                lock_modified_unix_ms,
                 lock_hash,
             ) {
                 entry.last_access_epoch_ms = now_ms;
@@ -2433,8 +2425,6 @@ fn try_metadata_result_cache_hit(
         &decoded,
         manifest_size_bytes,
         manifest_modified_unix_ms,
-        lock_size_bytes,
-        lock_modified_unix_ms,
         lock_hash,
     ) {
         return Ok(None);
@@ -2450,8 +2440,6 @@ fn try_metadata_result_cache_hit(
             MetadataResultCacheEntry {
                 manifest_size_bytes,
                 manifest_modified_unix_ms,
-                lock_size_bytes,
-                lock_modified_unix_ms,
                 lock_hash: lock_hash.to_string(),
                 run: decoded.run.clone(),
                 last_access_epoch_ms: now_ms,
@@ -2473,8 +2461,6 @@ struct MetadataResultCacheWriteContext<'a> {
     entry_path: &'a Path,
     manifest_size_bytes: u64,
     manifest_modified_unix_ms: u64,
-    lock_size_bytes: Option<u64>,
-    lock_modified_unix_ms: Option<u64>,
     lock_hash: &'a str,
 }
 
@@ -2486,8 +2472,6 @@ fn store_metadata_result_cache_entry(
         schema_version: METADATA_RESULT_CACHE_SCHEMA_VERSION,
         manifest_size_bytes: context.manifest_size_bytes,
         manifest_modified_unix_ms: context.manifest_modified_unix_ms,
-        lock_size_bytes: context.lock_size_bytes,
-        lock_modified_unix_ms: context.lock_modified_unix_ms,
         lock_hash: context.lock_hash.to_string(),
         run: run.clone(),
     };
@@ -2520,8 +2504,6 @@ fn store_metadata_result_cache_entry(
             MetadataResultCacheEntry {
                 manifest_size_bytes: context.manifest_size_bytes,
                 manifest_modified_unix_ms: context.manifest_modified_unix_ms,
-                lock_size_bytes: context.lock_size_bytes,
-                lock_modified_unix_ms: context.lock_modified_unix_ms,
                 lock_hash: context.lock_hash.to_string(),
                 run: run.clone(),
                 last_access_epoch_ms: now_ms,
@@ -2557,7 +2539,7 @@ fn run_scarb_metadata_with_uc_cache(
         .with_context(|| format!("failed to stat {}", manifest_path.display()))?;
     let manifest_size_bytes = manifest_metadata.len();
     let manifest_modified_unix_ms = metadata_modified_unix_ms(&manifest_metadata)?;
-    let (lock_size_bytes, lock_modified_unix_ms, lock_hash) = daemon_lock_state(manifest_path)?;
+    let (_, _, lock_hash) = daemon_lock_state(manifest_path)?;
     let scarb_version = scarb_version_line()?;
     let build_env_fingerprint = current_build_env_fingerprint();
     let cache_key =
@@ -2571,8 +2553,6 @@ fn run_scarb_metadata_with_uc_cache(
         &entry_path,
         manifest_size_bytes,
         manifest_modified_unix_ms,
-        lock_size_bytes,
-        lock_modified_unix_ms,
         &lock_hash,
     )? {
         cached_run.elapsed_ms = lookup_start.elapsed().as_secs_f64() * 1000.0;
@@ -2609,8 +2589,6 @@ fn run_scarb_metadata_with_uc_cache(
             entry_path: &entry_path,
             manifest_size_bytes,
             manifest_modified_unix_ms,
-            lock_size_bytes,
-            lock_modified_unix_ms,
             lock_hash: &lock_hash,
         };
         store_metadata_result_cache_entry(&write_context, &run)?;
@@ -5125,10 +5103,9 @@ fn metadata_result_cache_key(
     build_env_fingerprint: &str,
 ) -> String {
     let mut hasher = Hasher::new();
-    hasher.update(b"uc-metadata-result-cache-v1");
+    hasher.update(b"uc-metadata-result-cache-v2");
     hasher.update(normalize_fingerprint_path(manifest_path).as_bytes());
     hasher.update(args.format_version.to_string().as_bytes());
-    hasher.update(if args.offline { b"offline" } else { b"online" });
     hasher.update(
         args.global_cache_dir
             .as_ref()
@@ -5156,14 +5133,10 @@ fn metadata_cache_entry_matches(
     entry: &MetadataResultCacheEntry,
     manifest_size_bytes: u64,
     manifest_modified_unix_ms: u64,
-    lock_size_bytes: Option<u64>,
-    lock_modified_unix_ms: Option<u64>,
     lock_hash: &str,
 ) -> bool {
     entry.manifest_size_bytes == manifest_size_bytes
         && entry.manifest_modified_unix_ms == manifest_modified_unix_ms
-        && entry.lock_size_bytes == lock_size_bytes
-        && entry.lock_modified_unix_ms == lock_modified_unix_ms
         && entry.lock_hash == lock_hash
 }
 
@@ -5171,14 +5144,10 @@ fn metadata_cache_file_matches(
     entry: &MetadataResultCacheFile,
     manifest_size_bytes: u64,
     manifest_modified_unix_ms: u64,
-    lock_size_bytes: Option<u64>,
-    lock_modified_unix_ms: Option<u64>,
     lock_hash: &str,
 ) -> bool {
     entry.manifest_size_bytes == manifest_size_bytes
         && entry.manifest_modified_unix_ms == manifest_modified_unix_ms
-        && entry.lock_size_bytes == lock_size_bytes
-        && entry.lock_modified_unix_ms == lock_modified_unix_ms
         && entry.lock_hash == lock_hash
 }
 

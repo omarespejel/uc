@@ -245,12 +245,35 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             .deterministic_key_hex();
                             Ok((compiler_version, session_key))
                         };
+                        if let Some(hinted_session_key) =
+                            load_daemon_local_probe_hint(&workspace_root, &native_session_key)?
+                        {
+                            let (compiler_version, local_session_key) =
+                                build_scarb_fallback_context()?;
+                            let (run, cache_hit, fingerprint, telemetry) = run_local_with_backend(
+                                &local_session_key,
+                                &compiler_version,
+                                BuildCompileBackend::Scarb,
+                            )?;
+                            if hinted_session_key != local_session_key {
+                                let _ = persist_daemon_local_probe_hint(
+                                    &workspace_root,
+                                    &native_session_key,
+                                    &local_session_key,
+                                );
+                            }
+                            return Ok((run, cache_hit, fingerprint, local_session_key, telemetry));
+                        }
                         match run_local_with_backend(
                             &native_session_key,
                             &native_compiler_version,
                             BuildCompileBackend::Native,
                         ) {
                             Ok((run, cache_hit, fingerprint, telemetry)) => {
+                                let _ = clear_daemon_local_probe_hint(
+                                    &workspace_root,
+                                    &native_session_key,
+                                );
                                 Ok((run, cache_hit, fingerprint, native_session_key, telemetry))
                             }
                             Err(native_err) => {
@@ -333,11 +356,21 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
              -> Result<
                 Option<(CommandRun, String, BuildPhaseTelemetry, String)>,
             > {
+                let mut scarb_probe_context: Option<(String, String)> = None;
+                let mut resolve_scarb_probe_context = || -> Result<(String, String)> {
+                    if let Some((compiler_version, session_key)) = scarb_probe_context.as_ref() {
+                        return Ok((compiler_version.clone(), session_key.clone()));
+                    }
+                    let compiler_version = scarb_version_line()?;
+                    let session_key = build_session_key_for_compiler(&compiler_version)?;
+                    scarb_probe_context = Some((compiler_version.clone(), session_key.clone()));
+                    Ok((compiler_version, session_key))
+                };
                 if include_scarb_fallback_probe {
                     if let Some(hinted_session_key) =
                         load_daemon_local_probe_hint(&workspace_root, primary_session_key)?
                     {
-                        let scarb_compiler_version = scarb_version_line()?;
+                        let (scarb_compiler_version, _) = resolve_scarb_probe_context()?;
                         if let Some((run, fingerprint, telemetry)) = try_local_uc_cache_hit(
                             &common,
                             &manifest_path,
@@ -369,9 +402,8 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                     )));
                 }
                 if include_scarb_fallback_probe {
-                    let scarb_compiler_version = scarb_version_line()?;
-                    let scarb_session_key =
-                        build_session_key_for_compiler(&scarb_compiler_version)?;
+                    let (scarb_compiler_version, scarb_session_key) =
+                        resolve_scarb_probe_context()?;
                     if scarb_session_key != primary_session_key {
                         if let Some((run, fingerprint, telemetry)) = try_local_uc_cache_hit(
                             &common,
@@ -545,4 +577,47 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_test_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before UNIX_EPOCH")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&dir).expect("failed to create test directory");
+        dir
+    }
+
+    #[test]
+    fn daemon_local_probe_hint_roundtrip_and_clear() {
+        let workspace = unique_test_dir("uc-daemon-probe-hint");
+        let primary_session_key = "a".repeat(SESSION_KEY_LEN);
+        let hinted_session_key = "b".repeat(SESSION_KEY_LEN);
+
+        persist_daemon_local_probe_hint(&workspace, &primary_session_key, &hinted_session_key)
+            .expect("failed to persist daemon local probe hint");
+        let loaded = load_daemon_local_probe_hint(&workspace, &primary_session_key)
+            .expect("failed to load daemon local probe hint");
+        assert_eq!(
+            loaded,
+            Some(hinted_session_key.clone()),
+            "persisted probe hint should be readable"
+        );
+
+        clear_daemon_local_probe_hint(&workspace, &primary_session_key)
+            .expect("failed to clear daemon local probe hint");
+        let cleared = load_daemon_local_probe_hint(&workspace, &primary_session_key)
+            .expect("failed to load daemon local probe hint after clear");
+        assert!(
+            cleared.is_none(),
+            "probe hint should be removed after clear operation"
+        );
+
+        fs::remove_dir_all(&workspace).ok();
+    }
 }
