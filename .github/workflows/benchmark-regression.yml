@@ -139,6 +139,12 @@ jobs:
           NO_SCARB_PATH="$RUNNER_TEMP/no-scarb-path"
           mkdir -p "$NO_SCARB_PATH"
           mkdir -p benchmarks/results
+          cat > "$NO_SCARB_PATH/scarb" <<'EOF'
+          #!/usr/bin/env bash
+          echo "native-only gate: scarb is intentionally unavailable" >&2
+          exit 127
+          EOF
+          chmod +x "$NO_SCARB_PATH/scarb"
 
           run_native_only() {
             local manifest_path="$1"
@@ -147,7 +153,7 @@ jobs:
             local report_path="benchmarks/results/native-only-${tag}.json"
             local log_path="benchmarks/results/native-only-${tag}.log"
             set +e
-            PATH="$NO_SCARB_PATH" \
+            PATH="$NO_SCARB_PATH:$PATH" \
               "$UC_BIN" build \
                 --engine uc \
                 --daemon-mode off \

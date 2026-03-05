@@ -456,8 +456,8 @@ fn cached_object_hash_if_fresh(
     let Some(entry) = cache.get_mut(&key) else {
         return Ok(None);
     };
-    entry.last_access_epoch_ms = now_ms;
     if entry.size_bytes == metadata.len() && entry.modified_unix_ms == modified_unix_ms {
+        entry.last_access_epoch_ms = now_ms;
         return Ok(Some(entry.blake3_hex.clone()));
     }
     Ok(None)
@@ -962,4 +962,60 @@ pub(super) fn hash_file_blake3(path: &Path) -> Result<String> {
     }
 
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_test_dir(prefix: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&dir).expect("failed to create test directory");
+        dir
+    }
+
+    #[test]
+    fn stale_hash_lookup_does_not_refresh_access_age() {
+        let dir = unique_test_dir("uc-cache-object-hash-stale-age");
+        let object_path = dir.join("cache/object.bin");
+        if let Some(parent) = object_path.parent() {
+            fs::create_dir_all(parent).expect("failed to create object parent");
+        }
+
+        fs::write(&object_path, b"alpha").expect("failed to write object");
+        let metadata = fs::metadata(&object_path).expect("failed to stat object");
+        store_cache_object_hash(&object_path, &metadata, &"a".repeat(64))
+            .expect("failed to store object hash");
+
+        let key = cache_object_hash_memo_key(&object_path);
+        {
+            let mut cache = cache_object_hash_memo()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let entry = cache
+                .get_mut(&key)
+                .expect("cache entry should exist after store");
+            entry.last_access_epoch_ms = 7;
+        }
+
+        fs::write(&object_path, b"alpha-updated").expect("failed to mutate object");
+        let stale_metadata = fs::metadata(&object_path).expect("failed to stat mutated object");
+        let hit = cached_object_hash_if_fresh(&object_path, &stale_metadata)
+            .expect("fresh lookup should not fail");
+        assert!(hit.is_none(), "stale metadata should miss");
+
+        let cache = cache_object_hash_memo()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = cache.get(&key).expect("cache entry should still exist");
+        assert_eq!(
+            entry.last_access_epoch_ms, 7,
+            "stale cache lookup must not refresh access age"
+        );
+    }
 }
