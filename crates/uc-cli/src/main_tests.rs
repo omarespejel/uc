@@ -2997,6 +2997,63 @@ fn collect_cached_artifacts_for_entry_with_paths_limits_scan_scope() {
 }
 
 #[test]
+fn async_persist_worker_uses_precomputed_cached_artifacts() {
+    let dir = unique_test_dir("uc-async-persist-precomputed");
+    let workspace = dir.join("workspace");
+    let cache_root = workspace.join(".uc/cache");
+    let objects_root = cache_root.join("objects");
+    let entry_path = cache_root.join("build/session.json");
+    fs::create_dir_all(&objects_root).expect("failed to create objects root");
+    let object_rel_path = "aa/object.bin".to_string();
+    let object_path = objects_root.join(&object_rel_path);
+    fs::create_dir_all(
+        object_path
+            .parent()
+            .expect("object path should have parent directory"),
+    )
+    .expect("failed to create object parent");
+    fs::write(&object_path, b"artifact-object").expect("failed to write object bytes");
+    let object_hash = hash_file_blake3(&object_path).expect("failed to hash object");
+    let object_len = fs::metadata(&object_path)
+        .expect("failed to stat object")
+        .len();
+
+    let artifact = CachedArtifact {
+        relative_path: "demo.sierra.json".to_string(),
+        blake3_hex: object_hash,
+        size_bytes: object_len,
+        object_rel_path,
+    };
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let worker = thread::spawn(move || run_async_persist_worker(receiver));
+    sender
+        .send(AsyncPersistTask {
+            scope_key: "scope".to_string(),
+            workspace_root: workspace,
+            profile: "dev".to_string(),
+            fingerprint: "fingerprint".to_string(),
+            artifact_relative_paths: None,
+            cached_artifacts: Some(vec![artifact]),
+            cache_root: cache_root.clone(),
+            objects_dir: objects_root,
+            entry_path: entry_path.clone(),
+        })
+        .expect("failed to enqueue async persist task");
+    drop(sender);
+    worker
+        .join()
+        .expect("async persist worker should exit cleanly");
+
+    let entry = load_cache_entry(&entry_path)
+        .expect("failed to load async persisted cache entry")
+        .expect("cache entry should be written by async worker");
+    assert_eq!(entry.artifacts.len(), 1);
+    assert_eq!(entry.artifacts[0].relative_path, "demo.sierra.json");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn daemon_shared_cache_root_is_workspace_scoped_and_stable() {
     let root_a_1 = daemon_shared_cache_root(Path::new("/tmp/workspace-a"));
     let root_a_2 = daemon_shared_cache_root(Path::new("/tmp/workspace-a"));

@@ -3129,6 +3129,35 @@ fn run_build_with_uc_cache(
         let fingerprint_value = fingerprint.as_deref().unwrap_or_default();
         if options.async_cache_persist {
             telemetry.cache_persist_async = true;
+            let mut precomputed_cached_artifacts: Option<Vec<CachedArtifact>> = None;
+            if options.use_daemon_shared_cache && !local_cache_preexisted {
+                let shared_persist_start = Instant::now();
+                let shared_cached_artifacts = collect_cached_artifacts_for_entry_with_paths(
+                    &canonical_workspace_root,
+                    profile,
+                    &cache_root,
+                    &objects_dir,
+                    native_artifact_relative_paths.as_deref(),
+                )?;
+                precomputed_cached_artifacts = Some(shared_cached_artifacts.clone());
+                if let Err(err) = persist_daemon_shared_cache_entry_with_artifacts(
+                    &canonical_workspace_root,
+                    profile,
+                    session_key,
+                    fingerprint_value,
+                    &objects_dir,
+                    &shared_cached_artifacts,
+                ) {
+                    tracing::warn!(
+                        error = %format!("{err:#}"),
+                        "daemon shared cache persistence failed"
+                    );
+                    eprintln!("uc: warning: daemon shared cache persistence failed: {err:#}");
+                } else {
+                    telemetry.cache_persist_ms =
+                        shared_persist_start.elapsed().as_secs_f64() * 1000.0;
+                }
+            }
             let persist_scope_key = async_persist_scope_key(&canonical_workspace_root, profile);
             if try_mark_async_persist_in_flight(&persist_scope_key) {
                 telemetry.cache_persist_scheduled = true;
@@ -3138,6 +3167,7 @@ fn run_build_with_uc_cache(
                     profile: profile.to_string(),
                     fingerprint: fingerprint_value.to_string(),
                     artifact_relative_paths: native_artifact_relative_paths.clone(),
+                    cached_artifacts: precomputed_cached_artifacts,
                     cache_root: cache_root.clone(),
                     objects_dir: objects_dir.clone(),
                     entry_path: entry_path.clone(),
@@ -3162,33 +3192,6 @@ fn run_build_with_uc_cache(
                         tracing::warn!(error = %error, "failed to enqueue async cache persistence task");
                         eprintln!("uc: warning: {error}");
                     }
-                }
-            }
-            if options.use_daemon_shared_cache && !local_cache_preexisted {
-                let shared_persist_start = Instant::now();
-                let shared_cached_artifacts = collect_cached_artifacts_for_entry_with_paths(
-                    &canonical_workspace_root,
-                    profile,
-                    &cache_root,
-                    &objects_dir,
-                    native_artifact_relative_paths.as_deref(),
-                )?;
-                if let Err(err) = persist_daemon_shared_cache_entry_with_artifacts(
-                    &canonical_workspace_root,
-                    profile,
-                    session_key,
-                    fingerprint_value,
-                    &objects_dir,
-                    &shared_cached_artifacts,
-                ) {
-                    tracing::warn!(
-                        error = %format!("{err:#}"),
-                        "daemon shared cache persistence failed"
-                    );
-                    eprintln!("uc: warning: daemon shared cache persistence failed: {err:#}");
-                } else {
-                    telemetry.cache_persist_ms =
-                        shared_persist_start.elapsed().as_secs_f64() * 1000.0;
                 }
             }
         } else {

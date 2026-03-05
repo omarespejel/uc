@@ -178,6 +178,7 @@ pub(super) struct AsyncPersistTask {
     pub(super) profile: String,
     pub(super) fingerprint: String,
     pub(super) artifact_relative_paths: Option<Vec<String>>,
+    pub(super) cached_artifacts: Option<Vec<CachedArtifact>>,
     pub(super) cache_root: PathBuf,
     pub(super) objects_dir: PathBuf,
     pub(super) entry_path: PathBuf,
@@ -195,15 +196,32 @@ pub(super) fn async_persist_sender() -> &'static SyncSender<AsyncPersistTask> {
 pub(super) fn run_async_persist_worker(receiver: Receiver<AsyncPersistTask>) {
     for task in receiver {
         let _guard = AsyncPersistGuard::new(task.scope_key.clone());
-        if let Err(err) = persist_cache_entry_for_build(
-            &task.workspace_root,
-            &task.profile,
-            &task.fingerprint,
-            task.artifact_relative_paths.as_deref(),
-            &task.cache_root,
-            &task.objects_dir,
-            &task.entry_path,
-        ) {
+        let persist_result = if let Some(cached_artifacts) = task.cached_artifacts.as_deref() {
+            (|| -> Result<()> {
+                let _cache_lock = acquire_cache_lock(&task.cache_root)?;
+                persist_cache_entry(
+                    &task.profile,
+                    &task.fingerprint,
+                    cached_artifacts,
+                    &task.entry_path,
+                )?;
+                if should_enforce_cache_size_budget_now() {
+                    enforce_cache_size_budget(&task.cache_root)?;
+                }
+                Ok(())
+            })()
+        } else {
+            persist_cache_entry_for_build(
+                &task.workspace_root,
+                &task.profile,
+                &task.fingerprint,
+                task.artifact_relative_paths.as_deref(),
+                &task.cache_root,
+                &task.objects_dir,
+                &task.entry_path,
+            )
+        };
+        if let Err(err) = persist_result {
             let _ = fs::remove_file(&task.entry_path);
             record_async_persist_error(err.to_string());
             tracing::warn!(error = %format!("{err:#}"), "async cache persistence failed");
