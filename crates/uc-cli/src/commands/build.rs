@@ -256,6 +256,28 @@ fn should_probe_local_before_daemon(
     }
 }
 
+fn effective_native_mode(
+    configured_mode: NativeBuildMode,
+    native_auto_eligible: bool,
+) -> NativeBuildMode {
+    if configured_mode == NativeBuildMode::Auto && !native_auto_eligible {
+        NativeBuildMode::Off
+    } else {
+        configured_mode
+    }
+}
+
+fn daemon_backend_policy(
+    configured_mode: NativeBuildMode,
+    native_auto_eligible: bool,
+) -> (BuildCompileBackend, bool) {
+    match effective_native_mode(configured_mode, native_auto_eligible) {
+        NativeBuildMode::Off => (BuildCompileBackend::Scarb, false),
+        NativeBuildMode::Auto => (BuildCompileBackend::Native, true),
+        NativeBuildMode::Require => (BuildCompileBackend::Native, false),
+    }
+}
+
 fn daemon_socket_available_for_client() -> Result<bool> {
     #[cfg(not(unix))]
     {
@@ -297,7 +319,41 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             (run, false, fingerprint)
         }
         EngineArg::Uc => {
-            let native_mode = native_build_mode();
+            let configured_native_mode = native_build_mode();
+            let native_auto_preflight_error = if configured_native_mode == NativeBuildMode::Auto {
+                match native_compile_preflight(&common, &manifest_path, &workspace_root) {
+                    Ok(()) => None,
+                    Err(err) => {
+                        if native_error_allows_scarb_fallback(&err) {
+                            Some(format!("{err:#}"))
+                        } else {
+                            return Err(err);
+                        }
+                    }
+                }
+            } else {
+                None
+            };
+            let native_auto_eligible = native_auto_preflight_error.is_none();
+            let native_mode = effective_native_mode(configured_native_mode, native_auto_eligible);
+            if let Some(reason) = native_auto_preflight_error.as_deref() {
+                tracing::debug!(
+                    manifest_path = %manifest_path.display(),
+                    reason,
+                    "native auto preflight ineligible; using scarb backend"
+                );
+                if configured_native_mode == NativeBuildMode::Auto {
+                    if matches!(daemon_mode, DaemonModeArg::Off) {
+                        eprintln!(
+                            "uc: native compile unavailable ({reason}), falling back to scarb backend"
+                        );
+                    } else {
+                        eprintln!(
+                            "uc: daemon native build failed; daemon fell back to scarb backend ({reason})"
+                        );
+                    }
+                }
+            }
             let run_local_with_backend =
                 |session_key: &str,
                  compiler_version: &str,
@@ -469,12 +525,8 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             };
             let resolve_daemon_backend_context =
                 || -> Result<(BuildCompileBackend, bool, String, String)> {
-                    let daemon_compile_backend = if native_mode == NativeBuildMode::Off {
-                        BuildCompileBackend::Scarb
-                    } else {
-                        BuildCompileBackend::Native
-                    };
-                    let daemon_native_fallback_to_scarb = native_mode == NativeBuildMode::Auto;
+                    let (daemon_compile_backend, daemon_native_fallback_to_scarb) =
+                        daemon_backend_policy(configured_native_mode, native_auto_eligible);
                     let compiler_version = if daemon_compile_backend == BuildCompileBackend::Scarb {
                         scarb_version_line()?
                     } else {
@@ -906,6 +958,46 @@ mod tests {
         assert!(
             should_probe_local_before_daemon(DaemonModeArg::Require, true),
             "daemon require should probe local cache when daemon is available"
+        );
+    }
+
+    #[test]
+    fn effective_native_mode_downgrades_auto_when_preflight_is_ineligible() {
+        assert_eq!(
+            effective_native_mode(NativeBuildMode::Auto, true),
+            NativeBuildMode::Auto
+        );
+        assert_eq!(
+            effective_native_mode(NativeBuildMode::Auto, false),
+            NativeBuildMode::Off
+        );
+        assert_eq!(
+            effective_native_mode(NativeBuildMode::Off, false),
+            NativeBuildMode::Off
+        );
+        assert_eq!(
+            effective_native_mode(NativeBuildMode::Require, false),
+            NativeBuildMode::Require
+        );
+    }
+
+    #[test]
+    fn daemon_backend_policy_matches_effective_native_mode() {
+        assert_eq!(
+            daemon_backend_policy(NativeBuildMode::Off, false),
+            (BuildCompileBackend::Scarb, false)
+        );
+        assert_eq!(
+            daemon_backend_policy(NativeBuildMode::Auto, true),
+            (BuildCompileBackend::Native, true)
+        );
+        assert_eq!(
+            daemon_backend_policy(NativeBuildMode::Auto, false),
+            (BuildCompileBackend::Scarb, false)
+        );
+        assert_eq!(
+            daemon_backend_policy(NativeBuildMode::Require, false),
+            (BuildCompileBackend::Native, false)
         );
     }
 }

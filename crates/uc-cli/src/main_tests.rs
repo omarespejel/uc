@@ -1327,7 +1327,7 @@ fn native_build_mode_parses_expected_values() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     std::env::remove_var("UC_NATIVE_BUILD_MODE");
-    assert_eq!(native_build_mode(), NativeBuildMode::Off);
+    assert_eq!(native_build_mode(), NativeBuildMode::Auto);
 
     std::env::set_var("UC_NATIVE_BUILD_MODE", "off");
     assert_eq!(native_build_mode(), NativeBuildMode::Off);
@@ -1339,7 +1339,7 @@ fn native_build_mode_parses_expected_values() {
     assert_eq!(native_build_mode(), NativeBuildMode::Require);
 
     std::env::set_var("UC_NATIVE_BUILD_MODE", "invalid-mode");
-    assert_eq!(native_build_mode(), NativeBuildMode::Off);
+    assert_eq!(native_build_mode(), NativeBuildMode::Auto);
     std::env::remove_var("UC_NATIVE_BUILD_MODE");
 }
 

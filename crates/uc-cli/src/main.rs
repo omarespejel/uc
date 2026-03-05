@@ -155,7 +155,7 @@ const DEFAULT_NATIVE_IMPACTED_SUBSET_ENABLED: bool = true;
 const DEFAULT_DAEMON_SHARED_CACHE_ENABLED: bool = true;
 const DEFAULT_DAEMON_SHARED_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const DEFAULT_UC_DISABLE_SCARB_ARTIFACTS_FINGERPRINT: bool = true;
-const DEFAULT_UC_NATIVE_BUILD_MODE: &str = "off";
+const DEFAULT_UC_NATIVE_BUILD_MODE: &str = "auto";
 const TOOLCHAIN_CHECK_CACHE_SCHEMA_VERSION: u32 = 1;
 const MAX_TOOLCHAIN_CHECK_CACHE_BYTES: u64 = 64 * 1024;
 /// Default Starknet CASM bytecode limit used by native compile.
@@ -1336,6 +1336,15 @@ fn parse_env_bool(name: &str, default: bool) -> bool {
     }
 }
 
+fn default_native_build_mode() -> NativeBuildMode {
+    match DEFAULT_UC_NATIVE_BUILD_MODE {
+        "off" => NativeBuildMode::Off,
+        "auto" => NativeBuildMode::Auto,
+        "require" => NativeBuildMode::Require,
+        _ => NativeBuildMode::Off,
+    }
+}
+
 fn parse_native_build_mode(raw: &str) -> NativeBuildMode {
     match raw.trim().to_ascii_lowercase().as_str() {
         "off" => NativeBuildMode::Off,
@@ -1348,7 +1357,7 @@ fn parse_native_build_mode(raw: &str) -> NativeBuildMode {
                 default = DEFAULT_UC_NATIVE_BUILD_MODE,
                 "invalid native build mode; using default"
             );
-            NativeBuildMode::Off
+            default_native_build_mode()
         }
     }
 }
@@ -3592,6 +3601,27 @@ fn build_native_compile_context(
         );
     }
     Ok(context)
+}
+
+#[cfg(feature = "native-compile")]
+fn native_compile_preflight(
+    common: &BuildCommonArgs,
+    manifest_path: &Path,
+    workspace_root: &Path,
+) -> Result<()> {
+    build_native_compile_context(common, manifest_path, workspace_root).map(|_| ())
+}
+
+#[cfg(not(feature = "native-compile"))]
+fn native_compile_preflight(
+    common: &BuildCommonArgs,
+    manifest_path: &Path,
+    workspace_root: &Path,
+) -> Result<()> {
+    let _ = (common, manifest_path, workspace_root);
+    Err(native_fallback_eligible_error(
+        "native compile backend is disabled at build time; rebuild uc with `native-compile` feature",
+    ))
 }
 
 #[cfg(feature = "native-compile")]
