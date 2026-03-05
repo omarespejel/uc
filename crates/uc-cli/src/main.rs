@@ -5771,6 +5771,45 @@ fn daemon_lock_state(manifest_path: &Path) -> Result<(Option<u64>, Option<u64>, 
     ))
 }
 
+fn daemon_lock_metadata_state(manifest_path: &Path) -> Result<(Option<u64>, Option<u64>, String)> {
+    let lock_path = manifest_path
+        .parent()
+        .context("manifest path has no parent")?
+        .join("Scarb.lock");
+    let metadata = match fs::metadata(&lock_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok((None, None, "lock:none".to_string()));
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", lock_path.display()));
+        }
+    };
+    if !metadata.is_file() {
+        bail!("Scarb.lock path is not a file: {}", lock_path.display());
+    }
+    let lock_size_bytes = metadata.len();
+    let lock_modified_unix_ms = metadata_modified_unix_ms(&metadata)?;
+    let lock_change_unix_ms = metadata_change_unix_ms(&metadata);
+
+    let mut hasher = Hasher::new();
+    hasher.update(b"uc-scarb-lock-meta-v1");
+    hasher.update(&lock_size_bytes.to_le_bytes());
+    hasher.update(&lock_modified_unix_ms.to_le_bytes());
+    match lock_change_unix_ms {
+        Some(change_unix_ms) => {
+            hasher.update(b"change");
+            hasher.update(&change_unix_ms.to_le_bytes());
+        }
+        None => {
+            hasher.update(b"change:none");
+        }
+    }
+    let lock_meta_key = format!("lock-meta:{}", hasher.finalize().to_hex());
+
+    Ok((Some(lock_size_bytes), Some(lock_modified_unix_ms), lock_meta_key))
+}
+
 fn daemon_build_plan_invalidation_key(session_input: &SessionInput, lock_hash: &str) -> String {
     let mut hasher = Hasher::new();
     hasher.update(b"uc-daemon-build-plan-invalidation-v1");
@@ -5831,7 +5870,10 @@ fn prepare_daemon_build_plan_with_compiler_version(
         .with_context(|| format!("failed to stat {}", manifest_path.display()))?;
     let manifest_size_bytes = manifest_metadata.len();
     let manifest_modified_unix_ms = metadata_modified_unix_ms(&manifest_metadata)?;
-    let (lock_size_bytes, lock_modified_unix_ms, lock_hash) = daemon_lock_state(manifest_path)?;
+    // Daemon build-plan invalidation only needs lockfile change detection (not semantic lock hashing);
+    // use metadata-derived state to avoid lockfile-byte reads on every daemon request.
+    let (lock_size_bytes, lock_modified_unix_ms, lock_hash) =
+        daemon_lock_metadata_state(manifest_path)?;
     let cache_now_ms = epoch_ms_u64().unwrap_or_default();
 
     {

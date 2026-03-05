@@ -1671,6 +1671,53 @@ edition = "2024_07"
 }
 
 #[test]
+fn daemon_lock_metadata_state_tracks_lockfile_changes_without_hash_cache() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    daemon_lock_hash_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+
+    let workspace = unique_test_dir("uc-daemon-lock-metadata-state");
+    let manifest_path = workspace.join("Scarb.toml");
+    let lock_path = workspace.join("Scarb.lock");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("failed to write manifest");
+    fs::write(&lock_path, "state = \"aaaaaaaa\"\n").expect("failed to write lock file");
+
+    let (_, _, key_first) = daemon_lock_metadata_state(&manifest_path)
+        .expect("first lock metadata state read should work");
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    fs::write(&lock_path, "state = \"bbbbbbbb\"\n").expect("failed to mutate lock file");
+    let (_, _, key_second) = daemon_lock_metadata_state(&manifest_path)
+        .expect("second lock metadata state read should work");
+    assert_ne!(
+        key_first, key_second,
+        "lock metadata state key must change when Scarb.lock changes"
+    );
+
+    let hash_cache = daemon_lock_hash_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        hash_cache.is_empty(),
+        "metadata-only lock state should not populate the semantic lock hash cache"
+    );
+    drop(hash_cache);
+
+    fs::remove_dir_all(&workspace).ok();
+}
+
+#[test]
 fn metadata_result_cache_key_changes_with_metadata_options() {
     let manifest_path = Path::new("/tmp/workspace/Scarb.toml");
     let scarb_version = "scarb 2.14.0 (cache-key-test)";
