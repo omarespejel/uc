@@ -2947,6 +2947,56 @@ fn collect_cached_artifacts_for_entry_rebuilds_corrupted_existing_object() {
 }
 
 #[test]
+fn collect_cached_artifacts_for_entry_with_paths_limits_scan_scope() {
+    let dir = unique_test_dir("uc-collect-with-path-filter");
+    let workspace = dir.join("workspace");
+    let target_root = workspace.join("target/dev");
+    let cache_root = workspace.join(".uc/cache");
+    let objects_root = cache_root.join("objects");
+    fs::create_dir_all(&target_root).expect("failed to create target root");
+    fs::create_dir_all(&objects_root).expect("failed to create object root");
+
+    let selected = target_root.join("demo.contract_class.json");
+    let unselected = target_root.join("ignore.compiled_contract_class.json");
+    fs::write(&selected, b"selected-artifact").expect("failed to write selected artifact");
+    fs::write(&unselected, b"unselected-artifact").expect("failed to write unselected artifact");
+
+    let filtered = vec!["demo.contract_class.json".to_string()];
+    let cached = collect_cached_artifacts_for_entry_with_paths(
+        &workspace,
+        "dev",
+        &cache_root,
+        &objects_root,
+        Some(&filtered),
+    )
+    .expect("failed to collect filtered cached artifacts");
+
+    assert_eq!(cached.len(), 1, "expected one cached artifact");
+    assert_eq!(cached[0].relative_path, "demo.contract_class.json");
+
+    let selected_hash = hash_file_blake3(&selected).expect("failed to hash selected artifact");
+    let unselected_hash =
+        hash_file_blake3(&unselected).expect("failed to hash unselected artifact");
+    let selected_object =
+        objects_root.join(format!("{}/{}.bin", &selected_hash[0..2], selected_hash));
+    let unselected_object = objects_root.join(format!(
+        "{}/{}.bin",
+        &unselected_hash[0..2],
+        unselected_hash
+    ));
+    assert!(
+        selected_object.exists(),
+        "selected artifact object should be materialized in cache"
+    );
+    assert!(
+        !unselected_object.exists(),
+        "unselected artifact should not be persisted when filtered paths are provided"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn daemon_shared_cache_root_is_workspace_scoped_and_stable() {
     let root_a_1 = daemon_shared_cache_root(Path::new("/tmp/workspace-a"));
     let root_a_2 = daemon_shared_cache_root(Path::new("/tmp/workspace-a"));

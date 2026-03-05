@@ -177,6 +177,7 @@ pub(super) struct AsyncPersistTask {
     pub(super) workspace_root: PathBuf,
     pub(super) profile: String,
     pub(super) fingerprint: String,
+    pub(super) artifact_relative_paths: Option<Vec<String>>,
     pub(super) cache_root: PathBuf,
     pub(super) objects_dir: PathBuf,
     pub(super) entry_path: PathBuf,
@@ -198,6 +199,7 @@ pub(super) fn run_async_persist_worker(receiver: Receiver<AsyncPersistTask>) {
             &task.workspace_root,
             &task.profile,
             &task.fingerprint,
+            task.artifact_relative_paths.as_deref(),
             &task.cache_root,
             &task.objects_dir,
             &task.entry_path,
@@ -236,6 +238,7 @@ pub(super) fn persist_cache_entry_for_build(
     workspace_root: &Path,
     profile: &str,
     fingerprint: &str,
+    artifact_relative_paths: Option<&[String]>,
     cache_root: &Path,
     objects_dir: &Path,
     entry_path: &Path,
@@ -244,6 +247,7 @@ pub(super) fn persist_cache_entry_for_build(
         workspace_root,
         profile,
         fingerprint,
+        artifact_relative_paths,
         cache_root,
         objects_dir,
         entry_path,
@@ -255,12 +259,18 @@ pub(super) fn persist_cache_entry_for_build_with_artifacts(
     workspace_root: &Path,
     profile: &str,
     fingerprint: &str,
+    artifact_relative_paths: Option<&[String]>,
     cache_root: &Path,
     objects_dir: &Path,
     entry_path: &Path,
 ) -> Result<Vec<CachedArtifact>> {
-    let cached_artifacts =
-        collect_cached_artifacts_for_entry(workspace_root, profile, cache_root, objects_dir)?;
+    let cached_artifacts = collect_cached_artifacts_for_entry_with_paths(
+        workspace_root,
+        profile,
+        cache_root,
+        objects_dir,
+        artifact_relative_paths,
+    )?;
     let _cache_lock = acquire_cache_lock(cache_root)?;
     persist_cache_entry(profile, fingerprint, &cached_artifacts, entry_path)?;
     if should_enforce_cache_size_budget_now() {

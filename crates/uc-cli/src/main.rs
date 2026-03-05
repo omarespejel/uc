@@ -3087,7 +3087,7 @@ fn run_build_with_uc_cache(
         }
     }
 
-    let (run, native_phase_telemetry) = match compile_backend {
+    let (run, native_phase_telemetry, native_artifact_relative_paths) = match compile_backend {
         BuildCompileBackend::Scarb => {
             let (command, command_vec) = scarb_build_command(common, manifest_path);
             let run = if options.capture_output {
@@ -3097,17 +3097,21 @@ fn run_build_with_uc_cache(
             } else {
                 run_command_status_silent(command, command_vec)?
             };
-            (run, None)
+            (run, None, None)
         }
         BuildCompileBackend::Native => {
-            let (run, native_phase_telemetry) = run_native_build(
+            let (run, native_phase_telemetry, native_artifact_relative_paths) = run_native_build(
                 common,
                 manifest_path,
                 &canonical_workspace_root,
                 profile,
                 options.use_daemon_shared_cache,
             )?;
-            (run, Some(native_phase_telemetry))
+            (
+                run,
+                Some(native_phase_telemetry),
+                Some(native_artifact_relative_paths),
+            )
         }
     };
     telemetry.compile_ms = run.elapsed_ms;
@@ -3133,6 +3137,7 @@ fn run_build_with_uc_cache(
                     workspace_root: canonical_workspace_root.clone(),
                     profile: profile.to_string(),
                     fingerprint: fingerprint_value.to_string(),
+                    artifact_relative_paths: native_artifact_relative_paths.clone(),
                     cache_root: cache_root.clone(),
                     objects_dir: objects_dir.clone(),
                     entry_path: entry_path.clone(),
@@ -3161,11 +3166,20 @@ fn run_build_with_uc_cache(
             }
             if options.use_daemon_shared_cache && !local_cache_preexisted {
                 let shared_persist_start = Instant::now();
-                if let Err(err) = persist_daemon_shared_cache_entry_for_build(
+                let shared_cached_artifacts = collect_cached_artifacts_for_entry_with_paths(
+                    &canonical_workspace_root,
+                    profile,
+                    &cache_root,
+                    &objects_dir,
+                    native_artifact_relative_paths.as_deref(),
+                )?;
+                if let Err(err) = persist_daemon_shared_cache_entry_with_artifacts(
                     &canonical_workspace_root,
                     profile,
                     session_key,
                     fingerprint_value,
+                    &objects_dir,
+                    &shared_cached_artifacts,
                 ) {
                     tracing::warn!(
                         error = %format!("{err:#}"),
@@ -3183,6 +3197,7 @@ fn run_build_with_uc_cache(
                 &canonical_workspace_root,
                 profile,
                 fingerprint_value,
+                native_artifact_relative_paths.as_deref(),
                 &cache_root,
                 &objects_dir,
                 &entry_path,
@@ -4298,7 +4313,7 @@ fn run_native_build(
     workspace_root: &Path,
     profile: &str,
     daemon_context: bool,
-) -> Result<(CommandRun, NativeBuildPhaseTelemetry)> {
+) -> Result<(CommandRun, NativeBuildPhaseTelemetry, Vec<String>)> {
     if daemon_context {
         ensure_native_daemon_backend_available()?;
     }
@@ -4333,7 +4348,7 @@ fn run_native_build(
     workspace_root: &Path,
     profile: &str,
     daemon_context: bool,
-) -> Result<(CommandRun, NativeBuildPhaseTelemetry)> {
+) -> Result<(CommandRun, NativeBuildPhaseTelemetry, Vec<String>)> {
     let _ = (
         common,
         manifest_path,
@@ -4408,7 +4423,7 @@ fn run_native_build_inner(
     manifest_path: &Path,
     workspace_root: &Path,
     profile: &str,
-) -> Result<(CommandRun, NativeBuildPhaseTelemetry)> {
+) -> Result<(CommandRun, NativeBuildPhaseTelemetry, Vec<String>)> {
     let started = Instant::now();
     let context_start = Instant::now();
     let context = build_native_compile_context(common, manifest_path, workspace_root)?;
@@ -4421,7 +4436,7 @@ fn run_native_build_inner(
     let signature = native_compile_session_signature(manifest_path, &context);
     let compile_start = Instant::now();
     let session_scope_start = Instant::now();
-    let (artifact_count, frontend_compile_ms, casm_ms, artifact_write_ms) =
+    let (artifact_count, frontend_compile_ms, casm_ms, artifact_write_ms, produced_paths) =
         with_native_compile_session(workspace_root, &signature, |session| {
             let crate_ids =
                 CrateInput::into_crate_ids(&session.db, session.main_crate_inputs.clone());
@@ -4445,7 +4460,13 @@ fn run_native_build_inner(
                     &program.to_string(),
                 )?;
                 let artifact_write_ms = artifact_write_start.elapsed().as_secs_f64() * 1000.0;
-                return Ok((1, frontend_compile_ms, 0.0, artifact_write_ms));
+                return Ok((
+                    1,
+                    frontend_compile_ms,
+                    0.0,
+                    artifact_write_ms,
+                    vec![output_name],
+                ));
             }
 
             let frontend_compile_start = Instant::now();
@@ -4576,11 +4597,13 @@ fn run_native_build_inner(
             prune_native_target_outputs(&target_dir, &context.package_name, &keep_files)?;
             let artifact_pipeline_ms = artifact_pipeline_start.elapsed().as_secs_f64() * 1000.0;
             let artifact_write_ms = (artifact_pipeline_ms - casm_ms).max(0.0);
+            let produced_paths = keep_files.iter().cloned().collect::<Vec<_>>();
             Ok((
                 serialized_artifact_count + 1,
                 frontend_compile_ms,
                 casm_ms,
                 artifact_write_ms,
+                produced_paths,
             ))
         })?;
     let compile_ms = compile_start.elapsed().as_secs_f64() * 1000.0;
@@ -4624,7 +4647,7 @@ fn run_native_build_inner(
         artifact_count,
         "native build cold-path telemetry"
     );
-    Ok((run, native_phase_telemetry))
+    Ok((run, native_phase_telemetry, produced_paths))
 }
 
 #[cfg(feature = "native-compile")]
@@ -4884,11 +4907,28 @@ fn collect_profile_artifacts(workspace_root: &Path, profile: &str) -> Result<Vec
     collect_artifact_digests(&target_dir)
 }
 
+#[cfg(test)]
 fn collect_cached_artifacts_for_entry(
     workspace_root: &Path,
     profile: &str,
     cache_root: &Path,
     objects_dir: &Path,
+) -> Result<Vec<CachedArtifact>> {
+    collect_cached_artifacts_for_entry_with_paths(
+        workspace_root,
+        profile,
+        cache_root,
+        objects_dir,
+        None,
+    )
+}
+
+fn collect_cached_artifacts_for_entry_with_paths(
+    workspace_root: &Path,
+    profile: &str,
+    cache_root: &Path,
+    objects_dir: &Path,
+    artifact_relative_paths: Option<&[String]>,
 ) -> Result<Vec<CachedArtifact>> {
     let target_root = workspace_root.join("target").join(profile);
     if !target_root.exists() {
@@ -4897,34 +4937,39 @@ fn collect_cached_artifacts_for_entry(
 
     let index_path = cache_root.join("artifact-index-v1.json");
     let mut index = load_artifact_index_cached(&index_path)?;
-    let mut updated_index_entries: BTreeMap<String, ArtifactIndexEntry> = BTreeMap::new();
+    let mut updated_index_entries: BTreeMap<String, ArtifactIndexEntry> =
+        if artifact_relative_paths.is_some() {
+            index.entries.clone()
+        } else {
+            BTreeMap::new()
+        };
     let mut cached_artifacts = Vec::new();
     let now_ms = epoch_ms_u64().unwrap_or_default();
     let mtime_recheck_window_ms = fingerprint_mtime_recheck_window_ms();
-
-    for entry in WalkDir::new(&target_root).follow_links(false).into_iter() {
-        let entry = entry.with_context(|| {
-            format!(
-                "failed to traverse artifact tree under {}",
-                target_root.display()
-            )
-        })?;
-        if !entry.file_type().is_file() {
-            continue;
+    let mut process_cacheable_artifact = |path: &Path, strict: bool| -> Result<()> {
+        let metadata =
+            fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+        if !metadata.is_file() {
+            if strict {
+                bail!("expected artifact path is not a file: {}", path.display());
+            }
+            return Ok(());
         }
-        let path = entry.path();
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-            continue;
+            if strict {
+                bail!("artifact path is not valid UTF-8: {}", path.display());
+            }
+            return Ok(());
         };
         if !CACHEABLE_ARTIFACT_SUFFIXES
             .iter()
             .any(|suffix| name.ends_with(suffix))
         {
-            continue;
+            if strict {
+                bail!("artifact path is not cacheable: {}", path.display());
+            }
+            return Ok(());
         }
-
-        let metadata =
-            fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
         if metadata.len() > MAX_CACHEABLE_ARTIFACT_BYTES {
             bail!(
                 "cacheable artifact {} exceeds size limit ({} bytes > {} bytes)",
@@ -4939,7 +4984,6 @@ fn collect_cached_artifacts_for_entry(
             .to_string_lossy()
             .replace('\\', "/");
         let modified_unix_ms = metadata_modified_unix_ms(&metadata)?;
-
         let canonical_hash = if let Some(cached) = index.entries.get(&relative_path) {
             let should_rehash_recent =
                 now_ms.saturating_sub(modified_unix_ms) <= mtime_recheck_window_ms;
@@ -4956,7 +5000,6 @@ fn collect_cached_artifacts_for_entry(
         }
         .to_ascii_lowercase();
         validate_hex_digest("artifact blake3 hash", &canonical_hash, MIN_HASH_LEN)?;
-
         let object_rel_path = format!("{}/{}.bin", &canonical_hash[0..2], canonical_hash);
         let object_path = objects_dir.join(&object_rel_path);
         if !cache_object_matches_expected(&object_path, &canonical_hash, metadata.len())? {
@@ -4967,7 +5010,6 @@ fn collect_cached_artifacts_for_entry(
             }
             persist_artifact_object(path, &object_path)?;
         }
-
         cached_artifacts.push(CachedArtifact {
             relative_path: relative_path.clone(),
             blake3_hex: canonical_hash.clone(),
@@ -4982,6 +5024,34 @@ fn collect_cached_artifacts_for_entry(
                 blake3_hex: canonical_hash,
             },
         );
+        Ok(())
+    };
+
+    if let Some(relative_paths) = artifact_relative_paths {
+        let mut unique_relative_paths = BTreeSet::new();
+        for relative_path in relative_paths {
+            let sanitized = validated_relative_artifact_path(relative_path)?;
+            let normalized = normalize_fingerprint_path(&sanitized);
+            if !unique_relative_paths.insert(normalized.clone()) {
+                continue;
+            }
+            let absolute_path = target_root.join(&sanitized);
+            ensure_path_within_root(&target_root, &absolute_path, "cache collection path")?;
+            process_cacheable_artifact(&absolute_path, true)?;
+        }
+    } else {
+        for entry in WalkDir::new(&target_root).follow_links(false).into_iter() {
+            let entry = entry.with_context(|| {
+                format!(
+                    "failed to traverse artifact tree under {}",
+                    target_root.display()
+                )
+            })?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            process_cacheable_artifact(entry.path(), false)?;
+        }
     }
 
     cached_artifacts.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
@@ -5941,33 +6011,6 @@ fn persist_daemon_shared_cache_entry_with_artifacts(
     }
 
     persist_cache_entry(profile, fingerprint, cached_artifacts, &shared_entry_path)?;
-    let max_bytes = daemon_shared_cache_max_bytes();
-    if max_bytes > 0 {
-        enforce_cache_size_budget_with_budget(&shared_cache_root, max_bytes)?;
-    }
-    Ok(())
-}
-
-fn persist_daemon_shared_cache_entry_for_build(
-    workspace_root: &Path,
-    profile: &str,
-    session_key: &str,
-    fingerprint: &str,
-) -> Result<()> {
-    if !daemon_shared_cache_enabled() {
-        return Ok(());
-    }
-    let shared_cache_root = daemon_shared_cache_root(workspace_root);
-    let shared_objects_dir = shared_cache_root.join("objects");
-    let shared_entry_path = daemon_shared_cache_entry_path(&shared_cache_root, session_key);
-    let cached_artifacts = collect_cached_artifacts_for_entry(
-        workspace_root,
-        profile,
-        &shared_cache_root,
-        &shared_objects_dir,
-    )?;
-    let _cache_lock = acquire_cache_lock(&shared_cache_root)?;
-    persist_cache_entry(profile, fingerprint, &cached_artifacts, &shared_entry_path)?;
     let max_bytes = daemon_shared_cache_max_bytes();
     if max_bytes > 0 {
         enforce_cache_size_budget_with_budget(&shared_cache_root, max_bytes)?;
