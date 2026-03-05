@@ -263,6 +263,24 @@ fn daemon_build_request_defaults_capture_output_when_missing_from_wire() {
     }
 }
 
+#[cfg(feature = "native-compile")]
+#[test]
+fn starknet_artifact_files_omits_casm_when_none() {
+    let files = StarknetArtifactFiles {
+        sierra: "demo.contract_class.json".to_string(),
+        casm: None,
+    };
+    let json = serde_json::to_value(&files).expect("failed to encode artifact files");
+    assert_eq!(
+        json.get("sierra").and_then(serde_json::Value::as_str),
+        Some("demo.contract_class.json")
+    );
+    assert!(
+        json.get("casm").is_none(),
+        "casm key should be omitted when not generated"
+    );
+}
+
 #[test]
 fn daemon_build_response_roundtrip_preserves_telemetry_fields() {
     let response = DaemonResponse::Build {
@@ -285,6 +303,7 @@ fn daemon_build_response_roundtrip_preserves_telemetry_fields() {
                 cache_persist_ms: 5.0,
                 cache_persist_async: true,
                 cache_persist_scheduled: false,
+                ..BuildPhaseTelemetry::default()
             },
             compile_backend: DaemonBuildBackend::Native,
         },
@@ -337,7 +356,55 @@ fn daemon_build_response_deserializes_with_nested_telemetry_object() {
         DaemonResponse::Build { payload } => {
             assert_eq!(payload.run.elapsed_ms, 12.5);
             assert_eq!(payload.telemetry.compile_ms, 10.0);
+            assert_eq!(payload.telemetry.native_context_ms, 0.0);
+            assert_eq!(payload.telemetry.native_target_dir_ms, 0.0);
             assert_eq!(payload.compile_backend, DaemonBuildBackend::Scarb);
+        }
+        _ => panic!("expected build response"),
+    }
+}
+
+#[test]
+fn daemon_build_response_deserializes_with_native_subphase_telemetry() {
+    let json = r#"{
+        "type":"build",
+        "run":{
+            "command":["uc","build"],
+            "exit_code":0,
+            "elapsed_ms":33.0,
+            "stdout":"",
+            "stderr":""
+        },
+        "cache_hit":false,
+        "fingerprint":"f",
+        "session_key":"s",
+        "compile_backend":"native",
+        "telemetry":{
+            "fingerprint_ms":0.1,
+            "cache_lookup_ms":0.2,
+            "cache_restore_ms":0.3,
+            "compile_ms":30.0,
+            "cache_persist_ms":0.4,
+            "cache_persist_async":false,
+            "cache_persist_scheduled":false,
+            "native_context_ms":1.1,
+            "native_target_dir_ms":1.2,
+            "native_session_prepare_ms":2.3,
+            "native_frontend_compile_ms":22.4,
+            "native_casm_ms":3.5,
+            "native_artifact_write_ms":4.6
+        }
+    }"#;
+    let decoded = decode_daemon_response(json).expect("failed to decode daemon response");
+    match decoded {
+        DaemonResponse::Build { payload } => {
+            assert_eq!(payload.compile_backend, DaemonBuildBackend::Native);
+            assert_eq!(payload.telemetry.native_context_ms, 1.1);
+            assert_eq!(payload.telemetry.native_target_dir_ms, 1.2);
+            assert_eq!(payload.telemetry.native_session_prepare_ms, 2.3);
+            assert_eq!(payload.telemetry.native_frontend_compile_ms, 22.4);
+            assert_eq!(payload.telemetry.native_casm_ms, 3.5);
+            assert_eq!(payload.telemetry.native_artifact_write_ms, 4.6);
         }
         _ => panic!("expected build response"),
     }

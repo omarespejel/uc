@@ -34,6 +34,7 @@ UC_BIN="${UC_BIN:-}"
 UC_BIN_FROM_ENV=0
 CARGO_BUILD_FLAGS=()
 UC_DAEMON_SOCKET_PATH="${UC_DAEMON_SOCKET_PATH:-$TMP_DIR/uc-daemon.sock}"
+UC_DAEMON_SHARED_CACHE_DIR="${UC_DAEMON_SHARED_CACHE_DIR:-}"
 UC_DAEMON_STARTED=0
 TASKSET_ENABLED=0
 CPU_GOVERNOR="unknown"
@@ -103,6 +104,7 @@ Options:
   UC_DAEMON_CAPTURE_OUTPUT    Optional env override (0/1) for daemon build output capture
   UC_BUILD_PROFILE            UC cargo profile for benchmark binary (release|debug, default: release)
   UC_BIN                      Optional path override for uc benchmark binary
+  UC_DAEMON_SHARED_CACHE_DIR  Optional daemon shared-cache directory (default: isolated tmp dir)
   --cpu-set <list>            Optional CPU affinity list (e.g. 0 or 0-1)
   --nice-level <n>            Optional process nice level (default: 0)
   --warm-settle-seconds <n>   Wait after warm-up before warm-noop samples (default: 2.2)
@@ -454,6 +456,10 @@ if [[ "$TOOL" == "uc" ]]; then
     export UC_DAEMON_CAPTURE_OUTPUT
   fi
   if [[ "$UC_DAEMON_MODE" != "off" ]]; then
+    if [[ -z "$UC_DAEMON_SHARED_CACHE_DIR" ]]; then
+      UC_DAEMON_SHARED_CACHE_DIR="$TMP_DIR/uc-daemon-shared-cache"
+    fi
+    export UC_DAEMON_SHARED_CACHE_DIR
     UC_DAEMON_SOCKET_PATH="$UC_DAEMON_SOCKET_PATH" "$UC_BIN" daemon start >/dev/null
     UC_DAEMON_STARTED=1
   fi
@@ -594,6 +600,12 @@ pattern = re.compile(
     r"scheduled=(?P<scheduled>\w+)\s+"
     r"daemon_used=(?P<daemon_used>\w+)\s+"
     r"cache_hit=(?P<cache_hit>\w+)"
+    r"(?:\s+native_context=(?P<native_context>[0-9.]+)\s+"
+    r"native_target_dir=(?P<native_target_dir>[0-9.]+)\s+"
+    r"native_session_prepare=(?P<native_session_prepare>[0-9.]+)\s+"
+    r"native_frontend_compile=(?P<native_frontend_compile>[0-9.]+)\s+"
+    r"native_casm=(?P<native_casm>[0-9.]+)\s+"
+    r"native_artifact_write=(?P<native_artifact_write>[0-9.]+))?"
 )
 match = pattern.search(line)
 if not match:
@@ -601,6 +613,11 @@ if not match:
 
 def as_bool(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+def as_float(value) -> float:
+    if value is None or value == "":
+        return 0.0
+    return float(value)
 
 payload = {
     "elapsed_ms": elapsed_ms,
@@ -613,6 +630,12 @@ payload = {
     "persist_scheduled": as_bool(match.group("scheduled")),
     "daemon_used": as_bool(match.group("daemon_used")),
     "cache_hit": as_bool(match.group("cache_hit")),
+    "native_context_ms": as_float(match.group("native_context")),
+    "native_target_dir_ms": as_float(match.group("native_target_dir")),
+    "native_session_prepare_ms": as_float(match.group("native_session_prepare")),
+    "native_frontend_compile_ms": as_float(match.group("native_frontend_compile")),
+    "native_casm_ms": as_float(match.group("native_casm")),
+    "native_artifact_write_ms": as_float(match.group("native_artifact_write")),
 }
 with open(phase_file, "a", encoding="utf-8") as f:
     f.write(json.dumps(payload))
@@ -663,7 +686,13 @@ phase_stats_json_from_samples() {
       cache_lookup_ms: metric("cache_lookup_ms"),
       cache_restore_ms: metric("cache_restore_ms"),
       compile_ms: metric("compile_ms"),
-      cache_persist_ms: metric("cache_persist_ms")
+      cache_persist_ms: metric("cache_persist_ms"),
+      native_context_ms: metric("native_context_ms"),
+      native_target_dir_ms: metric("native_target_dir_ms"),
+      native_session_prepare_ms: metric("native_session_prepare_ms"),
+      native_frontend_compile_ms: metric("native_frontend_compile_ms"),
+      native_casm_ms: metric("native_casm_ms"),
+      native_artifact_write_ms: metric("native_artifact_write_ms")
     } end
   ' "$phase_file"
 }
@@ -786,6 +815,23 @@ reset_workload_outputs() {
   rm -rf "$cwd/target" "$cwd/.uc" "$cwd/.scarb"
 }
 
+reset_daemon_shared_cache_for_cold_run() {
+  if [[ "$TOOL" != "uc" || "$UC_DAEMON_MODE" == "off" ]]; then
+    return 0
+  fi
+  if [[ -z "${UC_DAEMON_SHARED_CACHE_DIR:-}" ]]; then
+    return 0
+  fi
+  case "$UC_DAEMON_SHARED_CACHE_DIR" in
+    "$TMP_DIR"/*) ;;
+    *)
+      echo "Refusing cold-run shared-cache reset outside benchmark tmp dir: $UC_DAEMON_SHARED_CACHE_DIR" >&2
+      exit 1
+      ;;
+  esac
+  rm -rf "$UC_DAEMON_SHARED_CACHE_DIR"
+}
+
 prime_build_dependencies_if_needed() {
   local workload="$1"
   local manifest="$2"
@@ -805,12 +851,11 @@ run_build_cold() {
   local workload="$1"
   local cwd="$2"
   local runs="$3"
-  shift 3
-  local -a command=("$@")
-  local command_string="$(command_to_string "${command[@]}")"
   local samples_file="$TMP_DIR/${TOOL}-${workload//\//_}-build-cold.samples"
   local phase_file="$TMP_DIR/${TOOL}-${workload//\//_}-build-cold.phases.ndjson"
   local baseline_dir="$TMP_DIR/cold-baselines/${workload//\//_}"
+  local run_root="$TMP_DIR/cold-runs/${workload//\//_}"
+  local command_string=""
   : > "$samples_file"
   : > "$phase_file"
 
@@ -819,11 +864,20 @@ run_build_cold() {
   rm -rf "$baseline_dir"
   cp -PR "$cwd" "$baseline_dir"
 
-  for _ in $(seq 1 "$runs"); do
-    assert_no_active_uc_cache_lock "$cwd"
-    rm -rf "$cwd"
-    cp -PR "$baseline_dir" "$cwd"
-    measure_command_ms "$cwd" "${command[@]}" >> "$samples_file"
+  for i in $(seq 1 "$runs"); do
+    local run_dir="$run_root/run-$i"
+    local run_manifest="$run_dir/Scarb.toml"
+    local -a run_command=()
+    mkdir -p "$(dirname "$run_dir")"
+    rm -rf "$run_dir"
+    cp -PR "$baseline_dir" "$run_dir"
+    reset_daemon_shared_cache_for_cold_run
+    build_command_for_manifest_with_mode "$run_manifest" "$BUILD_OFFLINE"
+    run_command=("${CMD_REPLY[@]}")
+    if [[ -z "$command_string" ]]; then
+      command_string="$(command_to_string "${run_command[@]}")"
+    fi
+    measure_command_ms "$run_dir" "${run_command[@]}" >> "$samples_file"
     record_uc_phase_sample "$phase_file"
   done
 
@@ -1035,7 +1089,7 @@ if [[ "$MATRIX" == "research" ]]; then
   fi
 
   if scenario_enabled "build.cold"; then
-    run_build_cold "hello_world" "$HELLO_DIR" "$COLD_RUNS" "${HELLO_BUILD_CMD[@]}"
+    run_build_cold "hello_world" "$HELLO_DIR" "$COLD_RUNS"
   fi
   if scenario_enabled "build.warm_noop"; then
     run_build_warm_noop "hello_world" "$HELLO_DIR" "$RUNS" "${HELLO_BUILD_CMD[@]}"
@@ -1045,7 +1099,7 @@ if [[ "$MATRIX" == "research" ]]; then
   fi
 
   if scenario_enabled "build.cold"; then
-    run_build_cold "workspaces" "$WS_DIR" "$COLD_RUNS" "${WS_BUILD_CMD[@]}"
+    run_build_cold "workspaces" "$WS_DIR" "$COLD_RUNS"
   fi
   if scenario_enabled "build.warm_noop"; then
     run_build_warm_noop "workspaces" "$WS_DIR" "$RUNS" "${WS_BUILD_CMD[@]}"
@@ -1081,7 +1135,7 @@ elif [[ "$MATRIX" == "smoke" ]]; then
   fi
 
   if scenario_enabled "build.cold"; then
-    run_build_cold "scarb_smoke" "$SMOKE_DIR" "$COLD_RUNS" "${SMOKE_BUILD_CMD[@]}"
+    run_build_cold "scarb_smoke" "$SMOKE_DIR" "$COLD_RUNS"
   fi
   if scenario_enabled "build.warm_noop"; then
     run_build_warm_noop "scarb_smoke" "$SMOKE_DIR" "$RUNS" "${SMOKE_BUILD_CMD[@]}"

@@ -476,6 +476,28 @@ struct BuildPhaseTelemetry {
     cache_persist_ms: f64,
     cache_persist_async: bool,
     cache_persist_scheduled: bool,
+    #[serde(default)]
+    native_context_ms: f64,
+    #[serde(default)]
+    native_target_dir_ms: f64,
+    #[serde(default)]
+    native_session_prepare_ms: f64,
+    #[serde(default)]
+    native_frontend_compile_ms: f64,
+    #[serde(default)]
+    native_casm_ms: f64,
+    #[serde(default)]
+    native_artifact_write_ms: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct NativeBuildPhaseTelemetry {
+    context_ms: f64,
+    target_dir_ms: f64,
+    session_prepare_ms: f64,
+    frontend_compile_ms: f64,
+    casm_ms: f64,
+    artifact_write_ms: f64,
 }
 
 #[derive(Copy, Clone)]
@@ -544,6 +566,7 @@ struct StarknetArtifactEntry {
 #[cfg(feature = "native-compile")]
 struct StarknetArtifactFiles {
     sierra: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     casm: Option<String>,
 }
 
@@ -2977,6 +3000,14 @@ fn run_build_with_uc_cache(
                     ),
                     stderr: String::new(),
                 };
+                if compile_backend == BuildCompileBackend::Native && options.use_daemon_shared_cache
+                {
+                    schedule_native_daemon_session_prewarm(
+                        common,
+                        manifest_path,
+                        &canonical_workspace_root,
+                    );
+                }
                 return Ok((
                     run,
                     true,
@@ -3015,6 +3046,13 @@ fn run_build_with_uc_cache(
                 stdout: format!("uc: cache hit, restored {} artifacts\n", restored_count),
                 stderr: String::new(),
             };
+            if compile_backend == BuildCompileBackend::Native && options.use_daemon_shared_cache {
+                schedule_native_daemon_session_prewarm(
+                    common,
+                    manifest_path,
+                    &canonical_workspace_root,
+                );
+            }
             return Ok((
                 run,
                 true,
@@ -3024,26 +3062,38 @@ fn run_build_with_uc_cache(
         }
     }
 
-    let run = match compile_backend {
+    let (run, native_phase_telemetry) = match compile_backend {
         BuildCompileBackend::Scarb => {
             let (command, command_vec) = scarb_build_command(common, manifest_path);
-            if options.capture_output {
+            let run = if options.capture_output {
                 run_command_capture(command, command_vec)?
             } else if options.inherit_output_when_uncaptured {
                 run_command_status(command, command_vec)?
             } else {
                 run_command_status_silent(command, command_vec)?
-            }
+            };
+            (run, None)
         }
-        BuildCompileBackend::Native => run_native_build(
-            common,
-            manifest_path,
-            &canonical_workspace_root,
-            profile,
-            options.use_daemon_shared_cache,
-        )?,
+        BuildCompileBackend::Native => {
+            let (run, native_phase_telemetry) = run_native_build(
+                common,
+                manifest_path,
+                &canonical_workspace_root,
+                profile,
+                options.use_daemon_shared_cache,
+            )?;
+            (run, Some(native_phase_telemetry))
+        }
     };
     telemetry.compile_ms = run.elapsed_ms;
+    if let Some(native_phase_telemetry) = native_phase_telemetry {
+        telemetry.native_context_ms = native_phase_telemetry.context_ms;
+        telemetry.native_target_dir_ms = native_phase_telemetry.target_dir_ms;
+        telemetry.native_session_prepare_ms = native_phase_telemetry.session_prepare_ms;
+        telemetry.native_frontend_compile_ms = native_phase_telemetry.frontend_compile_ms;
+        telemetry.native_casm_ms = native_phase_telemetry.casm_ms;
+        telemetry.native_artifact_write_ms = native_phase_telemetry.artifact_write_ms;
+    }
 
     if run.exit_code == 0 {
         ensure_fingerprint(&mut fingerprint, &mut telemetry)?;
@@ -3128,6 +3178,66 @@ fn run_build_with_uc_cache(
 
     let reported_fingerprint = fingerprint.unwrap_or_default();
     Ok((run, false, reported_fingerprint, telemetry))
+}
+
+#[cfg(feature = "native-compile")]
+fn native_daemon_prewarm_inflight() -> &'static Mutex<HashSet<String>> {
+    static VALUE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    VALUE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+#[cfg(feature = "native-compile")]
+fn schedule_native_daemon_session_prewarm(
+    common: &BuildCommonArgs,
+    manifest_path: &Path,
+    workspace_root: &Path,
+) {
+    let prewarm_key = format!("{}::{}", workspace_root.display(), manifest_path.display());
+    {
+        let mut inflight = native_daemon_prewarm_inflight()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !inflight.insert(prewarm_key.clone()) {
+            return;
+        }
+    }
+    let common = common.clone();
+    let manifest_path = manifest_path.to_path_buf();
+    let workspace_root = workspace_root.to_path_buf();
+    thread::spawn(move || {
+        let prewarm_result = (|| -> Result<()> {
+            let context = build_native_compile_context(&common, &manifest_path, &workspace_root)?;
+            let signature = native_compile_session_signature(&manifest_path, &context);
+            let _ = native_compile_session_handle(&workspace_root, &signature)?;
+            Ok(())
+        })();
+        if let Err(err) = prewarm_result {
+            tracing::debug!(
+                workspace_root = %workspace_root.display(),
+                manifest_path = %manifest_path.display(),
+                error = %format!("{err:#}"),
+                "daemon native session prewarm skipped"
+            );
+        } else {
+            tracing::debug!(
+                workspace_root = %workspace_root.display(),
+                manifest_path = %manifest_path.display(),
+                "daemon native session prewarmed"
+            );
+        }
+        let mut inflight = native_daemon_prewarm_inflight()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inflight.remove(&prewarm_key);
+    });
+}
+
+#[cfg(not(feature = "native-compile"))]
+fn schedule_native_daemon_session_prewarm(
+    _common: &BuildCommonArgs,
+    _manifest_path: &Path,
+    _workspace_root: &Path,
+) {
 }
 
 /// Maps Scarb package names into a safe Cairo crate key used in `cairo_project.toml`.
@@ -4163,7 +4273,7 @@ fn run_native_build(
     workspace_root: &Path,
     profile: &str,
     daemon_context: bool,
-) -> Result<CommandRun> {
+) -> Result<(CommandRun, NativeBuildPhaseTelemetry)> {
     if daemon_context {
         ensure_native_daemon_backend_available()?;
     }
@@ -4198,7 +4308,7 @@ fn run_native_build(
     workspace_root: &Path,
     profile: &str,
     daemon_context: bool,
-) -> Result<CommandRun> {
+) -> Result<(CommandRun, NativeBuildPhaseTelemetry)> {
     let _ = (
         common,
         manifest_path,
@@ -4273,7 +4383,7 @@ fn run_native_build_inner(
     manifest_path: &Path,
     workspace_root: &Path,
     profile: &str,
-) -> Result<CommandRun> {
+) -> Result<(CommandRun, NativeBuildPhaseTelemetry)> {
     let started = Instant::now();
     let context_start = Instant::now();
     let context = build_native_compile_context(common, manifest_path, workspace_root)?;
@@ -4285,143 +4395,181 @@ fn run_native_build_inner(
     let target_dir_ms = target_dir_start.elapsed().as_secs_f64() * 1000.0;
     let signature = native_compile_session_signature(manifest_path, &context);
     let compile_start = Instant::now();
-    let artifact_count = with_native_compile_session(workspace_root, &signature, |session| {
-        let crate_ids = CrateInput::into_crate_ids(&session.db, session.main_crate_inputs.clone());
-        let contracts = find_contracts(&session.db, &crate_ids);
+    let session_scope_start = Instant::now();
+    let (artifact_count, frontend_compile_ms, casm_ms, artifact_write_ms) =
+        with_native_compile_session(workspace_root, &signature, |session| {
+            let crate_ids =
+                CrateInput::into_crate_ids(&session.db, session.main_crate_inputs.clone());
+            let contracts = find_contracts(&session.db, &crate_ids);
 
-        if contracts.is_empty() {
-            let program = compile_prepared_db_program(
-                &session.db,
-                crate_ids,
-                native_compiler_config(&session.main_crate_inputs, profile),
-            )
-            .context("native cairo compile failed")?;
-            let output_name = format!("{}.sierra", context.package_name);
-            write_native_sierra_artifact(
-                &target_dir,
-                &context.package_name,
-                &output_name,
-                &program.to_string(),
-            )?;
-            return Ok(1);
-        }
-
-        let contract_refs: Vec<_> = contracts.iter().collect();
-        let contract_classes = compile_starknet_prepared_db(
-            &session.db,
-            &contract_refs,
-            native_compiler_config(&session.main_crate_inputs, profile),
-        )
-        .context("native starknet compile failed")?;
-        if contract_classes.len() != contracts.len() {
-            bail!(
-                "native compile returned mismatched contract classes (expected {}, got {})",
-                contracts.len(),
-                contract_classes.len()
-            );
-        }
-        #[cfg(debug_assertions)]
-        {
-            for (index, contract) in contracts.iter().enumerate() {
-                let mut single_class = compile_starknet_prepared_db(
+            if contracts.is_empty() {
+                let frontend_compile_start = Instant::now();
+                let program = compile_prepared_db_program(
                     &session.db,
-                    &[contract],
+                    crate_ids,
                     native_compiler_config(&session.main_crate_inputs, profile),
                 )
-                .with_context(|| {
-                    format!(
-                        "failed to validate native contract ordering for {}",
-                        contract.submodule_id.full_path(&session.db)
-                    )
-                })?;
-                let expected_class = single_class
-                    .pop()
-                    .context("single-contract native compile returned no output")?;
-                debug_assert_eq!(
-                    expected_class, contract_classes[index],
-                    "compile_starknet_prepared_db returned classes in unexpected order"
+                .context("native cairo compile failed")?;
+                let frontend_compile_ms = frontend_compile_start.elapsed().as_secs_f64() * 1000.0;
+                let artifact_write_start = Instant::now();
+                let output_name = format!("{}.sierra", context.package_name);
+                write_native_sierra_artifact(
+                    &target_dir,
+                    &context.package_name,
+                    &output_name,
+                    &program.to_string(),
+                )?;
+                let artifact_write_ms = artifact_write_start.elapsed().as_secs_f64() * 1000.0;
+                return Ok((1, frontend_compile_ms, 0.0, artifact_write_ms));
+            }
+
+            let frontend_compile_start = Instant::now();
+            let contract_refs: Vec<_> = contracts.iter().collect();
+            let contract_classes = compile_starknet_prepared_db(
+                &session.db,
+                &contract_refs,
+                native_compiler_config(&session.main_crate_inputs, profile),
+            )
+            .context("native starknet compile failed")?;
+            let frontend_compile_ms = frontend_compile_start.elapsed().as_secs_f64() * 1000.0;
+            if contract_classes.len() != contracts.len() {
+                bail!(
+                    "native compile returned mismatched contract classes (expected {}, got {})",
+                    contracts.len(),
+                    contract_classes.len()
                 );
             }
-        }
-        let mut serialized_artifacts = Vec::with_capacity(contract_classes.len().saturating_mul(2));
-        let mut keep_files = BTreeSet::new();
-        let mut contracts_manifest = Vec::with_capacity(contract_classes.len());
-        let module_paths: Vec<String> = contracts
-            .iter()
-            .map(|contract| contract.submodule_id.full_path(&session.db))
-            .collect();
-        let contract_stems = native_contract_file_stems(&module_paths);
-        // `compile_prepared_db` currently preserves input order (`contracts.par_iter().collect()`).
-        // Keep this zipped mapping explicit so a future upstream change is easy to audit here.
-        for ((module_path, contract_stem), contract_class) in module_paths
-            .into_iter()
-            .zip(contract_stems.into_iter())
-            .zip(contract_classes.into_iter())
-        {
-            let package_name = native_contract_package_name(&module_path).to_string();
-            let contract_name = native_contract_name(&module_path).to_string();
-            let artifact_id = native_starknet_artifact_id(&package_name, &module_path);
-            let file_stem = format!(
-                "{}_{}",
-                context.package_name,
-                sanitize_artifact_component(&contract_stem)
-            );
-            let artifact_file = format!("{file_stem}.contract_class.json");
-            let artifact_bytes = serde_json::to_vec(&contract_class)
-                .with_context(|| format!("failed to serialize {}", artifact_file))?;
-            serialized_artifacts.push((artifact_file.clone(), artifact_bytes));
-            keep_files.insert(artifact_file.clone());
+            #[cfg(debug_assertions)]
+            {
+                for (index, contract) in contracts.iter().enumerate() {
+                    let mut single_class = compile_starknet_prepared_db(
+                        &session.db,
+                        &[contract],
+                        native_compiler_config(&session.main_crate_inputs, profile),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "failed to validate native contract ordering for {}",
+                            contract.submodule_id.full_path(&session.db)
+                        )
+                    })?;
+                    let expected_class = single_class
+                        .pop()
+                        .context("single-contract native compile returned no output")?;
+                    debug_assert_eq!(
+                        expected_class, contract_classes[index],
+                        "compile_starknet_prepared_db returned classes in unexpected order"
+                    );
+                }
+            }
+            let artifact_pipeline_start = Instant::now();
+            let mut casm_ms = 0.0;
+            let mut serialized_artifacts =
+                Vec::with_capacity(contract_classes.len().saturating_mul(2));
+            let mut keep_files = BTreeSet::new();
+            let mut contracts_manifest = Vec::with_capacity(contract_classes.len());
+            let module_paths: Vec<String> = contracts
+                .iter()
+                .map(|contract| contract.submodule_id.full_path(&session.db))
+                .collect();
+            let contract_stems = native_contract_file_stems(&module_paths);
+            // `compile_prepared_db` currently preserves input order (`contracts.par_iter().collect()`).
+            // Keep this zipped mapping explicit so a future upstream change is easy to audit here.
+            for ((module_path, contract_stem), contract_class) in module_paths
+                .into_iter()
+                .zip(contract_stems.into_iter())
+                .zip(contract_classes.into_iter())
+            {
+                let package_name = native_contract_package_name(&module_path).to_string();
+                let contract_name = native_contract_name(&module_path).to_string();
+                let artifact_id = native_starknet_artifact_id(&package_name, &module_path);
+                let file_stem = format!(
+                    "{}_{}",
+                    context.package_name,
+                    sanitize_artifact_component(&contract_stem)
+                );
+                let artifact_file = format!("{file_stem}.contract_class.json");
+                let artifact_bytes = serde_json::to_vec(&contract_class)
+                    .with_context(|| format!("failed to serialize {}", artifact_file))?;
+                serialized_artifacts.push((artifact_file.clone(), artifact_bytes));
+                keep_files.insert(artifact_file.clone());
 
-            let casm_file = if context.starknet_target.casm {
-                let casm_contract =
-                    compile_native_casm_contract(contract_class, native_max_casm_bytecode_size())?;
-                let file_name = format!("{file_stem}.compiled_contract_class.json");
-                let casm_bytes = serde_json::to_vec(&casm_contract)
-                    .with_context(|| format!("failed to serialize {}", file_name))?;
-                serialized_artifacts.push((file_name.clone(), casm_bytes));
-                keep_files.insert(file_name.clone());
-                Some(file_name)
-            } else {
-                None
+                let casm_file = if context.starknet_target.casm {
+                    let casm_compile_start = Instant::now();
+                    let casm_contract = compile_native_casm_contract(
+                        contract_class,
+                        native_max_casm_bytecode_size(),
+                    )?;
+                    casm_ms += casm_compile_start.elapsed().as_secs_f64() * 1000.0;
+                    let file_name = format!("{file_stem}.compiled_contract_class.json");
+                    let casm_bytes = serde_json::to_vec(&casm_contract)
+                        .with_context(|| format!("failed to serialize {}", file_name))?;
+                    serialized_artifacts.push((file_name.clone(), casm_bytes));
+                    keep_files.insert(file_name.clone());
+                    Some(file_name)
+                } else {
+                    None
+                };
+
+                contracts_manifest.push(StarknetArtifactEntry {
+                    id: artifact_id,
+                    package_name,
+                    contract_name,
+                    module_path,
+                    artifacts: StarknetArtifactFiles {
+                        sierra: artifact_file,
+                        casm: casm_file,
+                    },
+                });
+            }
+            contracts_manifest.sort_by(|left, right| left.id.cmp(&right.id));
+            let serialized_artifact_count = serialized_artifacts.len();
+            let manifest = StarknetArtifactsManifest {
+                version: 1,
+                contracts: contracts_manifest,
             };
-
-            contracts_manifest.push(StarknetArtifactEntry {
-                id: artifact_id,
-                package_name,
-                contract_name,
-                module_path,
-                artifacts: StarknetArtifactFiles {
-                    sierra: artifact_file,
-                    casm: casm_file,
-                },
-            });
-        }
-        contracts_manifest.sort_by(|left, right| left.id.cmp(&right.id));
-        let serialized_artifact_count = serialized_artifacts.len();
-        let manifest = StarknetArtifactsManifest {
-            version: 1,
-            contracts: contracts_manifest,
-        };
-        let manifest_name = format!("{}.starknet_artifacts.json", context.package_name);
-        keep_files.insert(manifest_name.clone());
-        for (file_name, bytes) in serialized_artifacts {
-            let artifact_path = target_dir.join(&file_name);
-            ensure_path_within_root(&target_dir, &artifact_path, "native artifact output path")?;
-            fs::write(&artifact_path, bytes)
-                .with_context(|| format!("failed to write {}", artifact_path.display()))?;
-        }
-        let manifest_path = target_dir.join(&manifest_name);
-        ensure_path_within_root(
-            &target_dir,
-            &manifest_path,
-            "native starknet artifacts manifest path",
-        )?;
-        write_json_file_compact(&manifest_path, &manifest)
-            .with_context(|| format!("failed to write {}", manifest_path.display()))?;
-        prune_native_target_outputs(&target_dir, &context.package_name, &keep_files)?;
-        Ok(serialized_artifact_count + 1)
-    })?;
+            let manifest_name = format!("{}.starknet_artifacts.json", context.package_name);
+            keep_files.insert(manifest_name.clone());
+            for (file_name, bytes) in serialized_artifacts {
+                let artifact_path = target_dir.join(&file_name);
+                ensure_path_within_root(
+                    &target_dir,
+                    &artifact_path,
+                    "native artifact output path",
+                )?;
+                fs::write(&artifact_path, bytes)
+                    .with_context(|| format!("failed to write {}", artifact_path.display()))?;
+            }
+            let manifest_path = target_dir.join(&manifest_name);
+            ensure_path_within_root(
+                &target_dir,
+                &manifest_path,
+                "native starknet artifacts manifest path",
+            )?;
+            write_json_file_compact(&manifest_path, &manifest)
+                .with_context(|| format!("failed to write {}", manifest_path.display()))?;
+            prune_native_target_outputs(&target_dir, &context.package_name, &keep_files)?;
+            let artifact_pipeline_ms = artifact_pipeline_start.elapsed().as_secs_f64() * 1000.0;
+            let artifact_write_ms = (artifact_pipeline_ms - casm_ms).max(0.0);
+            Ok((
+                serialized_artifact_count + 1,
+                frontend_compile_ms,
+                casm_ms,
+                artifact_write_ms,
+            ))
+        })?;
     let compile_ms = compile_start.elapsed().as_secs_f64() * 1000.0;
+    let session_scope_ms = session_scope_start.elapsed().as_secs_f64() * 1000.0;
+    let session_prepare_ms =
+        (session_scope_ms - frontend_compile_ms - casm_ms - artifact_write_ms).max(0.0);
+    let native_phase_telemetry = NativeBuildPhaseTelemetry {
+        context_ms,
+        target_dir_ms,
+        session_prepare_ms,
+        frontend_compile_ms,
+        casm_ms,
+        artifact_write_ms,
+    };
     let run = CommandRun {
         command: vec![
             "uc-native".to_string(),
@@ -4442,12 +4590,16 @@ fn run_native_build_inner(
         profile,
         context_ms,
         target_dir_ms,
+        session_prepare_ms,
+        frontend_compile_ms,
+        casm_ms,
+        artifact_write_ms,
         compile_ms,
         total_ms = run.elapsed_ms,
         artifact_count,
         "native build cold-path telemetry"
     );
-    Ok(run)
+    Ok((run, native_phase_telemetry))
 }
 
 #[cfg(feature = "native-compile")]

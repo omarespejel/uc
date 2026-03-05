@@ -243,6 +243,10 @@ fn normalize_contract_class_compiler_version_triplet(value: &mut Value) {
         return;
     };
     if sierra_major != 1 {
+        tracing::debug!(
+            sierra_major,
+            "normalize_contract_class_compiler_version_triplet: unrecognized Sierra major version; skipping normalization"
+        );
         return;
     }
     if value_hex_u64(&program[1]).is_none()

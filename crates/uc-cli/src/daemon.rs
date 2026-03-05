@@ -209,18 +209,28 @@ pub(super) fn daemon_request_with_timeouts(
     }
 }
 
-// Parse via serde_json::Value first, then deserialize into the protocol type. This preserves
-// compatibility with our tagged+flattened daemon payload decoding across serde versions.
+// Prefer single-pass decode; keep a Value fallback for tagged+flattened compatibility quirks
+// observed across serde versions.
 pub(super) fn decode_daemon_request(line: &str) -> serde_json::Result<DaemonRequest> {
-    let value: serde_json::Value = serde_json::from_str(line)?;
-    serde_json::from_value(value)
+    match serde_json::from_str::<DaemonRequest>(line) {
+        Ok(request) => Ok(request),
+        Err(_) => {
+            let value: serde_json::Value = serde_json::from_str(line)?;
+            serde_json::from_value(value)
+        }
+    }
 }
 
-// Parse via serde_json::Value first, then deserialize into the protocol type. This preserves
-// compatibility with our tagged+flattened daemon payload decoding across serde versions.
+// Prefer single-pass decode; keep a Value fallback for tagged+flattened compatibility quirks
+// observed across serde versions.
 pub(super) fn decode_daemon_response(line: &str) -> serde_json::Result<DaemonResponse> {
-    let value: serde_json::Value = serde_json::from_str(line)?;
-    serde_json::from_value(value)
+    match serde_json::from_str::<DaemonResponse>(line) {
+        Ok(response) => Ok(response),
+        Err(_) => {
+            let value: serde_json::Value = serde_json::from_str(line)?;
+            serde_json::from_value(value)
+        }
+    }
 }
 
 #[cfg(unix)]

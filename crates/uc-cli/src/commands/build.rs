@@ -103,8 +103,18 @@ fn prune_daemon_local_probe_hints(hint_dir: &Path) -> Result<()> {
         {
             continue;
         }
-        let metadata =
-            fs::metadata(&path).with_context(|| format!("failed to stat {}", path.display()))?;
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    path = %path.display(),
+                    "failed to stat hint file during pruning; skipping"
+                );
+                continue;
+            }
+        };
         let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
         if now.duration_since(modified).unwrap_or_default() > max_age {
             let _ = fs::remove_file(&path);
@@ -723,7 +733,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
     if should_log_phase_telemetry() {
         if let Some(telemetry) = phase_telemetry.as_ref() {
             eprintln!(
-                "uc: phase timings (ms) fingerprint={:.3} cache_lookup={:.3} cache_restore={:.3} compile={:.3} cache_persist={:.3} async={} scheduled={} daemon_used={} cache_hit={}",
+                "uc: phase timings (ms) fingerprint={:.3} cache_lookup={:.3} cache_restore={:.3} compile={:.3} cache_persist={:.3} async={} scheduled={} daemon_used={} cache_hit={} native_context={:.3} native_target_dir={:.3} native_session_prepare={:.3} native_frontend_compile={:.3} native_casm={:.3} native_artifact_write={:.3}",
                 telemetry.fingerprint_ms,
                 telemetry.cache_lookup_ms,
                 telemetry.cache_restore_ms,
@@ -732,7 +742,13 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                 telemetry.cache_persist_async,
                 telemetry.cache_persist_scheduled,
                 daemon_used,
-                cache_hit
+                cache_hit,
+                telemetry.native_context_ms,
+                telemetry.native_target_dir_ms,
+                telemetry.native_session_prepare_ms,
+                telemetry.native_frontend_compile_ms,
+                telemetry.native_casm_ms,
+                telemetry.native_artifact_write_ms
             );
         }
     }
@@ -829,6 +845,35 @@ mod tests {
             !daemon_local_native_supported_hint(&workspace, &primary_session_key)
                 .expect("failed to read native-supported hint after clear"),
             "native-supported hint should be removed after clear operation"
+        );
+
+        fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_daemon_local_probe_hints_skips_dangling_entries() {
+        let workspace = unique_test_dir("uc-daemon-probe-hint-prune");
+        let hint_dir = workspace.join(".uc/cache/probe-hints");
+        fs::create_dir_all(&hint_dir).expect("failed to create hint directory");
+
+        let valid_key = "d".repeat(SESSION_KEY_LEN);
+        let valid_hint = hint_dir.join(format!("{valid_key}{DAEMON_LOCAL_PROBE_HINT_SUFFIX}"));
+        fs::write(&valid_hint, format!("{}\n", "e".repeat(SESSION_KEY_LEN)))
+            .expect("failed to write valid hint");
+
+        let dangling_key = "f".repeat(SESSION_KEY_LEN);
+        let dangling_hint =
+            hint_dir.join(format!("{dangling_key}{DAEMON_LOCAL_PROBE_HINT_SUFFIX}"));
+        let missing_target = hint_dir.join("missing-target");
+        std::os::unix::fs::symlink(&missing_target, &dangling_hint)
+            .expect("failed to create dangling hint symlink");
+
+        prune_daemon_local_probe_hints(&hint_dir)
+            .expect("prune should ignore dangling hint entries");
+        assert!(
+            valid_hint.exists(),
+            "valid hint should remain after pruning dangling entries"
         );
 
         fs::remove_dir_all(&workspace).ok();
