@@ -313,7 +313,7 @@ fi
 if [[ "${#SCENARIO_FILTERS[@]}" -gt 0 ]]; then
   for scenario in "${SCENARIO_FILTERS[@]}"; do
     case "$MATRIX:$scenario" in
-      research:build.cold|research:build.warm_noop|research:build.warm_edit|research:metadata.online_cold|research:metadata.offline_warm) ;;
+      research:build.cold|research:build.warm_noop|research:build.warm_edit|research:build.warm_edit_semantic|research:metadata.online_cold|research:metadata.offline_warm) ;;
       smoke:build.cold|smoke:build.warm_noop|smoke:build.warm_edit|smoke:build.warm_edit_semantic) ;;
       *)
         echo "Scenario '$scenario' is not supported for matrix '$MATRIX'" >&2
@@ -1083,7 +1083,7 @@ if [[ "$MATRIX" == "research" ]]; then
   build_command_for_manifest "$WS_MANIFEST"
   WS_BUILD_CMD=("${CMD_REPLY[@]}")
 
-  if scenario_enabled "build.cold" || scenario_enabled "build.warm_noop" || scenario_enabled "build.warm_edit"; then
+  if scenario_enabled "build.cold" || scenario_enabled "build.warm_noop" || scenario_enabled "build.warm_edit" || scenario_enabled "build.warm_edit_semantic"; then
     prime_build_dependencies_if_needed "hello_world" "$HELLO_MANIFEST"
     prime_build_dependencies_if_needed "workspaces" "$WS_MANIFEST"
   fi
@@ -1097,6 +1097,9 @@ if [[ "$MATRIX" == "research" ]]; then
   if scenario_enabled "build.warm_edit"; then
     run_build_warm_edit "hello_world" "$HELLO_DIR" "$HELLO_DIR/src/lib.cairo" "$RUNS" "${HELLO_BUILD_CMD[@]}"
   fi
+  if scenario_enabled "build.warm_edit_semantic"; then
+    run_build_warm_edit_semantic "hello_world" "$HELLO_DIR" "$HELLO_DIR/src/lib.cairo" "$RUNS" "${HELLO_BUILD_CMD[@]}"
+  fi
 
   if scenario_enabled "build.cold"; then
     run_build_cold "workspaces" "$WS_DIR" "$COLD_RUNS"
@@ -1106,6 +1109,9 @@ if [[ "$MATRIX" == "research" ]]; then
   fi
   if scenario_enabled "build.warm_edit"; then
     run_build_warm_edit "workspaces" "$WS_DIR" "$WS_DIR/crates/fibonacci/src/lib.cairo" "$RUNS" "${WS_BUILD_CMD[@]}"
+  fi
+  if scenario_enabled "build.warm_edit_semantic"; then
+    run_build_warm_edit_semantic "workspaces" "$WS_DIR" "$WS_DIR/crates/fibonacci/src/lib.cairo" "$RUNS" "${WS_BUILD_CMD[@]}"
   fi
 
   if scenario_enabled "metadata.online_cold" || scenario_enabled "metadata.offline_warm"; then

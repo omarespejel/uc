@@ -40,7 +40,7 @@ jobs:
 
       - name: Run smoke compare-build gate
         run: |
-          ./target/debug/uc compare-build \
+          ./target/release/uc compare-build \
             --manifest-path benchmarks/fixtures/scarb_smoke/Scarb.toml \
             --clean-before-each true \
             --output-path benchmarks/results/compare-smoke.json
@@ -205,6 +205,13 @@ jobs:
 
       - name: Build uc CLI
         run: cargo build -p uc-cli
+
+      - name: Normalize checkout text mode on Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          git config --global core.autocrlf false
+          git reset --hard HEAD
 
       - name: Capture fingerprint/session key
         shell: bash
