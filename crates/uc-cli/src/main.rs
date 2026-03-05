@@ -168,8 +168,8 @@ const DEFAULT_UC_NATIVE_DISALLOW_SCARB_FALLBACK: bool = false;
 const TOOLCHAIN_CHECK_CACHE_SCHEMA_VERSION: u32 = 1;
 const MAX_TOOLCHAIN_CHECK_CACHE_BYTES: u64 = 64 * 1024;
 /// Default Starknet CASM bytecode limit used by native compile.
-/// Mirrors the current Cairo/Scarb default (81_290) used for Starknet contract
-/// class validation and can be overridden with
+/// Mirrors the cairo-lang/scarb default used by contract class validation
+/// (81_290 as of cairo-lang 2.16.0 / Scarb 2.14.x) and can be overridden with
 /// `UC_NATIVE_MAX_CASM_BYTECODE_SIZE` for network-specific tuning.
 /// Reference:
 /// https://docs.starknet.io/architecture-and-concepts/smart-contracts/contract-classes/
@@ -3969,6 +3969,8 @@ fn collect_native_dependency_table_surface(
     path_roots: &mut BTreeMap<String, PathBuf>,
 ) {
     for (dependency_name, dependency_value) in table {
+        // `starknet` is provided by the compiler/plugin suite directly; every
+        // other dependency must resolve to a supported local path source.
         if dependency_name == "starknet" {
             continue;
         }
@@ -5808,7 +5810,8 @@ fn run_native_build_inner(
             removed_files = session.removed_files.len(),
             "native session snapshot delta"
         );
-        let crate_ids = CrateInput::into_crate_ids(&session.db, session.main_crate_inputs.clone());
+        let crate_ids =
+            CrateInput::into_crate_ids(&session.db, session.main_crate_inputs.iter().cloned());
         let contracts = find_contracts(&session.db, &crate_ids);
 
         if contracts.is_empty() {

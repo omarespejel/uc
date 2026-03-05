@@ -293,6 +293,14 @@ fn run_uc_build_output_only_with_env_overrides(
     } else {
         command.env_remove("UC_DAEMON_SOCKET_PATH");
     }
+    if let Some(path) = overrides.path_override {
+        command.env("PATH", path);
+    }
+    if let Some(version) = overrides.scarb_version_override {
+        command.env("UC_SCARB_VERSION_LINE", version);
+    } else {
+        command.env_remove("UC_SCARB_VERSION_LINE");
+    }
     if let Some(mode) = overrides.native_mode_override {
         command.env("UC_NATIVE_BUILD_MODE", mode);
     } else {
@@ -1244,6 +1252,51 @@ fn integration_native_require_mode_succeeds_without_scarb_on_supported_fixture()
     assert!(
         warm_report.cache_hit,
         "native require warm build should hit cache without scarb available"
+    );
+}
+
+#[test]
+fn integration_output_only_helper_applies_path_and_scarb_version_overrides() {
+    let _guard = serial_guard();
+    if !scarb_available() {
+        eprintln!(
+            "skipping integration_output_only_helper_applies_path_and_scarb_version_overrides: scarb not available"
+        );
+        return;
+    }
+    let workspace = make_test_workspace("output-only-env-overrides");
+    let manifest = workspace.root.join("Scarb.toml");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be after unix epoch")
+        .as_nanos();
+    let no_scarb_path = std::env::temp_dir().join(format!(
+        "uc-it-no-scarb-output-only-{}-{nonce}",
+        std::process::id()
+    ));
+
+    let output = run_uc_build_output_only_with_env_overrides(
+        &workspace.root,
+        &manifest,
+        "off",
+        None,
+        BuildEnvOverrides {
+            path_override: Some(&no_scarb_path),
+            scarb_version_override: Some("scarb 9.9.9 (output-only-override-test)"),
+            native_mode_override: Some("off"),
+            ..BuildEnvOverrides::default()
+        },
+    );
+    assert!(
+        !output.status.success(),
+        "PATH override should hide scarb and force build failure in output-only helper"
+    );
+    let combined = output_to_utf8(&output);
+    assert!(
+        combined.contains("failed to execute `scarb build`")
+            || combined.contains("No such file")
+            || combined.contains("not found"),
+        "unexpected output when PATH/scarb overrides are applied: {combined}"
     );
 }
 

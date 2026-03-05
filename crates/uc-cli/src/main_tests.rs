@@ -1,5 +1,6 @@
 use super::*;
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::sync::{Arc, Mutex, OnceLock as TestOnceLock};
 use std::thread;
@@ -47,6 +48,29 @@ impl CurrentDirRestore {
 impl Drop for CurrentDirRestore {
     fn drop(&mut self) {
         let _ = std::env::set_current_dir(&self.original);
+    }
+}
+
+struct ScopedEnvVar {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl ScopedEnvVar {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.as_ref() {
+            std::env::set_var(self.key, previous);
+        } else {
+            std::env::remove_var(self.key);
+        }
     }
 }
 
@@ -903,7 +927,7 @@ fn try_uc_build_via_daemon_auto_mode_falls_back_on_daemon_error() {
             .expect("failed to write daemon response delimiter");
         stream.flush().expect("failed to flush daemon response");
     });
-    std::env::set_var("UC_DAEMON_SOCKET_PATH", &socket_path);
+    let _socket_env = ScopedEnvVar::set("UC_DAEMON_SOCKET_PATH", &socket_path);
 
     let common = BuildCommonArgs {
         manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
@@ -925,7 +949,6 @@ fn try_uc_build_via_daemon_auto_mode_falls_back_on_daemon_error() {
     assert!(result.is_none());
 
     server.join().expect("daemon test server panicked");
-    std::env::remove_var("UC_DAEMON_SOCKET_PATH");
     let _ = fs::remove_file(&socket_path);
 }
 
@@ -963,7 +986,7 @@ fn try_uc_build_via_daemon_require_mode_surfaces_daemon_error() {
             .expect("failed to write daemon response delimiter");
         stream.flush().expect("failed to flush daemon response");
     });
-    std::env::set_var("UC_DAEMON_SOCKET_PATH", &socket_path);
+    let _socket_env = ScopedEnvVar::set("UC_DAEMON_SOCKET_PATH", &socket_path);
 
     let common = BuildCommonArgs {
         manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
@@ -989,7 +1012,6 @@ fn try_uc_build_via_daemon_require_mode_surfaces_daemon_error() {
     );
 
     server.join().expect("daemon test server panicked");
-    std::env::remove_var("UC_DAEMON_SOCKET_PATH");
     let _ = fs::remove_file(&socket_path);
 }
 
@@ -1029,7 +1051,7 @@ fn try_uc_build_via_daemon_require_mode_rejects_backend_mismatch() {
             .expect("failed to write daemon response delimiter");
         stream.flush().expect("failed to flush daemon response");
     });
-    std::env::set_var("UC_DAEMON_SOCKET_PATH", &socket_path);
+    let _socket_env = ScopedEnvVar::set("UC_DAEMON_SOCKET_PATH", &socket_path);
 
     let common = BuildCommonArgs {
         manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
@@ -1055,7 +1077,6 @@ fn try_uc_build_via_daemon_require_mode_rejects_backend_mismatch() {
     );
 
     server.join().expect("daemon test server panicked");
-    std::env::remove_var("UC_DAEMON_SOCKET_PATH");
     let _ = fs::remove_file(&socket_path);
 }
 
@@ -4742,9 +4763,15 @@ fn compile_native_casm_contract_rejects_tiny_bytecode_limit() {
     let err = compile_native_casm_contract(contract_class, 1)
         .expect_err("tiny CASM bytecode limit should fail for fixture contract");
     let message = format!("{err:#}");
+    let normalized = message.to_ascii_lowercase();
     assert!(
         message.contains("failed to compile native CASM contract class"),
         "expected CASM compile failure context, got: {message}"
+    );
+    assert!(
+        (normalized.contains("bytecode") || normalized.contains("code size"))
+            && (normalized.contains("limit") || normalized.contains("exceed")),
+        "expected CASM bytecode size-limit rejection, got: {message}"
     );
 }
 
