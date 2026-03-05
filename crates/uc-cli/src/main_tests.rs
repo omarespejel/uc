@@ -1179,7 +1179,7 @@ fn build_env_fingerprint_prefix_override_can_disable_default_prefixes() {
 }
 
 #[test]
-fn scarb_build_command_keeps_artifacts_fingerprint_enabled_by_default() {
+fn scarb_build_command_disables_artifacts_fingerprint_by_default() {
     let _guard = integration_env_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1199,15 +1199,15 @@ fn scarb_build_command_keeps_artifacts_fingerprint_enabled_by_default() {
         .find(|(key, _)| *key == std::ffi::OsStr::new("SCARB_ARTIFACTS_FINGERPRINT"))
         .and_then(|(_, value)| value)
         .map(|value| value.to_string_lossy().to_string());
-    assert_eq!(configured.as_deref(), Some("1"));
+    assert_eq!(configured.as_deref(), Some("0"));
 }
 
 #[test]
-fn scarb_build_command_can_disable_artifacts_fingerprint() {
+fn scarb_build_command_can_reenable_artifacts_fingerprint() {
     let _guard = integration_env_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    std::env::set_var("UC_DISABLE_SCARB_ARTIFACTS_FINGERPRINT", "1");
+    std::env::set_var("UC_DISABLE_SCARB_ARTIFACTS_FINGERPRINT", "0");
     let common = BuildCommonArgs {
         manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
         package: None,
@@ -1223,7 +1223,7 @@ fn scarb_build_command_can_disable_artifacts_fingerprint() {
         .find(|(key, _)| *key == std::ffi::OsStr::new("SCARB_ARTIFACTS_FINGERPRINT"))
         .and_then(|(_, value)| value)
         .map(|value| value.to_string_lossy().to_string());
-    assert_eq!(configured.as_deref(), Some("0"));
+    assert_eq!(configured.as_deref(), Some("1"));
     std::env::remove_var("UC_DISABLE_SCARB_ARTIFACTS_FINGERPRINT");
 }
 
