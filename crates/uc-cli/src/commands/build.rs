@@ -235,6 +235,29 @@ fn clear_daemon_local_native_supported_hint(
     }
 }
 
+fn should_probe_local_before_daemon(
+    daemon_mode: DaemonModeArg,
+    daemon_socket_available: bool,
+) -> bool {
+    match daemon_mode {
+        DaemonModeArg::Off => false,
+        DaemonModeArg::Auto => daemon_socket_available,
+        DaemonModeArg::Require => true,
+    }
+}
+
+fn daemon_socket_available_for_client() -> Result<bool> {
+    #[cfg(not(unix))]
+    {
+        Ok(false)
+    }
+    #[cfg(unix)]
+    {
+        let socket_path = daemon_socket_path(None)?;
+        Ok(socket_path.exists())
+    }
+}
+
 pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
     let common = args.common;
     let report_path = args.report_path;
@@ -552,62 +575,76 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                     (run, cache_hit, fingerprint)
                 }
                 DaemonModeArg::Auto => {
-                    let (
-                        daemon_compile_backend,
-                        daemon_native_fallback_to_scarb,
-                        compiler_version,
-                        local_session_key,
-                    ) = resolve_daemon_backend_context()?;
-                    if let Some((run, fingerprint, telemetry, hit_session_key)) =
-                        try_daemon_local_probe(
-                            &local_session_key,
-                            &compiler_version,
-                            daemon_native_fallback_to_scarb,
-                        )?
-                    {
-                        session_key = hit_session_key;
-                        phase_telemetry = Some(telemetry);
-                        (run, true, fingerprint)
-                    } else if let Some(response) = try_uc_build_via_daemon(
-                        &common,
-                        &manifest_path,
-                        true,
-                        daemon_compile_backend,
-                        daemon_native_fallback_to_scarb,
-                    )? {
-                        if daemon_native_fallback_to_scarb
-                            && response.compile_backend == DaemonBuildBackend::Scarb
-                            && response.session_key != local_session_key
-                        {
-                            let _ = persist_daemon_local_probe_hint(
-                                &workspace_root,
-                                &local_session_key,
-                                &response.session_key,
-                            );
-                            let _ = clear_daemon_local_native_supported_hint(
-                                &workspace_root,
-                                &local_session_key,
-                            );
-                        } else if response.session_key == local_session_key {
-                            let _ =
-                                clear_daemon_local_probe_hint(&workspace_root, &local_session_key);
-                            if response.compile_backend == DaemonBuildBackend::Native {
-                                let _ = persist_daemon_local_native_supported_hint(
-                                    &workspace_root,
-                                    &local_session_key,
-                                );
-                            }
-                        }
-                        daemon_used = true;
-                        session_key = response.session_key;
-                        phase_telemetry = Some(response.telemetry);
-                        (response.run, response.cache_hit, response.fingerprint)
-                    } else {
+                    let daemon_socket_available = daemon_socket_available_for_client()?;
+                    if !should_probe_local_before_daemon(
+                        DaemonModeArg::Auto,
+                        daemon_socket_available,
+                    ) {
                         let (run, cache_hit, fingerprint, fallback_session_key, telemetry) =
                             run_local_for_native_mode(native_mode)?;
                         session_key = fallback_session_key;
                         phase_telemetry = Some(telemetry);
                         (run, cache_hit, fingerprint)
+                    } else {
+                        let (
+                            daemon_compile_backend,
+                            daemon_native_fallback_to_scarb,
+                            compiler_version,
+                            local_session_key,
+                        ) = resolve_daemon_backend_context()?;
+                        if let Some((run, fingerprint, telemetry, hit_session_key)) =
+                            try_daemon_local_probe(
+                                &local_session_key,
+                                &compiler_version,
+                                daemon_native_fallback_to_scarb,
+                            )?
+                        {
+                            session_key = hit_session_key;
+                            phase_telemetry = Some(telemetry);
+                            (run, true, fingerprint)
+                        } else if let Some(response) = try_uc_build_via_daemon(
+                            &common,
+                            &manifest_path,
+                            true,
+                            daemon_compile_backend,
+                            daemon_native_fallback_to_scarb,
+                        )? {
+                            if daemon_native_fallback_to_scarb
+                                && response.compile_backend == DaemonBuildBackend::Scarb
+                                && response.session_key != local_session_key
+                            {
+                                let _ = persist_daemon_local_probe_hint(
+                                    &workspace_root,
+                                    &local_session_key,
+                                    &response.session_key,
+                                );
+                                let _ = clear_daemon_local_native_supported_hint(
+                                    &workspace_root,
+                                    &local_session_key,
+                                );
+                            } else if response.session_key == local_session_key {
+                                let _ = clear_daemon_local_probe_hint(
+                                    &workspace_root,
+                                    &local_session_key,
+                                );
+                                if response.compile_backend == DaemonBuildBackend::Native {
+                                    let _ = persist_daemon_local_native_supported_hint(
+                                        &workspace_root,
+                                        &local_session_key,
+                                    );
+                                }
+                            }
+                            daemon_used = true;
+                            session_key = response.session_key;
+                            phase_telemetry = Some(response.telemetry);
+                            (response.run, response.cache_hit, response.fingerprint)
+                        } else {
+                            let (run, cache_hit, fingerprint, fallback_session_key, telemetry) =
+                                run_local_for_native_mode(native_mode)?;
+                            session_key = fallback_session_key;
+                            phase_telemetry = Some(telemetry);
+                            (run, cache_hit, fingerprint)
+                        }
                     }
                 }
                 DaemonModeArg::Require => {
@@ -781,5 +818,35 @@ mod tests {
         );
 
         fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[test]
+    fn should_probe_local_before_daemon_follows_mode_policy() {
+        assert!(
+            !should_probe_local_before_daemon(DaemonModeArg::Off, false),
+            "daemon off should never probe local pre-daemon path"
+        );
+        assert!(
+            !should_probe_local_before_daemon(DaemonModeArg::Off, true),
+            "daemon off should never probe local pre-daemon path"
+        );
+
+        assert!(
+            !should_probe_local_before_daemon(DaemonModeArg::Auto, false),
+            "daemon auto should skip pre-daemon probe when daemon socket is unavailable"
+        );
+        assert!(
+            should_probe_local_before_daemon(DaemonModeArg::Auto, true),
+            "daemon auto should probe local cache when daemon socket is available"
+        );
+
+        assert!(
+            should_probe_local_before_daemon(DaemonModeArg::Require, false),
+            "daemon require should still probe local cache first to preserve cache-hit fast path"
+        );
+        assert!(
+            should_probe_local_before_daemon(DaemonModeArg::Require, true),
+            "daemon require should probe local cache when daemon is available"
+        );
     }
 }
