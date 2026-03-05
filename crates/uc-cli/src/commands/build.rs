@@ -113,11 +113,11 @@ fn prune_daemon_local_probe_hints(hint_dir: &Path) -> Result<()> {
         entries.push((path, modified));
     }
     entries.sort_by_key(|(_, modified)| *modified);
-    while entries.len() > DAEMON_LOCAL_PROBE_HINT_MAX_ENTRIES {
-        if let Some((path, _)) = entries.first() {
-            let _ = fs::remove_file(path);
-        }
-        entries.remove(0);
+    let stale_count = entries
+        .len()
+        .saturating_sub(DAEMON_LOCAL_PROBE_HINT_MAX_ENTRIES);
+    for (path, _) in entries.into_iter().take(stale_count) {
+        let _ = fs::remove_file(path);
     }
     Ok(())
 }
@@ -499,20 +499,31 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                 } else {
                     false
                 };
+                let mut tried_current_scarb_probe = false;
                 if include_scarb_fallback_probe && !native_supported_hint {
                     if let Some(hinted_session_key) =
                         load_daemon_local_probe_hint(&workspace_root, primary_session_key)?
                     {
-                        let (scarb_compiler_version, _) = resolve_scarb_probe_context()?;
-                        if let Some((run, fingerprint, telemetry)) = try_local_uc_cache_hit(
-                            &common,
-                            &manifest_path,
-                            &workspace_root,
-                            &profile,
-                            &hinted_session_key,
-                            &scarb_compiler_version,
-                        )? {
-                            return Ok(Some((run, fingerprint, telemetry, hinted_session_key)));
+                        let (scarb_compiler_version, scarb_session_key) =
+                            resolve_scarb_probe_context()?;
+                        if hinted_session_key != scarb_session_key {
+                            let _ = persist_daemon_local_probe_hint(
+                                &workspace_root,
+                                primary_session_key,
+                                &scarb_session_key,
+                            );
+                        } else {
+                            tried_current_scarb_probe = true;
+                            if let Some((run, fingerprint, telemetry)) = try_local_uc_cache_hit(
+                                &common,
+                                &manifest_path,
+                                &workspace_root,
+                                &profile,
+                                &scarb_session_key,
+                                &scarb_compiler_version,
+                            )? {
+                                return Ok(Some((run, fingerprint, telemetry, scarb_session_key)));
+                            }
                         }
                     }
                 }
@@ -538,7 +549,10 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                         primary_session_key.to_string(),
                     )));
                 }
-                if include_scarb_fallback_probe && !native_supported_hint {
+                if include_scarb_fallback_probe
+                    && !native_supported_hint
+                    && !tried_current_scarb_probe
+                {
                     let (scarb_compiler_version, scarb_session_key) =
                         resolve_scarb_probe_context()?;
                     if scarb_session_key != primary_session_key {
