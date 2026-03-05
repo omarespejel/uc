@@ -3139,7 +3139,6 @@ fn run_build_with_uc_cache(
                     &objects_dir,
                     native_artifact_relative_paths.as_deref(),
                 )?;
-                precomputed_cached_artifacts = Some(shared_cached_artifacts.clone());
                 if let Err(err) = persist_daemon_shared_cache_entry_with_artifacts(
                     &canonical_workspace_root,
                     profile,
@@ -3157,6 +3156,7 @@ fn run_build_with_uc_cache(
                     telemetry.cache_persist_ms =
                         shared_persist_start.elapsed().as_secs_f64() * 1000.0;
                 }
+                precomputed_cached_artifacts = Some(shared_cached_artifacts);
             }
             let persist_scope_key = async_persist_scope_key(&canonical_workspace_root, profile);
             if try_mark_async_persist_in_flight(&persist_scope_key) {
