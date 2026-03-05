@@ -23,9 +23,22 @@
       "min_median_p95_delta_percent": 0.0
     },
     {
+      "scenario": "build.warm_edit_semantic",
+      "workload": "hello_world",
+      "min_median_p95_delta_percent": -10.0,
+      "min_single_cycle_p95_delta_percent": -25.0
+    },
+    {
+      "scenario": "build.warm_edit_semantic",
+      "workload": "workspaces",
+      "min_median_p95_delta_percent": -10.0,
+      "min_single_cycle_p95_delta_percent": -25.0
+    },
+    {
       "scenario": "build.cold",
       "workload": "workspaces",
-      "min_median_p95_delta_percent": 0.0
+      "min_median_p95_delta_percent": 0.0,
+      "min_single_cycle_p95_delta_percent": -25.0
     },
     {
       "scenario": "metadata.online_cold",

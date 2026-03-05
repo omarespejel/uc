@@ -307,6 +307,12 @@ pub(super) fn daemon_status_snapshot(
         native_refresh_full_rebuild_count: native_cache.refresh_full_rebuild_count,
         native_refresh_changed_files_total: native_cache.refresh_changed_files_total,
         native_refresh_removed_files_total: native_cache.refresh_removed_files_total,
+        native_fallback_preflight_ineligible_count: native_cache
+            .fallback_preflight_ineligible_count,
+        native_fallback_local_native_error_count: native_cache.fallback_local_native_error_count,
+        native_fallback_daemon_native_error_count: native_cache.fallback_daemon_native_error_count,
+        native_fallback_daemon_backend_downgrade_count: native_cache
+            .fallback_daemon_backend_downgrade_count,
     }
 }
 

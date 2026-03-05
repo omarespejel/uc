@@ -12,11 +12,13 @@ use cairo_lang_defs::ids::ModuleId;
 #[cfg(feature = "native-compile")]
 use cairo_lang_defs::ids::TopLevelLanguageElementId;
 #[cfg(feature = "native-compile")]
-use cairo_lang_filesystem::db::init_dev_corelib;
+use cairo_lang_filesystem::db::{init_dev_corelib, FilesGroup};
 #[cfg(feature = "native-compile")]
 use cairo_lang_filesystem::ids::CrateInput;
 #[cfg(feature = "native-compile")]
-use cairo_lang_filesystem::ids::FileLongId;
+use cairo_lang_filesystem::ids::{FileId, FileLongId};
+#[cfg(feature = "native-compile")]
+use cairo_lang_filesystem::override_file_content;
 #[cfg(feature = "native-compile")]
 use cairo_lang_lowering::optimizations::config::Optimizations;
 #[cfg(feature = "native-compile")]
@@ -36,8 +38,6 @@ use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use notify::event::{ModifyKind as NotifyModifyKind, RenameMode as NotifyRenameMode};
 #[cfg(feature = "native-compile")]
 use notify::{EventKind as NotifyEventKind, RecommendedWatcher, RecursiveMode, Watcher};
-#[cfg(feature = "native-compile")]
-use salsa::{Database as _, Durability as SalsaDurability};
 #[cfg(feature = "native-compile")]
 use scarb_stable_hash::short_hash;
 use serde::{Deserialize, Serialize};
@@ -154,8 +154,13 @@ const DEFAULT_NATIVE_INCREMENTAL_MAX_CHANGED_FILES: usize = 256;
 const DEFAULT_NATIVE_IMPACTED_SUBSET_ENABLED: bool = true;
 const DEFAULT_DAEMON_SHARED_CACHE_ENABLED: bool = true;
 const DEFAULT_DAEMON_SHARED_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+// Default-off for Scarb's artifact fingerprint check in uc's Scarb-backed path.
+// This removes an extra post-build verification step on the hot path; users who
+// require Scarb's artifact fingerprint verification can opt back in with
+// `UC_DISABLE_SCARB_ARTIFACTS_FINGERPRINT=0`.
 const DEFAULT_UC_DISABLE_SCARB_ARTIFACTS_FINGERPRINT: bool = true;
 const DEFAULT_UC_NATIVE_BUILD_MODE: &str = "auto";
+const DEFAULT_UC_NATIVE_DISALLOW_SCARB_FALLBACK: bool = false;
 const TOOLCHAIN_CHECK_CACHE_SCHEMA_VERSION: u32 = 1;
 const MAX_TOOLCHAIN_CHECK_CACHE_BYTES: u64 = 64 * 1024;
 /// Default Starknet CASM bytecode limit used by native compile.
@@ -855,6 +860,14 @@ struct DaemonStatusPayload {
     native_refresh_changed_files_total: u64,
     #[serde(default)]
     native_refresh_removed_files_total: u64,
+    #[serde(default)]
+    native_fallback_preflight_ineligible_count: u64,
+    #[serde(default)]
+    native_fallback_local_native_error_count: u64,
+    #[serde(default)]
+    native_fallback_daemon_native_error_count: u64,
+    #[serde(default)]
+    native_fallback_daemon_backend_downgrade_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -993,6 +1006,14 @@ struct DaemonHealth {
     last_failure_at: Option<Instant>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum NativeFallbackReason {
+    PreflightIneligible,
+    LocalNativeError,
+    DaemonNativeError,
+    DaemonBackendDowngrade,
+}
+
 #[derive(Default, Clone, Copy)]
 struct NativeCacheTelemetrySnapshot {
     session_entries: u64,
@@ -1007,6 +1028,10 @@ struct NativeCacheTelemetrySnapshot {
     refresh_full_rebuild_count: u64,
     refresh_changed_files_total: u64,
     refresh_removed_files_total: u64,
+    fallback_preflight_ineligible_count: u64,
+    fallback_local_native_error_count: u64,
+    fallback_daemon_native_error_count: u64,
+    fallback_daemon_backend_downgrade_count: u64,
 }
 
 #[cfg(feature = "native-compile")]
@@ -1037,6 +1062,52 @@ fn native_refresh_changed_files_counter() -> &'static AtomicU64 {
 fn native_refresh_removed_files_counter() -> &'static AtomicU64 {
     static VALUE: OnceLock<AtomicU64> = OnceLock::new();
     VALUE.get_or_init(|| AtomicU64::new(0))
+}
+
+fn native_fallback_preflight_counter() -> &'static AtomicU64 {
+    static VALUE: OnceLock<AtomicU64> = OnceLock::new();
+    VALUE.get_or_init(|| AtomicU64::new(0))
+}
+
+fn native_fallback_local_error_counter() -> &'static AtomicU64 {
+    static VALUE: OnceLock<AtomicU64> = OnceLock::new();
+    VALUE.get_or_init(|| AtomicU64::new(0))
+}
+
+fn native_fallback_daemon_error_counter() -> &'static AtomicU64 {
+    static VALUE: OnceLock<AtomicU64> = OnceLock::new();
+    VALUE.get_or_init(|| AtomicU64::new(0))
+}
+
+fn native_fallback_daemon_backend_downgrade_counter() -> &'static AtomicU64 {
+    static VALUE: OnceLock<AtomicU64> = OnceLock::new();
+    VALUE.get_or_init(|| AtomicU64::new(0))
+}
+
+fn record_native_fallback(reason: NativeFallbackReason) {
+    match reason {
+        NativeFallbackReason::PreflightIneligible => {
+            native_fallback_preflight_counter().fetch_add(1, Ordering::Relaxed);
+        }
+        NativeFallbackReason::LocalNativeError => {
+            native_fallback_local_error_counter().fetch_add(1, Ordering::Relaxed);
+        }
+        NativeFallbackReason::DaemonNativeError => {
+            native_fallback_daemon_error_counter().fetch_add(1, Ordering::Relaxed);
+        }
+        NativeFallbackReason::DaemonBackendDowngrade => {
+            native_fallback_daemon_backend_downgrade_counter().fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn native_fallback_telemetry_snapshot() -> (u64, u64, u64, u64) {
+    (
+        native_fallback_preflight_counter().load(Ordering::Relaxed),
+        native_fallback_local_error_counter().load(Ordering::Relaxed),
+        native_fallback_daemon_error_counter().load(Ordering::Relaxed),
+        native_fallback_daemon_backend_downgrade_counter().load(Ordering::Relaxed),
+    )
 }
 
 #[cfg(feature = "native-compile")]
@@ -1154,6 +1225,12 @@ fn native_cache_telemetry_snapshot() -> NativeCacheTelemetrySnapshot {
         refresh_changed_files_total,
         refresh_removed_files_total,
     ) = native_refresh_telemetry_snapshot();
+    let (
+        fallback_preflight_ineligible_count,
+        fallback_local_native_error_count,
+        fallback_daemon_native_error_count,
+        fallback_daemon_backend_downgrade_count,
+    ) = native_fallback_telemetry_snapshot();
     NativeCacheTelemetrySnapshot {
         session_entries,
         session_estimated_bytes,
@@ -1167,6 +1244,10 @@ fn native_cache_telemetry_snapshot() -> NativeCacheTelemetrySnapshot {
         refresh_full_rebuild_count,
         refresh_changed_files_total,
         refresh_removed_files_total,
+        fallback_preflight_ineligible_count,
+        fallback_local_native_error_count,
+        fallback_daemon_native_error_count,
+        fallback_daemon_backend_downgrade_count,
     }
 }
 
@@ -1366,6 +1447,13 @@ fn native_build_mode() -> NativeBuildMode {
     let raw = std::env::var("UC_NATIVE_BUILD_MODE")
         .unwrap_or_else(|_| DEFAULT_UC_NATIVE_BUILD_MODE.to_string());
     parse_native_build_mode(&raw)
+}
+
+fn native_disallow_scarb_fallback() -> bool {
+    parse_env_bool(
+        "UC_NATIVE_DISALLOW_SCARB_FALLBACK",
+        DEFAULT_UC_NATIVE_DISALLOW_SCARB_FALLBACK,
+    )
 }
 
 fn parse_lockfile_dependency_version(lockfile: &str, dependency_name: &str) -> Option<String> {
@@ -2064,7 +2152,7 @@ fn run_daemon_status(args: DaemonSocketArgs) -> Result<()> {
         let status = daemon_ping(&socket_path)
             .with_context(|| format!("daemon not reachable on {}", socket_path.display()))?;
         println!(
-            "uc daemon running (pid={}, started_at_epoch_ms={}, socket={}, protocol={}, healthy={}, total_requests={}, failed_requests={}, rate_limited_requests={}, native_session_cache_entries={}, native_session_cache_estimated_bytes={}, native_context_cache_entries={}, native_context_cache_estimated_bytes={}, native_build_locks={}, metadata_cache_entries={}, metadata_cache_estimated_bytes={}, native_refresh_none={}, native_refresh_incremental={}, native_refresh_full_rebuild={}, native_refresh_changed_files_total={}, native_refresh_removed_files_total={}, last_error={})",
+            "uc daemon running (pid={}, started_at_epoch_ms={}, socket={}, protocol={}, healthy={}, total_requests={}, failed_requests={}, rate_limited_requests={}, native_session_cache_entries={}, native_session_cache_estimated_bytes={}, native_context_cache_entries={}, native_context_cache_estimated_bytes={}, native_build_locks={}, metadata_cache_entries={}, metadata_cache_estimated_bytes={}, native_refresh_none={}, native_refresh_incremental={}, native_refresh_full_rebuild={}, native_refresh_changed_files_total={}, native_refresh_removed_files_total={}, native_fallback_preflight_ineligible={}, native_fallback_local_native_error={}, native_fallback_daemon_native_error={}, native_fallback_daemon_backend_downgrade={}, last_error={})",
             status.pid,
             status.started_at_epoch_ms,
             status.socket_path,
@@ -2085,6 +2173,10 @@ fn run_daemon_status(args: DaemonSocketArgs) -> Result<()> {
             status.native_refresh_full_rebuild_count,
             status.native_refresh_changed_files_total,
             status.native_refresh_removed_files_total,
+            status.native_fallback_preflight_ineligible_count,
+            status.native_fallback_local_native_error_count,
+            status.native_fallback_daemon_native_error_count,
+            status.native_fallback_daemon_backend_downgrade_count,
             status
                 .last_error
                 .clone()
@@ -2107,7 +2199,7 @@ fn run_daemon_health(args: DaemonSocketArgs) -> Result<()> {
             .with_context(|| format!("daemon not reachable on {}", socket_path.display()))?;
         if status.healthy {
             println!(
-                "healthy (pid={}, total_requests={}, failed_requests={}, rate_limited_requests={}, native_session_cache_entries={}, native_session_cache_estimated_bytes={}, native_context_cache_entries={}, native_context_cache_estimated_bytes={}, native_build_locks={}, metadata_cache_entries={}, metadata_cache_estimated_bytes={}, native_refresh_none={}, native_refresh_incremental={}, native_refresh_full_rebuild={}, native_refresh_changed_files_total={}, native_refresh_removed_files_total={})",
+                "healthy (pid={}, total_requests={}, failed_requests={}, rate_limited_requests={}, native_session_cache_entries={}, native_session_cache_estimated_bytes={}, native_context_cache_entries={}, native_context_cache_estimated_bytes={}, native_build_locks={}, metadata_cache_entries={}, metadata_cache_estimated_bytes={}, native_refresh_none={}, native_refresh_incremental={}, native_refresh_full_rebuild={}, native_refresh_changed_files_total={}, native_refresh_removed_files_total={}, native_fallback_preflight_ineligible={}, native_fallback_local_native_error={}, native_fallback_daemon_native_error={}, native_fallback_daemon_backend_downgrade={})",
                 status.pid,
                 status.total_requests,
                 status.failed_requests,
@@ -2123,7 +2215,11 @@ fn run_daemon_health(args: DaemonSocketArgs) -> Result<()> {
                 status.native_refresh_incremental_count,
                 status.native_refresh_full_rebuild_count,
                 status.native_refresh_changed_files_total,
-                status.native_refresh_removed_files_total
+                status.native_refresh_removed_files_total,
+                status.native_fallback_preflight_ineligible_count,
+                status.native_fallback_local_native_error_count,
+                status.native_fallback_daemon_native_error_count,
+                status.native_fallback_daemon_backend_downgrade_count
             );
             Ok(())
         } else {
@@ -2236,6 +2332,14 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
             native_refresh_full_rebuild_count: native_cache.refresh_full_rebuild_count,
             native_refresh_changed_files_total: native_cache.refresh_changed_files_total,
             native_refresh_removed_files_total: native_cache.refresh_removed_files_total,
+            native_fallback_preflight_ineligible_count: native_cache
+                .fallback_preflight_ineligible_count,
+            native_fallback_local_native_error_count: native_cache
+                .fallback_local_native_error_count,
+            native_fallback_daemon_native_error_count: native_cache
+                .fallback_daemon_native_error_count,
+            native_fallback_daemon_backend_downgrade_count: native_cache
+                .fallback_daemon_backend_downgrade_count,
         });
         let health = Arc::new(Mutex::new(DaemonHealth::default()));
         let rate_limiter = Arc::new(Mutex::new(DaemonRateLimiter::new()));
@@ -2384,6 +2488,12 @@ fn try_uc_build_via_daemon(
                     if actual_backend == BuildCompileBackend::Scarb
                         && compile_backend == BuildCompileBackend::Native
                     {
+                        if native_disallow_scarb_fallback() {
+                            bail!(
+                                "daemon build request failed: native fallback is disallowed (UC_NATIVE_DISALLOW_SCARB_FALLBACK=1)"
+                            );
+                        }
+                        record_native_fallback(NativeFallbackReason::DaemonBackendDowngrade);
                         eprintln!(
                             "uc: daemon native build failed; daemon fell back to scarb backend"
                         );
@@ -2638,6 +2748,12 @@ fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildRespon
                 && request.native_fallback_to_scarb
                 && native_error_allows_scarb_fallback(&native_err) =>
         {
+            if native_disallow_scarb_fallback() {
+                return Err(native_err).context(
+                    "native fallback is disallowed (UC_NATIVE_DISALLOW_SCARB_FALLBACK=1)",
+                );
+            }
+            record_native_fallback(NativeFallbackReason::DaemonNativeError);
             tracing::warn!(
                 error = %native_err,
                 "daemon native build unavailable; falling back to scarb backend"
@@ -4747,6 +4863,52 @@ fn native_impacted_subset_used(total_contracts: usize, compiled_contracts: usize
 }
 
 #[cfg(feature = "native-compile")]
+fn native_apply_file_keyed_session_updates(
+    db: &mut RootDatabase,
+    workspace_root: &Path,
+    changed_files: &[String],
+    removed_files: &[String],
+) -> Result<()> {
+    for relative in changed_files {
+        let relative_path = Path::new(relative);
+        if relative_path.is_absolute() {
+            bail!(
+                "native changed-file path must be relative: {}",
+                relative_path.display()
+            );
+        }
+        let absolute_path = workspace_root.join(relative_path);
+        ensure_path_within_root(
+            workspace_root,
+            &absolute_path,
+            "native changed-file override path",
+        )?;
+        let content = fs::read_to_string(&absolute_path)
+            .with_context(|| format!("failed to read {}", absolute_path.display()))?;
+        let file_id = FileId::new(db, FileLongId::OnDisk(absolute_path));
+        override_file_content!(db, file_id, Some(Arc::<str>::from(content)));
+    }
+    for relative in removed_files {
+        let relative_path = Path::new(relative);
+        if relative_path.is_absolute() {
+            bail!(
+                "native removed-file path must be relative: {}",
+                relative_path.display()
+            );
+        }
+        let absolute_path = workspace_root.join(relative_path);
+        ensure_path_within_root(
+            workspace_root,
+            &absolute_path,
+            "native removed-file override path",
+        )?;
+        let file_id = FileId::new(db, FileLongId::OnDisk(absolute_path));
+        override_file_content!(db, file_id, None);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native-compile")]
 fn with_native_compile_session<T>(
     workspace_root: &Path,
     signature: &NativeCompileSessionSignature,
@@ -4890,10 +5052,38 @@ fn with_native_compile_session<T>(
             refresh_action,
             NativeSessionRefreshAction::IncrementalChangedSet
         ) {
-            // Trigger an incremental Salsa revision bump so untracked file-content
-            // reads re-evaluate only impacted units instead of rebuilding the whole
-            // native compiler database/session.
-            session.db.synthetic_write(SalsaDurability::LOW);
+            // Prefer file-keyed override updates for changed files to avoid coarse
+            // full-DB invalidation on every incremental refresh.
+            match native_apply_file_keyed_session_updates(
+                &mut session.db,
+                workspace_root,
+                &changed_files,
+                &removed_files,
+            ) {
+                Ok(()) => {
+                    tracing::debug!(
+                        changed_files = changed_files.len(),
+                        removed_files = removed_files.len(),
+                        drift_scan_ms,
+                        "native session applied file-keyed incremental updates"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        workspace_root = %workspace_root.display(),
+                        changed_files = changed_files.len(),
+                        removed_files = removed_files.len(),
+                        error = %format!("{err:#}"),
+                        "native file-keyed update failed; rebuilding native compile session state"
+                    );
+                    if let Some(state) = rebuilt_state.take() {
+                        *session = state;
+                    } else {
+                        *session =
+                            build_native_compile_session_state(workspace_root, signature.clone())?;
+                    }
+                }
+            }
             if let Some((tracked_sources, tracked_source_bytes)) = current_source_snapshot.take() {
                 session.tracked_sources = tracked_sources;
                 session.tracked_source_bytes = tracked_source_bytes;
@@ -4901,12 +5091,6 @@ fn with_native_compile_session<T>(
             if source_root_mtime != 0 {
                 session.source_root_modified_unix_ms = source_root_mtime;
             }
-            tracing::debug!(
-                changed_files = changed_files.len(),
-                removed_files = removed_files.len(),
-                drift_scan_ms,
-                "native session incrementally refreshed from changed-file set"
-            );
         } else if source_root_mtime != 0
             && session.source_root_modified_unix_ms != source_root_mtime
         {
@@ -5149,8 +5333,7 @@ fn run_native_build_inner(
         let mut selected_indices: Vec<usize> = (0..contracts.len()).collect();
         let mut reused_contract_entries = Vec::new();
         let mut reused_keep_files = BTreeSet::new();
-        if daemon_context
-            && native_impacted_subset_enabled()
+        if native_impacted_subset_enabled()
             && (!session.changed_files.is_empty() || !session.removed_files.is_empty())
         {
             if let Some(impacted_indices) = native_impacted_contract_indices(

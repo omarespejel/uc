@@ -1344,6 +1344,25 @@ fn native_build_mode_parses_expected_values() {
 }
 
 #[test]
+fn native_disallow_scarb_fallback_parses_expected_values() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::env::remove_var("UC_NATIVE_DISALLOW_SCARB_FALLBACK");
+    assert!(!native_disallow_scarb_fallback());
+
+    std::env::set_var("UC_NATIVE_DISALLOW_SCARB_FALLBACK", "1");
+    assert!(native_disallow_scarb_fallback());
+
+    std::env::set_var("UC_NATIVE_DISALLOW_SCARB_FALLBACK", "true");
+    assert!(native_disallow_scarb_fallback());
+
+    std::env::set_var("UC_NATIVE_DISALLOW_SCARB_FALLBACK", "0");
+    assert!(!native_disallow_scarb_fallback());
+    std::env::remove_var("UC_NATIVE_DISALLOW_SCARB_FALLBACK");
+}
+
+#[test]
 fn parse_lockfile_dependency_version_extracts_target_package() {
     let lockfile = r#"
 [[package]]
@@ -1699,6 +1718,33 @@ fn native_refresh_telemetry_counters_accumulate_events() {
     assert!(
         after.4 >= before.4 + 3,
         "removed file counter should accumulate recorded deltas"
+    );
+}
+
+#[test]
+fn native_fallback_telemetry_counters_accumulate_events() {
+    let before = native_fallback_telemetry_snapshot();
+    record_native_fallback(NativeFallbackReason::PreflightIneligible);
+    record_native_fallback(NativeFallbackReason::LocalNativeError);
+    record_native_fallback(NativeFallbackReason::DaemonNativeError);
+    record_native_fallback(NativeFallbackReason::DaemonBackendDowngrade);
+    let after = native_fallback_telemetry_snapshot();
+
+    assert!(
+        after.0 > before.0,
+        "preflight fallback counter should increase"
+    );
+    assert!(
+        after.1 > before.1,
+        "local native fallback counter should increase"
+    );
+    assert!(
+        after.2 > before.2,
+        "daemon native fallback counter should increase"
+    );
+    assert!(
+        after.3 > before.3,
+        "daemon backend downgrade fallback counter should increase"
     );
 }
 

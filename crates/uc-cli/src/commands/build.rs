@@ -339,6 +339,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         }
         EngineArg::Uc => {
             let configured_native_mode = native_build_mode();
+            let disallow_native_fallback = native_disallow_scarb_fallback();
             let native_auto_preflight_error = if configured_native_mode == NativeBuildMode::Auto {
                 match native_compile_preflight(&common, &manifest_path, &workspace_root) {
                     Ok(()) => None,
@@ -356,6 +357,12 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             let native_auto_eligible = native_auto_preflight_error.is_none();
             let native_mode = effective_native_mode(configured_native_mode, native_auto_eligible);
             if let Some(reason) = native_auto_preflight_error.as_deref() {
+                if disallow_native_fallback {
+                    bail!(
+                        "native fallback is disallowed (UC_NATIVE_DISALLOW_SCARB_FALLBACK=1): preflight failed ({reason})"
+                    );
+                }
+                record_native_fallback(NativeFallbackReason::PreflightIneligible);
                 tracing::debug!(
                     manifest_path = %manifest_path.display(),
                     reason,
@@ -368,7 +375,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                         );
                     } else {
                         eprintln!(
-                            "uc: daemon native build failed; daemon fell back to scarb backend ({reason})"
+                            "uc: native compile not supported for this project ({reason}); daemon will use scarb backend"
                         );
                     }
                 }
@@ -449,6 +456,12 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                         if let Some(hinted_session_key) =
                             load_daemon_local_probe_hint(&workspace_root, &native_session_key)?
                         {
+                            if disallow_native_fallback {
+                                bail!(
+                                    "native fallback is disallowed (UC_NATIVE_DISALLOW_SCARB_FALLBACK=1): cached fallback hint present for session key {native_session_key}"
+                                );
+                            }
+                            record_native_fallback(NativeFallbackReason::DaemonBackendDowngrade);
                             let (compiler_version, local_session_key) =
                                 build_scarb_fallback_context()?;
                             let (run, cache_hit, fingerprint, telemetry) = run_local_with_backend(
@@ -489,6 +502,12 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                 if !native_error_allows_scarb_fallback(&native_err) {
                                     return Err(native_err);
                                 }
+                                if disallow_native_fallback {
+                                    return Err(native_err).context(
+                                        "native fallback is disallowed (UC_NATIVE_DISALLOW_SCARB_FALLBACK=1)",
+                                    );
+                                }
+                                record_native_fallback(NativeFallbackReason::LocalNativeError);
                                 eprintln!(
                                     "uc: native compile unavailable ({:#}), falling back to scarb backend",
                                     native_err
@@ -574,6 +593,12 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                 has_scarb_probe_hint,
                             );
                         if daemon_compile_backend == BuildCompileBackend::Scarb {
+                            if disallow_native_fallback {
+                                bail!(
+                                    "native fallback is disallowed (UC_NATIVE_DISALLOW_SCARB_FALLBACK=1): fallback hint present for session key {local_session_key}"
+                                );
+                            }
+                            record_native_fallback(NativeFallbackReason::DaemonBackendDowngrade);
                             tracing::debug!(
                                 session_key = %local_session_key,
                                 "native auto fallback hint present; preferring scarb backend for daemon request"
@@ -615,6 +640,11 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                     if let Some(hinted_session_key) =
                         load_daemon_local_probe_hint(&workspace_root, primary_session_key)?
                     {
+                        if disallow_native_fallback {
+                            bail!(
+                                "native fallback is disallowed (UC_NATIVE_DISALLOW_SCARB_FALLBACK=1): cached fallback hint present for session key {primary_session_key}"
+                            );
+                        }
                         let (scarb_compiler_version, scarb_session_key) =
                             resolve_scarb_probe_context()?;
                         if hinted_session_key != scarb_session_key {

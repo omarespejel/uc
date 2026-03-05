@@ -41,6 +41,7 @@ struct BuildEnvOverrides<'a> {
     scarb_version_override: Option<&'a str>,
     native_mode_override: Option<&'a str>,
     native_corelib_override: Option<&'a Path>,
+    native_disallow_scarb_fallback_override: Option<&'a str>,
 }
 
 impl Drop for TestWorkspace {
@@ -61,6 +62,11 @@ fn fixture_source() -> PathBuf {
         .join("../../benchmarks/fixtures/scarb_smoke")
         .canonicalize()
         .expect("failed to resolve scarb_smoke fixture path")
+}
+
+fn local_native_corelib_src() -> Option<PathBuf> {
+    let candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../cairo/corelib/src");
+    candidate.canonicalize().ok().filter(|path| path.is_dir())
 }
 
 fn make_test_workspace(name: &str) -> TestWorkspace {
@@ -224,6 +230,11 @@ fn run_uc_build_for_root_with_env_overrides(
     } else {
         command.env_remove("UC_NATIVE_CORELIB_SRC");
     }
+    if let Some(value) = overrides.native_disallow_scarb_fallback_override {
+        command.env("UC_NATIVE_DISALLOW_SCARB_FALLBACK", value);
+    } else {
+        command.env_remove("UC_NATIVE_DISALLOW_SCARB_FALLBACK");
+    }
     let output = command.output().expect("failed to execute uc build");
     let report_bytes = fs::read(&report_path).unwrap_or_else(|err| {
         panic!(
@@ -286,6 +297,11 @@ fn run_uc_build_output_only_with_env_overrides(
     } else {
         command.env_remove("UC_NATIVE_CORELIB_SRC");
     }
+    if let Some(value) = overrides.native_disallow_scarb_fallback_override {
+        command.env("UC_NATIVE_DISALLOW_SCARB_FALLBACK", value);
+    } else {
+        command.env_remove("UC_NATIVE_DISALLOW_SCARB_FALLBACK");
+    }
     command.output().expect("failed to execute uc build")
 }
 
@@ -319,6 +335,41 @@ fn output_to_utf8(output: &Output) -> String {
     message.push_str(&String::from_utf8_lossy(&output.stdout));
     message.push_str(&String::from_utf8_lossy(&output.stderr));
     message
+}
+
+fn assert_starknet_manifest_has_materialized_casm(target_profile_dir: &Path, context: &str) {
+    let manifest_artifacts = target_profile_dir.join("uc_smoke.starknet_artifacts.json");
+    assert!(
+        manifest_artifacts.exists(),
+        "{context}: expected starknet artifacts manifest at {}",
+        manifest_artifacts.display()
+    );
+    let manifest_bytes = fs::read(&manifest_artifacts).unwrap_or_else(|err| {
+        panic!(
+            "{context}: failed to read starknet artifacts manifest {}: {err}",
+            manifest_artifacts.display()
+        )
+    });
+    let artifact_manifest: StarknetArtifactsManifest =
+        serde_json::from_slice(&manifest_bytes).expect("failed to parse starknet artifacts JSON");
+    assert!(
+        !artifact_manifest.contracts.is_empty(),
+        "{context}: expected at least one starknet contract entry in {}",
+        manifest_artifacts.display()
+    );
+    let mut referenced_casm_count = 0usize;
+    for contract in artifact_manifest.contracts {
+        if let Some(casm_relative) = contract.artifacts.casm {
+            referenced_casm_count += 1;
+            let casm_path = target_profile_dir.join(&casm_relative);
+            assert!(
+                casm_path.is_file(),
+                "{context}: expected CASM artifact {} to exist",
+                casm_path.display()
+            );
+        }
+    }
+    eprintln!("{context}: validated {referenced_casm_count} CASM manifest references");
 }
 
 fn assert_success(output: &Output, context: &str) {
@@ -851,6 +902,7 @@ fn integration_daemon_auto_mode_local_hit_uses_scarb_key_after_native_fallback()
             scarb_version_override: Some(&scarb_version),
             native_mode_override: Some("auto"),
             native_corelib_override: Some(&missing_corelib),
+            ..BuildEnvOverrides::default()
         },
     );
     assert_success(
@@ -863,7 +915,8 @@ fn integration_daemon_auto_mode_local_hit_uses_scarb_key_after_native_fallback()
     );
     let seed_combined = output_to_utf8(&seed_output);
     assert!(
-        seed_combined.contains("daemon native build failed; daemon fell back to scarb backend"),
+        seed_combined.contains("native compile not supported for this project")
+            && seed_combined.contains("daemon will use scarb backend"),
         "daemon seed build should report native->scarb fallback: {seed_combined}"
     );
 
@@ -885,6 +938,7 @@ fn integration_daemon_auto_mode_local_hit_uses_scarb_key_after_native_fallback()
             scarb_version_override: Some(&scarb_version),
             native_mode_override: Some("auto"),
             native_corelib_override: Some(&missing_corelib),
+            ..BuildEnvOverrides::default()
         },
     );
     assert_success(
@@ -1010,11 +1064,9 @@ fn integration_native_auto_mode_falls_back_when_native_backend_unavailable() {
         target_dev.exists(),
         "scarb fallback should materialize target artifacts directory"
     );
-    let manifest_artifacts = target_dev.join("uc_smoke.starknet_artifacts.json");
-    assert!(
-        manifest_artifacts.exists(),
-        "scarb fallback should emit starknet artifacts manifest at {}",
-        manifest_artifacts.display()
+    assert_starknet_manifest_has_materialized_casm(
+        &target_dev,
+        "native auto fallback warm restore",
     );
 
     let (warm_output, warm_report) = run_uc_build_for_root_with_env_overrides(
@@ -1034,32 +1086,48 @@ fn integration_native_auto_mode_falls_back_when_native_backend_unavailable() {
         warm_report.cache_hit,
         "warm fallback build should restore artifacts from cache"
     );
-    let manifest_bytes = fs::read(&manifest_artifacts).unwrap_or_else(|err| {
-        panic!(
-            "failed to read starknet artifacts manifest {}: {err}",
-            manifest_artifacts.display()
-        )
-    });
-    let artifact_manifest: StarknetArtifactsManifest =
-        serde_json::from_slice(&manifest_bytes).expect("failed to parse starknet artifacts JSON");
-    assert!(
-        !artifact_manifest.contracts.is_empty(),
-        "expected at least one starknet contract entry in {}",
-        manifest_artifacts.display()
+    assert_starknet_manifest_has_materialized_casm(
+        &target_dev,
+        "native auto fallback warm restore",
     );
-    let mut referenced_casm_count = 0usize;
-    for contract in artifact_manifest.contracts {
-        if let Some(casm_relative) = contract.artifacts.casm {
-            referenced_casm_count += 1;
-            let casm_path = target_dev.join(&casm_relative);
-            assert!(
-                casm_path.is_file(),
-                "warm restore should materialize CASM artifact {}",
-                casm_path.display()
-            );
-        }
-    }
-    eprintln!("validated {referenced_casm_count} CASM manifest references after warm restore");
+}
+
+#[test]
+fn integration_native_auto_mode_fails_when_scarb_fallback_is_disallowed() {
+    let _guard = serial_guard();
+    let workspace = make_test_workspace("native-auto-fallback-disallowed");
+    let manifest = workspace.root.join("Scarb.toml");
+    let missing_corelib = std::env::temp_dir().join(format!(
+        "uc-it-missing-corelib-disallow-fallback-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos()
+    ));
+    let _ = fs::remove_dir_all(&missing_corelib);
+
+    let output = run_uc_build_output_only_with_env_overrides(
+        &workspace.root,
+        &manifest,
+        "off",
+        None,
+        BuildEnvOverrides {
+            native_mode_override: Some("auto"),
+            native_corelib_override: Some(&missing_corelib),
+            native_disallow_scarb_fallback_override: Some("1"),
+            ..BuildEnvOverrides::default()
+        },
+    );
+    assert!(
+        !output.status.success(),
+        "native auto mode should fail when scarb fallback is explicitly disallowed"
+    );
+    let combined = output_to_utf8(&output);
+    assert!(
+        combined.contains("native fallback is disallowed"),
+        "unexpected failure output when fallback is disallowed: {combined}"
+    );
 }
 
 #[test]
@@ -1102,6 +1170,74 @@ fn integration_native_require_mode_fails_when_native_backend_unavailable() {
     assert!(
         combined.contains("native compile mode is require but native backend failed"),
         "unexpected native require failure output: {combined}"
+    );
+}
+
+#[test]
+fn integration_native_require_mode_succeeds_without_scarb_on_supported_fixture() {
+    let _guard = serial_guard();
+    let Some(corelib_src) = local_native_corelib_src() else {
+        eprintln!(
+            "skipping integration_native_require_mode_succeeds_without_scarb_on_supported_fixture: compatible local cairo corelib not found"
+        );
+        return;
+    };
+    let workspace = make_test_workspace("native-require-no-scarb");
+    let manifest = workspace.root.join("Scarb.toml");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be after unix epoch")
+        .as_nanos();
+    let no_scarb_path = std::env::temp_dir().join(format!(
+        "uc-it-no-scarb-native-require-{}-{nonce}",
+        std::process::id()
+    ));
+
+    let (output, report) = run_uc_build_for_root_with_env_overrides(
+        &workspace.root,
+        &manifest,
+        "native-require-no-scarb",
+        "off",
+        None,
+        BuildEnvOverrides {
+            path_override: Some(&no_scarb_path),
+            native_mode_override: Some("require"),
+            native_corelib_override: Some(&corelib_src),
+            native_disallow_scarb_fallback_override: Some("1"),
+            ..BuildEnvOverrides::default()
+        },
+    );
+    assert_success(&output, "native require build without scarb");
+    assert_eq!(report.exit_code, 0);
+    let combined = output_to_utf8(&output);
+    assert!(
+        !combined.contains("falling back to scarb backend")
+            && !combined.contains("daemon fell back to scarb backend"),
+        "native require build should not fallback to scarb: {combined}"
+    );
+    let target_dev = workspace.root.join("target/dev");
+    assert_starknet_manifest_has_materialized_casm(
+        &target_dev,
+        "native require build without scarb",
+    );
+
+    let (_warm_output, warm_report) = run_uc_build_for_root_with_env_overrides(
+        &workspace.root,
+        &manifest,
+        "native-require-no-scarb-warm",
+        "off",
+        None,
+        BuildEnvOverrides {
+            path_override: Some(&no_scarb_path),
+            native_mode_override: Some("require"),
+            native_corelib_override: Some(&corelib_src),
+            native_disallow_scarb_fallback_override: Some("1"),
+            ..BuildEnvOverrides::default()
+        },
+    );
+    assert!(
+        warm_report.cache_hit,
+        "native require warm build should hit cache without scarb available"
     );
 }
 
