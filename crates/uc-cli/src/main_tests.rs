@@ -3351,6 +3351,70 @@ fn run_build_with_uc_cache_defers_fingerprint_when_entry_is_missing() {
 }
 
 #[test]
+fn run_build_with_uc_cache_defers_fingerprint_when_shared_entry_is_missing() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !scarb_available() {
+        return;
+    }
+    let dir = unique_test_dir("uc-run-build-deferred-shared-fingerprint");
+    let workspace = dir.join("workspace");
+    let shared_cache_dir = dir.join("daemon-shared-cache");
+    fs::create_dir_all(&workspace).expect("failed to create workspace");
+    std::env::set_var("UC_DAEMON_SHARED_CACHE_DIR", &shared_cache_dir);
+    let manifest_path = workspace.join("Scarb.toml");
+    let common = BuildCommonArgs {
+        manifest_path: Some(manifest_path.clone()),
+        package: None,
+        workspace: false,
+        features: Vec::new(),
+        offline: false,
+        release: false,
+        profile: None,
+    };
+    let session_key = "c".repeat(SESSION_KEY_LEN);
+    let compiler_version = scarb_version_line().expect("failed to resolve scarb version");
+    let (run, cache_hit, fingerprint, telemetry) = run_build_with_uc_cache(
+        &common,
+        BuildCacheRunContext {
+            manifest_path: &manifest_path,
+            workspace_root: &workspace,
+            profile: "dev",
+            session_key: &session_key,
+            compiler_version: &compiler_version,
+            compile_backend: BuildCompileBackend::Scarb,
+            options: BuildRunOptions {
+                capture_output: true,
+                inherit_output_when_uncaptured: true,
+                async_cache_persist: false,
+                use_daemon_shared_cache: true,
+            },
+        },
+    )
+    .expect("compile miss path should return command result, not fingerprint error");
+    assert!(
+        !cache_hit,
+        "missing shared cache entry with missing manifest must remain a cache miss"
+    );
+    assert_ne!(
+        run.exit_code, 0,
+        "missing manifest should fail the compile command"
+    );
+    assert!(
+        fingerprint.is_empty(),
+        "shared-cache probe should not force fingerprint work when shared entry is absent"
+    );
+    assert_eq!(
+        telemetry.fingerprint_ms, 0.0,
+        "shared-cache miss without entry should avoid fingerprint computation"
+    );
+
+    std::env::remove_var("UC_DAEMON_SHARED_CACHE_DIR");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn validate_manifest_dependency_sanity_rejects_self_dependency() {
     let dir = unique_test_dir("uc-self-dependency");
     let manifest_path = dir.join("Scarb.toml");

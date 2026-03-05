@@ -3055,14 +3055,19 @@ fn run_build_with_uc_cache(
     }
 
     if options.use_daemon_shared_cache {
-        ensure_fingerprint(&mut fingerprint, &mut telemetry)?;
         let shared_lookup_start = Instant::now();
-        let shared_restore = try_restore_daemon_shared_cache(
-            &canonical_workspace_root,
-            profile,
-            session_key,
-            fingerprint.as_deref().unwrap_or_default(),
-        )?;
+        let shared_restore = if daemon_shared_cache_entry_exists(&canonical_workspace_root, session_key)?
+        {
+            ensure_fingerprint(&mut fingerprint, &mut telemetry)?;
+            try_restore_daemon_shared_cache(
+                &canonical_workspace_root,
+                profile,
+                session_key,
+                fingerprint.as_deref().unwrap_or_default(),
+            )?
+        } else {
+            None
+        };
         telemetry.cache_lookup_ms += shared_lookup_start.elapsed().as_secs_f64() * 1000.0;
         if let Some(restored_count) = shared_restore {
             let total_elapsed_ms =
@@ -5973,6 +5978,20 @@ fn daemon_shared_cache_entry_path(shared_cache_root: &Path, session_key: &str) -
     shared_cache_root
         .join("build")
         .join(format!("{session_key}.json"))
+}
+
+fn daemon_shared_cache_entry_exists(workspace_root: &Path, session_key: &str) -> Result<bool> {
+    if !daemon_shared_cache_enabled() {
+        return Ok(false);
+    }
+    let shared_cache_root = daemon_shared_cache_root(workspace_root);
+    let shared_entry_path = daemon_shared_cache_entry_path(&shared_cache_root, session_key);
+    match fs::metadata(&shared_entry_path) {
+        Ok(metadata) => Ok(metadata.is_file()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err)
+            .with_context(|| format!("failed to stat {}", shared_entry_path.display())),
+    }
 }
 
 fn try_restore_daemon_shared_cache(
