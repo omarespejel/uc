@@ -126,7 +126,7 @@ jobs:
           echo "UC_NATIVE_CORELIB_SRC=$CAIRO_ROOT/cairo/corelib/src" >> "$GITHUB_ENV"
 
       - name: Build uc CLI
-        run: cargo build -p uc-cli
+        run: cargo build --release -p uc-cli
 
       - name: Enforce native-only builds on supported smoke/research fixtures
         env:
