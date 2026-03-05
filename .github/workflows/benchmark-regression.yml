@@ -77,10 +77,6 @@ jobs:
             https://github.com/starkware-libs/cairo.git "$CAIRO_ROOT/cairo"
           echo "UC_RESEARCH_ROOT=$RESEARCH_ROOT" >> "$GITHUB_ENV"
           echo "UC_NATIVE_CORELIB_SRC=$CAIRO_ROOT/cairo/corelib/src" >> "$GITHUB_ENV"
-          CAIRO_ROOT="$RUNNER_TEMP/cairo-workspace"
-          git clone --depth 1 --branch v2.16.0 \
-            https://github.com/starkware-libs/cairo.git "$CAIRO_ROOT/cairo"
-          echo "UC_NATIVE_CORELIB_SRC=$CAIRO_ROOT/cairo/corelib/src" >> "$GITHUB_ENV"
 
       - name: Build uc CLI
         run: cargo build --release -p uc-cli
@@ -123,7 +119,11 @@ jobs:
           mkdir -p "$RESEARCH_ROOT"
           git clone --depth 1 --branch v2.14.0 \
             https://github.com/software-mansion/scarb.git "$RESEARCH_ROOT/scarb"
+          CAIRO_ROOT="$RUNNER_TEMP/cairo-workspace"
+          git clone --depth 1 --branch v2.16.0 \
+            https://github.com/starkware-libs/cairo.git "$CAIRO_ROOT/cairo"
           echo "UC_RESEARCH_ROOT=$RESEARCH_ROOT" >> "$GITHUB_ENV"
+          echo "UC_NATIVE_CORELIB_SRC=$CAIRO_ROOT/cairo/corelib/src" >> "$GITHUB_ENV"
 
       - name: Build uc CLI
         run: cargo build -p uc-cli
@@ -212,14 +212,14 @@ jobs:
             --report-path benchmarks/results/cross-platform-${{ matrix.os }}.json
 
           "$PYTHON_BIN" - <<'PY'
-import json
-from pathlib import Path
+          import json
+          from pathlib import Path
 
-report_path = Path("benchmarks/results/cross-platform-${{ matrix.os }}.json")
-report = json.loads(report_path.read_text(encoding="utf-8"))
-Path("determinism/${{ matrix.os }}.fingerprint.txt").write_text(report["fingerprint"] + "\n", encoding="utf-8")
-Path("determinism/${{ matrix.os }}.session-key.txt").write_text(report["session_key"] + "\n", encoding="utf-8")
-PY
+          report_path = Path("benchmarks/results/cross-platform-${{ matrix.os }}.json")
+          report = json.loads(report_path.read_text(encoding="utf-8"))
+          Path("determinism/${{ matrix.os }}.fingerprint.txt").write_text(report["fingerprint"] + "\n", encoding="utf-8")
+          Path("determinism/${{ matrix.os }}.session-key.txt").write_text(report["session_key"] + "\n", encoding="utf-8")
+          PY
 
       - name: Upload determinism sample
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
