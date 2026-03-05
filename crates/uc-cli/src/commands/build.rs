@@ -278,6 +278,25 @@ fn daemon_backend_policy(
     }
 }
 
+fn daemon_backend_policy_with_hint_state(
+    configured_mode: NativeBuildMode,
+    native_auto_eligible: bool,
+    native_supported_hint: bool,
+    has_scarb_probe_hint: bool,
+) -> (BuildCompileBackend, bool) {
+    let (backend, native_fallback_to_scarb) =
+        daemon_backend_policy(configured_mode, native_auto_eligible);
+    if backend == BuildCompileBackend::Native
+        && native_fallback_to_scarb
+        && !native_supported_hint
+        && has_scarb_probe_hint
+    {
+        (BuildCompileBackend::Scarb, false)
+    } else {
+        (backend, native_fallback_to_scarb)
+    }
+}
+
 fn daemon_socket_available_for_client() -> Result<bool> {
     #[cfg(not(unix))]
     {
@@ -525,14 +544,44 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             };
             let resolve_daemon_backend_context =
                 || -> Result<(BuildCompileBackend, bool, String, String)> {
-                    let (daemon_compile_backend, daemon_native_fallback_to_scarb) =
+                    let (mut daemon_compile_backend, mut daemon_native_fallback_to_scarb) =
                         daemon_backend_policy(configured_native_mode, native_auto_eligible);
-                    let compiler_version = if daemon_compile_backend == BuildCompileBackend::Scarb {
-                        scarb_version_line()?
-                    } else {
-                        native_compiler_version_line()
-                    };
-                    let local_session_key = build_session_key_for_compiler(&compiler_version)?;
+                    let mut compiler_version =
+                        if daemon_compile_backend == BuildCompileBackend::Scarb {
+                            scarb_version_line()?
+                        } else {
+                            native_compiler_version_line()
+                        };
+                    let mut local_session_key = build_session_key_for_compiler(&compiler_version)?;
+                    if daemon_compile_backend == BuildCompileBackend::Native
+                        && daemon_native_fallback_to_scarb
+                    {
+                        let native_supported_hint = daemon_local_native_supported_hint(
+                            &workspace_root,
+                            &local_session_key,
+                        )?;
+                        let has_scarb_probe_hint = if native_supported_hint {
+                            false
+                        } else {
+                            load_daemon_local_probe_hint(&workspace_root, &local_session_key)?
+                                .is_some()
+                        };
+                        (daemon_compile_backend, daemon_native_fallback_to_scarb) =
+                            daemon_backend_policy_with_hint_state(
+                                configured_native_mode,
+                                native_auto_eligible,
+                                native_supported_hint,
+                                has_scarb_probe_hint,
+                            );
+                        if daemon_compile_backend == BuildCompileBackend::Scarb {
+                            tracing::debug!(
+                                session_key = %local_session_key,
+                                "native auto fallback hint present; preferring scarb backend for daemon request"
+                            );
+                            compiler_version = scarb_version_line()?;
+                            local_session_key = build_session_key_for_compiler(&compiler_version)?;
+                        }
+                    }
                     Ok((
                         daemon_compile_backend,
                         daemon_native_fallback_to_scarb,
@@ -997,6 +1046,34 @@ mod tests {
         );
         assert_eq!(
             daemon_backend_policy(NativeBuildMode::Require, false),
+            (BuildCompileBackend::Native, false)
+        );
+    }
+
+    #[test]
+    fn daemon_backend_policy_with_hint_state_prefers_scarb_after_known_auto_fallback() {
+        assert_eq!(
+            daemon_backend_policy_with_hint_state(NativeBuildMode::Auto, true, false, true),
+            (BuildCompileBackend::Scarb, false)
+        );
+        assert_eq!(
+            daemon_backend_policy_with_hint_state(NativeBuildMode::Auto, true, true, true),
+            (BuildCompileBackend::Native, true)
+        );
+        assert_eq!(
+            daemon_backend_policy_with_hint_state(NativeBuildMode::Auto, true, false, false),
+            (BuildCompileBackend::Native, true)
+        );
+    }
+
+    #[test]
+    fn daemon_backend_policy_with_hint_state_keeps_non_auto_modes_unchanged() {
+        assert_eq!(
+            daemon_backend_policy_with_hint_state(NativeBuildMode::Off, false, false, true),
+            (BuildCompileBackend::Scarb, false)
+        );
+        assert_eq!(
+            daemon_backend_policy_with_hint_state(NativeBuildMode::Require, true, false, true),
             (BuildCompileBackend::Native, false)
         );
     }
