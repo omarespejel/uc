@@ -1,10 +1,20 @@
 use super::*;
 
+const DEFAULT_CACHE_OBJECT_HASH_MEMO_MAX_ENTRIES: usize = 4096;
+
 #[derive(Clone)]
 pub(super) struct BuildEntryCacheEntry {
     pub(super) file_size_bytes: u64,
     pub(super) file_modified_unix_ms: u64,
     pub(super) entry: BuildCacheEntry,
+    pub(super) last_access_epoch_ms: u64,
+}
+
+#[derive(Clone)]
+pub(super) struct CacheObjectHashMemoEntry {
+    pub(super) size_bytes: u64,
+    pub(super) modified_unix_ms: u64,
+    pub(super) blake3_hex: String,
     pub(super) last_access_epoch_ms: u64,
 }
 
@@ -367,6 +377,82 @@ pub(super) fn is_removable_cache_file(path: &Path) -> bool {
     name != ".lock"
 }
 
+fn cache_object_hash_memo_max_entries() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_env_usize(
+            "UC_CACHE_OBJECT_HASH_MEMO_MAX_ENTRIES",
+            DEFAULT_CACHE_OBJECT_HASH_MEMO_MAX_ENTRIES,
+        )
+        .max(1)
+    })
+}
+
+fn cache_object_hash_memo() -> &'static Mutex<HashMap<String, CacheObjectHashMemoEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CacheObjectHashMemoEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cache_object_hash_memo_key(path: &Path) -> String {
+    normalize_fingerprint_path(path)
+}
+
+pub(super) fn evict_oldest_cache_object_hash_memo_entries(
+    cache: &mut HashMap<String, CacheObjectHashMemoEntry>,
+    max_entries: usize,
+) {
+    while cache.len() > max_entries {
+        let Some(oldest_key) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_access_epoch_ms)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest_key);
+    }
+}
+
+fn cached_object_hash_if_fresh(
+    object_path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<Option<String>> {
+    let modified_unix_ms = metadata_modified_unix_ms(metadata)?;
+    let now_ms = epoch_ms_u64().unwrap_or_default();
+    let key = cache_object_hash_memo_key(object_path);
+    let mut cache = cache_object_hash_memo()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(entry) = cache.get_mut(&key) else {
+        return Ok(None);
+    };
+    entry.last_access_epoch_ms = now_ms;
+    if entry.size_bytes == metadata.len() && entry.modified_unix_ms == modified_unix_ms {
+        return Ok(Some(entry.blake3_hex.clone()));
+    }
+    Ok(None)
+}
+
+fn store_cache_object_hash(object_path: &Path, metadata: &fs::Metadata, hash: &str) -> Result<()> {
+    let modified_unix_ms = metadata_modified_unix_ms(metadata)?;
+    let now_ms = epoch_ms_u64().unwrap_or_default();
+    let key = cache_object_hash_memo_key(object_path);
+    let mut cache = cache_object_hash_memo()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.insert(
+        key,
+        CacheObjectHashMemoEntry {
+            size_bytes: metadata.len(),
+            modified_unix_ms,
+            blake3_hex: hash.to_ascii_lowercase(),
+            last_access_epoch_ms: now_ms,
+        },
+    );
+    evict_oldest_cache_object_hash_memo_entries(&mut cache, cache_object_hash_memo_max_entries());
+    Ok(())
+}
+
 pub(super) fn build_entry_cache() -> &'static Mutex<HashMap<String, BuildEntryCacheEntry>> {
     static CACHE: OnceLock<Mutex<HashMap<String, BuildEntryCacheEntry>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -574,7 +660,14 @@ pub(super) fn cache_object_matches_expected(
     if !metadata.is_file() || metadata.len() != expected_size {
         return Ok(false);
     }
-    let actual_hash = hash_file_blake3(object_path)?;
+    let actual_hash =
+        if let Some(cached_hash) = cached_object_hash_if_fresh(object_path, &metadata)? {
+            cached_hash
+        } else {
+            let computed = hash_file_blake3(object_path)?;
+            store_cache_object_hash(object_path, &metadata, &computed)?;
+            computed
+        };
     Ok(actual_hash.eq_ignore_ascii_case(expected_hash))
 }
 

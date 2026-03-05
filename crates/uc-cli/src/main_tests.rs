@@ -2520,6 +2520,44 @@ fn artifact_index_cache_eviction_removes_oldest_entries() {
 }
 
 #[test]
+fn cache_object_hash_memo_eviction_removes_oldest_entries() {
+    let mut cache = HashMap::new();
+    cache.insert(
+        "oldest".to_string(),
+        CacheObjectHashMemoEntry {
+            size_bytes: 1,
+            modified_unix_ms: 1,
+            blake3_hex: "a".repeat(64),
+            last_access_epoch_ms: 1,
+        },
+    );
+    cache.insert(
+        "middle".to_string(),
+        CacheObjectHashMemoEntry {
+            size_bytes: 1,
+            modified_unix_ms: 1,
+            blake3_hex: "b".repeat(64),
+            last_access_epoch_ms: 2,
+        },
+    );
+    cache.insert(
+        "newest".to_string(),
+        CacheObjectHashMemoEntry {
+            size_bytes: 1,
+            modified_unix_ms: 1,
+            blake3_hex: "c".repeat(64),
+            last_access_epoch_ms: 3,
+        },
+    );
+
+    evict_oldest_cache_object_hash_memo_entries(&mut cache, 2);
+    assert_eq!(cache.len(), 2);
+    assert!(!cache.contains_key("oldest"));
+    assert!(cache.contains_key("middle"));
+    assert!(cache.contains_key("newest"));
+}
+
+#[test]
 fn load_cache_entry_cached_invalidates_when_file_changes() {
     let dir = unique_test_dir("uc-build-entry-cache-invalidate");
     let entry_path = dir.join("cache/build/test.json");
@@ -2563,6 +2601,47 @@ fn load_cache_entry_cached_invalidates_when_file_changes() {
         .expect("failed to load second cache entry")
         .expect("second cache entry should exist");
     assert_eq!(loaded_second.fingerprint, "fp-b");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn cache_object_matches_expected_recomputes_when_object_changes() {
+    let dir = unique_test_dir("uc-cache-object-hash-memo-refresh");
+    let object = dir.join("objects/aa/object.bin");
+    fs::create_dir_all(
+        object
+            .parent()
+            .expect("cache object path should include parent directory"),
+    )
+    .expect("failed to create object parent directory");
+    fs::write(&object, b"first-bytes").expect("failed to write initial object bytes");
+    let metadata = fs::metadata(&object).expect("failed to stat initial object");
+    let expected_size = metadata.len();
+    let first_hash = hash_file_blake3(&object).expect("failed to hash initial object bytes");
+    assert!(
+        cache_object_matches_expected(&object, &first_hash, expected_size)
+            .expect("expected object should match on first check"),
+        "initial object hash should match"
+    );
+
+    thread::sleep(Duration::from_millis(10));
+    fs::write(&object, b"secondbytes").expect("failed to rewrite object bytes");
+    let second_hash = hash_file_blake3(&object).expect("failed to hash updated object bytes");
+    assert_ne!(
+        first_hash, second_hash,
+        "sanity: updated object content should produce a different hash"
+    );
+    assert!(
+        !cache_object_matches_expected(&object, &first_hash, expected_size)
+            .expect("stale hash should fail after object rewrite"),
+        "stale object hash should be rejected"
+    );
+    assert!(
+        cache_object_matches_expected(&object, &second_hash, expected_size)
+            .expect("updated hash should match after object rewrite"),
+        "updated object hash should match"
+    );
+
     fs::remove_dir_all(&dir).ok();
 }
 
