@@ -1752,6 +1752,7 @@ fn native_compile_context_cache_ttl_eviction_prunes_stale_entries() {
             casm: true,
         },
         manifest_content_hash: "manifest-blake3:demo".to_string(),
+        non_starknet_dependencies: Vec::new(),
     };
     let mut cache = HashMap::new();
     cache.insert(
@@ -3674,80 +3675,42 @@ demo = "1.0.0"
 }
 
 #[test]
-fn build_native_compile_context_rejects_non_starknet_dependencies() {
-    let dir = unique_test_dir("uc-native-context-reject-dep");
-    let manifest_path = dir.join("Scarb.toml");
-    fs::create_dir_all(dir.join("src")).expect("failed to create src directory");
-    fs::write(dir.join("src/lib.cairo"), "fn main() {}\n").expect("failed to write lib.cairo");
-    fs::write(
-        &manifest_path,
+fn collect_native_non_starknet_dependencies_collects_root_dependencies() {
+    let manifest: TomlValue = toml::from_str(
         r#"[package]
 name = "demo"
 version = "0.1.0"
 edition = "2024_07"
 
 [dependencies]
+starknet = "2.7.0"
 alexandria = "0.9.0"
 "#,
     )
-    .expect("failed to write manifest");
-
-    let common = BuildCommonArgs {
-        manifest_path: Some(manifest_path.clone()),
-        package: None,
-        workspace: false,
-        features: Vec::new(),
-        offline: true,
-        release: false,
-        profile: None,
-    };
-    let err = build_native_compile_context(&common, &manifest_path, &dir)
-        .expect_err("unsupported dependency should fail native context resolution");
-    assert!(
-        format!("{err:#}")
-            .contains("native compile does not support [dependencies].alexandria yet"),
-        "unexpected error: {err:#}"
-    );
-    fs::remove_dir_all(&dir).ok();
+    .expect("manifest should parse");
+    let deps = collect_native_non_starknet_dependencies(&manifest);
+    assert_eq!(deps, vec!["[dependencies].alexandria".to_string()]);
 }
 
 #[test]
-fn build_native_compile_context_rejects_target_cfg_non_starknet_dependencies() {
-    let dir = unique_test_dir("uc-native-context-reject-target-cfg-dep");
-    let manifest_path = dir.join("Scarb.toml");
-    fs::create_dir_all(dir.join("src")).expect("failed to create src directory");
-    fs::write(dir.join("src/lib.cairo"), "fn main() {}\n").expect("failed to write lib.cairo");
-    fs::write(
-        &manifest_path,
+fn collect_native_non_starknet_dependencies_collects_target_cfg_dependencies() {
+    let manifest: TomlValue = toml::from_str(
         r#"[package]
 name = "demo"
 version = "0.1.0"
 edition = "2024_07"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+starknet = "2.7.0"
 alexandria = "0.9.0"
 "#,
     )
-    .expect("failed to write manifest");
-
-    let common = BuildCommonArgs {
-        manifest_path: Some(manifest_path.clone()),
-        package: None,
-        workspace: false,
-        features: Vec::new(),
-        offline: true,
-        release: false,
-        profile: None,
-    };
-    let err = build_native_compile_context(&common, &manifest_path, &dir)
-        .expect_err("unsupported target cfg dependency should fail native context resolution");
-    assert!(
-        format!("{err:#}").contains(
-            "native compile does not support [target.cfg(target_os = \"linux\").dependencies].alexandria yet"
-        ),
-        "unexpected error: {err:#}"
+    .expect("manifest should parse");
+    let deps = collect_native_non_starknet_dependencies(&manifest);
+    assert_eq!(
+        deps,
+        vec!["[target.cfg(target_os = \"linux\").dependencies].alexandria".to_string()]
     );
-    fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -4607,6 +4570,47 @@ fn native_error_allows_scarb_fallback_only_when_marked() {
     assert!(
         native_error_allows_scarb_fallback(&eligible),
         "fallback-eligible errors should trigger scarb fallback in auto mode"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn mark_native_fallback_eligible_for_external_dependencies_only_marks_when_present() {
+    let base_context = NativeCompileContext {
+        package_name: "demo".to_string(),
+        crate_name: "demo".to_string(),
+        cairo_project_dir: PathBuf::from("/tmp/demo/.uc/native-project"),
+        corelib_src: PathBuf::from("/tmp/demo/corelib/src"),
+        starknet_target: NativeStarknetTargetProps {
+            sierra: true,
+            casm: true,
+        },
+        manifest_content_hash: "manifest-blake3:demo".to_string(),
+        non_starknet_dependencies: Vec::new(),
+    };
+
+    let plain = mark_native_fallback_eligible_for_external_dependencies(
+        anyhow::Error::msg("native starknet compile failed"),
+        &base_context,
+    );
+    assert!(
+        !native_error_allows_scarb_fallback(&plain),
+        "errors without external manifest deps must stay non-fallback"
+    );
+
+    let mut with_external = base_context.clone();
+    with_external.non_starknet_dependencies = vec!["[dependencies].alexandria".to_string()];
+    let eligible = mark_native_fallback_eligible_for_external_dependencies(
+        anyhow::Error::msg("native starknet compile failed"),
+        &with_external,
+    );
+    assert!(
+        native_error_allows_scarb_fallback(&eligible),
+        "errors with external manifest deps should be fallback-eligible"
+    );
+    assert!(
+        format!("{eligible:#}").contains("non-starknet dependencies"),
+        "fallback-eligible message should explain why scarb fallback is allowed"
     );
 }
 

@@ -568,6 +568,7 @@ struct NativeCompileContext {
     corelib_src: PathBuf,
     starknet_target: NativeStarknetTargetProps,
     manifest_content_hash: String,
+    non_starknet_dependencies: Vec<String>,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -3769,28 +3770,27 @@ fn validate_native_requested_package(
 }
 
 #[cfg(feature = "native-compile")]
-fn validate_native_dependency_table(
+fn collect_native_non_starknet_dependency_table(
     section_label: &str,
     table: &toml::map::Map<String, TomlValue>,
-) -> Result<()> {
+    unsupported: &mut BTreeSet<String>,
+) {
     for dependency_name in table.keys() {
-        // Native compile currently supports only the Starknet plugin dependency surface.
+        // `starknet` is compiler-native; additional dependencies may still compile
+        // if they are not referenced by the local package build target.
         if dependency_name != "starknet" {
-            return Err(native_fallback_eligible_error(format!(
-                "native compile does not support {section_label}.{} yet",
-                dependency_name
-            )));
+            unsupported.insert(format!("{section_label}.{}", dependency_name));
         }
     }
-    Ok(())
 }
 
 #[cfg(feature = "native-compile")]
-fn validate_native_manifest_dependency_surface(manifest: &TomlValue) -> Result<()> {
+fn collect_native_non_starknet_dependencies(manifest: &TomlValue) -> Vec<String> {
+    let mut unsupported = BTreeSet::new();
     for section_name in ["dependencies", "dev-dependencies"] {
         if let Some(table) = manifest.get(section_name).and_then(TomlValue::as_table) {
             let section_label = format!("[{}]", section_name);
-            validate_native_dependency_table(&section_label, table)?;
+            collect_native_non_starknet_dependency_table(&section_label, table, &mut unsupported);
         }
     }
 
@@ -3805,12 +3805,16 @@ fn validate_native_manifest_dependency_surface(manifest: &TomlValue) -> Result<(
                     .and_then(TomlValue::as_table)
                 {
                     let section_label = format!("[target.{}.{}]", target_name, section_name);
-                    validate_native_dependency_table(&section_label, table)?;
+                    collect_native_non_starknet_dependency_table(
+                        &section_label,
+                        table,
+                        &mut unsupported,
+                    );
                 }
             }
         }
     }
-    Ok(())
+    unsupported.into_iter().collect()
 }
 
 #[cfg(feature = "native-compile")]
@@ -3839,7 +3843,13 @@ fn build_native_compile_context_uncached(
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .context("native compile requires [package].name in Scarb.toml")?;
-    validate_native_manifest_dependency_surface(&manifest)?;
+    let non_starknet_dependencies = collect_native_non_starknet_dependencies(&manifest);
+    if !non_starknet_dependencies.is_empty() {
+        tracing::debug!(
+            dependencies = ?non_starknet_dependencies,
+            "native compile detected non-starknet manifest dependencies; continuing with local crate compile path"
+        );
+    }
 
     if let Some(lib_table) = manifest.get("lib").and_then(TomlValue::as_table) {
         if let Some(path) = lib_table.get("path").and_then(TomlValue::as_str) {
@@ -3900,6 +3910,7 @@ fn build_native_compile_context_uncached(
         corelib_src,
         starknet_target,
         manifest_content_hash,
+        non_starknet_dependencies,
     })
 }
 
@@ -3926,8 +3937,27 @@ fn native_compile_context_estimated_bytes(context: &NativeCompileContext) -> u64
     let scalar_bytes = context.package_name.len()
         + context.crate_name.len()
         + context.manifest_content_hash.len()
+        + context
+            .non_starknet_dependencies
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
         + path_bytes;
     u64::try_from(scalar_bytes).unwrap_or(u64::MAX)
+}
+
+#[cfg(feature = "native-compile")]
+fn mark_native_fallback_eligible_for_external_dependencies(
+    err: anyhow::Error,
+    context: &NativeCompileContext,
+) -> anyhow::Error {
+    if context.non_starknet_dependencies.is_empty() {
+        return err;
+    }
+    let deps = context.non_starknet_dependencies.join(", ");
+    mark_native_fallback_eligible(err.context(format!(
+        "native compile manifest includes non-starknet dependencies ({deps}); retrying with scarb fallback is allowed"
+    )))
 }
 
 #[cfg(feature = "native-compile")]
@@ -5276,7 +5306,12 @@ fn run_native_build_inner(
                 crate_ids,
                 native_compiler_config(&session.main_crate_inputs, profile),
             )
-            .context("native cairo compile failed")?;
+            .map_err(|err| {
+                mark_native_fallback_eligible_for_external_dependencies(
+                    err.context("native cairo compile failed"),
+                    &context,
+                )
+            })?;
             let frontend_compile_ms = frontend_compile_start.elapsed().as_secs_f64() * 1000.0;
             let artifact_write_start = Instant::now();
             let output_name = format!("{}.sierra", context.package_name);
@@ -5380,7 +5415,12 @@ fn run_native_build_inner(
             &contract_refs,
             native_compiler_config(&session.main_crate_inputs, profile),
         )
-        .context("native starknet compile failed")?;
+        .map_err(|err| {
+            mark_native_fallback_eligible_for_external_dependencies(
+                err.context("native starknet compile failed"),
+                &context,
+            )
+        })?;
         let frontend_compile_ms = frontend_compile_start.elapsed().as_secs_f64() * 1000.0;
         if contract_classes.len() != selected_indices.len() {
             bail!(
