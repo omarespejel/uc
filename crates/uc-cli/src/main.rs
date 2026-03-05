@@ -568,7 +568,8 @@ struct NativeCompileContext {
     corelib_src: PathBuf,
     starknet_target: NativeStarknetTargetProps,
     manifest_content_hash: String,
-    non_starknet_dependencies: Vec<String>,
+    external_non_starknet_dependencies: Vec<String>,
+    path_dependency_roots: Vec<NativePathDependencyRoot>,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -576,6 +577,13 @@ struct NativeCompileContext {
 struct NativeStarknetTargetProps {
     sierra: bool,
     casm: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+#[cfg(feature = "native-compile")]
+struct NativePathDependencyRoot {
+    crate_name: String,
+    source_root: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3770,27 +3778,132 @@ fn validate_native_requested_package(
 }
 
 #[cfg(feature = "native-compile")]
-fn collect_native_non_starknet_dependency_table(
+fn native_workspace_dependency_entry<'a>(
+    manifest: &'a TomlValue,
+    dependency_name: &str,
+) -> Option<&'a TomlValue> {
+    manifest
+        .get("workspace")
+        .and_then(TomlValue::as_table)
+        .and_then(|workspace| workspace.get("dependencies"))
+        .and_then(TomlValue::as_table)
+        .and_then(|deps| deps.get(dependency_name))
+}
+
+#[cfg(feature = "native-compile")]
+fn native_dependency_path_from_value(
+    manifest: &TomlValue,
+    dependency_name: &str,
+    dependency_value: &TomlValue,
+) -> Option<(String, bool)> {
+    let table = dependency_value.as_table()?;
+    if let Some(path) = table.get("path").and_then(TomlValue::as_str) {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return Some((trimmed.to_string(), false));
+        }
+    }
+    if table
+        .get("workspace")
+        .and_then(TomlValue::as_bool)
+        .is_some_and(|value| value)
+    {
+        let workspace_entry = native_workspace_dependency_entry(manifest, dependency_name)?;
+        if let Some(path) = workspace_entry
+            .as_table()
+            .and_then(|entry| entry.get("path"))
+            .and_then(TomlValue::as_str)
+        {
+            let trimmed = path.trim();
+            if !trimmed.is_empty() {
+                return Some((trimmed.to_string(), true));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(feature = "native-compile")]
+fn collect_native_dependency_table_surface(
     section_label: &str,
     table: &toml::map::Map<String, TomlValue>,
-    unsupported: &mut BTreeSet<String>,
+    manifest: &TomlValue,
+    manifest_dir: &Path,
+    workspace_root: &Path,
+    external: &mut BTreeSet<String>,
+    path_roots: &mut BTreeMap<String, PathBuf>,
 ) {
-    for dependency_name in table.keys() {
-        // `starknet` is compiler-native; additional dependencies may still compile
-        // if they are not referenced by the local package build target.
-        if dependency_name != "starknet" {
-            unsupported.insert(format!("{section_label}.{}", dependency_name));
+    for (dependency_name, dependency_value) in table {
+        if dependency_name == "starknet" {
+            continue;
+        }
+        let dependency_label = format!("{section_label}.{dependency_name}");
+        let Some((raw_path, workspace_relative)) =
+            native_dependency_path_from_value(manifest, dependency_name, dependency_value)
+        else {
+            external.insert(dependency_label);
+            continue;
+        };
+
+        let dependency_root = if workspace_relative {
+            workspace_root.join(&raw_path)
+        } else {
+            manifest_dir.join(&raw_path)
+        };
+        if ensure_path_within_root(
+            workspace_root,
+            &dependency_root,
+            "native path dependency root",
+        )
+        .is_err()
+        {
+            external.insert(dependency_label);
+            continue;
+        }
+
+        let dependency_source_root = dependency_root.join("src");
+        let dependency_lib_path = dependency_source_root.join("lib.cairo");
+        if !dependency_lib_path.is_file() {
+            external.insert(dependency_label);
+            continue;
+        }
+
+        let dependency_crate_name = normalize_package_name_for_cairo_crate(dependency_name);
+        match path_roots.entry(dependency_crate_name) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(dependency_source_root);
+            }
+            std::collections::btree_map::Entry::Occupied(existing)
+                if existing.get() == &dependency_source_root => {}
+            std::collections::btree_map::Entry::Occupied(_) => {
+                external.insert(dependency_label);
+            }
         }
     }
 }
 
 #[cfg(feature = "native-compile")]
-fn collect_native_non_starknet_dependencies(manifest: &TomlValue) -> Vec<String> {
-    let mut unsupported = BTreeSet::new();
+fn collect_native_dependency_surface(
+    manifest: &TomlValue,
+    manifest_path: &Path,
+    workspace_root: &Path,
+) -> (Vec<String>, Vec<NativePathDependencyRoot>) {
+    let mut external = BTreeSet::new();
+    let mut path_roots = BTreeMap::new();
+    let manifest_dir = manifest_path.parent().unwrap_or(workspace_root);
+
     for section_name in ["dependencies", "dev-dependencies"] {
         if let Some(table) = manifest.get(section_name).and_then(TomlValue::as_table) {
             let section_label = format!("[{}]", section_name);
-            collect_native_non_starknet_dependency_table(&section_label, table, &mut unsupported);
+            collect_native_dependency_table_surface(
+                &section_label,
+                table,
+                manifest,
+                manifest_dir,
+                workspace_root,
+                &mut external,
+                &mut path_roots,
+            );
         }
     }
 
@@ -3805,16 +3918,28 @@ fn collect_native_non_starknet_dependencies(manifest: &TomlValue) -> Vec<String>
                     .and_then(TomlValue::as_table)
                 {
                     let section_label = format!("[target.{}.{}]", target_name, section_name);
-                    collect_native_non_starknet_dependency_table(
+                    collect_native_dependency_table_surface(
                         &section_label,
                         table,
-                        &mut unsupported,
+                        manifest,
+                        manifest_dir,
+                        workspace_root,
+                        &mut external,
+                        &mut path_roots,
                     );
                 }
             }
         }
     }
-    unsupported.into_iter().collect()
+
+    let path_dependency_roots = path_roots
+        .into_iter()
+        .map(|(crate_name, source_root)| NativePathDependencyRoot {
+            crate_name,
+            source_root,
+        })
+        .collect();
+    (external.into_iter().collect(), path_dependency_roots)
 }
 
 #[cfg(feature = "native-compile")]
@@ -3843,11 +3968,21 @@ fn build_native_compile_context_uncached(
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .context("native compile requires [package].name in Scarb.toml")?;
-    let non_starknet_dependencies = collect_native_non_starknet_dependencies(&manifest);
-    if !non_starknet_dependencies.is_empty() {
+    let (external_non_starknet_dependencies, path_dependency_roots) =
+        collect_native_dependency_surface(&manifest, manifest_path, workspace_root);
+    if !path_dependency_roots.is_empty() {
         tracing::debug!(
-            dependencies = ?non_starknet_dependencies,
-            "native compile detected non-starknet manifest dependencies; continuing with local crate compile path"
+            roots = ?path_dependency_roots
+                .iter()
+                .map(|root| (root.crate_name.as_str(), root.source_root.display().to_string()))
+                .collect::<Vec<_>>(),
+            "native compile detected local path dependencies; wiring crate roots in cairo_project.toml"
+        );
+    }
+    if !external_non_starknet_dependencies.is_empty() {
+        tracing::debug!(
+            dependencies = ?external_non_starknet_dependencies,
+            "native compile detected external non-starknet dependencies; scarb fallback remains eligible on native compile failures"
         );
     }
 
@@ -3889,11 +4024,25 @@ fn build_native_compile_context_uncached(
         )
     })?;
     let cairo_project_path = cairo_project_dir.join("cairo_project.toml");
-    let source_root_string = normalize_fingerprint_path(&source_root);
-    let escaped_source_root = toml_escape_basic_string(&source_root_string);
+    let mut crate_roots = BTreeMap::new();
+    crate_roots.insert(crate_name.clone(), source_root.clone());
+    for root in &path_dependency_roots {
+        crate_roots
+            .entry(root.crate_name.clone())
+            .or_insert_with(|| root.source_root.clone());
+    }
+    let escaped_crate_roots = crate_roots
+        .iter()
+        .map(|(root_name, root_path)| {
+            (
+                root_name.clone(),
+                toml_escape_basic_string(&normalize_fingerprint_path(root_path)),
+            )
+        })
+        .collect::<Vec<_>>();
     let (cairo_edition, _) = resolve_manifest_cairo_settings_from_manifest(&manifest);
     let cairo_project_toml =
-        native_cairo_project_toml(&crate_name, &escaped_source_root, cairo_edition.as_deref());
+        native_cairo_project_toml(&escaped_crate_roots, cairo_edition.as_deref());
     write_text_file_if_changed(
         &cairo_project_path,
         &cairo_project_toml,
@@ -3910,7 +4059,8 @@ fn build_native_compile_context_uncached(
         corelib_src,
         starknet_target,
         manifest_content_hash,
-        non_starknet_dependencies,
+        external_non_starknet_dependencies,
+        path_dependency_roots,
     })
 }
 
@@ -3933,14 +4083,24 @@ fn write_text_file_if_changed(path: &Path, contents: &str, label: &str) -> Resul
 #[cfg(feature = "native-compile")]
 fn native_compile_context_estimated_bytes(context: &NativeCompileContext) -> u64 {
     let path_bytes = normalize_fingerprint_path(&context.cairo_project_dir).len()
-        + normalize_fingerprint_path(&context.corelib_src).len();
+        + normalize_fingerprint_path(&context.corelib_src).len()
+        + context
+            .path_dependency_roots
+            .iter()
+            .map(|root| normalize_fingerprint_path(&root.source_root).len())
+            .sum::<usize>();
     let scalar_bytes = context.package_name.len()
         + context.crate_name.len()
         + context.manifest_content_hash.len()
         + context
-            .non_starknet_dependencies
+            .external_non_starknet_dependencies
             .iter()
             .map(String::len)
+            .sum::<usize>()
+        + context
+            .path_dependency_roots
+            .iter()
+            .map(|root| root.crate_name.len())
             .sum::<usize>()
         + path_bytes;
     u64::try_from(scalar_bytes).unwrap_or(u64::MAX)
@@ -3951,10 +4111,10 @@ fn mark_native_fallback_eligible_for_external_dependencies(
     err: anyhow::Error,
     context: &NativeCompileContext,
 ) -> anyhow::Error {
-    if context.non_starknet_dependencies.is_empty() {
+    if context.external_non_starknet_dependencies.is_empty() {
         return err;
     }
-    let deps = context.non_starknet_dependencies.join(", ");
+    let deps = context.external_non_starknet_dependencies.join(", ");
     mark_native_fallback_eligible(err.context(format!(
         "native compile manifest includes non-starknet dependencies ({deps}); retrying with scarb fallback is allowed"
     )))
@@ -4102,11 +4262,16 @@ fn update_native_compile_session_cached_estimated_bytes(
 
 #[cfg(feature = "native-compile")]
 fn native_cairo_project_toml(
-    crate_name: &str,
-    escaped_source_root: &str,
+    crate_roots: &[(String, String)],
     cairo_edition: Option<&str>,
 ) -> String {
-    let mut content = format!("[crate_roots]\n{crate_name} = \"{escaped_source_root}\"\n");
+    let mut content = String::from("[crate_roots]\n");
+    for (crate_name, escaped_source_root) in crate_roots {
+        content.push_str(crate_name);
+        content.push_str(" = \"");
+        content.push_str(escaped_source_root);
+        content.push_str("\"\n");
+    }
     if let Some(edition) = cairo_edition
         .map(str::trim)
         .filter(|value| !value.is_empty())

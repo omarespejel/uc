@@ -1752,7 +1752,8 @@ fn native_compile_context_cache_ttl_eviction_prunes_stale_entries() {
             casm: true,
         },
         manifest_content_hash: "manifest-blake3:demo".to_string(),
-        non_starknet_dependencies: Vec::new(),
+        external_non_starknet_dependencies: Vec::new(),
+        path_dependency_roots: Vec::new(),
     };
     let mut cache = HashMap::new();
     cache.insert(
@@ -3675,7 +3676,7 @@ demo = "1.0.0"
 }
 
 #[test]
-fn collect_native_non_starknet_dependencies_collects_root_dependencies() {
+fn collect_native_dependency_surface_collects_external_root_and_target_dependencies() {
     let manifest: TomlValue = toml::from_str(
         r#"[package]
 name = "demo"
@@ -3685,32 +3686,124 @@ edition = "2024_07"
 [dependencies]
 starknet = "2.7.0"
 alexandria = "0.9.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+dojo = "1.2.3"
 "#,
     )
     .expect("manifest should parse");
-    let deps = collect_native_non_starknet_dependencies(&manifest);
-    assert_eq!(deps, vec!["[dependencies].alexandria".to_string()]);
+    let manifest_path = PathBuf::from("/tmp/uc-dependency-surface-root/Scarb.toml");
+    let workspace_root = PathBuf::from("/tmp/uc-dependency-surface-root");
+    let (external, path_roots) =
+        collect_native_dependency_surface(&manifest, &manifest_path, &workspace_root);
+    assert!(path_roots.is_empty());
+    assert_eq!(
+        external,
+        vec![
+            "[dependencies].alexandria".to_string(),
+            "[target.cfg(target_os = \"linux\").dependencies].dojo".to_string(),
+        ]
+    );
 }
 
 #[test]
-fn collect_native_non_starknet_dependencies_collects_target_cfg_dependencies() {
-    let manifest: TomlValue = toml::from_str(
+fn collect_native_dependency_surface_collects_local_path_dependency_roots() {
+    let dir = unique_test_dir("uc-native-dependency-surface-path-roots");
+    let manifest_path = dir.join("Scarb.toml");
+    let local_dep_src = dir.join("deps/local-dep/src");
+    let shared_dep_src = dir.join("deps/shared-dep/src");
+    fs::create_dir_all(&local_dep_src).expect("failed to create local dependency src");
+    fs::create_dir_all(&shared_dep_src).expect("failed to create shared dependency src");
+    fs::write(local_dep_src.join("lib.cairo"), "fn local() {}\n")
+        .expect("failed to write local dependency lib.cairo");
+    fs::write(shared_dep_src.join("lib.cairo"), "fn shared() {}\n")
+        .expect("failed to write shared dependency lib.cairo");
+    fs::write(
+        &manifest_path,
         r#"[package]
 name = "demo"
 version = "0.1.0"
 edition = "2024_07"
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[workspace.dependencies]
+shared-dep = { path = "deps/shared-dep" }
+
+[dependencies]
 starknet = "2.7.0"
+local-dep = { path = "deps/local-dep" }
+shared-dep = { workspace = true }
 alexandria = "0.9.0"
 "#,
     )
-    .expect("manifest should parse");
-    let deps = collect_native_non_starknet_dependencies(&manifest);
+    .expect("failed to write manifest");
+    let manifest_text = fs::read_to_string(&manifest_path).expect("failed to read manifest");
+    let manifest: TomlValue = toml::from_str(&manifest_text).expect("manifest should parse");
+    let (external, path_roots) = collect_native_dependency_surface(&manifest, &manifest_path, &dir);
+
     assert_eq!(
-        deps,
-        vec!["[target.cfg(target_os = \"linux\").dependencies].alexandria".to_string()]
+        external,
+        vec!["[dependencies].alexandria".to_string()],
+        "only non-path non-starknet deps should remain external",
     );
+    assert_eq!(
+        path_roots,
+        vec![
+            NativePathDependencyRoot {
+                crate_name: "local_dep".to_string(),
+                source_root: local_dep_src,
+            },
+            NativePathDependencyRoot {
+                crate_name: "shared_dep".to_string(),
+                source_root: shared_dep_src,
+            },
+        ],
+        "path dependencies should be tracked as native crate roots",
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn collect_native_dependency_surface_resolves_workspace_paths_from_workspace_root() {
+    let dir = unique_test_dir("uc-native-dependency-surface-workspace-path-root");
+    let package_dir = dir.join("packages/app");
+    let manifest_path = package_dir.join("Scarb.toml");
+    let shared_dep_src = dir.join("deps/shared-dep/src");
+    fs::create_dir_all(&shared_dep_src).expect("failed to create shared dependency src");
+    fs::create_dir_all(&package_dir).expect("failed to create package directory");
+    fs::write(shared_dep_src.join("lib.cairo"), "fn shared() {}\n")
+        .expect("failed to write shared dependency lib.cairo");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+
+[workspace.dependencies]
+shared-dep = { path = "deps/shared-dep" }
+
+[dependencies]
+shared-dep = { workspace = true }
+"#,
+    )
+    .expect("failed to write package manifest");
+    let manifest_text = fs::read_to_string(&manifest_path).expect("failed to read manifest");
+    let manifest: TomlValue = toml::from_str(&manifest_text).expect("manifest should parse");
+    let (external, path_roots) = collect_native_dependency_surface(&manifest, &manifest_path, &dir);
+
+    assert!(
+        external.is_empty(),
+        "workspace path dependency should not be external"
+    );
+    assert_eq!(
+        path_roots,
+        vec![NativePathDependencyRoot {
+            crate_name: "shared_dep".to_string(),
+            source_root: shared_dep_src,
+        }],
+        "workspace path dependencies should resolve from workspace root, not package manifest directory",
+    );
+    fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -3901,7 +3994,10 @@ edition = "2024_07"
 
 #[test]
 fn native_cairo_project_toml_prefers_explicit_cairo_edition() {
-    let rendered = native_cairo_project_toml("demo_native", "/tmp/demo/src", Some("2023_10"));
+    let rendered = native_cairo_project_toml(
+        &[("demo_native".to_string(), "/tmp/demo/src".to_string())],
+        Some("2023_10"),
+    );
     assert!(
         rendered.contains("[crate_roots]\ndemo_native = \"/tmp/demo/src\""),
         "crate roots stanza should be present"
@@ -4586,7 +4682,8 @@ fn mark_native_fallback_eligible_for_external_dependencies_only_marks_when_prese
             casm: true,
         },
         manifest_content_hash: "manifest-blake3:demo".to_string(),
-        non_starknet_dependencies: Vec::new(),
+        external_non_starknet_dependencies: Vec::new(),
+        path_dependency_roots: Vec::new(),
     };
 
     let plain = mark_native_fallback_eligible_for_external_dependencies(
@@ -4599,7 +4696,8 @@ fn mark_native_fallback_eligible_for_external_dependencies_only_marks_when_prese
     );
 
     let mut with_external = base_context.clone();
-    with_external.non_starknet_dependencies = vec!["[dependencies].alexandria".to_string()];
+    with_external.external_non_starknet_dependencies =
+        vec!["[dependencies].alexandria".to_string()];
     let eligible = mark_native_fallback_eligible_for_external_dependencies(
         anyhow::Error::msg("native starknet compile failed"),
         &with_external,
