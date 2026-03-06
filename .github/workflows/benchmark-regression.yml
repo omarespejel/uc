@@ -6,6 +6,10 @@ on:
   push:
     branches: [main]
 
+env:
+  SCARB_FIXTURE_TAG: v2.16.0
+  CAIRO_CORELIB_TAG: v2.16.0
+
 jobs:
   benchmark-smoke:
     runs-on: ubuntu-latest
@@ -17,7 +21,7 @@ jobs:
         run: |
           set -euo pipefail
           CAIRO_ROOT="$RUNNER_TEMP/cairo-workspace"
-          git clone --depth 1 --branch v2.16.0 \
+          git clone --depth 1 --branch "$CAIRO_CORELIB_TAG" \
             https://github.com/starkware-libs/cairo.git "$CAIRO_ROOT/cairo"
           echo "UC_NATIVE_CORELIB_SRC=$CAIRO_ROOT/cairo/corelib/src" >> "$GITHUB_ENV"
 
@@ -82,10 +86,10 @@ jobs:
           set -euo pipefail
           RESEARCH_ROOT="$RUNNER_TEMP/research-workspace"
           mkdir -p "$RESEARCH_ROOT"
-          git clone --depth 1 --branch v2.14.0 \
+          git clone --depth 1 --branch "$SCARB_FIXTURE_TAG" \
             https://github.com/software-mansion/scarb.git "$RESEARCH_ROOT/scarb"
           CAIRO_ROOT="$RUNNER_TEMP/cairo-workspace"
-          git clone --depth 1 --branch v2.16.0 \
+          git clone --depth 1 --branch "$CAIRO_CORELIB_TAG" \
             https://github.com/starkware-libs/cairo.git "$CAIRO_ROOT/cairo"
           echo "UC_RESEARCH_ROOT=$RESEARCH_ROOT" >> "$GITHUB_ENV"
           echo "UC_NATIVE_CORELIB_SRC=$CAIRO_ROOT/cairo/corelib/src" >> "$GITHUB_ENV"
@@ -129,10 +133,10 @@ jobs:
           set -euo pipefail
           RESEARCH_ROOT="$RUNNER_TEMP/research-workspace"
           mkdir -p "$RESEARCH_ROOT"
-          git clone --depth 1 --branch v2.14.0 \
+          git clone --depth 1 --branch "$SCARB_FIXTURE_TAG" \
             https://github.com/software-mansion/scarb.git "$RESEARCH_ROOT/scarb"
           CAIRO_ROOT="$RUNNER_TEMP/cairo-workspace"
-          git clone --depth 1 --branch v2.16.0 \
+          git clone --depth 1 --branch "$CAIRO_CORELIB_TAG" \
             https://github.com/starkware-libs/cairo.git "$CAIRO_ROOT/cairo"
           echo "UC_RESEARCH_ROOT=$RESEARCH_ROOT" >> "$GITHUB_ENV"
           echo "UC_NATIVE_CORELIB_SRC=$CAIRO_ROOT/cairo/corelib/src" >> "$GITHUB_ENV"

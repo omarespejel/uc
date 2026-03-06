@@ -57,7 +57,13 @@ struct ScopedEnvVar {
 }
 
 impl ScopedEnvVar {
-    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+    // All process-global env mutation in tests must run under `integration_env_lock()`
+    // to avoid cross-test races when the harness executes tests in parallel.
+    fn set_with_lock(
+        _guard: &std::sync::MutexGuard<'_, ()>,
+        key: &'static str,
+        value: impl AsRef<std::ffi::OsStr>,
+    ) -> Self {
         let previous = std::env::var_os(key);
         std::env::set_var(key, value);
         Self { key, previous }
@@ -942,7 +948,7 @@ fn try_uc_build_via_daemon_auto_mode_falls_back_on_daemon_error() {
             .expect("failed to write daemon response delimiter");
         stream.flush().expect("failed to flush daemon response");
     });
-    let _socket_env = ScopedEnvVar::set("UC_DAEMON_SOCKET_PATH", &socket_path);
+    let _socket_env = ScopedEnvVar::set_with_lock(&_guard, "UC_DAEMON_SOCKET_PATH", &socket_path);
 
     let common = BuildCommonArgs {
         manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
@@ -1001,7 +1007,7 @@ fn try_uc_build_via_daemon_require_mode_surfaces_daemon_error() {
             .expect("failed to write daemon response delimiter");
         stream.flush().expect("failed to flush daemon response");
     });
-    let _socket_env = ScopedEnvVar::set("UC_DAEMON_SOCKET_PATH", &socket_path);
+    let _socket_env = ScopedEnvVar::set_with_lock(&_guard, "UC_DAEMON_SOCKET_PATH", &socket_path);
 
     let common = BuildCommonArgs {
         manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
@@ -1066,7 +1072,7 @@ fn try_uc_build_via_daemon_require_mode_rejects_backend_mismatch() {
             .expect("failed to write daemon response delimiter");
         stream.flush().expect("failed to flush daemon response");
     });
-    let _socket_env = ScopedEnvVar::set("UC_DAEMON_SOCKET_PATH", &socket_path);
+    let _socket_env = ScopedEnvVar::set_with_lock(&_guard, "UC_DAEMON_SOCKET_PATH", &socket_path);
 
     let common = BuildCommonArgs {
         manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),

@@ -290,9 +290,11 @@ fn clear_daemon_local_probe_hint(workspace_root: &Path, primary_session_key: &st
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("failed to remove daemon probe hint {}", hint_path.display())
-                });
+                tracing::warn!(
+                    error = %err,
+                    hint_path = %hint_path.display(),
+                    "failed to remove daemon probe hint; continuing"
+                );
             }
         }
     }
@@ -1166,6 +1168,24 @@ mod tests {
             cleared.is_none(),
             "probe hint should be removed after clear operation"
         );
+
+        fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[test]
+    fn clear_daemon_local_probe_hint_tolerates_unremovable_paths() {
+        let workspace = unique_test_dir("uc-daemon-probe-hint-clear-unremovable");
+        let primary_session_key = "a".repeat(SESSION_KEY_LEN);
+        let hint_path = daemon_local_probe_hint_path(&workspace, &primary_session_key)
+            .expect("failed to compute probe hint path");
+        if let Some(parent) = hint_path.parent() {
+            fs::create_dir_all(parent).expect("failed to create probe hint directory");
+        }
+        // Directory at hint-file path makes remove_file fail with `IsADirectory`.
+        fs::create_dir_all(&hint_path).expect("failed to create directory at probe hint path");
+
+        clear_daemon_local_probe_hint(&workspace, &primary_session_key)
+            .expect("clear should treat hint cleanup failures as best-effort");
 
         fs::remove_dir_all(&workspace).ok();
     }
