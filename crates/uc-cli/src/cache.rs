@@ -465,6 +465,8 @@ fn cached_object_hash_if_fresh(
         return Ok(None);
     };
     if entry.size_bytes == metadata.len() && entry.modified_unix_ms == modified_unix_ms {
+        // Refresh the memo entry age only on a true metadata hit.
+        // Stale probes must not extend LRU lifetime for outdated hashes.
         entry.last_access_epoch_ms = now_ms;
         return Ok(Some(entry.blake3_hex.clone()));
     }

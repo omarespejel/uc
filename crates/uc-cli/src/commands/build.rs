@@ -387,12 +387,11 @@ fn clear_daemon_local_native_supported_hint(
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "failed to remove native-supported hint {}",
-                        hint_path.display()
-                    )
-                });
+                tracing::warn!(
+                    error = %err,
+                    hint_path = %hint_path.display(),
+                    "failed to remove native-supported hint; continuing"
+                );
             }
         }
     }
@@ -1210,6 +1209,25 @@ mod tests {
                 .expect("failed to read native-supported hint after clear"),
             "native-supported hint should be removed after clear operation"
         );
+
+        fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[test]
+    fn clear_daemon_local_native_supported_hint_tolerates_unremovable_paths() {
+        let workspace = unique_test_dir("uc-daemon-native-supported-hint-clear-unremovable");
+        let primary_session_key = "d".repeat(SESSION_KEY_LEN);
+        let hint_path = daemon_local_native_supported_hint_path(&workspace, &primary_session_key)
+            .expect("failed to compute native-supported hint path");
+        if let Some(parent) = hint_path.parent() {
+            fs::create_dir_all(parent).expect("failed to create native-supported hint directory");
+        }
+        // Directory at hint-file path makes remove_file fail with `IsADirectory`.
+        fs::create_dir_all(&hint_path)
+            .expect("failed to create directory at native-supported hint path");
+
+        clear_daemon_local_native_supported_hint(&workspace, &primary_session_key)
+            .expect("clear should treat native-supported hint cleanup failures as best-effort");
 
         fs::remove_dir_all(&workspace).ok();
     }

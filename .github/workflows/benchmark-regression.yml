@@ -9,6 +9,8 @@ on:
 env:
   SCARB_FIXTURE_TAG: v2.16.0
   CAIRO_CORELIB_TAG: v2.16.0
+  SCARB_FIXTURE_SHA: 231227f3fe49cc813b1b018a67cf3b7080766e24
+  CAIRO_CORELIB_SHA: 6a43d7c9419481fcb82376447fecf85c44d8fbbf
 
 jobs:
   benchmark-smoke:
@@ -23,6 +25,11 @@ jobs:
           CAIRO_ROOT="$RUNNER_TEMP/cairo-workspace"
           git clone --depth 1 --branch "$CAIRO_CORELIB_TAG" \
             https://github.com/starkware-libs/cairo.git "$CAIRO_ROOT/cairo"
+          CAIRO_HEAD="$(git -C "$CAIRO_ROOT/cairo" rev-parse HEAD)"
+          if [[ "$CAIRO_HEAD" != "$CAIRO_CORELIB_SHA" ]]; then
+            echo "cairo tag $CAIRO_CORELIB_TAG resolved to unexpected commit $CAIRO_HEAD (expected $CAIRO_CORELIB_SHA)" >&2
+            exit 1
+          fi
           echo "UC_NATIVE_CORELIB_SRC=$CAIRO_ROOT/cairo/corelib/src" >> "$GITHUB_ENV"
 
       - name: Install Scarb
@@ -88,9 +95,19 @@ jobs:
           mkdir -p "$RESEARCH_ROOT"
           git clone --depth 1 --branch "$SCARB_FIXTURE_TAG" \
             https://github.com/software-mansion/scarb.git "$RESEARCH_ROOT/scarb"
+          SCARB_HEAD="$(git -C "$RESEARCH_ROOT/scarb" rev-parse HEAD)"
+          if [[ "$SCARB_HEAD" != "$SCARB_FIXTURE_SHA" ]]; then
+            echo "scarb tag $SCARB_FIXTURE_TAG resolved to unexpected commit $SCARB_HEAD (expected $SCARB_FIXTURE_SHA)" >&2
+            exit 1
+          fi
           CAIRO_ROOT="$RUNNER_TEMP/cairo-workspace"
           git clone --depth 1 --branch "$CAIRO_CORELIB_TAG" \
             https://github.com/starkware-libs/cairo.git "$CAIRO_ROOT/cairo"
+          CAIRO_HEAD="$(git -C "$CAIRO_ROOT/cairo" rev-parse HEAD)"
+          if [[ "$CAIRO_HEAD" != "$CAIRO_CORELIB_SHA" ]]; then
+            echo "cairo tag $CAIRO_CORELIB_TAG resolved to unexpected commit $CAIRO_HEAD (expected $CAIRO_CORELIB_SHA)" >&2
+            exit 1
+          fi
           echo "UC_RESEARCH_ROOT=$RESEARCH_ROOT" >> "$GITHUB_ENV"
           echo "UC_NATIVE_CORELIB_SRC=$CAIRO_ROOT/cairo/corelib/src" >> "$GITHUB_ENV"
 
@@ -135,9 +152,19 @@ jobs:
           mkdir -p "$RESEARCH_ROOT"
           git clone --depth 1 --branch "$SCARB_FIXTURE_TAG" \
             https://github.com/software-mansion/scarb.git "$RESEARCH_ROOT/scarb"
+          SCARB_HEAD="$(git -C "$RESEARCH_ROOT/scarb" rev-parse HEAD)"
+          if [[ "$SCARB_HEAD" != "$SCARB_FIXTURE_SHA" ]]; then
+            echo "scarb tag $SCARB_FIXTURE_TAG resolved to unexpected commit $SCARB_HEAD (expected $SCARB_FIXTURE_SHA)" >&2
+            exit 1
+          fi
           CAIRO_ROOT="$RUNNER_TEMP/cairo-workspace"
           git clone --depth 1 --branch "$CAIRO_CORELIB_TAG" \
             https://github.com/starkware-libs/cairo.git "$CAIRO_ROOT/cairo"
+          CAIRO_HEAD="$(git -C "$CAIRO_ROOT/cairo" rev-parse HEAD)"
+          if [[ "$CAIRO_HEAD" != "$CAIRO_CORELIB_SHA" ]]; then
+            echo "cairo tag $CAIRO_CORELIB_TAG resolved to unexpected commit $CAIRO_HEAD (expected $CAIRO_CORELIB_SHA)" >&2
+            exit 1
+          fi
           echo "UC_RESEARCH_ROOT=$RESEARCH_ROOT" >> "$GITHUB_ENV"
           echo "UC_NATIVE_CORELIB_SRC=$CAIRO_ROOT/cairo/corelib/src" >> "$GITHUB_ENV"
 

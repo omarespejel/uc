@@ -246,8 +246,10 @@ fn hash_contract_class_json_semantic(path: &Path) -> Result<(String, u64)> {
 fn contract_class_schema_marker(value: &Value) -> Option<&Value> {
     // `contract_class_version` appears in Starknet contract-class JSON.
     // `sierra_format_version` appears in raw Sierra program JSON.
-    // `sierra_version` is treated as a legacy alias to keep normalization
-    // forward-compatible with intermediate tooling outputs.
+    // `sierra_version` is a legacy alias kept for compatibility with older
+    // artifacts accepted by uc (see
+    // `contract_class_semantic_hash_accepts_legacy_sierra_version_marker`).
+    // Unknown schemas still fall back to raw hashing via `hash_file_with_limit`.
     value
         .get("contract_class_version")
         .or_else(|| value.get("sierra_format_version"))
@@ -381,6 +383,8 @@ fn parse_hex_u64(value: &str) -> Option<u64> {
 }
 
 fn validate_supported_sierra_schema(value: &Value, path: &Path) -> Result<()> {
+    // Accept legacy `sierra_version` marker for backward compatibility with
+    // historical fixtures; new outputs should use `sierra_format_version`.
     let Some(version_value) = value
         .get("sierra_format_version")
         .or_else(|| value.get("sierra_version"))
