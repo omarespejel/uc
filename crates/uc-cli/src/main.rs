@@ -13,7 +13,7 @@ use cairo_lang_defs::ids::ModuleId;
 #[cfg(feature = "native-compile")]
 use cairo_lang_defs::ids::TopLevelLanguageElementId;
 #[cfg(feature = "native-compile")]
-use cairo_lang_filesystem::db::{files_group_input, init_dev_corelib, FilesGroup};
+use cairo_lang_filesystem::db::{init_dev_corelib, set_file_override_content_keyed, FilesGroup};
 #[cfg(feature = "native-compile")]
 use cairo_lang_filesystem::detect::detect_corelib;
 #[cfg(feature = "native-compile")]
@@ -832,6 +832,7 @@ struct NativeCompileSessionState {
     main_crate_inputs: Vec<CrateInput>,
     tracked_sources: BTreeMap<String, NativeTrackedFileState>,
     tracked_source_bytes: u64,
+    journal_cursor_applied: u64,
     source_root_modified_unix_ms: u64,
     contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
     contract_output_plans: Vec<NativeContractOutputPlan>,
@@ -858,6 +859,8 @@ struct NativeCompileSessionImageFile {
     tracked_source_bytes: u64,
     contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
     contract_output_plans: Vec<NativeContractOutputPlan>,
+    #[serde(default)]
+    journal_cursor_applied: u64,
     generated_at_epoch_ms: u64,
 }
 
@@ -870,6 +873,7 @@ struct NativeCompileSessionImageSnapshot {
     tracked_source_bytes: u64,
     contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
     contract_output_plans: Vec<NativeContractOutputPlan>,
+    journal_cursor_applied: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -879,6 +883,7 @@ struct NativeSourceChangeJournal {
     removed_files: BTreeSet<String>,
     overflowed: bool,
     cursor: u64,
+    applied_cursor: u64,
 }
 
 #[cfg(feature = "native-compile")]
@@ -928,6 +933,8 @@ struct NativeSourceJournalFile {
     overflowed: bool,
     #[serde(default)]
     cursor: u64,
+    #[serde(default)]
+    applied_cursor: u64,
     #[serde(default)]
     updated_at_epoch_ms: u64,
 }
@@ -5124,7 +5131,6 @@ fn native_update_compile_session_post_build_state(
             return;
         }
     };
-    let journal_cursor = native_current_source_journal_cursor(workspace_root);
     let (estimated_bytes, image_snapshot, buildinfo_snapshot) = {
         let mut session = session_handle
             .lock()
@@ -5163,7 +5169,9 @@ fn native_update_compile_session_post_build_state(
         (
             native_compile_session_state_estimated_bytes(&session),
             state_changed.then(|| native_compile_session_image_snapshot_from_state(&session)),
-            state_changed.then(|| native_buildinfo_file_from_state(&session, journal_cursor)),
+            state_changed.then(|| {
+                native_buildinfo_file_from_state(&session, session.journal_cursor_applied)
+            }),
         )
     };
     update_native_compile_session_cached_estimated_bytes(workspace_root, estimated_bytes);
@@ -5622,6 +5630,7 @@ fn native_compile_session_image_snapshot_from_state(
         tracked_source_bytes: session.tracked_source_bytes,
         contract_source_dependencies: session.contract_source_dependencies.clone(),
         contract_output_plans: session.contract_output_plans.clone(),
+        journal_cursor_applied: session.journal_cursor_applied,
     }
 }
 
@@ -5643,6 +5652,7 @@ fn persist_native_compile_session_image_snapshot(
         tracked_source_bytes: snapshot.tracked_source_bytes,
         contract_source_dependencies: snapshot.contract_source_dependencies.clone(),
         contract_output_plans: snapshot.contract_output_plans.clone(),
+        journal_cursor_applied: snapshot.journal_cursor_applied,
         generated_at_epoch_ms: epoch_ms_u64().unwrap_or_default(),
     };
     let bytes = serde_json::to_vec(&image).context("failed to encode native session image")?;
@@ -5774,6 +5784,7 @@ fn try_native_compile_session_image_restore(
         tracked_source_bytes,
         contract_source_dependencies: decoded.contract_source_dependencies,
         contract_output_plans: decoded.contract_output_plans,
+        journal_cursor_applied: decoded.journal_cursor_applied,
     })
 }
 
@@ -5815,6 +5826,7 @@ fn native_source_journal_file_from_state(
         removed_files: state.removed_files.iter().cloned().collect(),
         overflowed: state.overflowed,
         cursor: state.cursor,
+        applied_cursor: state.applied_cursor.min(state.cursor),
         updated_at_epoch_ms: epoch_ms_u64().unwrap_or_default(),
     }
 }
@@ -5840,6 +5852,7 @@ fn native_source_journal_state_from_file(
         removed_files,
         overflowed: decoded.overflowed || changed_overflow || removed_overflow,
         cursor: decoded.cursor,
+        applied_cursor: decoded.applied_cursor.min(decoded.cursor),
     }
 }
 
@@ -6231,7 +6244,7 @@ fn build_native_compile_session_state(
             image.contract_output_plans,
             true,
             false,
-            native_current_source_journal_cursor(workspace_root),
+            image.journal_cursor_applied,
         )
     } else if let Some(buildinfo) = restored_buildinfo {
         (
@@ -6277,6 +6290,7 @@ fn build_native_compile_session_state(
         main_crate_inputs,
         tracked_sources,
         tracked_source_bytes,
+        journal_cursor_applied,
         source_root_modified_unix_ms,
         contract_source_dependencies,
         contract_output_plans,
@@ -6286,7 +6300,7 @@ fn build_native_compile_session_state(
         persist_native_compile_session_image_snapshot_best_effort(workspace_root, &snapshot);
     }
     if !buildinfo_hit || !session_image_hit {
-        let buildinfo = native_buildinfo_file_from_state(&state, journal_cursor_applied);
+        let buildinfo = native_buildinfo_file_from_state(&state, state.journal_cursor_applied);
         persist_native_buildinfo_sidecar_best_effort(workspace_root, &buildinfo);
     }
     Ok(state)
@@ -6650,6 +6664,7 @@ enum NativeSourceJournalDelta {
 fn native_take_source_journal_delta(
     workspace_root: &Path,
     source_roots: &[PathBuf],
+    session_applied_cursor: u64,
 ) -> NativeSourceJournalDelta {
     let journal = match ensure_native_source_change_watcher(workspace_root, source_roots) {
         Ok(journal) => journal,
@@ -6665,10 +6680,35 @@ fn native_take_source_journal_delta(
     let mut state = journal
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state.applied_cursor > state.cursor {
+        state.applied_cursor = state.cursor;
+        state.overflowed = true;
+    }
+    if session_applied_cursor > state.applied_cursor {
+        if state.cursor <= session_applied_cursor {
+            state.changed_files.clear();
+            state.removed_files.clear();
+            state.overflowed = false;
+            state.applied_cursor = state.cursor;
+            let snapshot = state.clone();
+            drop(state);
+            persist_native_source_change_journal_best_effort(workspace_root, &snapshot);
+            return NativeSourceJournalDelta::NoChanges;
+        }
+        // We only persist aggregate changed/removed sets, not per-cursor history. If the
+        // caller's applied cursor is ahead of the journal's applied cursor and there are newer
+        // events in the journal, replay from that boundary is ambiguous. Force a conservative
+        // full scan once and resume journal mode afterwards.
+        state.changed_files.clear();
+        state.removed_files.clear();
+        state.overflowed = true;
+        state.applied_cursor = session_applied_cursor.min(state.cursor);
+    }
     if state.overflowed {
         state.overflowed = false;
         state.changed_files.clear();
         state.removed_files.clear();
+        state.applied_cursor = state.cursor;
         let snapshot = state.clone();
         drop(state);
         persist_native_source_change_journal_best_effort(workspace_root, &snapshot);
@@ -6679,12 +6719,20 @@ fn native_take_source_journal_delta(
         return NativeSourceJournalDelta::FallbackFullScan;
     }
     if state.changed_files.is_empty() && state.removed_files.is_empty() {
+        if state.applied_cursor != state.cursor {
+            state.applied_cursor = state.cursor;
+            let snapshot = state.clone();
+            drop(state);
+            persist_native_source_change_journal_best_effort(workspace_root, &snapshot);
+            return NativeSourceJournalDelta::NoChanges;
+        }
         return NativeSourceJournalDelta::NoChanges;
     }
     let changed_files = state.changed_files.iter().cloned().collect::<Vec<_>>();
     let removed_files = state.removed_files.iter().cloned().collect::<Vec<_>>();
     state.changed_files.clear();
     state.removed_files.clear();
+    state.applied_cursor = state.cursor;
     let snapshot = state.clone();
     drop(state);
     persist_native_source_change_journal_best_effort(workspace_root, &snapshot);
@@ -6914,36 +6962,15 @@ fn native_apply_file_keyed_session_updates(
         let file = db.file_input(file_id).clone();
         updates.push((file, None));
     }
-    let mut overrides = files_group_input(db)
-        .file_overrides(db)
-        .clone()
-        .unwrap_or_default();
     let mut overrides_changed = false;
     for (file, content) in updates {
-        match content {
-            Some(content) => {
-                let should_update = overrides
-                    .get(&file)
-                    .is_none_or(|existing| existing.as_ref() != content.as_ref());
-                if should_update {
-                    overrides.insert(file, content);
-                    overrides_changed = true;
-                }
-            }
-            None => {
-                if overrides.swap_remove(&file).is_some() {
-                    overrides_changed = true;
-                }
-            }
+        if set_file_override_content_keyed(db, file, content) {
+            overrides_changed = true;
         }
     }
     if !overrides_changed {
         return Ok(false);
     }
-    salsa::Setter::to(
-        files_group_input(db).set_file_overrides(db),
-        Some(overrides),
-    );
     Ok(true)
 }
 
@@ -6956,11 +6983,14 @@ fn with_native_compile_session<T>(
 ) -> Result<T> {
     let source_roots = native_compile_source_roots(workspace_root, &signature.context);
     let session_handle = native_compile_session_handle(workspace_root, signature)?;
-    let needs_full_rebuild = {
+    let (needs_full_rebuild, session_applied_cursor) = {
         let session = session_handle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        session.signature != *signature
+        (
+            session.signature != *signature,
+            session.journal_cursor_applied,
+        )
     };
     let snapshot_previous_sources = || {
         let session = session_handle
@@ -6979,7 +7009,11 @@ fn with_native_compile_session<T>(
     ) = if needs_full_rebuild {
         (Vec::new(), Vec::new(), None, 0_u64, false)
     } else if daemon_context {
-        match native_take_source_journal_delta(workspace_root, &source_roots) {
+        match native_take_source_journal_delta(
+            workspace_root,
+            &source_roots,
+            session_applied_cursor,
+        ) {
             NativeSourceJournalDelta::NoChanges => (Vec::new(), Vec::new(), None, 0_u64, false),
             NativeSourceJournalDelta::Changed {
                 changed_files,
@@ -7097,7 +7131,6 @@ fn with_native_compile_session<T>(
         None
     };
     let mut current_source_snapshot = current_source_snapshot;
-    let journal_cursor = native_current_source_journal_cursor(workspace_root);
     let estimated_bytes;
     let (snapshot, image_snapshot, buildinfo_snapshot) = {
         let mut session = session_handle
@@ -7202,6 +7235,11 @@ fn with_native_compile_session<T>(
             session.source_root_modified_unix_ms = source_root_mtime;
             state_mutated = true;
         }
+        let journal_cursor = native_current_source_journal_cursor(workspace_root);
+        if session.journal_cursor_applied != journal_cursor {
+            session.journal_cursor_applied = journal_cursor;
+            state_mutated = true;
+        }
         estimated_bytes = native_compile_session_state_estimated_bytes(&session);
         (
             NativeCompileSessionSnapshot {
@@ -7214,7 +7252,9 @@ fn with_native_compile_session<T>(
                 contract_output_plans: session.contract_output_plans.clone(),
             },
             state_mutated.then(|| native_compile_session_image_snapshot_from_state(&session)),
-            state_mutated.then(|| native_buildinfo_file_from_state(&session, journal_cursor)),
+            state_mutated.then(|| {
+                native_buildinfo_file_from_state(&session, session.journal_cursor_applied)
+            }),
         )
     };
     update_native_compile_session_cached_estimated_bytes(workspace_root, estimated_bytes);

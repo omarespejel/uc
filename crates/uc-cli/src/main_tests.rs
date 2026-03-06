@@ -4878,6 +4878,7 @@ fn native_compile_session_image_round_trip_restores_tracked_sources_and_dependen
         tracked_source_bytes,
         contract_source_dependencies: dependencies.clone(),
         contract_output_plans: plans.clone(),
+        journal_cursor_applied: 33,
     };
     persist_native_compile_session_image_snapshot(&dir, &snapshot)
         .expect("native session image should persist");
@@ -4888,6 +4889,7 @@ fn native_compile_session_image_round_trip_restores_tracked_sources_and_dependen
     assert_eq!(restored.tracked_source_bytes, tracked_source_bytes);
     assert_eq!(restored.contract_source_dependencies, dependencies);
     assert_eq!(restored.contract_output_plans, plans);
+    assert_eq!(restored.journal_cursor_applied, 33);
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -4913,6 +4915,7 @@ fn native_compile_session_image_restore_rejects_signature_and_root_mtime_mismatc
         tracked_source_bytes,
         contract_source_dependencies: BTreeMap::new(),
         contract_output_plans: Vec::new(),
+        journal_cursor_applied: 0,
     };
     persist_native_compile_session_image_snapshot(&dir, &snapshot)
         .expect("native session image should persist");
@@ -5006,6 +5009,7 @@ fn native_source_journal_persistence_round_trip_and_consumption() {
         removed_files: BTreeSet::from(["src/old.cairo".to_string()]),
         overflowed: false,
         cursor: 9,
+        applied_cursor: 4,
     };
     persist_native_source_change_journal(&dir, &initial_state)
         .expect("native source journal should persist");
@@ -5015,7 +5019,7 @@ fn native_source_journal_persistence_round_trip_and_consumption() {
     assert_eq!(loaded.removed_files, initial_state.removed_files);
     assert_eq!(loaded.cursor, initial_state.cursor);
 
-    let delta = native_take_source_journal_delta(&dir, &[]);
+    let delta = native_take_source_journal_delta(&dir, &[], 4);
     match delta {
         NativeSourceJournalDelta::Changed {
             changed_files,
@@ -5039,6 +5043,10 @@ fn native_source_journal_persistence_round_trip_and_consumption() {
         consumed.cursor, 9,
         "cursor should remain monotonic after journal consumption"
     );
+    assert_eq!(
+        consumed.applied_cursor, 9,
+        "consuming journal delta should advance applied cursor to consumed cursor"
+    );
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -5052,11 +5060,12 @@ fn native_source_journal_overflow_triggers_fallback_and_clears_persisted_state()
         removed_files: BTreeSet::new(),
         overflowed: true,
         cursor: 15,
+        applied_cursor: 7,
     };
     persist_native_source_change_journal(&dir, &initial_state)
         .expect("native source journal should persist");
 
-    let delta = native_take_source_journal_delta(&dir, &[]);
+    let delta = native_take_source_journal_delta(&dir, &[], 7);
     assert!(
         matches!(delta, NativeSourceJournalDelta::FallbackFullScan),
         "overflow marker should force full-scan fallback"
@@ -5067,6 +5076,69 @@ fn native_source_journal_overflow_triggers_fallback_and_clears_persisted_state()
         "overflow fallback should clear persisted journal state after consumption"
     );
     assert_eq!(cleared.cursor, 15);
+    assert_eq!(
+        cleared.applied_cursor, 15,
+        "overflow fallback should advance applied cursor to the full-scan boundary"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_source_journal_replay_skips_stale_entries_when_session_cursor_is_ahead() {
+    let dir = unique_test_dir("uc-native-source-journal-replay-stale");
+    let initial_state = NativeSourceChangeJournal {
+        changed_files: BTreeSet::from(["src/lib.cairo".to_string()]),
+        removed_files: BTreeSet::new(),
+        overflowed: false,
+        cursor: 5,
+        applied_cursor: 2,
+    };
+    persist_native_source_change_journal(&dir, &initial_state)
+        .expect("native source journal should persist");
+
+    let delta = native_take_source_journal_delta(&dir, &[], 8);
+    assert!(
+        matches!(delta, NativeSourceJournalDelta::NoChanges),
+        "session cursors ahead of journal cursor should treat pending entries as stale"
+    );
+    let cleared = load_native_source_change_journal(&dir);
+    assert!(
+        cleared.changed_files.is_empty() && cleared.removed_files.is_empty() && !cleared.overflowed,
+        "stale replay guard should clear journal sets without forcing overflow fallback"
+    );
+    assert_eq!(cleared.applied_cursor, 5);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_source_journal_replay_gap_forces_full_scan_for_ambiguous_cursor_range() {
+    let dir = unique_test_dir("uc-native-source-journal-replay-gap");
+    let initial_state = NativeSourceChangeJournal {
+        changed_files: BTreeSet::from(["src/lib.cairo".to_string()]),
+        removed_files: BTreeSet::new(),
+        overflowed: false,
+        cursor: 12,
+        applied_cursor: 3,
+    };
+    persist_native_source_change_journal(&dir, &initial_state)
+        .expect("native source journal should persist");
+
+    let delta = native_take_source_journal_delta(&dir, &[], 8);
+    assert!(
+        matches!(delta, NativeSourceJournalDelta::FallbackFullScan),
+        "cursor replay gaps with newer journal events should force one conservative full scan"
+    );
+    let cleared = load_native_source_change_journal(&dir);
+    assert!(
+        cleared.changed_files.is_empty() && cleared.removed_files.is_empty() && !cleared.overflowed,
+        "full-scan fallback should drain persisted changed/removed sets"
+    );
+    assert_eq!(cleared.applied_cursor, 12);
+    assert_eq!(cleared.cursor, 12);
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -5483,6 +5555,7 @@ fn native_apply_file_keyed_session_updates_batches_changed_and_removed_files() {
 
     fs::write(&changed_path, "fn current() -> felt252 { 3 }\n")
         .expect("failed to rewrite changed source");
+    fs::remove_file(&removed_path).expect("failed to remove removed source");
     let update_applied = native_apply_file_keyed_session_updates(
         &mut db,
         &workspace,
@@ -5504,27 +5577,29 @@ fn native_apply_file_keyed_session_updates_batches_changed_and_removed_files() {
     .expect("metadata noise no-op batch should succeed");
     assert!(
         !noop_applied,
-        "identical content should skip aggregate override-map writes"
+        "identical content should skip keyed override writes"
     );
 
-    let changed_file = db
-        .file_input(FileId::new(&db, FileLongId::OnDisk(changed_path.clone())))
-        .clone();
-    let removed_file = db
-        .file_input(FileId::new(&db, FileLongId::OnDisk(removed_path.clone())))
-        .clone();
-    let overrides = files_group_input(&db)
-        .file_overrides(&db)
-        .clone()
-        .expect("file override map should exist");
+    let changed_file_id = FileId::new(&db, FileLongId::OnDisk(changed_path.clone()));
+    let removed_file_id = FileId::new(&db, FileLongId::OnDisk(removed_path.clone()));
+    let changed_content = db.file_content(changed_file_id).map(str::to_string);
+    let removed_content = db.file_content(removed_file_id).map(str::to_string);
     assert_eq!(
-        overrides.get(&changed_file).map(|content| content.as_ref()),
+        changed_content.as_deref(),
         Some("fn current() -> felt252 { 3 }\n"),
-        "changed files should carry the latest override content"
+        "changed files should expose the latest keyed override content"
     );
     assert!(
-        !overrides.contains_key(&removed_file),
-        "removed files should have overrides cleared in the same batched write"
+        removed_content.is_none(),
+        "removed files should clear keyed overrides in the same batched write"
+    );
+    let legacy_overrides = cairo_lang_filesystem::db::files_group_input(&db)
+        .file_overrides(&db)
+        .clone()
+        .expect("legacy file override map should be initialized");
+    assert!(
+        legacy_overrides.is_empty(),
+        "keyed invalidation path should not rewrite the aggregate file override map"
     );
 
     fs::remove_dir_all(&workspace).ok();
