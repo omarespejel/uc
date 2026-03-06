@@ -3821,11 +3821,15 @@ alexandria = "0.9.0"
         vec![
             NativePathDependencyRoot {
                 crate_name: "local_dep".to_string(),
-                source_root: local_dep_src,
+                source_root: local_dep_src
+                    .canonicalize()
+                    .expect("failed to canonicalize local dependency src"),
             },
             NativePathDependencyRoot {
                 crate_name: "shared_dep".to_string(),
-                source_root: shared_dep_src,
+                source_root: shared_dep_src
+                    .canonicalize()
+                    .expect("failed to canonicalize shared dependency src"),
             },
         ],
         "path dependencies should be tracked as native crate roots",
@@ -3878,7 +3882,9 @@ shared-dep = { workspace = true }
         surface.path_dependency_roots,
         vec![NativePathDependencyRoot {
             crate_name: "shared_dep".to_string(),
-            source_root: shared_dep_src,
+            source_root: shared_dep_src
+                .canonicalize()
+                .expect("failed to canonicalize shared dependency src"),
         }],
         "workspace path dependencies should resolve from workspace root, not package manifest directory",
     );
@@ -3961,11 +3967,15 @@ local-dep = { path = "deps/local-dep" }
         vec![
             NativePathDependencyRoot {
                 crate_name: "local_dep".to_string(),
-                source_root: local_dep_src,
+                source_root: local_dep_src
+                    .canonicalize()
+                    .expect("failed to canonicalize local dependency src"),
             },
             NativePathDependencyRoot {
                 crate_name: "shared_dep".to_string(),
-                source_root: shared_dep_src,
+                source_root: shared_dep_src
+                    .canonicalize()
+                    .expect("failed to canonicalize shared dependency src"),
             },
         ],
         "transitive local dependencies should extend crate roots beyond direct root manifest entries",
@@ -3976,6 +3986,136 @@ local-dep = { path = "deps/local-dep" }
                 && config.dependencies == vec!["shared_dep".to_string()]
         }),
         "path dependency manifests should wire their own local dependency edges into cairo_project overrides"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn collect_native_dependency_surface_ignores_dev_dependencies_for_build_surface() {
+    let dir = unique_test_dir("uc-native-dependency-surface-ignores-dev-deps");
+    let manifest_path = dir.join("Scarb.toml");
+    let dev_dep_src = dir.join("deps/dev-tool/src");
+    fs::create_dir_all(&dev_dep_src).expect("failed to create dev dependency src");
+    fs::write(dev_dep_src.join("lib.cairo"), "fn dev_tool() {}\n")
+        .expect("failed to write dev dependency lib.cairo");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+
+[dependencies]
+starknet = "2.7.0"
+
+[dev-dependencies]
+dev-tool = { path = "deps/dev-tool" }
+serde = "1.0.0"
+"#,
+    )
+    .expect("failed to write manifest");
+    let manifest_text = fs::read_to_string(&manifest_path).expect("failed to read manifest");
+    let manifest: TomlValue = toml::from_str(&manifest_text).expect("manifest should parse");
+    let surface = collect_native_dependency_surface(&manifest, &manifest_path, &dir);
+
+    assert!(
+        surface.external_non_starknet_dependencies.is_empty(),
+        "dev-only dependencies should not force native build fallback"
+    );
+    assert!(
+        surface.path_dependency_roots.is_empty(),
+        "dev-only local path dependencies should not be included in build dependency roots"
+    );
+    assert!(
+        surface
+            .crate_dependency_configs
+            .iter()
+            .any(|config| config.crate_name == "demo" && config.dependencies.is_empty()),
+        "root crate should only include runtime dependencies"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn collect_native_dependency_surface_canonicalizes_equivalent_path_roots() {
+    let dir = unique_test_dir("uc-native-dependency-surface-canonical-path-roots");
+    let manifest_path = dir.join("Scarb.toml");
+    let local_dep_src = dir.join("deps/local-dep/src");
+    let shared_dep_src = dir.join("deps/shared-dep/src");
+    fs::create_dir_all(dir.join("src")).expect("failed to create root src");
+    fs::create_dir_all(&local_dep_src).expect("failed to create local dependency src");
+    fs::create_dir_all(&shared_dep_src).expect("failed to create shared dependency src");
+    fs::write(dir.join("src/lib.cairo"), "fn root() {}\n").expect("failed to write root lib.cairo");
+    fs::write(local_dep_src.join("lib.cairo"), "fn local() {}\n")
+        .expect("failed to write local dependency lib.cairo");
+    fs::write(shared_dep_src.join("lib.cairo"), "fn shared() {}\n")
+        .expect("failed to write shared dependency lib.cairo");
+    fs::write(
+        local_dep_src
+            .parent()
+            .expect("local dependency source root should have a parent")
+            .join("Scarb.toml"),
+        r#"[package]
+name = "local-dep"
+version = "0.1.0"
+edition = "2024_07"
+
+[dependencies]
+shared-dep = { path = "../shared-dep" }
+"#,
+    )
+    .expect("failed to write local dependency manifest");
+    fs::write(
+        shared_dep_src
+            .parent()
+            .expect("shared dependency source root should have a parent")
+            .join("Scarb.toml"),
+        r#"[package]
+name = "shared-dep"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("failed to write shared dependency manifest");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+
+[dependencies]
+local-dep = { path = "deps/local-dep" }
+shared-dep = { path = "deps/shared-dep" }
+"#,
+    )
+    .expect("failed to write root manifest");
+
+    let manifest_text = fs::read_to_string(&manifest_path).expect("failed to read root manifest");
+    let manifest: TomlValue = toml::from_str(&manifest_text).expect("manifest should parse");
+    let surface = collect_native_dependency_surface(&manifest, &manifest_path, &dir);
+
+    assert!(
+        surface.external_non_starknet_dependencies.is_empty(),
+        "equivalent path aliases should not be treated as conflicting dependency roots"
+    );
+    assert_eq!(
+        surface.path_dependency_roots,
+        vec![
+            NativePathDependencyRoot {
+                crate_name: "local_dep".to_string(),
+                source_root: local_dep_src
+                    .canonicalize()
+                    .expect("failed to canonicalize local dependency src"),
+            },
+            NativePathDependencyRoot {
+                crate_name: "shared_dep".to_string(),
+                source_root: shared_dep_src
+                    .canonicalize()
+                    .expect("failed to canonicalize shared dependency src"),
+            },
+        ],
+        "local dependency roots should be canonicalized before dedupe and conflict checks",
     );
     fs::remove_dir_all(&dir).ok();
 }

@@ -4092,6 +4092,7 @@ fn collect_native_dependency_table_surface(
         } else {
             context.manifest_dir.join(&raw_path)
         };
+        let dependency_root = dependency_root.canonicalize().unwrap_or(dependency_root);
         if ensure_path_within_root(
             context.workspace_root,
             &dependency_root,
@@ -4109,6 +4110,13 @@ fn collect_native_dependency_table_surface(
             external.insert(dependency_label);
             continue;
         }
+        let dependency_source_root = match dependency_source_root.canonicalize() {
+            Ok(path) => path,
+            Err(_) => {
+                external.insert(dependency_label);
+                continue;
+            }
+        };
 
         let dependency_crate_name = normalize_package_name_for_cairo_crate(dependency_name);
         match path_roots.entry(dependency_crate_name) {
@@ -4142,7 +4150,7 @@ fn collect_native_manifest_dependency_surface(
         workspace_root,
     };
 
-    for section_name in ["dependencies", "dev-dependencies"] {
+    for section_name in ["dependencies"] {
         if let Some(table) = manifest.get(section_name).and_then(TomlValue::as_table) {
             let section_label = format!("[{}]", section_name);
             collect_native_dependency_table_surface(
@@ -4160,7 +4168,7 @@ fn collect_native_manifest_dependency_surface(
             let Some(target_section_table) = target_section.as_table() else {
                 continue;
             };
-            for section_name in ["dependencies", "dev-dependencies"] {
+            for section_name in ["dependencies"] {
                 if let Some(table) = target_section_table
                     .get(section_name)
                     .and_then(TomlValue::as_table)
@@ -4194,12 +4202,15 @@ fn collect_native_dependency_surface(
     manifest_path: &Path,
     workspace_root: &Path,
 ) -> NativeDependencySurface {
-    let manifest_dir = manifest_path.parent().unwrap_or(workspace_root);
+    let canonical_workspace_root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let manifest_dir = manifest_path.parent().unwrap_or(&canonical_workspace_root);
     let (mut external, mut path_roots) = collect_native_manifest_dependency_surface(
         manifest,
         Some(manifest),
         manifest_dir,
-        workspace_root,
+        &canonical_workspace_root,
         "",
     );
     let root_crate_name = manifest
@@ -4276,14 +4287,16 @@ fn collect_native_dependency_surface(
         }
         let (dependency_cairo_edition, _) =
             resolve_manifest_cairo_settings_from_manifest(&dependency_manifest);
-        let dependency_manifest_dir = dependency_manifest_path.parent().unwrap_or(workspace_root);
+        let dependency_manifest_dir = dependency_manifest_path
+            .parent()
+            .unwrap_or(&canonical_workspace_root);
         let dependency_label_prefix = format!("[dependency.{dependency_crate_name}]");
         let (dependency_external, dependency_path_roots) =
             collect_native_manifest_dependency_surface(
                 &dependency_manifest,
                 Some(manifest),
                 dependency_manifest_dir,
-                workspace_root,
+                &canonical_workspace_root,
                 &dependency_label_prefix,
             );
         external.extend(dependency_external);
