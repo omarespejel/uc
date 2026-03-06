@@ -468,7 +468,9 @@ fn should_probe_local_before_daemon(
     match daemon_mode {
         DaemonModeArg::Off => false,
         DaemonModeArg::Auto => daemon_socket_available,
-        DaemonModeArg::Require => true,
+        // In require mode, prefer daemon-first when reachable; probing local cache first
+        // adds fingerprint overhead to the dominant warm/no-op path.
+        DaemonModeArg::Require => !daemon_socket_available,
     }
 }
 
@@ -1115,25 +1117,14 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                         compiler_version,
                         local_session_key,
                     ) = resolve_daemon_backend_context()?;
-                    if let Some((run, fingerprint, telemetry, hit_session_key)) =
-                        try_daemon_local_probe(
-                            &local_session_key,
-                            &compiler_version,
-                            daemon_native_fallback_to_scarb,
-                        )?
-                    {
-                        session_key = hit_session_key;
-                        phase_telemetry = Some(telemetry);
-                        (run, true, fingerprint)
-                    } else {
-                        let response = try_uc_build_via_daemon(
-                            &common,
-                            &manifest_path,
-                            false,
-                            daemon_compile_backend,
-                            daemon_native_fallback_to_scarb,
-                        )?
-                        .context("daemon mode is require but daemon is unavailable")?;
+                    let daemon_response = try_uc_build_via_daemon(
+                        &common,
+                        &manifest_path,
+                        false,
+                        daemon_compile_backend,
+                        daemon_native_fallback_to_scarb,
+                    )?;
+                    if let Some(response) = daemon_response {
                         if daemon_native_fallback_to_scarb
                             && response.compile_backend == DaemonBuildBackend::Scarb
                             && response.session_key != local_session_key
@@ -1161,6 +1152,18 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                         session_key = response.session_key;
                         phase_telemetry = Some(response.telemetry);
                         (response.run, response.cache_hit, response.fingerprint)
+                    } else if let Some((run, fingerprint, telemetry, hit_session_key)) =
+                        try_daemon_local_probe(
+                            &local_session_key,
+                            &compiler_version,
+                            daemon_native_fallback_to_scarb,
+                        )?
+                    {
+                        session_key = hit_session_key;
+                        phase_telemetry = Some(telemetry);
+                        (run, true, fingerprint)
+                    } else {
+                        bail!("daemon mode is require but daemon is unavailable");
                     }
                 }
             }
@@ -1569,11 +1572,11 @@ mod tests {
 
         assert!(
             should_probe_local_before_daemon(DaemonModeArg::Require, false),
-            "daemon require should still probe local cache first to preserve cache-hit fast path"
+            "daemon require should probe local cache when daemon is unavailable"
         );
         assert!(
-            should_probe_local_before_daemon(DaemonModeArg::Require, true),
-            "daemon require should probe local cache when daemon is available"
+            !should_probe_local_before_daemon(DaemonModeArg::Require, true),
+            "daemon require should skip local pre-daemon probe when daemon is available"
         );
     }
 
