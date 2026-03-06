@@ -4418,6 +4418,122 @@ fn native_compile_session_build_lock_is_per_key_and_released_when_idle() {
 }
 
 #[cfg(feature = "native-compile")]
+fn native_test_compile_session_signature(
+    workspace_root: &Path,
+    manifest_hash: &str,
+) -> NativeCompileSessionSignature {
+    NativeCompileSessionSignature {
+        manifest_path: workspace_root.join("Scarb.toml"),
+        manifest_content_hash: manifest_hash.to_string(),
+        context: NativeCompileContext {
+            package_name: "demo".to_string(),
+            crate_name: "demo".to_string(),
+            workspace_mode_supported: true,
+            cairo_project_dir: workspace_root.join(".uc/native-project"),
+            corelib_src: workspace_root.join("toolchain/corelib/src"),
+            starknet_target: NativeStarknetTargetProps {
+                sierra: true,
+                casm: true,
+            },
+            manifest_content_hash: manifest_hash.to_string(),
+            external_non_starknet_dependencies: vec!["serde".to_string()],
+            path_dependency_roots: vec![NativePathDependencyRoot {
+                crate_name: "shared".to_string(),
+                source_root: workspace_root.join("deps/shared/src"),
+            }],
+            crate_dependency_configs: vec![NativeCrateDependencyConfig {
+                crate_name: "demo".to_string(),
+                cairo_edition: Some("2024_07".to_string()),
+                dependencies: vec!["starknet".to_string()],
+            }],
+        },
+    }
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_compile_session_image_round_trip_restores_tracked_sources_and_dependency_index() {
+    let dir = unique_test_dir("uc-native-session-image-roundtrip");
+    let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
+    let tracked_sources = BTreeMap::from([
+        (
+            "src/lib.cairo".to_string(),
+            NativeTrackedFileState {
+                size_bytes: 42,
+                modified_unix_ms: 101,
+            },
+        ),
+        (
+            "src/math.cairo".to_string(),
+            NativeTrackedFileState {
+                size_bytes: 12,
+                modified_unix_ms: 102,
+            },
+        ),
+    ]);
+    let tracked_source_bytes = native_tracked_sources_total_bytes(&tracked_sources)
+        .expect("tracked source bytes should be computed");
+    let dependencies = BTreeMap::from([(
+        "demo::token".to_string(),
+        BTreeSet::from(["src/lib.cairo".to_string(), "src/math.cairo".to_string()]),
+    )]);
+    let snapshot = NativeCompileSessionImageSnapshot {
+        signature_hash: native_compile_session_signature_hash(&signature),
+        source_root_modified_unix_ms: 777,
+        tracked_sources: tracked_sources.clone(),
+        tracked_source_bytes,
+        contract_source_dependencies: dependencies.clone(),
+    };
+    persist_native_compile_session_image_snapshot(&dir, &snapshot)
+        .expect("native session image should persist");
+
+    let restored = try_native_compile_session_image_restore(&dir, &signature, 777)
+        .expect("matching signature/root mtime should restore session image");
+    assert_eq!(restored.tracked_sources, tracked_sources);
+    assert_eq!(restored.tracked_source_bytes, tracked_source_bytes);
+    assert_eq!(restored.contract_source_dependencies, dependencies);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_compile_session_image_restore_rejects_signature_and_root_mtime_mismatches() {
+    let dir = unique_test_dir("uc-native-session-image-invalidations");
+    let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
+    let tracked_sources = BTreeMap::from([(
+        "src/lib.cairo".to_string(),
+        NativeTrackedFileState {
+            size_bytes: 5,
+            modified_unix_ms: 11,
+        },
+    )]);
+    let tracked_source_bytes = native_tracked_sources_total_bytes(&tracked_sources)
+        .expect("tracked source bytes should be computed");
+    let snapshot = NativeCompileSessionImageSnapshot {
+        signature_hash: native_compile_session_signature_hash(&signature),
+        source_root_modified_unix_ms: 999,
+        tracked_sources,
+        tracked_source_bytes,
+        contract_source_dependencies: BTreeMap::new(),
+    };
+    persist_native_compile_session_image_snapshot(&dir, &snapshot)
+        .expect("native session image should persist");
+
+    let different_signature = native_test_compile_session_signature(&dir, "manifest-blake3:other");
+    assert!(
+        try_native_compile_session_image_restore(&dir, &different_signature, 999).is_none(),
+        "signature mismatch must invalidate persisted session image"
+    );
+    assert!(
+        try_native_compile_session_image_restore(&dir, &signature, 1_000).is_none(),
+        "source-root mtime mismatch must invalidate persisted session image"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
 #[test]
 fn native_session_refresh_action_prefers_incremental_for_changed_sets() {
     assert_eq!(

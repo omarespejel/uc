@@ -160,6 +160,10 @@ const DEFAULT_NATIVE_IMPACTED_SUBSET_ENABLED: bool = true;
 const DEFAULT_NATIVE_COMPILE_SESSION_MEMORY_MULTIPLIER: u64 = 64;
 #[cfg(feature = "native-compile")]
 const DEFAULT_NATIVE_COMPILE_SESSION_MEMORY_BASE_OVERHEAD_BYTES: u64 = 32 * 1024 * 1024;
+#[cfg(feature = "native-compile")]
+const NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION: u32 = 1;
+#[cfg(feature = "native-compile")]
+const MAX_NATIVE_COMPILE_SESSION_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_DAEMON_SHARED_CACHE_ENABLED: bool = true;
 const DEFAULT_DAEMON_SHARED_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 // Default-off for Scarb's artifact fingerprint check in uc's Scarb-backed path.
@@ -804,7 +808,7 @@ struct NativeCompileContextCacheEntry {
     estimated_bytes: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg(feature = "native-compile")]
 struct NativeTrackedFileState {
     size_bytes: u64,
@@ -829,6 +833,28 @@ struct NativeCompileSessionSnapshot {
     changed_files: Vec<String>,
     removed_files: Vec<String>,
     journal_fallback_full_scan: bool,
+    contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg(feature = "native-compile")]
+struct NativeCompileSessionImageFile {
+    schema_version: u32,
+    signature_hash: String,
+    source_root_modified_unix_ms: u64,
+    tracked_sources: BTreeMap<String, NativeTrackedFileState>,
+    tracked_source_bytes: u64,
+    contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
+    generated_at_epoch_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+#[cfg(feature = "native-compile")]
+struct NativeCompileSessionImageSnapshot {
+    signature_hash: String,
+    source_root_modified_unix_ms: u64,
+    tracked_sources: BTreeMap<String, NativeTrackedFileState>,
+    tracked_source_bytes: u64,
     contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
 }
 
@@ -4975,25 +5001,45 @@ fn native_update_compile_session_contract_dependencies(
             return;
         }
     };
-    let estimated_bytes = {
+    let (estimated_bytes, image_snapshot) = {
         let mut session = session_handle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if session.signature != *signature {
             return;
         }
+        let mut dependencies_changed = false;
         for (module_path, dependencies) in dependency_updates {
             if dependencies.is_empty() {
-                session.contract_source_dependencies.remove(module_path);
-            } else {
-                session
+                if session
                     .contract_source_dependencies
-                    .insert(module_path.clone(), dependencies.clone());
+                    .remove(module_path)
+                    .is_some()
+                {
+                    dependencies_changed = true;
+                }
+            } else {
+                match session.contract_source_dependencies.get(module_path) {
+                    Some(existing) if existing == dependencies => {}
+                    _ => {
+                        session
+                            .contract_source_dependencies
+                            .insert(module_path.clone(), dependencies.clone());
+                        dependencies_changed = true;
+                    }
+                }
             }
         }
-        native_compile_session_state_estimated_bytes(&session)
+        (
+            native_compile_session_state_estimated_bytes(&session),
+            dependencies_changed
+                .then(|| native_compile_session_image_snapshot_from_state(&session)),
+        )
     };
     update_native_compile_session_cached_estimated_bytes(workspace_root, estimated_bytes);
+    if let Some(image_snapshot) = image_snapshot {
+        persist_native_compile_session_image_snapshot_best_effort(workspace_root, &image_snapshot);
+    }
 }
 
 #[cfg(feature = "native-compile")]
@@ -5190,6 +5236,256 @@ fn native_compile_session_signature(
 }
 
 #[cfg(feature = "native-compile")]
+fn native_compile_session_signature_hash(signature: &NativeCompileSessionSignature) -> String {
+    let mut hasher = Hasher::new();
+    hasher.update(b"uc-native-session-image-signature-v1");
+    hasher.update(normalize_fingerprint_path(&signature.manifest_path).as_bytes());
+    hasher.update(signature.manifest_content_hash.as_bytes());
+    hasher.update(signature.context.package_name.as_bytes());
+    hasher.update(signature.context.crate_name.as_bytes());
+    hasher.update(normalize_fingerprint_path(&signature.context.cairo_project_dir).as_bytes());
+    hasher.update(normalize_fingerprint_path(&signature.context.corelib_src).as_bytes());
+    hasher.update(if signature.context.starknet_target.sierra {
+        b"1"
+    } else {
+        b"0"
+    });
+    hasher.update(if signature.context.starknet_target.casm {
+        b"1"
+    } else {
+        b"0"
+    });
+
+    let mut external_dependencies = signature.context.external_non_starknet_dependencies.clone();
+    external_dependencies.sort();
+    external_dependencies.dedup();
+    for dependency in external_dependencies {
+        hasher.update(b"\x1Fdep\x1F");
+        hasher.update(dependency.as_bytes());
+    }
+
+    let mut dependency_roots = signature
+        .context
+        .path_dependency_roots
+        .iter()
+        .map(|root| {
+            format!(
+                "{}={}",
+                root.crate_name,
+                normalize_fingerprint_path(&root.source_root)
+            )
+        })
+        .collect::<Vec<_>>();
+    dependency_roots.sort();
+    dependency_roots.dedup();
+    for root in dependency_roots {
+        hasher.update(b"\x1Froot\x1F");
+        hasher.update(root.as_bytes());
+    }
+
+    let mut crate_dependency_configs = signature.context.crate_dependency_configs.clone();
+    crate_dependency_configs.sort_by(|left, right| {
+        left.crate_name
+            .cmp(&right.crate_name)
+            .then_with(|| left.cairo_edition.cmp(&right.cairo_edition))
+    });
+    for config in crate_dependency_configs {
+        hasher.update(b"\x1Fcfg\x1F");
+        hasher.update(config.crate_name.as_bytes());
+        hasher.update(b"=");
+        hasher.update(
+            config
+                .cairo_edition
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        let mut dependencies = config.dependencies;
+        dependencies.sort();
+        dependencies.dedup();
+        for dependency in dependencies {
+            hasher.update(b",");
+            hasher.update(dependency.as_bytes());
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+#[cfg(feature = "native-compile")]
+fn native_compile_session_image_path(workspace_root: &Path) -> Result<PathBuf> {
+    let image_path = workspace_root.join(".uc/cache/native-session/session-image-v1.json");
+    ensure_path_within_root(
+        workspace_root,
+        &image_path,
+        "native compile session image path",
+    )?;
+    Ok(image_path)
+}
+
+#[cfg(feature = "native-compile")]
+fn native_compile_session_image_snapshot_from_state(
+    session: &NativeCompileSessionState,
+) -> NativeCompileSessionImageSnapshot {
+    NativeCompileSessionImageSnapshot {
+        signature_hash: native_compile_session_signature_hash(&session.signature),
+        source_root_modified_unix_ms: session.source_root_modified_unix_ms,
+        tracked_sources: session.tracked_sources.clone(),
+        tracked_source_bytes: session.tracked_source_bytes,
+        contract_source_dependencies: session.contract_source_dependencies.clone(),
+    }
+}
+
+#[cfg(feature = "native-compile")]
+fn persist_native_compile_session_image_snapshot(
+    workspace_root: &Path,
+    snapshot: &NativeCompileSessionImageSnapshot,
+) -> Result<()> {
+    let image_path = native_compile_session_image_path(workspace_root)?;
+    let parent = image_path
+        .parent()
+        .context("native compile session image path has no parent directory")?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let image = NativeCompileSessionImageFile {
+        schema_version: NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION,
+        signature_hash: snapshot.signature_hash.clone(),
+        source_root_modified_unix_ms: snapshot.source_root_modified_unix_ms,
+        tracked_sources: snapshot.tracked_sources.clone(),
+        tracked_source_bytes: snapshot.tracked_source_bytes,
+        contract_source_dependencies: snapshot.contract_source_dependencies.clone(),
+        generated_at_epoch_ms: epoch_ms_u64().unwrap_or_default(),
+    };
+    let bytes = serde_json::to_vec(&image).context("failed to encode native session image")?;
+    if bytes.len() as u64 > MAX_NATIVE_COMPILE_SESSION_IMAGE_BYTES {
+        tracing::warn!(
+            path = %image_path.display(),
+            bytes = bytes.len(),
+            max_bytes = MAX_NATIVE_COMPILE_SESSION_IMAGE_BYTES,
+            "skipping native session image write: image exceeds size limit"
+        );
+        return Ok(());
+    }
+    atomic_write_bytes(&image_path, &bytes, "native session image")
+}
+
+#[cfg(feature = "native-compile")]
+fn persist_native_compile_session_image_snapshot_best_effort(
+    workspace_root: &Path,
+    snapshot: &NativeCompileSessionImageSnapshot,
+) {
+    if let Err(err) = persist_native_compile_session_image_snapshot(workspace_root, snapshot) {
+        tracing::warn!(
+            workspace_root = %workspace_root.display(),
+            error = %format!("{err:#}"),
+            "failed to persist native session image"
+        );
+    }
+}
+
+#[cfg(feature = "native-compile")]
+fn try_native_compile_session_image_restore(
+    workspace_root: &Path,
+    signature: &NativeCompileSessionSignature,
+    source_root_modified_unix_ms: u64,
+) -> Option<NativeCompileSessionImageSnapshot> {
+    let image_path = match native_compile_session_image_path(workspace_root) {
+        Ok(path) => path,
+        Err(err) => {
+            tracing::warn!(
+                workspace_root = %workspace_root.display(),
+                error = %format!("{err:#}"),
+                "native session image path is invalid; ignoring persisted image"
+            );
+            return None;
+        }
+    };
+    let metadata = match fs::metadata(&image_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            tracing::warn!(
+                path = %image_path.display(),
+                error = %err,
+                "failed to stat native session image; ignoring"
+            );
+            return None;
+        }
+    };
+    if metadata.len() > MAX_NATIVE_COMPILE_SESSION_IMAGE_BYTES {
+        tracing::warn!(
+            path = %image_path.display(),
+            bytes = metadata.len(),
+            max_bytes = MAX_NATIVE_COMPILE_SESSION_IMAGE_BYTES,
+            "ignoring oversized native session image"
+        );
+        let _ = fs::remove_file(&image_path);
+        return None;
+    }
+    let bytes = match read_bytes_with_limit(
+        &image_path,
+        MAX_NATIVE_COMPILE_SESSION_IMAGE_BYTES,
+        "native session image",
+    ) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(
+                path = %image_path.display(),
+                error = %format!("{err:#}"),
+                "failed to read native session image; ignoring"
+            );
+            return None;
+        }
+    };
+    let decoded: NativeCompileSessionImageFile = match serde_json::from_slice::<
+        NativeCompileSessionImageFile,
+    >(&bytes)
+    {
+        Ok(image) if image.schema_version == NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION => image,
+        Ok(_) => return None,
+        Err(err) => {
+            tracing::warn!(
+                path = %image_path.display(),
+                error = %err,
+                "failed to decode native session image; ignoring"
+            );
+            return None;
+        }
+    };
+    let signature_hash = native_compile_session_signature_hash(signature);
+    if decoded.signature_hash != signature_hash {
+        return None;
+    }
+    if decoded.source_root_modified_unix_ms != source_root_modified_unix_ms {
+        return None;
+    }
+    let tracked_source_bytes = match native_tracked_sources_total_bytes(&decoded.tracked_sources) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(
+                path = %image_path.display(),
+                error = %format!("{err:#}"),
+                "native session image tracked source set is invalid; ignoring"
+            );
+            return None;
+        }
+    };
+    if tracked_source_bytes != decoded.tracked_source_bytes {
+        tracing::warn!(
+            path = %image_path.display(),
+            image_bytes = decoded.tracked_source_bytes,
+            computed_bytes = tracked_source_bytes,
+            "native session image tracked-source byte budget drift; using computed value"
+        );
+    }
+    Some(NativeCompileSessionImageSnapshot {
+        signature_hash,
+        source_root_modified_unix_ms: decoded.source_root_modified_unix_ms,
+        tracked_sources: decoded.tracked_sources,
+        tracked_source_bytes,
+        contract_source_dependencies: decoded.contract_source_dependencies,
+    })
+}
+
+#[cfg(feature = "native-compile")]
 fn build_native_compile_session_state(
     workspace_root: &Path,
     signature: NativeCompileSessionSignature,
@@ -5214,17 +5510,39 @@ fn build_native_compile_session_state(
             )
         })?;
     let setup_project_ms = setup_start.elapsed().as_secs_f64() * 1000.0;
-    let scan_start = Instant::now();
-    let (tracked_sources, tracked_source_bytes) =
-        native_collect_tracked_sources(workspace_root, &source_roots)?;
-    let source_scan_ms = scan_start.elapsed().as_secs_f64() * 1000.0;
     let source_root_modified_unix_ms =
         native_source_roots_modified_unix_ms(workspace_root, &source_roots)?;
+    let scan_start = Instant::now();
+    let restored_image = try_native_compile_session_image_restore(
+        workspace_root,
+        &signature,
+        source_root_modified_unix_ms,
+    );
+    let (tracked_sources, tracked_source_bytes, contract_source_dependencies, session_image_hit) =
+        if let Some(image) = restored_image {
+            (
+                image.tracked_sources,
+                image.tracked_source_bytes,
+                image.contract_source_dependencies,
+                true,
+            )
+        } else {
+            let (tracked_sources, tracked_source_bytes) =
+                native_collect_tracked_sources(workspace_root, &source_roots)?;
+            (
+                tracked_sources,
+                tracked_source_bytes,
+                BTreeMap::new(),
+                false,
+            )
+        };
+    let source_scan_ms = scan_start.elapsed().as_secs_f64() * 1000.0;
     tracing::debug!(
         workspace_root = %workspace_root.display(),
         db_init_ms,
         setup_project_ms,
         source_scan_ms,
+        session_image_hit,
         tracked_sources = tracked_sources.len(),
         source_roots = ?source_roots
             .iter()
@@ -5232,15 +5550,20 @@ fn build_native_compile_session_state(
             .collect::<Vec<_>>(),
         "native session state built"
     );
-    Ok(NativeCompileSessionState {
+    let state = NativeCompileSessionState {
         signature,
         db,
         main_crate_inputs,
         tracked_sources,
         tracked_source_bytes,
         source_root_modified_unix_ms,
-        contract_source_dependencies: BTreeMap::new(),
-    })
+        contract_source_dependencies,
+    };
+    if !session_image_hit {
+        let snapshot = native_compile_session_image_snapshot_from_state(&state);
+        persist_native_compile_session_image_snapshot_best_effort(workspace_root, &snapshot);
+    }
+    Ok(state)
 }
 
 #[cfg(feature = "native-compile")]
@@ -5928,16 +6251,18 @@ fn with_native_compile_session<T>(
     };
     let mut current_source_snapshot = current_source_snapshot;
     let estimated_bytes;
-    let snapshot = {
+    let (snapshot, image_snapshot) = {
         let mut session = session_handle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state_mutated = false;
         if session.signature != *signature {
             if let Some(state) = rebuilt_state.take() {
                 *session = state;
             } else {
                 *session = build_native_compile_session_state(workspace_root, signature.clone())?;
             }
+            state_mutated = true;
         } else if matches!(
             refresh_action,
             NativeSessionRefreshAction::IncrementalChangedSet
@@ -5972,31 +6297,41 @@ fn with_native_compile_session<T>(
                         *session =
                             build_native_compile_session_state(workspace_root, signature.clone())?;
                     }
+                    state_mutated = true;
                 }
             }
             if let Some((tracked_sources, tracked_source_bytes)) = current_source_snapshot.take() {
                 session.tracked_sources = tracked_sources;
                 session.tracked_source_bytes = tracked_source_bytes;
+                state_mutated = true;
             }
             if source_root_mtime != 0 {
                 session.source_root_modified_unix_ms = source_root_mtime;
+                state_mutated = true;
             }
         } else if source_root_mtime != 0
             && session.source_root_modified_unix_ms != source_root_mtime
         {
             session.source_root_modified_unix_ms = source_root_mtime;
+            state_mutated = true;
         }
         estimated_bytes = native_compile_session_state_estimated_bytes(&session);
-        NativeCompileSessionSnapshot {
-            db: session.db.snapshot(),
-            main_crate_inputs: session.main_crate_inputs.clone(),
-            changed_files: changed_files.clone(),
-            removed_files: removed_files.clone(),
-            journal_fallback_full_scan,
-            contract_source_dependencies: session.contract_source_dependencies.clone(),
-        }
+        (
+            NativeCompileSessionSnapshot {
+                db: session.db.snapshot(),
+                main_crate_inputs: session.main_crate_inputs.clone(),
+                changed_files: changed_files.clone(),
+                removed_files: removed_files.clone(),
+                journal_fallback_full_scan,
+                contract_source_dependencies: session.contract_source_dependencies.clone(),
+            },
+            state_mutated.then(|| native_compile_session_image_snapshot_from_state(&session)),
+        )
     };
     update_native_compile_session_cached_estimated_bytes(workspace_root, estimated_bytes);
+    if let Some(image_snapshot) = image_snapshot {
+        persist_native_compile_session_image_snapshot_best_effort(workspace_root, &image_snapshot);
+    }
     f(&snapshot)
 }
 
