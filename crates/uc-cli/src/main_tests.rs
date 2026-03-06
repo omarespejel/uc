@@ -4477,12 +4477,21 @@ fn native_compile_session_image_round_trip_restores_tracked_sources_and_dependen
         "demo::token".to_string(),
         BTreeSet::from(["src/lib.cairo".to_string(), "src/math.cairo".to_string()]),
     )]);
+    let plans = vec![NativeContractOutputPlan {
+        module_path: "demo::token".to_string(),
+        artifact_id: "id-token".to_string(),
+        package_name: "demo".to_string(),
+        contract_name: "token".to_string(),
+        artifact_file: "demo_token.contract_class.json".to_string(),
+        casm_file: Some("demo_token.compiled_contract_class.json".to_string()),
+    }];
     let snapshot = NativeCompileSessionImageSnapshot {
         signature_hash: native_compile_session_signature_hash(&signature),
         source_root_modified_unix_ms: 777,
         tracked_sources: tracked_sources.clone(),
         tracked_source_bytes,
         contract_source_dependencies: dependencies.clone(),
+        contract_output_plans: plans.clone(),
     };
     persist_native_compile_session_image_snapshot(&dir, &snapshot)
         .expect("native session image should persist");
@@ -4492,6 +4501,7 @@ fn native_compile_session_image_round_trip_restores_tracked_sources_and_dependen
     assert_eq!(restored.tracked_sources, tracked_sources);
     assert_eq!(restored.tracked_source_bytes, tracked_source_bytes);
     assert_eq!(restored.contract_source_dependencies, dependencies);
+    assert_eq!(restored.contract_output_plans, plans);
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -4516,6 +4526,7 @@ fn native_compile_session_image_restore_rejects_signature_and_root_mtime_mismatc
         tracked_sources,
         tracked_source_bytes,
         contract_source_dependencies: BTreeMap::new(),
+        contract_output_plans: Vec::new(),
     };
     persist_native_compile_session_image_snapshot(&dir, &snapshot)
         .expect("native session image should persist");
@@ -5083,6 +5094,67 @@ fn native_reusable_unaffected_manifest_entries_reuses_only_safe_entries() {
     assert!(
         missing.is_none(),
         "missing unaffected artifact should force full-compile fallback"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_cached_noop_keep_files_requires_complete_manifest_artifacts() {
+    let dir = unique_test_dir("uc-native-noop-keep-files");
+    fs::create_dir_all(&dir).expect("failed to create target dir");
+    let plans = vec![NativeContractOutputPlan {
+        module_path: "pkg::token".to_string(),
+        artifact_id: "id-token".to_string(),
+        package_name: "pkg".to_string(),
+        contract_name: "token".to_string(),
+        artifact_file: "pkg_token.contract_class.json".to_string(),
+        casm_file: Some("pkg_token.compiled_contract_class.json".to_string()),
+    }];
+    let manifest = StarknetArtifactsManifest {
+        version: 1,
+        contracts: vec![StarknetArtifactEntry {
+            id: plans[0].artifact_id.clone(),
+            package_name: plans[0].package_name.clone(),
+            contract_name: plans[0].contract_name.clone(),
+            module_path: plans[0].module_path.clone(),
+            artifacts: StarknetArtifactFiles {
+                sierra: plans[0].artifact_file.clone(),
+                casm: plans[0].casm_file.clone(),
+            },
+        }],
+    };
+    fs::write(
+        dir.join("pkg.starknet_artifacts.json"),
+        serde_json::to_vec(&manifest).expect("manifest should serialize"),
+    )
+    .expect("failed to write manifest");
+    fs::write(dir.join(&plans[0].artifact_file), "{}\n").expect("failed to write sierra artifact");
+    fs::write(
+        dir.join(
+            plans[0]
+                .casm_file
+                .as_ref()
+                .expect("casm file should exist in plan"),
+        ),
+        "{}\n",
+    )
+    .expect("failed to write casm artifact");
+
+    let keep_files = native_cached_noop_keep_files(&dir, "pkg", &plans)
+        .expect("noop keep-file evaluation should succeed")
+        .expect("valid manifest/artifacts should enable noop reuse");
+    assert!(keep_files.contains("pkg_token.contract_class.json"));
+    assert!(keep_files.contains("pkg_token.compiled_contract_class.json"));
+    assert!(keep_files.contains("pkg.starknet_artifacts.json"));
+
+    fs::remove_file(dir.join("pkg_token.contract_class.json")).expect("failed to remove sierra");
+    let missing = native_cached_noop_keep_files(&dir, "pkg", &plans)
+        .expect("noop keep-file evaluation should still succeed");
+    assert!(
+        missing.is_none(),
+        "missing artifact should disable noop reuse"
     );
 
     fs::remove_dir_all(&dir).ok();

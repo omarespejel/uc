@@ -824,6 +824,7 @@ struct NativeCompileSessionState {
     tracked_source_bytes: u64,
     source_root_modified_unix_ms: u64,
     contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
+    contract_output_plans: Vec<NativeContractOutputPlan>,
 }
 
 #[cfg(feature = "native-compile")]
@@ -834,6 +835,7 @@ struct NativeCompileSessionSnapshot {
     removed_files: Vec<String>,
     journal_fallback_full_scan: bool,
     contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
+    contract_output_plans: Vec<NativeContractOutputPlan>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -845,6 +847,7 @@ struct NativeCompileSessionImageFile {
     tracked_sources: BTreeMap<String, NativeTrackedFileState>,
     tracked_source_bytes: u64,
     contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
+    contract_output_plans: Vec<NativeContractOutputPlan>,
     generated_at_epoch_ms: u64,
 }
 
@@ -856,6 +859,7 @@ struct NativeCompileSessionImageSnapshot {
     tracked_sources: BTreeMap<String, NativeTrackedFileState>,
     tracked_source_bytes: u64,
     contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
+    contract_output_plans: Vec<NativeContractOutputPlan>,
 }
 
 #[derive(Debug, Default)]
@@ -4696,11 +4700,25 @@ fn native_compile_session_state_estimated_bytes(state: &NativeCompileSessionStat
                     .fold(0_u64, |inner, dep| inner.saturating_add(dep.len() as u64));
                 acc.saturating_add(module_bytes.saturating_add(deps_bytes))
             });
+    let plan_bytes = state.contract_output_plans.iter().fold(0_u64, |acc, plan| {
+        acc.saturating_add(plan.module_path.len() as u64)
+            .saturating_add(plan.artifact_id.len() as u64)
+            .saturating_add(plan.package_name.len() as u64)
+            .saturating_add(plan.contract_name.len() as u64)
+            .saturating_add(plan.artifact_file.len() as u64)
+            .saturating_add(
+                plan.casm_file
+                    .as_ref()
+                    .map(|value| value.len() as u64)
+                    .unwrap_or(0),
+            )
+    });
     // RootDatabase memory is dominated by interned/query state, not raw file bytes.
     // Use a conservative source-scaled heuristic so byte-based eviction is meaningful.
     native_compile_session_estimated_heap_bytes(state.tracked_source_bytes)
         .saturating_add(tracked_meta_bytes)
         .saturating_add(dependency_bytes)
+        .saturating_add(plan_bytes)
 }
 
 #[cfg(feature = "native-compile")]
@@ -4860,7 +4878,7 @@ fn native_starknet_artifact_id(package_name: &str, contract_path: &str) -> Strin
 }
 
 #[cfg(feature = "native-compile")]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 struct NativeContractOutputPlan {
     module_path: String,
     artifact_id: String,
@@ -4982,12 +5000,13 @@ fn native_collect_contract_dependency_updates(
 }
 
 #[cfg(feature = "native-compile")]
-fn native_update_compile_session_contract_dependencies(
+fn native_update_compile_session_post_build_state(
     workspace_root: &Path,
     signature: &NativeCompileSessionSignature,
     dependency_updates: &[(String, BTreeSet<String>)],
+    contract_output_plans: Option<&[NativeContractOutputPlan]>,
 ) {
-    if dependency_updates.is_empty() {
+    if dependency_updates.is_empty() && contract_output_plans.is_none() {
         return;
     }
     let session_handle = match native_compile_session_handle(workspace_root, signature) {
@@ -4996,7 +5015,7 @@ fn native_update_compile_session_contract_dependencies(
             tracing::warn!(
                 workspace_root = %workspace_root.display(),
                 error = %format!("{err:#}"),
-                "failed to update native contract dependency index after compile"
+                "failed to update native session post-build state"
             );
             return;
         }
@@ -5008,7 +5027,7 @@ fn native_update_compile_session_contract_dependencies(
         if session.signature != *signature {
             return;
         }
-        let mut dependencies_changed = false;
+        let mut state_changed = false;
         for (module_path, dependencies) in dependency_updates {
             if dependencies.is_empty() {
                 if session
@@ -5016,7 +5035,7 @@ fn native_update_compile_session_contract_dependencies(
                     .remove(module_path)
                     .is_some()
                 {
-                    dependencies_changed = true;
+                    state_changed = true;
                 }
             } else {
                 match session.contract_source_dependencies.get(module_path) {
@@ -5025,15 +5044,20 @@ fn native_update_compile_session_contract_dependencies(
                         session
                             .contract_source_dependencies
                             .insert(module_path.clone(), dependencies.clone());
-                        dependencies_changed = true;
+                        state_changed = true;
                     }
                 }
             }
         }
+        if let Some(contract_output_plans) = contract_output_plans {
+            if session.contract_output_plans != contract_output_plans {
+                session.contract_output_plans = contract_output_plans.to_vec();
+                state_changed = true;
+            }
+        }
         (
             native_compile_session_state_estimated_bytes(&session),
-            dependencies_changed
-                .then(|| native_compile_session_image_snapshot_from_state(&session)),
+            state_changed.then(|| native_compile_session_image_snapshot_from_state(&session)),
         )
     };
     update_native_compile_session_cached_estimated_bytes(workspace_root, estimated_bytes);
@@ -5161,6 +5185,25 @@ fn native_reusable_unaffected_manifest_entries(
         reusable_entries.push(entry.clone());
     }
     Ok(Some((reusable_entries, keep_files)))
+}
+
+#[cfg(feature = "native-compile")]
+fn native_cached_noop_keep_files(
+    target_dir: &Path,
+    package_name: &str,
+    plans: &[NativeContractOutputPlan],
+) -> Result<Option<BTreeSet<String>>> {
+    if plans.is_empty() {
+        return Ok(None);
+    }
+    let impacted = BTreeSet::new();
+    let Some((_entries, mut keep_files)) =
+        native_reusable_unaffected_manifest_entries(target_dir, package_name, plans, &impacted)?
+    else {
+        return Ok(None);
+    };
+    keep_files.insert(format!("{package_name}.starknet_artifacts.json"));
+    Ok(Some(keep_files))
 }
 
 #[cfg(feature = "native-compile")]
@@ -5332,6 +5375,7 @@ fn native_compile_session_image_snapshot_from_state(
         tracked_sources: session.tracked_sources.clone(),
         tracked_source_bytes: session.tracked_source_bytes,
         contract_source_dependencies: session.contract_source_dependencies.clone(),
+        contract_output_plans: session.contract_output_plans.clone(),
     }
 }
 
@@ -5352,6 +5396,7 @@ fn persist_native_compile_session_image_snapshot(
         tracked_sources: snapshot.tracked_sources.clone(),
         tracked_source_bytes: snapshot.tracked_source_bytes,
         contract_source_dependencies: snapshot.contract_source_dependencies.clone(),
+        contract_output_plans: snapshot.contract_output_plans.clone(),
         generated_at_epoch_ms: epoch_ms_u64().unwrap_or_default(),
     };
     let bytes = serde_json::to_vec(&image).context("failed to encode native session image")?;
@@ -5482,6 +5527,7 @@ fn try_native_compile_session_image_restore(
         tracked_sources: decoded.tracked_sources,
         tracked_source_bytes,
         contract_source_dependencies: decoded.contract_source_dependencies,
+        contract_output_plans: decoded.contract_output_plans,
     })
 }
 
@@ -5518,24 +5564,31 @@ fn build_native_compile_session_state(
         &signature,
         source_root_modified_unix_ms,
     );
-    let (tracked_sources, tracked_source_bytes, contract_source_dependencies, session_image_hit) =
-        if let Some(image) = restored_image {
-            (
-                image.tracked_sources,
-                image.tracked_source_bytes,
-                image.contract_source_dependencies,
-                true,
-            )
-        } else {
-            let (tracked_sources, tracked_source_bytes) =
-                native_collect_tracked_sources(workspace_root, &source_roots)?;
-            (
-                tracked_sources,
-                tracked_source_bytes,
-                BTreeMap::new(),
-                false,
-            )
-        };
+    let (
+        tracked_sources,
+        tracked_source_bytes,
+        contract_source_dependencies,
+        contract_output_plans,
+        session_image_hit,
+    ) = if let Some(image) = restored_image {
+        (
+            image.tracked_sources,
+            image.tracked_source_bytes,
+            image.contract_source_dependencies,
+            image.contract_output_plans,
+            true,
+        )
+    } else {
+        let (tracked_sources, tracked_source_bytes) =
+            native_collect_tracked_sources(workspace_root, &source_roots)?;
+        (
+            tracked_sources,
+            tracked_source_bytes,
+            BTreeMap::new(),
+            Vec::new(),
+            false,
+        )
+    };
     let source_scan_ms = scan_start.elapsed().as_secs_f64() * 1000.0;
     tracing::debug!(
         workspace_root = %workspace_root.display(),
@@ -5558,6 +5611,7 @@ fn build_native_compile_session_state(
         tracked_source_bytes,
         source_root_modified_unix_ms,
         contract_source_dependencies,
+        contract_output_plans,
     };
     if !session_image_hit {
         let snapshot = native_compile_session_image_snapshot_from_state(&state);
@@ -6324,6 +6378,7 @@ fn with_native_compile_session<T>(
                 removed_files: removed_files.clone(),
                 journal_fallback_full_scan,
                 contract_source_dependencies: session.contract_source_dependencies.clone(),
+                contract_output_plans: session.contract_output_plans.clone(),
             },
             state_mutated.then(|| native_compile_session_image_snapshot_from_state(&session)),
         )
@@ -6489,12 +6544,41 @@ fn run_native_build_inner(
         impacted_subset_used,
         journal_fallback_full_scan,
         dependency_updates,
+        contract_output_plans,
     ) = with_native_compile_session(workspace_root, &signature, daemon_context, |session| {
         tracing::trace!(
             changed_files = session.changed_files.len(),
             removed_files = session.removed_files.len(),
             "native session snapshot delta"
         );
+        if session.changed_files.is_empty() && session.removed_files.is_empty() {
+            if let Some(keep_files) = native_cached_noop_keep_files(
+                &target_dir,
+                &context.package_name,
+                &session.contract_output_plans,
+            )? {
+                let produced_paths = keep_files.iter().cloned().collect::<Vec<_>>();
+                tracing::debug!(
+                    contracts = session.contract_output_plans.len(),
+                    "native compile reused cached artifacts for unchanged source set"
+                );
+                return Ok((
+                    keep_files.len(),
+                    0.0,
+                    0.0,
+                    0.0,
+                    produced_paths,
+                    0_u64,
+                    0_u64,
+                    session.contract_output_plans.len() as u64,
+                    0_u64,
+                    false,
+                    session.journal_fallback_full_scan,
+                    Vec::new(),
+                    None,
+                ));
+            }
+        }
         let crate_ids =
             CrateInput::into_crate_ids(&session.db, session.main_crate_inputs.iter().cloned());
         let contracts = find_contracts(&session.db, &crate_ids);
@@ -6535,6 +6619,7 @@ fn run_native_build_inner(
                 false,
                 session.journal_fallback_full_scan,
                 Vec::new(),
+                Some(Vec::new()),
             ));
         }
 
@@ -6759,12 +6844,14 @@ fn run_native_build_inner(
             impacted_subset_used,
             session.journal_fallback_full_scan,
             dependency_updates,
+            Some(all_plans),
         ))
     })?;
-    native_update_compile_session_contract_dependencies(
+    native_update_compile_session_post_build_state(
         workspace_root,
         &signature,
         &dependency_updates,
+        contract_output_plans.as_deref(),
     );
     let compile_ms = compile_start.elapsed().as_secs_f64() * 1000.0;
     let session_scope_ms = session_scope_start.elapsed().as_secs_f64() * 1000.0;
