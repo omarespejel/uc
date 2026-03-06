@@ -5155,6 +5155,98 @@ fn native_impacted_source_index_requires_complete_dependency_index_for_unmatched
 
 #[cfg(feature = "native-compile")]
 #[test]
+fn native_filter_changed_files_to_contract_source_index_skips_unrelated_sources_when_complete() {
+    let by_source = HashMap::from([
+        ("src/contract_a.cairo".to_string(), vec![0_usize]),
+        ("src/shared.cairo".to_string(), vec![0_usize, 1_usize]),
+        ("src/contract_b.cairo".to_string(), vec![1_usize]),
+    ]);
+    let (changed, removed) = native_filter_changed_files_to_contract_source_index(
+        &[
+            "src/contract_a.cairo".to_string(),
+            "src/unrelated_math.cairo".to_string(),
+        ],
+        &[
+            "src/unknown_removed.cairo".to_string(),
+            "src/contract_b.cairo".to_string(),
+        ],
+        &by_source,
+        true,
+    );
+    assert_eq!(
+        changed,
+        vec!["src/contract_a.cairo".to_string()],
+        "complete dependency index should scope changed-file overrides to tracked sources only"
+    );
+    assert_eq!(
+        removed,
+        vec!["src/contract_b.cairo".to_string()],
+        "complete dependency index should scope removed-file overrides to tracked sources only"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_filter_changed_files_to_contract_source_index_keeps_full_set_when_incomplete() {
+    let by_source = HashMap::from([("src/contract_a.cairo".to_string(), vec![0_usize])]);
+    let changed_input = vec![
+        "src/contract_a.cairo".to_string(),
+        "src/untracked.cairo".to_string(),
+    ];
+    let removed_input = vec!["src/removed_untracked.cairo".to_string()];
+    let (changed, removed) = native_filter_changed_files_to_contract_source_index(
+        &changed_input,
+        &removed_input,
+        &by_source,
+        false,
+    );
+    assert_eq!(
+        changed, changed_input,
+        "incomplete dependency indexes must keep conservative changed-file coverage"
+    );
+    assert_eq!(
+        removed, removed_input,
+        "incomplete dependency indexes must keep conservative removed-file coverage"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_contract_source_index_for_module_paths_tracks_per_source_indices_and_completeness() {
+    let module_paths = vec!["pkg::a".to_string(), "pkg::b".to_string()];
+    let dependencies = BTreeMap::from([(
+        "pkg::a".to_string(),
+        BTreeSet::from([
+            "src/contract_a.cairo".to_string(),
+            "src/shared.cairo".to_string(),
+        ]),
+    )]);
+    let (by_source, complete) =
+        native_contract_source_index_for_module_paths(&module_paths, &dependencies);
+    assert!(
+        !complete,
+        "missing dependency entries for any contract keep the index conservative/incomplete"
+    );
+    assert_eq!(
+        by_source
+            .get("src/contract_a.cairo")
+            .expect("source should be indexed"),
+        &vec![0_usize]
+    );
+    assert_eq!(
+        by_source
+            .get("src/shared.cairo")
+            .expect("shared source should be indexed"),
+        &vec![0_usize]
+    );
+    assert!(
+        by_source.get("src/contract_b.cairo").is_none(),
+        "contracts without dependency entries must not create synthetic source-index mappings"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
 fn native_impacted_contract_indices_uses_module_paths_without_rebuilding_source_index() {
     let module_paths = vec![
         "pkg::contract_a".to_string(),

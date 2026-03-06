@@ -5175,63 +5175,7 @@ fn native_update_compile_session_post_build_state(
     }
 }
 
-#[cfg(feature = "native-compile")]
-fn native_impacted_contract_indices(
-    module_paths: &[String],
-    contract_source_paths: &[Option<String>],
-    changed_files: &[String],
-    removed_files: &[String],
-    contract_source_dependencies: &BTreeMap<String, BTreeSet<String>>,
-) -> Option<Vec<usize>> {
-    if changed_files.is_empty() && removed_files.is_empty() {
-        return Some(Vec::new());
-    }
-    let changed_sources: HashSet<&str> = changed_files
-        .iter()
-        .chain(removed_files.iter())
-        .map(String::as_str)
-        .collect();
-    let mut unmatched_sources = changed_sources.clone();
-    let mut impacted = BTreeSet::new();
-    let mut dependency_index_complete = true;
-    for (index, module_path) in module_paths.iter().enumerate() {
-        if let Some(dependencies) = contract_source_dependencies.get(module_path) {
-            if dependencies.is_empty() {
-                dependency_index_complete = false;
-            }
-            let mut contract_impacted = false;
-            for dependency in dependencies {
-                if changed_sources.contains(dependency.as_str()) {
-                    contract_impacted = true;
-                    unmatched_sources.remove(dependency.as_str());
-                }
-            }
-            if contract_impacted {
-                impacted.insert(index);
-            }
-            continue;
-        }
-        dependency_index_complete = false;
-        if let Some(Some(source_path)) = contract_source_paths.get(index) {
-            if changed_sources.contains(source_path.as_str()) {
-                impacted.insert(index);
-                unmatched_sources.remove(source_path.as_str());
-            }
-        }
-    }
-    if !dependency_index_complete && !unmatched_sources.is_empty() {
-        tracing::debug!(
-            changed_files = changed_files.len(),
-            removed_files = removed_files.len(),
-            indexed_sources = changed_sources.len().saturating_sub(unmatched_sources.len()),
-            "native impacted subset index is incomplete for changed file set; falling back to full compile"
-        );
-        return None;
-    }
-    Some(impacted.into_iter().collect())
-}
-
-#[cfg(feature = "native-compile")]
+#[cfg(all(feature = "native-compile", test))]
 fn native_contract_dependency_index_complete(
     contract_output_plans: &[NativeContractOutputPlan],
     contract_source_dependencies: &BTreeMap<String, BTreeSet<String>>,
@@ -5247,6 +5191,91 @@ fn native_contract_dependency_index_complete(
 }
 
 #[cfg(feature = "native-compile")]
+fn native_contract_source_index_for_module_paths(
+    module_paths: &[String],
+    contract_source_dependencies: &BTreeMap<String, BTreeSet<String>>,
+) -> (HashMap<String, Vec<usize>>, bool) {
+    let mut by_source_sets: HashMap<String, BTreeSet<usize>> = HashMap::new();
+    let mut dependency_index_complete = !module_paths.is_empty();
+    for (index, module_path) in module_paths.iter().enumerate() {
+        let Some(dependencies) = contract_source_dependencies.get(module_path) else {
+            dependency_index_complete = false;
+            continue;
+        };
+        if dependencies.is_empty() {
+            dependency_index_complete = false;
+            continue;
+        }
+        for dependency in dependencies {
+            by_source_sets
+                .entry(dependency.clone())
+                .or_default()
+                .insert(index);
+        }
+    }
+    let by_source = by_source_sets
+        .into_iter()
+        .map(|(source, indices)| (source, indices.into_iter().collect::<Vec<_>>()))
+        .collect();
+    (by_source, dependency_index_complete)
+}
+
+#[cfg(feature = "native-compile")]
+fn native_contract_source_index(
+    contract_output_plans: &[NativeContractOutputPlan],
+    contract_source_dependencies: &BTreeMap<String, BTreeSet<String>>,
+) -> (HashMap<String, Vec<usize>>, bool) {
+    let module_paths = contract_output_plans
+        .iter()
+        .map(|plan| plan.module_path.clone())
+        .collect::<Vec<_>>();
+    native_contract_source_index_for_module_paths(&module_paths, contract_source_dependencies)
+}
+
+#[cfg(feature = "native-compile")]
+fn native_collect_impacted_contract_indices_from_source_index(
+    by_source: &HashMap<String, Vec<usize>>,
+    changed_files: &[String],
+    removed_files: &[String],
+) -> (BTreeSet<usize>, BTreeSet<String>) {
+    let mut impacted = BTreeSet::new();
+    let mut unmatched_sources = BTreeSet::new();
+    for source in changed_files.iter().chain(removed_files.iter()) {
+        let Some(indices) = by_source.get(source) else {
+            unmatched_sources.insert(source.clone());
+            continue;
+        };
+        for index in indices {
+            impacted.insert(*index);
+        }
+    }
+    (impacted, unmatched_sources)
+}
+
+#[cfg(feature = "native-compile")]
+fn native_filter_changed_files_to_contract_source_index(
+    changed_files: &[String],
+    removed_files: &[String],
+    by_source: &HashMap<String, Vec<usize>>,
+    dependency_index_complete: bool,
+) -> (Vec<String>, Vec<String>) {
+    if !dependency_index_complete {
+        return (changed_files.to_vec(), removed_files.to_vec());
+    }
+    let scoped_changed = changed_files
+        .iter()
+        .filter(|source| by_source.contains_key(source.as_str()))
+        .cloned()
+        .collect();
+    let scoped_removed = removed_files
+        .iter()
+        .filter(|source| by_source.contains_key(source.as_str()))
+        .cloned()
+        .collect();
+    (scoped_changed, scoped_removed)
+}
+
+#[cfg(all(feature = "native-compile", test))]
 fn native_changed_files_affect_tracked_contracts(
     changed_files: &[String],
     removed_files: &[String],
@@ -5256,23 +5285,16 @@ fn native_changed_files_affect_tracked_contracts(
     if changed_files.is_empty() && removed_files.is_empty() {
         return false;
     }
-    if !native_contract_dependency_index_complete(
-        contract_output_plans,
-        contract_source_dependencies,
-    ) {
+    let (by_source, dependency_index_complete) =
+        native_contract_source_index(contract_output_plans, contract_source_dependencies);
+    if !dependency_index_complete {
         // Keep the conservative behavior when dependency coverage is incomplete.
         return true;
     }
-    let changed_sources: HashSet<&str> = changed_files
+    changed_files
         .iter()
         .chain(removed_files.iter())
-        .map(String::as_str)
-        .collect();
-    contract_source_dependencies.values().any(|dependencies| {
-        dependencies
-            .iter()
-            .any(|path| changed_sources.contains(path.as_str()))
-    })
+        .any(|source| by_source.contains_key(source.as_str()))
 }
 
 #[cfg(all(feature = "native-compile", test))]
@@ -5282,25 +5304,72 @@ fn native_impacted_contract_indices_from_source_index(
     removed_files: &[String],
     dependency_index_complete: bool,
 ) -> Option<Vec<usize>> {
-    let mut impacted = BTreeSet::new();
-    let mut unmatched_source_found = false;
-    for source in changed_files.iter().chain(removed_files.iter()) {
-        let Some(indices) = by_source.get(source) else {
-            unmatched_source_found = true;
-            continue;
-        };
-        for index in indices {
-            impacted.insert(*index);
-        }
-    }
-    if unmatched_source_found && !dependency_index_complete {
+    let (impacted, unmatched_sources) = native_collect_impacted_contract_indices_from_source_index(
+        by_source,
+        changed_files,
+        removed_files,
+    );
+    if !unmatched_sources.is_empty() && !dependency_index_complete {
         tracing::debug!(
             changed_files = changed_files.len(),
             removed_files = removed_files.len(),
-            indexed_sources = by_source.len(),
+            indexed_sources = changed_files
+                .iter()
+                .chain(removed_files.iter())
+                .map(String::as_str)
+                .collect::<HashSet<_>>()
+                .len()
+                .saturating_sub(unmatched_sources.len()),
             "native impacted subset index is incomplete for changed file set; falling back to full compile"
         );
         return None;
+    }
+    Some(impacted.into_iter().collect())
+}
+
+#[cfg(feature = "native-compile")]
+fn native_impacted_contract_indices(
+    module_paths: &[String],
+    contract_source_paths: &[Option<String>],
+    changed_files: &[String],
+    removed_files: &[String],
+    contract_source_dependencies: &BTreeMap<String, BTreeSet<String>>,
+) -> Option<Vec<usize>> {
+    if changed_files.is_empty() && removed_files.is_empty() {
+        return Some(Vec::new());
+    }
+    let (by_source, dependency_index_complete) =
+        native_contract_source_index_for_module_paths(module_paths, contract_source_dependencies);
+    let (mut impacted, mut unmatched_sources) =
+        native_collect_impacted_contract_indices_from_source_index(
+            &by_source,
+            changed_files,
+            removed_files,
+        );
+    if !unmatched_sources.is_empty() && !dependency_index_complete {
+        for (index, source_path) in contract_source_paths.iter().enumerate() {
+            let Some(source_path) = source_path else {
+                continue;
+            };
+            if unmatched_sources.remove(source_path) {
+                impacted.insert(index);
+            }
+        }
+        if !unmatched_sources.is_empty() {
+            tracing::debug!(
+                changed_files = changed_files.len(),
+                removed_files = removed_files.len(),
+                indexed_sources = changed_files
+                    .iter()
+                    .chain(removed_files.iter())
+                    .map(String::as_str)
+                    .collect::<HashSet<_>>()
+                    .len()
+                    .saturating_sub(unmatched_sources.len()),
+                "native impacted subset index is incomplete for changed file set; falling back to full compile"
+            );
+            return None;
+        }
     }
     Some(impacted.into_iter().collect())
 }
@@ -7044,21 +7113,29 @@ fn with_native_compile_session<T>(
             refresh_action,
             NativeSessionRefreshAction::IncrementalChangedSet
         ) {
-            if native_changed_files_affect_tracked_contracts(
-                &changed_files,
-                &removed_files,
+            let (by_source, dependency_index_complete) = native_contract_source_index(
                 &session.contract_output_plans,
                 &session.contract_source_dependencies,
-            ) {
+            );
+            let (scoped_changed_files, scoped_removed_files) =
+                native_filter_changed_files_to_contract_source_index(
+                    &changed_files,
+                    &removed_files,
+                    &by_source,
+                    dependency_index_complete,
+                );
+            if !scoped_changed_files.is_empty() || !scoped_removed_files.is_empty() {
                 // Prefer file-keyed override updates for relevant source changes to avoid coarse
                 // full-DB invalidation on every incremental refresh.
                 match native_apply_file_keyed_session_updates(
                     &mut session.db,
                     workspace_root,
-                    &changed_files,
-                    &removed_files,
+                    &scoped_changed_files,
+                    &scoped_removed_files,
                 ) {
                     Ok(applied_override_update) => {
+                        changed_files = scoped_changed_files;
+                        removed_files = scoped_removed_files;
                         if applied_override_update {
                             tracing::debug!(
                                 changed_files = changed_files.len(),
