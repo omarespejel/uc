@@ -6102,18 +6102,12 @@ fn native_tracked_sources_total_bytes(
 }
 
 #[cfg(feature = "native-compile")]
-fn native_apply_source_change_journal_delta(
+fn native_apply_source_change_journal_delta_in_place(
     workspace_root: &Path,
-    previous_sources: &BTreeMap<String, NativeTrackedFileState>,
+    tracked_sources: &mut BTreeMap<String, NativeTrackedFileState>,
     changed_files: &[String],
     removed_files: &[String],
-) -> Result<(
-    BTreeMap<String, NativeTrackedFileState>,
-    u64,
-    Vec<String>,
-    Vec<String>,
-)> {
-    let mut tracked_sources = previous_sources.clone();
+) -> Result<(u64, Vec<String>, Vec<String>)> {
     let mut effective_changed = BTreeSet::new();
     let mut effective_removed = BTreeSet::new();
     for relative in removed_files {
@@ -6178,8 +6172,8 @@ fn native_apply_source_change_journal_delta(
             size_bytes,
             modified_unix_ms: metadata_modified_unix_ms(&metadata)?,
         };
-        tracked_sources.insert(relative.clone(), next_state.clone());
-        if previous_sources.get(relative) == Some(&next_state) {
+        let previous = tracked_sources.insert(relative.clone(), next_state.clone());
+        if previous.as_ref() == Some(&next_state) {
             // Watcher noise can emit modify events without semantic/metadata drift.
             effective_changed.remove(relative);
             effective_removed.remove(relative);
@@ -6188,12 +6182,39 @@ fn native_apply_source_change_journal_delta(
             effective_changed.insert(relative.clone());
         }
     }
-    let total_bytes = native_tracked_sources_total_bytes(&tracked_sources)?;
+    let total_bytes = native_tracked_sources_total_bytes(tracked_sources)?;
     Ok((
-        tracked_sources,
         total_bytes,
         effective_changed.into_iter().collect(),
         effective_removed.into_iter().collect(),
+    ))
+}
+
+#[cfg(all(feature = "native-compile", test))]
+fn native_apply_source_change_journal_delta(
+    workspace_root: &Path,
+    previous_sources: &BTreeMap<String, NativeTrackedFileState>,
+    changed_files: &[String],
+    removed_files: &[String],
+) -> Result<(
+    BTreeMap<String, NativeTrackedFileState>,
+    u64,
+    Vec<String>,
+    Vec<String>,
+)> {
+    let mut tracked_sources = previous_sources.clone();
+    let (total_bytes, effective_changed, effective_removed) =
+        native_apply_source_change_journal_delta_in_place(
+            workspace_root,
+            &mut tracked_sources,
+            changed_files,
+            removed_files,
+        )?;
+    Ok((
+        tracked_sources,
+        total_bytes,
+        effective_changed,
+        effective_removed,
     ))
 }
 
@@ -6306,16 +6327,19 @@ fn with_native_compile_session<T>(
 ) -> Result<T> {
     let source_roots = native_compile_source_roots(workspace_root, &signature.context);
     let session_handle = native_compile_session_handle(workspace_root, signature)?;
-    let (needs_full_rebuild, previous_sources) = {
+    let needs_full_rebuild = {
         let session = session_handle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if session.signature != *signature {
-            (true, BTreeMap::new())
-        } else {
-            (false, session.tracked_sources.clone())
-        }
+        session.signature != *signature
     };
+    let snapshot_previous_sources = || {
+        let session = session_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        session.tracked_sources.clone()
+    };
+    let mut source_delta_applied_pre_refresh = false;
     let drift_scan_start = Instant::now();
     let (
         mut changed_files,
@@ -6332,30 +6356,38 @@ fn with_native_compile_session<T>(
                 changed_files,
                 removed_files,
             } => {
-                match native_apply_source_change_journal_delta(
+                let mut session = session_handle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match native_apply_source_change_journal_delta_in_place(
                     workspace_root,
-                    &previous_sources,
+                    &mut session.tracked_sources,
                     &changed_files,
                     &removed_files,
                 ) {
                     Ok((
-                        tracked_sources,
                         tracked_source_bytes,
                         effective_changed_files,
                         effective_removed_files,
-                    )) => (
-                        effective_changed_files,
-                        effective_removed_files,
-                        Some((tracked_sources, tracked_source_bytes)),
-                        0_u64,
-                        false,
-                    ),
+                    )) => {
+                        session.tracked_source_bytes = tracked_source_bytes;
+                        source_delta_applied_pre_refresh = true;
+                        (
+                            effective_changed_files,
+                            effective_removed_files,
+                            None,
+                            0_u64,
+                            false,
+                        )
+                    }
                     Err(err) => {
+                        drop(session);
                         tracing::warn!(
                             workspace_root = %workspace_root.display(),
                             error = %format!("{err:#}"),
                             "native source watcher delta rejected; falling back to full source scan"
                         );
+                        let previous_sources = snapshot_previous_sources();
                         let (current_sources, current_source_bytes) =
                             native_collect_tracked_sources(workspace_root, &source_roots)?;
                         let (changed_files, removed_files) =
@@ -6373,6 +6405,7 @@ fn with_native_compile_session<T>(
                 }
             }
             NativeSourceJournalDelta::FallbackFullScan => {
+                let previous_sources = snapshot_previous_sources();
                 let (current_sources, current_source_bytes) =
                     native_collect_tracked_sources(workspace_root, &source_roots)?;
                 let (changed_files, removed_files) =
@@ -6389,6 +6422,7 @@ fn with_native_compile_session<T>(
             }
         }
     } else {
+        let previous_sources = snapshot_previous_sources();
         let (current_sources, current_source_bytes) =
             native_collect_tracked_sources(workspace_root, &source_roots)?;
         let (changed_files, removed_files) =
@@ -6439,7 +6473,7 @@ fn with_native_compile_session<T>(
         let mut session = session_handle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut state_mutated = false;
+        let mut state_mutated = source_delta_applied_pre_refresh;
         if session.signature != *signature {
             if let Some(state) = rebuilt_state.take() {
                 *session = state;

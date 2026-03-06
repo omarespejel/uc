@@ -5547,6 +5547,65 @@ fn native_apply_source_change_journal_delta_filters_metadata_noop_events() {
 
 #[cfg(feature = "native-compile")]
 #[test]
+fn native_apply_source_change_journal_delta_in_place_matches_copy_variant() {
+    let dir = unique_test_dir("uc-native-source-journal-in-place");
+    fs::create_dir_all(dir.join("src")).expect("failed to create src directory");
+    fs::write(dir.join("src/lib.cairo"), "fn lib() {}\n").expect("failed to write lib.cairo");
+    fs::write(dir.join("src/new.cairo"), "fn new_file() {}\n").expect("failed to write new.cairo");
+    let previous = BTreeMap::from([
+        (
+            "src/lib.cairo".to_string(),
+            NativeTrackedFileState {
+                size_bytes: 4,
+                modified_unix_ms: 1,
+            },
+        ),
+        (
+            "src/old.cairo".to_string(),
+            NativeTrackedFileState {
+                size_bytes: 3,
+                modified_unix_ms: 1,
+            },
+        ),
+    ]);
+    let changed = vec!["src/lib.cairo".to_string(), "src/new.cairo".to_string()];
+    let removed = vec!["src/old.cairo".to_string()];
+    let (expected_snapshot, expected_total, expected_changed, expected_removed) =
+        native_apply_source_change_journal_delta(&dir, &previous, &changed, &removed)
+            .expect("copy variant should succeed");
+
+    let mut in_place_snapshot = previous.clone();
+    let (in_place_total, in_place_changed, in_place_removed) =
+        native_apply_source_change_journal_delta_in_place(
+            &dir,
+            &mut in_place_snapshot,
+            &changed,
+            &removed,
+        )
+        .expect("in-place variant should succeed");
+
+    assert_eq!(
+        in_place_snapshot, expected_snapshot,
+        "in-place and copy variants should produce identical tracked snapshots"
+    );
+    assert_eq!(
+        in_place_total, expected_total,
+        "in-place and copy variants should report identical source byte budgets"
+    );
+    assert_eq!(
+        in_place_changed, expected_changed,
+        "in-place and copy variants should report identical changed-file sets"
+    );
+    assert_eq!(
+        in_place_removed, expected_removed,
+        "in-place and copy variants should report identical removed-file sets"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
 fn native_reusable_unaffected_manifest_entries_reuses_only_safe_entries() {
     let dir = unique_test_dir("uc-native-manifest-reuse");
     fs::create_dir_all(&dir).expect("failed to create target dir");
