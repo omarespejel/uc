@@ -4304,6 +4304,30 @@ fn native_cairo_project_toml_renders_override_dependencies_for_local_crates() {
 }
 
 #[test]
+fn native_cairo_project_toml_defaults_global_and_override_edition_when_unspecified() {
+    let rendered = native_cairo_project_toml(
+        &[
+            ("demo".to_string(), "/tmp/demo/src".to_string()),
+            ("utils".to_string(), "/tmp/utils/src".to_string()),
+        ],
+        &[NativeCrateDependencyConfig {
+            crate_name: "demo".to_string(),
+            cairo_edition: None,
+            dependencies: vec!["utils".to_string()],
+        }],
+        None,
+    );
+    assert!(
+        rendered.contains("[config.global]\nedition = \"2024_07\""),
+        "missing manifest edition should fall back to default global edition: {rendered}"
+    );
+    assert!(
+        rendered.contains("[config.override.demo]\nedition = \"2024_07\""),
+        "crate override should always emit an effective edition: {rendered}"
+    );
+}
+
+#[test]
 fn native_starknet_artifact_id_matches_scarb_contract_id_shape() {
     assert_eq!(
         native_starknet_artifact_id("uc_smoke", "uc_smoke::contract_patterns::portfolio_router"),

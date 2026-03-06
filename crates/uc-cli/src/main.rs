@@ -110,6 +110,7 @@ const DEFAULT_CACHE_BUDGET_MIN_INTERVAL_MS: u64 = 5 * 60 * 1000;
 const FINGERPRINT_INDEX_SCHEMA_VERSION: u32 = 2;
 const ARTIFACT_INDEX_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_DIAGNOSTICS_SIMILARITY_THRESHOLD: f64 = 99.5;
+const DEFAULT_CAIRO_EDITION: &str = "2024_07";
 const DAEMON_REQUEST_SIZE_LIMIT_BYTES: usize = 1024 * 1024;
 const DAEMON_RESPONSE_SIZE_OVERHEAD_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_DAEMON_RESPONSE_SIZE_LIMIT_BYTES: usize = (MAX_CAPTURE_STDOUT_BYTES as usize)
@@ -4760,14 +4761,13 @@ fn native_cairo_project_toml(
     }
     let normalized_global_edition = cairo_edition
         .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if let Some(edition) = normalized_global_edition {
-        let escaped_edition = toml_escape_basic_string(edition);
-        content.push_str("\n[config.global]\n");
-        content.push_str("edition = \"");
-        content.push_str(&escaped_edition);
-        content.push_str("\"\n");
-    }
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_CAIRO_EDITION);
+    let escaped_edition = toml_escape_basic_string(normalized_global_edition);
+    content.push_str("\n[config.global]\n");
+    content.push_str("edition = \"");
+    content.push_str(&escaped_edition);
+    content.push_str("\"\n");
     for crate_config in crate_dependency_configs
         .iter()
         .filter(|config| !config.dependencies.is_empty())
@@ -4781,13 +4781,11 @@ fn native_cairo_project_toml(
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .or(normalized_global_edition);
-        if let Some(edition) = effective_edition {
-            let escaped_edition = toml_escape_basic_string(edition);
-            content.push_str("edition = \"");
-            content.push_str(&escaped_edition);
-            content.push_str("\"\n");
-        }
+            .unwrap_or(normalized_global_edition);
+        let escaped_edition = toml_escape_basic_string(effective_edition);
+        content.push_str("edition = \"");
+        content.push_str(&escaped_edition);
+        content.push_str("\"\n");
 
         content.push_str("\n[config.override.");
         content.push_str(&crate_config.crate_name);
@@ -8875,7 +8873,7 @@ fn write_uc_toml(
 
     let name = package_name.unwrap_or("unknown-package");
     let version = package_version.unwrap_or("0.1.0");
-    let edition = edition.unwrap_or("2024_07");
+    let edition = edition.unwrap_or(DEFAULT_CAIRO_EDITION);
 
     let mut project = toml::map::Map::new();
     project.insert("name".to_string(), TomlValue::String(name.to_string()));
