@@ -4634,6 +4634,105 @@ fn native_impacted_source_index_requires_complete_dependency_index_for_unmatched
 
 #[cfg(feature = "native-compile")]
 #[test]
+fn native_impacted_contract_indices_uses_module_paths_without_rebuilding_source_index() {
+    let module_paths = vec![
+        "pkg::contract_a".to_string(),
+        "pkg::contract_b".to_string(),
+        "pkg::contract_c".to_string(),
+    ];
+    let contract_source_paths = vec![
+        Some("src/contract_a.cairo".to_string()),
+        Some("src/contract_b.cairo".to_string()),
+        Some("src/contract_c.cairo".to_string()),
+    ];
+    let dependencies = BTreeMap::from([
+        (
+            "pkg::contract_a".to_string(),
+            BTreeSet::from([
+                "src/contract_a.cairo".to_string(),
+                "src/shared.cairo".to_string(),
+            ]),
+        ),
+        (
+            "pkg::contract_b".to_string(),
+            BTreeSet::from(["src/contract_b.cairo".to_string()]),
+        ),
+        (
+            "pkg::contract_c".to_string(),
+            BTreeSet::from(["src/contract_c.cairo".to_string()]),
+        ),
+    ]);
+
+    let impacted = native_impacted_contract_indices(
+        &module_paths,
+        &contract_source_paths,
+        &[String::from("src/shared.cairo")],
+        &[],
+        &dependencies,
+    )
+    .expect("complete dependency index should return impacted subset");
+    assert_eq!(
+        impacted,
+        vec![0],
+        "shared dependency should impact contract_a only"
+    );
+
+    let unrelated = native_impacted_contract_indices(
+        &module_paths,
+        &contract_source_paths,
+        &[String::from("src/math.cairo")],
+        &[],
+        &dependencies,
+    )
+    .expect("unrelated source changes should be accepted on complete indexes");
+    assert!(
+        unrelated.is_empty(),
+        "unrelated source edits should not force contract recompilation"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_impacted_contract_indices_stays_conservative_when_dependency_index_is_incomplete() {
+    let module_paths = vec!["pkg::contract_a".to_string(), "pkg::contract_b".to_string()];
+    let contract_source_paths = vec![
+        Some("src/contract_a.cairo".to_string()),
+        Some("src/contract_b.cairo".to_string()),
+    ];
+    let dependencies = BTreeMap::from([(
+        "pkg::contract_a".to_string(),
+        BTreeSet::from(["src/contract_a.cairo".to_string()]),
+    )]);
+
+    let impacted = native_impacted_contract_indices(
+        &module_paths,
+        &contract_source_paths,
+        &[String::from("src/contract_b.cairo")],
+        &[],
+        &dependencies,
+    )
+    .expect("missing dependency entry should fall back to source path for matched files");
+    assert_eq!(
+        impacted,
+        vec![1],
+        "source-path fallback should still identify directly changed contracts"
+    );
+
+    assert!(
+        native_impacted_contract_indices(
+            &module_paths,
+            &contract_source_paths,
+            &[String::from("src/math.cairo")],
+            &[],
+            &dependencies
+        )
+        .is_none(),
+        "incomplete indexes must force full compile for unmatched changed files"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
 fn native_changed_files_affect_tracked_contracts_skips_unrelated_changes_when_index_complete() {
     let plans = vec![
         NativeContractOutputPlan {
@@ -4776,16 +4875,10 @@ fn native_apply_file_keyed_session_updates_batches_changed_and_removed_files() {
     .expect("batched update should succeed");
 
     let changed_file = db
-        .file_input(FileId::new(
-            &db,
-            FileLongId::OnDisk(changed_path.clone()),
-        ))
+        .file_input(FileId::new(&db, FileLongId::OnDisk(changed_path.clone())))
         .clone();
     let removed_file = db
-        .file_input(FileId::new(
-            &db,
-            FileLongId::OnDisk(removed_path.clone()),
-        ))
+        .file_input(FileId::new(&db, FileLongId::OnDisk(removed_path.clone())))
         .clone();
     let overrides = files_group_input(&db)
         .file_overrides(&db)
