@@ -1,5 +1,4 @@
 use super::*;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(super) fn daemon_socket_path(override_path: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = override_path {
@@ -112,10 +111,14 @@ pub(super) fn read_line_limited<R: BufRead>(
 
         let newline_pos = chunk.iter().position(|byte| *byte == b'\n');
         let take_len = newline_pos.unwrap_or(chunk.len());
-        bytes.extend_from_slice(&chunk[..take_len]);
-        if bytes.len() > max_bytes {
+        let remaining = max_bytes.saturating_sub(bytes.len());
+        // Accept exactly `max_bytes` bytes only when a newline is present in the
+        // current chunk. Without a newline, reaching the limit is treated as an
+        // oversized line to avoid boundary ambiguity across buffered reads.
+        if take_len > remaining || (newline_pos.is_none() && take_len >= remaining) {
             bail!("{label} exceeds size limit ({max_bytes} bytes)");
         }
+        bytes.extend_from_slice(&chunk[..take_len]);
 
         let consumed = if newline_pos.is_some() {
             take_len + 1
@@ -144,6 +147,40 @@ pub(super) fn daemon_request(
         daemon_request_read_timeout(request),
         daemon_request_write_timeout(),
     )
+}
+
+fn debug_daemon_response_enabled() -> bool {
+    static VALUE: OnceLock<bool> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        matches!(
+            std::env::var("UC_DEBUG_DAEMON_RESPONSE")
+                .ok()
+                .map(|value| value.trim().to_ascii_lowercase()),
+            Some(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on")
+        )
+    })
+}
+
+fn flatten_payload_wrapped_wire_shape(value: &mut serde_json::Value) {
+    let Some(root) = value.as_object_mut() else {
+        return;
+    };
+    let Some(payload) = root.remove("payload") else {
+        return;
+    };
+    let serde_json::Value::Object(payload_map) = payload else {
+        root.insert("payload".to_string(), payload);
+        return;
+    };
+    for (key, item) in payload_map {
+        if key == "type" {
+            continue;
+        }
+        // Skip redundant payload `type`: the root discriminant is authoritative and
+        // must not be overridden by payload-wrapped clients.
+        // Non-discriminant payload fields stay authoritative over root duplicates.
+        root.insert(key, item);
+    }
 }
 
 #[cfg(unix)]
@@ -175,20 +212,47 @@ pub(super) fn daemon_request_with_timeouts(
         let mut reader = BufReader::new(&mut stream);
         read_line_limited(
             &mut reader,
-            DAEMON_REQUEST_SIZE_LIMIT_BYTES,
+            daemon_response_size_limit_bytes(),
             "daemon response",
         )?
     };
     if response_line.trim().is_empty() {
         bail!("daemon returned empty response");
     }
-    serde_json::from_str(response_line.trim_end()).context("failed to decode daemon response")
+    match decode_daemon_response(response_line.trim_end()) {
+        Ok(response) => Ok(response),
+        Err(err) => {
+            if debug_daemon_response_enabled() {
+                eprintln!(
+                    "uc: debug raw daemon response: {}",
+                    response_line.trim_end()
+                );
+            }
+            Err(err).context("failed to decode daemon response")
+        }
+    }
+}
+
+// Daemon wire payloads can be wrapped (`payload`) or flat (legacy/hybrid).
+// Normalize through `Value` once and decode from the normalized shape.
+pub(super) fn decode_daemon_request(line: &str) -> serde_json::Result<DaemonRequest> {
+    let mut value: serde_json::Value = serde_json::from_str(line)?;
+    flatten_payload_wrapped_wire_shape(&mut value);
+    serde_json::from_value(value)
+}
+
+// Daemon wire payloads can be wrapped (`payload`) or flat (legacy/hybrid).
+// Normalize through `Value` once and decode from the normalized shape.
+pub(super) fn decode_daemon_response(line: &str) -> serde_json::Result<DaemonResponse> {
+    let mut value: serde_json::Value = serde_json::from_str(line)?;
+    flatten_payload_wrapped_wire_shape(&mut value);
+    serde_json::from_value(value)
 }
 
 #[cfg(unix)]
 pub(super) fn daemon_ping(socket_path: &Path) -> Result<DaemonStatusPayload> {
     match daemon_request(socket_path, &DaemonRequest::Ping)? {
-        DaemonResponse::Pong(status) => Ok(status),
+        DaemonResponse::Pong { payload } => Ok(payload),
         DaemonResponse::Error { message } => bail!("daemon ping failed: {message}"),
         _ => bail!("unexpected daemon response to ping"),
     }
@@ -196,8 +260,8 @@ pub(super) fn daemon_ping(socket_path: &Path) -> Result<DaemonStatusPayload> {
 
 pub(super) fn daemon_request_protocol_version(request: &DaemonRequest) -> Option<&str> {
     match request {
-        DaemonRequest::Build(payload) => Some(payload.protocol_version.as_str()),
-        DaemonRequest::Metadata(payload) => Some(payload.protocol_version.as_str()),
+        DaemonRequest::Build { payload } => Some(payload.protocol_version.as_str()),
+        DaemonRequest::Metadata { payload } => Some(payload.protocol_version.as_str()),
         DaemonRequest::Ping | DaemonRequest::Shutdown => None,
     }
 }
@@ -218,6 +282,7 @@ pub(super) fn daemon_status_snapshot(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
+    let native_cache = native_cache_telemetry_snapshot();
     DaemonStatusPayload {
         pid: base.pid,
         started_at_epoch_ms: base.started_at_epoch_ms,
@@ -228,6 +293,24 @@ pub(super) fn daemon_status_snapshot(
         failed_requests: snapshot.failed_requests,
         rate_limited_requests: snapshot.rate_limited_requests,
         last_error: snapshot.last_error,
+        native_compile_session_cache_entries: native_cache.session_entries,
+        native_compile_session_cache_estimated_bytes: native_cache.session_estimated_bytes,
+        native_compile_context_cache_entries: native_cache.context_entries,
+        native_compile_context_cache_estimated_bytes: native_cache.context_estimated_bytes,
+        native_compile_session_build_locks: native_cache.build_locks,
+        metadata_result_cache_entries: native_cache.metadata_entries,
+        metadata_result_cache_estimated_bytes: native_cache.metadata_estimated_bytes,
+        native_refresh_none_count: native_cache.refresh_none_count,
+        native_refresh_incremental_count: native_cache.refresh_incremental_count,
+        native_refresh_full_rebuild_count: native_cache.refresh_full_rebuild_count,
+        native_refresh_changed_files_total: native_cache.refresh_changed_files_total,
+        native_refresh_removed_files_total: native_cache.refresh_removed_files_total,
+        native_fallback_preflight_ineligible_count: native_cache
+            .fallback_preflight_ineligible_count,
+        native_fallback_local_native_error_count: native_cache.fallback_local_native_error_count,
+        native_fallback_daemon_native_error_count: native_cache.fallback_daemon_native_error_count,
+        native_fallback_daemon_backend_downgrade_count: native_cache
+            .fallback_daemon_backend_downgrade_count,
     }
 }
 
@@ -335,7 +418,7 @@ pub(super) fn handle_daemon_connection(
         return Ok(());
     }
 
-    let request: DaemonRequest = match serde_json::from_str(request_line.trim_end()) {
+    let request: DaemonRequest = match decode_daemon_request(request_line.trim_end()) {
         Ok(request) => request,
         Err(err) => {
             let message = format!("failed to parse daemon request: {err}");
@@ -372,17 +455,19 @@ pub(super) fn handle_daemon_connection(
     let response = match request {
         DaemonRequest::Ping => {
             record_daemon_success(health);
-            DaemonResponse::Pong(daemon_status_snapshot(status, health))
+            DaemonResponse::Pong {
+                payload: daemon_status_snapshot(status, health),
+            }
         }
         DaemonRequest::Shutdown => {
             record_daemon_success(health);
-            should_shutdown.store(true, Ordering::Relaxed);
+            should_shutdown.store(true, Ordering::Release);
             DaemonResponse::Ack
         }
-        DaemonRequest::Build(request) => match execute_daemon_build(request) {
+        DaemonRequest::Build { payload } => match execute_daemon_build(payload) {
             Ok(result) => {
                 record_daemon_success(health);
-                DaemonResponse::Build(result)
+                DaemonResponse::Build { payload: result }
             }
             Err(err) => {
                 let message = format!("{err:#}");
@@ -390,10 +475,10 @@ pub(super) fn handle_daemon_connection(
                 DaemonResponse::Error { message }
             }
         },
-        DaemonRequest::Metadata(request) => match execute_daemon_metadata(request) {
+        DaemonRequest::Metadata { payload } => match execute_daemon_metadata(payload) {
             Ok(result) => {
                 record_daemon_success(health);
-                DaemonResponse::Metadata(result)
+                DaemonResponse::Metadata { payload: result }
             }
             Err(err) => {
                 let message = format!("{err:#}");

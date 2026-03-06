@@ -1,10 +1,20 @@
 use super::*;
 
+const DEFAULT_CACHE_OBJECT_HASH_MEMO_MAX_ENTRIES: usize = 4096;
+
 #[derive(Clone)]
 pub(super) struct BuildEntryCacheEntry {
     pub(super) file_size_bytes: u64,
     pub(super) file_modified_unix_ms: u64,
     pub(super) entry: BuildCacheEntry,
+    pub(super) last_access_epoch_ms: u64,
+}
+
+#[derive(Clone)]
+pub(super) struct CacheObjectHashMemoEntry {
+    pub(super) size_bytes: u64,
+    pub(super) modified_unix_ms: u64,
+    pub(super) blake3_hex: String,
     pub(super) last_access_epoch_ms: u64,
 }
 
@@ -167,6 +177,8 @@ pub(super) struct AsyncPersistTask {
     pub(super) workspace_root: PathBuf,
     pub(super) profile: String,
     pub(super) fingerprint: String,
+    pub(super) artifact_relative_paths: Option<Vec<String>>,
+    pub(super) cached_artifacts: Option<Vec<CachedArtifact>>,
     pub(super) cache_root: PathBuf,
     pub(super) objects_dir: PathBuf,
     pub(super) entry_path: PathBuf,
@@ -184,14 +196,32 @@ pub(super) fn async_persist_sender() -> &'static SyncSender<AsyncPersistTask> {
 pub(super) fn run_async_persist_worker(receiver: Receiver<AsyncPersistTask>) {
     for task in receiver {
         let _guard = AsyncPersistGuard::new(task.scope_key.clone());
-        if let Err(err) = persist_cache_entry_for_build(
-            &task.workspace_root,
-            &task.profile,
-            &task.fingerprint,
-            &task.cache_root,
-            &task.objects_dir,
-            &task.entry_path,
-        ) {
+        let persist_result = if let Some(cached_artifacts) = task.cached_artifacts.as_deref() {
+            (|| -> Result<()> {
+                let _cache_lock = acquire_cache_lock(&task.cache_root)?;
+                persist_cache_entry(
+                    &task.profile,
+                    &task.fingerprint,
+                    cached_artifacts,
+                    &task.entry_path,
+                )?;
+                if should_enforce_cache_size_budget_now() {
+                    enforce_cache_size_budget(&task.cache_root)?;
+                }
+                Ok(())
+            })()
+        } else {
+            persist_cache_entry_for_build(
+                &task.workspace_root,
+                &task.profile,
+                &task.fingerprint,
+                task.artifact_relative_paths.as_deref(),
+                &task.cache_root,
+                &task.objects_dir,
+                &task.entry_path,
+            )
+        };
+        if let Err(err) = persist_result {
             let _ = fs::remove_file(&task.entry_path);
             record_async_persist_error(err.to_string());
             tracing::warn!(error = %format!("{err:#}"), "async cache persistence failed");
@@ -226,6 +256,7 @@ pub(super) fn persist_cache_entry_for_build(
     workspace_root: &Path,
     profile: &str,
     fingerprint: &str,
+    artifact_relative_paths: Option<&[String]>,
     cache_root: &Path,
     objects_dir: &Path,
     entry_path: &Path,
@@ -234,6 +265,7 @@ pub(super) fn persist_cache_entry_for_build(
         workspace_root,
         profile,
         fingerprint,
+        artifact_relative_paths,
         cache_root,
         objects_dir,
         entry_path,
@@ -245,12 +277,18 @@ pub(super) fn persist_cache_entry_for_build_with_artifacts(
     workspace_root: &Path,
     profile: &str,
     fingerprint: &str,
+    artifact_relative_paths: Option<&[String]>,
     cache_root: &Path,
     objects_dir: &Path,
     entry_path: &Path,
 ) -> Result<Vec<CachedArtifact>> {
-    let cached_artifacts =
-        collect_cached_artifacts_for_entry(workspace_root, profile, cache_root, objects_dir)?;
+    let cached_artifacts = collect_cached_artifacts_for_entry_with_paths(
+        workspace_root,
+        profile,
+        cache_root,
+        objects_dir,
+        artifact_relative_paths,
+    )?;
     let _cache_lock = acquire_cache_lock(cache_root)?;
     persist_cache_entry(profile, fingerprint, &cached_artifacts, entry_path)?;
     if should_enforce_cache_size_budget_now() {
@@ -365,6 +403,125 @@ pub(super) fn is_removable_cache_file(path: &Path) -> bool {
         return false;
     };
     name != ".lock"
+}
+
+fn cache_object_hash_memo_max_entries() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_env_usize(
+            "UC_CACHE_OBJECT_HASH_MEMO_MAX_ENTRIES",
+            DEFAULT_CACHE_OBJECT_HASH_MEMO_MAX_ENTRIES,
+        )
+        .max(1)
+    })
+}
+
+fn cache_object_hash_memo() -> &'static Mutex<HashMap<String, CacheObjectHashMemoEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CacheObjectHashMemoEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cache_object_hash_memo_key(path: &Path) -> String {
+    normalize_fingerprint_path(path)
+}
+
+#[cfg(test)]
+fn clear_cache_object_hash_memo_for_test() {
+    cache_object_hash_memo()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
+fn cache_object_hash_memo_keys_to_evict(
+    mut age_and_keys: Vec<(u64, String)>,
+    remove_count: usize,
+) -> Vec<String> {
+    if remove_count == 0 || age_and_keys.is_empty() {
+        return Vec::new();
+    }
+    age_and_keys.sort_unstable_by_key(|(age, _)| *age);
+    age_and_keys
+        .into_iter()
+        .take(remove_count)
+        .map(|(_, key)| key)
+        .collect()
+}
+
+#[cfg(test)]
+pub(super) fn evict_oldest_cache_object_hash_memo_entries(
+    cache: &mut HashMap<String, CacheObjectHashMemoEntry>,
+    max_entries: usize,
+) {
+    let remove_count = cache.len().saturating_sub(max_entries);
+    if remove_count == 0 {
+        return;
+    }
+    let keys_to_evict = cache_object_hash_memo_keys_to_evict(
+        cache
+            .iter()
+            .map(|(key, entry)| (entry.last_access_epoch_ms, key.clone()))
+            .collect(),
+        remove_count,
+    );
+    for key in keys_to_evict {
+        cache.remove(&key);
+    }
+}
+
+fn cached_object_hash_if_fresh(
+    object_path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<Option<String>> {
+    let modified_unix_ms = metadata_modified_unix_ms(metadata)?;
+    let now_ms = epoch_ms_u64().unwrap_or_default();
+    let key = cache_object_hash_memo_key(object_path);
+    let mut cache = cache_object_hash_memo()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(entry) = cache.get_mut(&key) else {
+        return Ok(None);
+    };
+    if entry.size_bytes == metadata.len() && entry.modified_unix_ms == modified_unix_ms {
+        // Refresh the memo entry age only on a true metadata hit.
+        // Stale probes must not extend LRU lifetime for outdated hashes.
+        entry.last_access_epoch_ms = now_ms;
+        return Ok(Some(entry.blake3_hex.clone()));
+    }
+    Ok(None)
+}
+
+fn store_cache_object_hash(object_path: &Path, metadata: &fs::Metadata, hash: &str) -> Result<()> {
+    let modified_unix_ms = metadata_modified_unix_ms(metadata)?;
+    let now_ms = epoch_ms_u64().unwrap_or_default();
+    let key = cache_object_hash_memo_key(object_path);
+    let max_entries = cache_object_hash_memo_max_entries();
+    let mut cache = cache_object_hash_memo()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.insert(
+        key,
+        CacheObjectHashMemoEntry {
+            size_bytes: metadata.len(),
+            modified_unix_ms,
+            blake3_hex: hash.to_ascii_lowercase(),
+            last_access_epoch_ms: now_ms,
+        },
+    );
+    let remove_count = cache.len().saturating_sub(max_entries);
+    if remove_count > 0 {
+        let keys_to_evict = cache_object_hash_memo_keys_to_evict(
+            cache
+                .iter()
+                .map(|(entry_key, entry)| (entry.last_access_epoch_ms, entry_key.clone()))
+                .collect(),
+            remove_count,
+        );
+        for eviction_key in keys_to_evict {
+            cache.remove(&eviction_key);
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn build_entry_cache() -> &'static Mutex<HashMap<String, BuildEntryCacheEntry>> {
@@ -574,7 +731,14 @@ pub(super) fn cache_object_matches_expected(
     if !metadata.is_file() || metadata.len() != expected_size {
         return Ok(false);
     }
-    let actual_hash = hash_file_blake3(object_path)?;
+    let actual_hash =
+        if let Some(cached_hash) = cached_object_hash_if_fresh(object_path, &metadata)? {
+            cached_hash
+        } else {
+            let computed = hash_file_blake3(object_path)?;
+            store_cache_object_hash(object_path, &metadata, &computed)?;
+            computed
+        };
     Ok(actual_hash.eq_ignore_ascii_case(expected_hash))
 }
 
@@ -839,4 +1003,68 @@ pub(super) fn hash_file_blake3(path: &Path) -> Result<String> {
     }
 
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_test_dir(prefix: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("{prefix}-{}-{nonce}-{counter}", std::process::id()));
+        fs::create_dir_all(&dir).expect("failed to create test directory");
+        dir
+    }
+
+    #[test]
+    fn stale_hash_lookup_does_not_refresh_access_age() {
+        clear_cache_object_hash_memo_for_test();
+        let dir = unique_test_dir("uc-cache-object-hash-stale-age");
+        let object_path = dir.join("cache/object.bin");
+        if let Some(parent) = object_path.parent() {
+            fs::create_dir_all(parent).expect("failed to create object parent");
+        }
+
+        fs::write(&object_path, b"alpha").expect("failed to write object");
+        let metadata = fs::metadata(&object_path).expect("failed to stat object");
+        store_cache_object_hash(&object_path, &metadata, &"a".repeat(64))
+            .expect("failed to store object hash");
+
+        let key = cache_object_hash_memo_key(&object_path);
+        {
+            let mut cache = cache_object_hash_memo()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let entry = cache
+                .get_mut(&key)
+                .expect("cache entry should exist after store");
+            entry.last_access_epoch_ms = 7;
+        }
+
+        fs::write(&object_path, b"alpha-updated").expect("failed to mutate object");
+        let stale_metadata = fs::metadata(&object_path).expect("failed to stat mutated object");
+        let hit = cached_object_hash_if_fresh(&object_path, &stale_metadata)
+            .expect("fresh lookup should not fail");
+        assert!(hit.is_none(), "stale metadata should miss");
+
+        {
+            let cache = cache_object_hash_memo()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let entry = cache.get(&key).expect("cache entry should still exist");
+            assert_eq!(
+                entry.last_access_epoch_ms, 7,
+                "stale cache lookup must not refresh access age"
+            );
+        }
+        clear_cache_object_hash_memo_for_test();
+    }
 }

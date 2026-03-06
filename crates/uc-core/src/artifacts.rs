@@ -22,15 +22,18 @@ pub struct ArtifactMismatch {
     pub candidate_hash: Option<String>,
 }
 
-const DEFAULT_SUFFIXES: [&str; 5] = [
+const DEFAULT_SUFFIXES: [&str; 7] = [
     ".sierra.json",
     ".sierra",
     ".casm",
     ".contract_class.json",
+    ".compiled_contract_class.json",
+    ".starknet_artifacts.json",
     ".executable.json",
 ];
 const MAX_ARTIFACT_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 const SIERRA_NORMALIZATION_SCHEMA_TAG: &str = "sierra-normalization-v3";
+const CONTRACT_CLASS_NORMALIZATION_SCHEMA_TAG: &str = "contract-class-normalization-v1";
 
 pub fn collect_artifact_digests(target_root: &Path) -> Result<Vec<ArtifactDigest>> {
     if !target_root.exists() {
@@ -61,6 +64,10 @@ pub fn collect_artifact_digests(target_root: &Path) -> Result<Vec<ArtifactDigest
 
         let (blake3_hex, size_bytes) = if name.ends_with(".sierra.json") {
             hash_sierra_json_semantic(path)?
+        } else if name.ends_with(".compiled_contract_class.json") {
+            hash_file_with_limit(path)?
+        } else if name.ends_with(".contract_class.json") {
+            hash_contract_class_json_semantic(path)?
         } else {
             hash_file_with_limit(path)?
         };
@@ -195,7 +202,191 @@ fn hash_sierra_json_semantic(path: &Path) -> Result<(String, u64)> {
     Ok((hasher.finalize().to_hex().to_string(), metadata.len()))
 }
 
+fn hash_contract_class_json_semantic(path: &Path) -> Result<(String, u64)> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    if metadata.len() > MAX_ARTIFACT_SIZE_BYTES {
+        bail!(
+            "artifact {} exceeds size limit ({} bytes > {} bytes)",
+            path.display(),
+            metadata.len(),
+            MAX_ARTIFACT_SIZE_BYTES
+        );
+    }
+
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut value: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse JSON {}", path.display()))?;
+    if contract_class_schema_marker(&value).is_none() {
+        tracing::debug!(
+            path = %path.display(),
+            "contract class missing schema marker; falling back to raw hash"
+        );
+        return hash_file_with_limit(path);
+    }
+    if let Err(schema_err) = validate_supported_contract_class_schema(&value, path) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %format!("{schema_err:#}"),
+            supported_contract_class_version_major = "0",
+            supported_sierra_format_version_major = "1",
+            "unsupported contract-class schema; falling back to raw hash (semantic compare disabled for this artifact). if this persists after upgrading uc, please open an issue with this schema/version"
+        );
+        return hash_file_with_limit(path);
+    }
+    normalize_contract_class_compiler_version_triplet(&mut value);
+    normalize_sierra_json_ids(&mut value);
+    let canonical = canonicalize_json(&value);
+    let canonical_bytes = serde_json::to_vec(&canonical)
+        .with_context(|| format!("failed to serialize normalized JSON {}", path.display()))?;
+    let mut hasher = Hasher::new();
+    hasher.update(CONTRACT_CLASS_NORMALIZATION_SCHEMA_TAG.as_bytes());
+    hasher.update(&canonical_bytes);
+    Ok((hasher.finalize().to_hex().to_string(), metadata.len()))
+}
+
+fn contract_class_schema_marker(value: &Value) -> Option<&Value> {
+    // `contract_class_version` appears in Starknet contract-class JSON.
+    // `sierra_format_version` appears in raw Sierra program JSON.
+    // `sierra_version` is a legacy alias kept for compatibility with older
+    // artifacts accepted by uc (see
+    // `contract_class_semantic_hash_accepts_legacy_sierra_version_marker`).
+    // Unknown schemas still fall back to raw hashing via `hash_file_with_limit`.
+    value
+        .get("contract_class_version")
+        .or_else(|| value.get("sierra_format_version"))
+        .or_else(|| value.get("sierra_version"))
+}
+
+fn contract_class_schema_version_text(
+    version_value: &Value,
+    field_name: &str,
+    path: &Path,
+) -> Result<String> {
+    let version = match version_value {
+        Value::String(text) => text.trim().to_string(),
+        Value::Number(num) => num.to_string(),
+        _ => bail!(
+            "unsupported `{}` type in {} (expected string/number)",
+            field_name,
+            path.display()
+        ),
+    };
+    if version.is_empty() {
+        bail!("empty `{}` value in {}", field_name, path.display());
+    }
+    Ok(version)
+}
+
+fn validate_contract_class_schema_marker_major(
+    version_value: &Value,
+    field_name: &str,
+    allowed_majors: &[&str],
+    path: &Path,
+) -> Result<()> {
+    let version = contract_class_schema_version_text(version_value, field_name, path)?;
+    let major = version.split('.').next().unwrap_or_default();
+    if !allowed_majors.contains(&major) {
+        let expected = allowed_majors.join(" or ");
+        bail!(
+            "unsupported `{}` version `{}` in {} (expected major version {})",
+            field_name,
+            version,
+            path.display(),
+            expected
+        );
+    }
+    Ok(())
+}
+
+fn validate_supported_contract_class_schema(value: &Value, path: &Path) -> Result<()> {
+    let Some(_) = contract_class_schema_marker(value) else {
+        bail!("missing contract-class schema marker in {}", path.display());
+    };
+    if let Some(version_value) = value.get("contract_class_version") {
+        validate_contract_class_schema_marker_major(
+            version_value,
+            "contract_class_version",
+            &["0"],
+            path,
+        )?;
+    }
+    if let Some(version_value) = value.get("sierra_format_version") {
+        validate_contract_class_schema_marker_major(
+            version_value,
+            "sierra_format_version",
+            &["1"],
+            path,
+        )?;
+    }
+    if let Some(version_value) = value.get("sierra_version") {
+        validate_contract_class_schema_marker_major(version_value, "sierra_version", &["1"], path)?;
+    }
+    validate_declaration_section_ids(value, "type_declarations", path)?;
+    validate_declaration_section_ids(value, "libfunc_declarations", path)?;
+    validate_declaration_id_uniqueness(value, path)?;
+    Ok(())
+}
+
+fn normalize_contract_class_compiler_version_triplet(value: &mut Value) {
+    let Some(program) = value
+        .get_mut("sierra_program")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    if program.len() < 6 {
+        return;
+    }
+    let Some(sierra_major) = value_hex_u64(&program[0]) else {
+        return;
+    };
+    if sierra_major != 1 {
+        tracing::debug!(
+            sierra_major,
+            "normalize_contract_class_compiler_version_triplet: unrecognized Sierra major version; skipping normalization"
+        );
+        return;
+    }
+    if value_hex_u64(&program[1]).is_none()
+        || value_hex_u64(&program[2]).is_none()
+        || value_hex_u64(&program[3]).is_none()
+        || value_hex_u64(&program[4]).is_none()
+        || value_hex_u64(&program[5]).is_none()
+    {
+        return;
+    }
+    for index in 3..=5 {
+        match program.get(index) {
+            Some(Value::String(_)) => program[index] = Value::String("0x0".to_string()),
+            Some(Value::Number(_)) => program[index] = Value::Number(serde_json::Number::from(0)),
+            _ => return,
+        }
+    }
+}
+
+fn value_hex_u64(value: &Value) -> Option<u64> {
+    match value {
+        Value::String(text) => parse_hex_u64(text),
+        Value::Number(number) => number.as_u64(),
+        _ => None,
+    }
+}
+
+fn parse_hex_u64(value: &str) -> Option<u64> {
+    let trimmed = value.trim();
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        return u64::from_str_radix(hex, 16).ok();
+    }
+    trimmed.parse::<u64>().ok()
+}
+
 fn validate_supported_sierra_schema(value: &Value, path: &Path) -> Result<()> {
+    // Accept legacy `sierra_version` marker for backward compatibility with
+    // historical fixtures; new outputs should use `sierra_format_version`.
     let Some(version_value) = value
         .get("sierra_format_version")
         .or_else(|| value.get("sierra_version"))
@@ -263,44 +454,105 @@ fn validate_declaration_id_shape(
     match id_value {
         Value::Number(_) => Ok(()),
         Value::Object(map) => {
-            let nested_id = map.get("id").with_context(|| {
-                format!(
-                    "unsupported Sierra schema in {}: {}[{}].id object is missing nested `id`",
-                    path.display(),
-                    section,
-                    index
-                )
-            })?;
-            if extract_numeric_id(Some(nested_id)).is_none() {
-                bail!(
-                    "unsupported Sierra schema in {}: {}[{}].id nested value must be numeric",
-                    path.display(),
-                    section,
-                    index
-                );
-            }
-            if let Some(debug_name) = map.get("debug_name") {
-                if !debug_name.is_string() {
+            if let Some(nested_id) = map.get("id") {
+                if extract_numeric_id(Some(nested_id)).is_none() {
                     bail!(
-                        "unsupported Sierra schema in {}: {}[{}].id.debug_name must be a string",
+                        "unsupported Sierra schema in {}: {}[{}].id nested value must be numeric",
                         path.display(),
                         section,
                         index
                     );
                 }
+                if let Some(debug_name) = map.get("debug_name") {
+                    if !debug_name.is_string() {
+                        bail!(
+                            "unsupported Sierra schema in {}: {}[{}].id.debug_name must be a string",
+                            path.display(),
+                            section,
+                            index
+                        );
+                    }
+                }
+                for key in map.keys() {
+                    if key != "id" && key != "debug_name" {
+                        bail!(
+                            "unsupported Sierra schema in {}: {}[{}].id has unexpected key `{}`",
+                            path.display(),
+                            section,
+                            index,
+                            key
+                        );
+                    }
+                }
+                return Ok(());
             }
-            for key in map.keys() {
-                if key != "id" && key != "debug_name" {
-                    bail!(
-                        "unsupported Sierra schema in {}: {}[{}].id has unexpected key `{}`",
+
+            // Accept tagged enum wrappers emitted by cairo-lang JSON, e.g.
+            // {"ConcreteTypeId": {"id": 11, "debug_name": "felt252"}}.
+            if map.len() == 1 {
+                let (variant, payload) = map
+                    .iter()
+                    .next()
+                    .context("tagged declaration id object should contain one entry")?;
+                let payload_object = payload.as_object().with_context(|| {
+                    format!(
+                        "unsupported Sierra schema in {}: {}[{}].id.{} payload must be an object",
                         path.display(),
                         section,
                         index,
-                        key
+                        variant
+                    )
+                })?;
+                let nested_id = payload_object.get("id").with_context(|| {
+                    format!(
+                        "unsupported Sierra schema in {}: {}[{}].id.{} is missing nested `id`",
+                        path.display(),
+                        section,
+                        index,
+                        variant
+                    )
+                })?;
+                if extract_numeric_id(Some(nested_id)).is_none() {
+                    bail!(
+                        "unsupported Sierra schema in {}: {}[{}].id.{} nested value must be numeric",
+                        path.display(),
+                        section,
+                        index,
+                        variant
                     );
                 }
+                if let Some(debug_name) = payload_object.get("debug_name") {
+                    if !debug_name.is_string() {
+                        bail!(
+                            "unsupported Sierra schema in {}: {}[{}].id.{}.debug_name must be a string",
+                            path.display(),
+                            section,
+                            index,
+                            variant
+                        );
+                    }
+                }
+                for key in payload_object.keys() {
+                    if key != "id" && key != "debug_name" {
+                        bail!(
+                            "unsupported Sierra schema in {}: {}[{}].id.{} has unexpected key `{}`",
+                            path.display(),
+                            section,
+                            index,
+                            variant,
+                            key
+                        );
+                    }
+                }
+                return Ok(());
             }
-            Ok(())
+
+            bail!(
+                "unsupported Sierra schema in {}: {}[{}].id object is missing nested `id`",
+                path.display(),
+                section,
+                index
+            );
         }
         _ => bail!(
             "unsupported Sierra schema in {}: {}[{}].id must be numeric or an object with numeric `id`",
@@ -386,14 +638,41 @@ fn extract_numeric_id(value: Option<&Value>) -> Option<i64> {
         Value::Number(num) => num
             .as_i64()
             .or_else(|| num.as_u64().and_then(|v| i64::try_from(v).ok())),
-        Value::Object(map) => map
-            .get("id")
-            .and_then(|nested| extract_numeric_id(Some(nested))),
+        Value::Object(map) => {
+            if let Some(id_value) = map.get("id") {
+                return extract_numeric_id(Some(id_value));
+            }
+            if map.len() == 1 {
+                return map
+                    .values()
+                    .next()
+                    .and_then(|nested| extract_numeric_id(Some(nested)));
+            }
+            None
+        }
         _ => None,
     }
 }
 
 fn extract_debug_name(item: &Value) -> Option<String> {
+    if let Some(name) = item.get("id").and_then(Value::as_object).and_then(|id| {
+        if let Some(debug_name) = id.get("debug_name").and_then(Value::as_str) {
+            return Some(debug_name.to_string());
+        }
+        if id.len() == 1 {
+            return id
+                .values()
+                .next()
+                .and_then(Value::as_object)
+                .and_then(|variant| variant.get("debug_name"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+        None
+    }) {
+        return Some(name);
+    }
+
     if let Some(name) = item
         .get("id")
         .and_then(Value::as_object)
@@ -488,7 +767,8 @@ fn canonicalize_json(value: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonicalize_json, compare_artifact_sets, hash_sierra_json_semantic,
+        canonicalize_json, collect_artifact_digests, compare_artifact_sets,
+        hash_contract_class_json_semantic, hash_file_with_limit, hash_sierra_json_semantic,
         normalize_sierra_json_ids, validate_supported_sierra_schema, ArtifactDigest,
     };
     use serde_json::json;
@@ -513,6 +793,69 @@ mod tests {
             "uc-core-{name}-{}-{nonce}.json",
             std::process::id()
         ))
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("uc-core-{name}-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn collect_artifact_digests_includes_native_compiled_and_manifest_suffixes() {
+        let dir = unique_test_dir("artifact-suffixes");
+        fs::create_dir_all(&dir).expect("failed to create artifact suffixes test directory");
+        fs::write(
+            dir.join("pkg_token.compiled_contract_class.json"),
+            br#"{"test":"compiled"}"#,
+        )
+        .expect("failed to write compiled contract class artifact");
+        fs::write(
+            dir.join("pkg.starknet_artifacts.json"),
+            br#"{"contracts":[]}"#,
+        )
+        .expect("failed to write starknet artifacts manifest");
+        fs::write(
+            dir.join("pkg_token.contract_class.json"),
+            br#"{
+                "contract_class_version":"0.1.0",
+                "sierra_program":["0x1","0x7","0x0","0x2","0x10","0x0","0x2b9"],
+                "type_declarations":[{"id":{"ConcreteTypeId":{"id":11,"debug_name":"felt252"}}}],
+                "libfunc_declarations":[{"id":{"ConcreteLibfuncId":{"id":41,"debug_name":"store_temp<felt252>"}}}],
+                "entry_points_by_type":{},
+                "abi":""
+            }"#,
+        )
+        .expect("failed to write contract class artifact");
+        fs::write(dir.join("ignored.meta.json"), br#"{"ignored":true}"#)
+            .expect("failed to write ignored artifact");
+
+        let digests = collect_artifact_digests(&dir).expect("failed to collect artifact digests");
+        let relative_paths: Vec<_> = digests
+            .iter()
+            .map(|item| item.relative_path.as_str())
+            .collect();
+        assert!(
+            relative_paths.contains(&"pkg_token.compiled_contract_class.json"),
+            "compiled contract class suffix should be included"
+        );
+        assert!(
+            relative_paths.contains(&"pkg.starknet_artifacts.json"),
+            "starknet artifacts manifest suffix should be included"
+        );
+        assert!(
+            relative_paths.contains(&"pkg_token.contract_class.json"),
+            "contract class suffix should be included"
+        );
+        assert_eq!(
+            digests.len(),
+            3,
+            "unexpected digest set: {relative_paths:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -660,6 +1003,21 @@ mod tests {
     }
 
     #[test]
+    fn sierra_schema_guard_accepts_tagged_declaration_id_wrappers() {
+        let value = json!({
+            "sierra_format_version": "1.0.0",
+            "type_declarations": [{
+                "id": {"ConcreteTypeId": {"id": 7, "debug_name": "felt252"}}
+            }],
+            "libfunc_declarations": [{
+                "id": {"ConcreteLibfuncId": {"id": 9, "debug_name": "store_temp<felt252>"}}
+            }],
+        });
+        validate_supported_sierra_schema(&value, Path::new("sample.sierra.json"))
+            .expect("tagged declaration wrappers should be accepted");
+    }
+
+    #[test]
     fn sierra_schema_guard_rejects_unexpected_declaration_id_object_keys() {
         let value = json!({
             "sierra_format_version": "1.0.0",
@@ -804,5 +1162,219 @@ mod tests {
 
         let _ = fs::remove_file(&path_a);
         let _ = fs::remove_file(&path_b);
+    }
+
+    #[test]
+    fn contract_class_semantic_hash_ignores_compiler_version_triplet() {
+        let path_a = unique_test_path("contract-hash-a");
+        let path_b = unique_test_path("contract-hash-b");
+        let body_a = json!({
+            "contract_class_version": "0.1.0",
+            "sierra_program": ["0x1", "0x7", "0x0", "0x2", "0xe", "0x0", "0x2b9"],
+            "type_declarations": [{"id": {"id": 11, "debug_name": "felt252"}}],
+            "libfunc_declarations": [{"id": {"id": 41, "debug_name": "store_temp<felt252>"}}],
+        });
+        let body_b = json!({
+            "contract_class_version": "0.1.0",
+            "sierra_program": ["0x1", "0x7", "0x0", "0x2", "0x10", "0x0", "0x2b9"],
+            "type_declarations": [{"id": {"id": 11, "debug_name": "felt252"}}],
+            "libfunc_declarations": [{"id": {"id": 41, "debug_name": "store_temp<felt252>"}}],
+        });
+        fs::write(
+            &path_a,
+            serde_json::to_vec(&body_a).expect("failed to encode contract hash a"),
+        )
+        .expect("failed to write contract hash a");
+        fs::write(
+            &path_b,
+            serde_json::to_vec(&body_b).expect("failed to encode contract hash b"),
+        )
+        .expect("failed to write contract hash b");
+
+        let hash_a = hash_contract_class_json_semantic(&path_a)
+            .expect("failed to hash contract a")
+            .0;
+        let hash_b = hash_contract_class_json_semantic(&path_b)
+            .expect("failed to hash contract b")
+            .0;
+        assert_eq!(
+            hash_a, hash_b,
+            "contract-class semantic hash should ignore compiler version triplet differences"
+        );
+
+        let _ = fs::remove_file(&path_a);
+        let _ = fs::remove_file(&path_b);
+    }
+
+    #[test]
+    fn contract_class_semantic_hash_changes_on_program_semantics() {
+        let path_a = unique_test_path("contract-semantic-a");
+        let path_b = unique_test_path("contract-semantic-b");
+        let body_a = json!({
+            "contract_class_version": "0.1.0",
+            "sierra_program": ["0x1", "0x7", "0x0", "0x2", "0x10", "0x0", "0x2b9"],
+            "type_declarations": [{"id": {"id": 11, "debug_name": "felt252"}}],
+            "libfunc_declarations": [{"id": {"id": 41, "debug_name": "store_temp<felt252>"}}],
+        });
+        let body_b = json!({
+            "contract_class_version": "0.1.0",
+            "sierra_program": ["0x1", "0x7", "0x0", "0x2", "0x10", "0x0", "0x2ba"],
+            "type_declarations": [{"id": {"id": 11, "debug_name": "felt252"}}],
+            "libfunc_declarations": [{"id": {"id": 41, "debug_name": "store_temp<felt252>"}}],
+        });
+        fs::write(
+            &path_a,
+            serde_json::to_vec(&body_a).expect("failed to encode semantic contract a"),
+        )
+        .expect("failed to write semantic contract a");
+        fs::write(
+            &path_b,
+            serde_json::to_vec(&body_b).expect("failed to encode semantic contract b"),
+        )
+        .expect("failed to write semantic contract b");
+
+        let hash_a = hash_contract_class_json_semantic(&path_a)
+            .expect("failed to hash semantic contract a")
+            .0;
+        let hash_b = hash_contract_class_json_semantic(&path_b)
+            .expect("failed to hash semantic contract b")
+            .0;
+        assert_ne!(
+            hash_a, hash_b,
+            "contract-class semantic hash must change on Sierra program semantic changes"
+        );
+
+        let _ = fs::remove_file(&path_a);
+        let _ = fs::remove_file(&path_b);
+    }
+
+    #[test]
+    fn contract_class_semantic_hash_falls_back_to_raw_hash_for_unknown_schema_major() {
+        let path = unique_test_path("contract-schema-fallback");
+        let body = json!({
+            "contract_class_version": "9.0.0",
+            "sierra_program": ["0x1", "0x7", "0x0", "0x2", "0x10", "0x0", "0x2b9"],
+            "type_declarations": [{"id": {"id": 11, "debug_name": "felt252"}}],
+            "libfunc_declarations": [{"id": {"id": 41, "debug_name": "store_temp<felt252"}}],
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec(&body).expect("failed to encode fallback contract"),
+        )
+        .expect("failed to write fallback contract");
+
+        let semantic = hash_contract_class_json_semantic(&path)
+            .expect("semantic hashing should fall back instead of failing");
+        let raw = hash_file_with_limit(&path).expect("raw hash should succeed");
+        assert_eq!(
+            semantic, raw,
+            "unsupported contract-class schema should fall back to raw hashing"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn contract_class_semantic_hash_falls_back_for_contract_class_major_one() {
+        let path = unique_test_path("contract-schema-major-one-fallback");
+        let body = json!({
+            "contract_class_version": "1.0.0",
+            "sierra_program": ["0x1", "0x7", "0x0", "0x2", "0x10", "0x0", "0x2b9"],
+            "type_declarations": [{"id": {"id": 11, "debug_name": "felt252"}}],
+            "libfunc_declarations": [{"id": {"id": 41, "debug_name": "store_temp<felt252>"}}],
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec(&body).expect("failed to encode fallback contract"),
+        )
+        .expect("failed to write fallback contract");
+
+        let semantic = hash_contract_class_json_semantic(&path)
+            .expect("semantic hashing should fall back instead of failing");
+        let raw = hash_file_with_limit(&path).expect("raw hash should succeed");
+        assert_eq!(
+            semantic, raw,
+            "unsupported contract_class_version major should fall back to raw hashing"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn contract_class_semantic_hash_falls_back_when_sierra_format_major_is_unsupported() {
+        let path = unique_test_path("contract-schema-sierra-format-major-fallback");
+        let body = json!({
+            "contract_class_version": "0.1.0",
+            "sierra_format_version": "2.0.0",
+            "sierra_program": ["0x1", "0x7", "0x0", "0x2", "0x10", "0x0", "0x2b9"],
+            "type_declarations": [{"id": {"id": 11, "debug_name": "felt252"}}],
+            "libfunc_declarations": [{"id": {"id": 41, "debug_name": "store_temp<felt252>"}}],
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec(&body).expect("failed to encode fallback contract"),
+        )
+        .expect("failed to write fallback contract");
+
+        let semantic = hash_contract_class_json_semantic(&path)
+            .expect("semantic hashing should fall back instead of failing");
+        let raw = hash_file_with_limit(&path).expect("raw hash should succeed");
+        assert_eq!(
+            semantic, raw,
+            "unsupported sierra_format_version should fall back to raw hashing"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn contract_class_semantic_hash_accepts_legacy_sierra_version_marker() {
+        let path = unique_test_path("contract-schema-legacy-sierra-version");
+        let body = json!({
+            "sierra_version": "1.0.0",
+            "sierra_program": ["0x1", "0x7", "0x0", "0x2", "0x10", "0x0", "0x2b9"],
+            "type_declarations": [{"id": {"id": 11, "debug_name": "felt252"}}],
+            "libfunc_declarations": [{"id": {"id": 41, "debug_name": "store_temp<felt252>"}}],
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec(&body).expect("failed to encode contract"),
+        )
+        .expect("failed to write contract");
+
+        let semantic = hash_contract_class_json_semantic(&path)
+            .expect("legacy sierra_version marker should be accepted");
+        let raw = hash_file_with_limit(&path).expect("raw hash should succeed");
+        assert_ne!(
+            semantic, raw,
+            "recognized legacy schema marker should keep semantic hashing path"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn contract_class_semantic_hash_falls_back_to_raw_hash_when_schema_marker_missing() {
+        let path = unique_test_path("contract-schema-marker-missing");
+        let body = json!({
+            "sierra_program": ["0x1", "0x7", "0x0", "0x2", "0x10", "0x0", "0x2b9"],
+            "type_declarations": [{"id": {"id": 11, "debug_name": "felt252"}}],
+            "libfunc_declarations": [{"id": {"id": 41, "debug_name": "store_temp<felt252>"}}],
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec(&body).expect("failed to encode marker-missing contract"),
+        )
+        .expect("failed to write marker-missing contract");
+
+        let semantic = hash_contract_class_json_semantic(&path)
+            .expect("semantic hashing should fall back when schema marker is missing");
+        let raw = hash_file_with_limit(&path).expect("raw hash should succeed");
+        assert_eq!(
+            semantic, raw,
+            "missing schema marker should fall back to raw hashing"
+        );
+
+        let _ = fs::remove_file(&path);
     }
 }

@@ -43,7 +43,9 @@ WORKSPACE_ROOT=/path/to/compiler-starknet ./benchmarks/scripts/run_dual_run_comp
   --lock-baseline
 ```
 
-`run_stability_benchmarks.sh` enforces a locked lane (`--runs 12`, `--cold-runs 12`, pinned CPU + strict pinning). Use `--allow-unpinned` only when affinity APIs are unavailable on the host.
+`run_stability_benchmarks.sh` enforces a locked lane (`--runs 12`, `--cold-runs 12`, pinned CPU + strict pinning) and always evaluates the matrix gate config (`benchmarks/gates/perf-gate-<matrix>.json` by default).
+The current stability gate requires warm-noop median p95 improvement of at least +20% and blocks catastrophic single-cycle warm-noop outliers (< -20%).
+Use `--allow-unpinned` only when affinity APIs are unavailable on the host.
 Stability runs default to `--host-preflight require` and fail fast if noisy host processes are detected; use `--allow-noisy-host` only for debugging or environments where process isolation is not possible.
 
 ## Compare Two Benchmark Runs

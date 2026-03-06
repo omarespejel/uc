@@ -6,23 +6,46 @@ on:
   push:
     branches: [main]
 
+env:
+  SCARB_FIXTURE_TAG: v2.16.0
+  CAIRO_CORELIB_TAG: v2.16.0
+  SCARB_FIXTURE_SHA: 231227f3fe49cc813b1b018a67cf3b7080766e24
+  CAIRO_CORELIB_SHA: 6a43d7c9419481fcb82376447fecf85c44d8fbbf
+
 jobs:
   benchmark-smoke:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Prepare native corelib source
+        run: |
+          set -euo pipefail
+          CAIRO_ROOT="$RUNNER_TEMP/cairo-workspace"
+          git clone --depth 1 --branch "$CAIRO_CORELIB_TAG" \
+            https://github.com/starkware-libs/cairo.git "$CAIRO_ROOT/cairo"
+          CAIRO_HEAD="$(git -C "$CAIRO_ROOT/cairo" rev-parse HEAD)"
+          if [[ "$CAIRO_HEAD" != "$CAIRO_CORELIB_SHA" ]]; then
+            echo "cairo tag $CAIRO_CORELIB_TAG resolved to unexpected commit $CAIRO_HEAD (expected $CAIRO_CORELIB_SHA)" >&2
+            exit 1
+          fi
+          echo "UC_NATIVE_CORELIB_SRC=$CAIRO_ROOT/cairo/corelib/src" >> "$GITHUB_ENV"
 
       - name: Install Scarb
-        uses: software-mansion/setup-scarb@v1
+        uses: software-mansion/setup-scarb@9d86a1616deecc95e8e8435daf902c5d025dc8b8 # v1
 
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Build uc CLI
-        run: cargo build -p uc-cli
+        run: cargo build --release -p uc-cli
 
       - name: Run smoke stability benchmark cycles
+        env:
+          UC_NATIVE_BUILD_MODE: auto
+          UC_NATIVE_DISALLOW_SCARB_FALLBACK: "0"
+          UC_NATIVE_CORELIB_SRC: ${{ env.UC_NATIVE_CORELIB_SRC }}
         run: |
           chmod +x benchmarks/scripts/run_local_benchmarks.sh
           chmod +x benchmarks/scripts/run_stability_benchmarks.sh
@@ -31,23 +54,186 @@ jobs:
             --matrix smoke \
             --runs 12 \
             --cold-runs 12 \
-            --cycles 3 \
-            --allow-unpinned \
+            --cycles 5 \
+            --uc-daemon-mode require \
+            --cpu-set 0 \
+            --strict-pinning \
             --host-preflight warn \
             --gate-config benchmarks/gates/perf-gate-smoke.json
 
       - name: Run smoke compare-build gate
+        env:
+          UC_NATIVE_BUILD_MODE: require
+          UC_NATIVE_DISALLOW_SCARB_FALLBACK: "1"
+          UC_NATIVE_CORELIB_SRC: ${{ env.UC_NATIVE_CORELIB_SRC }}
         run: |
-          ./target/debug/uc compare-build \
+          ./target/release/uc compare-build \
             --manifest-path benchmarks/fixtures/scarb_smoke/Scarb.toml \
             --clean-before-each true \
             --output-path benchmarks/results/compare-smoke.json
 
       - name: Upload benchmark artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: benchmark-results
+          path: benchmarks/results/
+
+  benchmark-research-strict:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Scarb
+        uses: software-mansion/setup-scarb@9d86a1616deecc95e8e8435daf902c5d025dc8b8 # v1
+
+      - name: Install benchmark tools
+        run: sudo apt-get update && sudo apt-get install -y jq util-linux
+
+      - name: Prepare research workspace
+        run: |
+          set -euo pipefail
+          RESEARCH_ROOT="$RUNNER_TEMP/research-workspace"
+          mkdir -p "$RESEARCH_ROOT"
+          git clone --depth 1 --branch "$SCARB_FIXTURE_TAG" \
+            https://github.com/software-mansion/scarb.git "$RESEARCH_ROOT/scarb"
+          SCARB_HEAD="$(git -C "$RESEARCH_ROOT/scarb" rev-parse HEAD)"
+          if [[ "$SCARB_HEAD" != "$SCARB_FIXTURE_SHA" ]]; then
+            echo "scarb tag $SCARB_FIXTURE_TAG resolved to unexpected commit $SCARB_HEAD (expected $SCARB_FIXTURE_SHA)" >&2
+            exit 1
+          fi
+          CAIRO_ROOT="$RUNNER_TEMP/cairo-workspace"
+          git clone --depth 1 --branch "$CAIRO_CORELIB_TAG" \
+            https://github.com/starkware-libs/cairo.git "$CAIRO_ROOT/cairo"
+          CAIRO_HEAD="$(git -C "$CAIRO_ROOT/cairo" rev-parse HEAD)"
+          if [[ "$CAIRO_HEAD" != "$CAIRO_CORELIB_SHA" ]]; then
+            echo "cairo tag $CAIRO_CORELIB_TAG resolved to unexpected commit $CAIRO_HEAD (expected $CAIRO_CORELIB_SHA)" >&2
+            exit 1
+          fi
+          echo "UC_RESEARCH_ROOT=$RESEARCH_ROOT" >> "$GITHUB_ENV"
+          echo "UC_NATIVE_CORELIB_SRC=$CAIRO_ROOT/cairo/corelib/src" >> "$GITHUB_ENV"
+
+      - name: Build uc CLI
+        run: cargo build --release -p uc-cli
+
+      - name: Run strict-pinned research stability gate
+        run: |
+          chmod +x benchmarks/scripts/run_local_benchmarks.sh
+          chmod +x benchmarks/scripts/run_stability_benchmarks.sh
+          chmod +x benchmarks/scripts/gate_benchmark_summary.sh
+          ./benchmarks/scripts/run_stability_benchmarks.sh \
+            --matrix research \
+            --workspace-root "$UC_RESEARCH_ROOT" \
+            --runs 12 \
+            --cold-runs 12 \
+            --cycles 5 \
+            --uc-daemon-mode require \
+            --cpu-set 0 \
+            --strict-pinning \
+            --host-preflight require \
+            --gate-config benchmarks/gates/perf-gate-research.json
+
+      - name: Upload research benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: benchmark-results-research
+          path: benchmarks/results/
+
+  native-only-supported:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Prepare research workspace
+        run: |
+          set -euo pipefail
+          RESEARCH_ROOT="$RUNNER_TEMP/research-workspace"
+          mkdir -p "$RESEARCH_ROOT"
+          git clone --depth 1 --branch "$SCARB_FIXTURE_TAG" \
+            https://github.com/software-mansion/scarb.git "$RESEARCH_ROOT/scarb"
+          SCARB_HEAD="$(git -C "$RESEARCH_ROOT/scarb" rev-parse HEAD)"
+          if [[ "$SCARB_HEAD" != "$SCARB_FIXTURE_SHA" ]]; then
+            echo "scarb tag $SCARB_FIXTURE_TAG resolved to unexpected commit $SCARB_HEAD (expected $SCARB_FIXTURE_SHA)" >&2
+            exit 1
+          fi
+          CAIRO_ROOT="$RUNNER_TEMP/cairo-workspace"
+          git clone --depth 1 --branch "$CAIRO_CORELIB_TAG" \
+            https://github.com/starkware-libs/cairo.git "$CAIRO_ROOT/cairo"
+          CAIRO_HEAD="$(git -C "$CAIRO_ROOT/cairo" rev-parse HEAD)"
+          if [[ "$CAIRO_HEAD" != "$CAIRO_CORELIB_SHA" ]]; then
+            echo "cairo tag $CAIRO_CORELIB_TAG resolved to unexpected commit $CAIRO_HEAD (expected $CAIRO_CORELIB_SHA)" >&2
+            exit 1
+          fi
+          echo "UC_RESEARCH_ROOT=$RESEARCH_ROOT" >> "$GITHUB_ENV"
+          echo "UC_NATIVE_CORELIB_SRC=$CAIRO_ROOT/cairo/corelib/src" >> "$GITHUB_ENV"
+
+      - name: Build uc CLI
+        run: cargo build --release -p uc-cli
+
+      - name: Enforce native-only builds on supported smoke/research fixtures
+        env:
+          UC_NATIVE_BUILD_MODE: require
+          UC_NATIVE_DISALLOW_SCARB_FALLBACK: "1"
+          UC_NATIVE_CORELIB_SRC: ${{ env.UC_NATIVE_CORELIB_SRC }}
+        run: |
+          set -euo pipefail
+          UC_BIN="./target/release/uc"
+          NO_SCARB_PATH="$RUNNER_TEMP/no-scarb-path"
+          mkdir -p "$NO_SCARB_PATH"
+          mkdir -p benchmarks/results
+          printf '%s\n' '#!/usr/bin/env bash' \
+            'echo "native-only gate: scarb is intentionally unavailable" >&2' \
+            'exit 127' > "$NO_SCARB_PATH/scarb"
+          chmod +x "$NO_SCARB_PATH/scarb"
+
+          run_native_only() {
+            local manifest_path="$1"
+            local tag="$2"
+            local allow_skip_unsupported="${3:-0}"
+            local report_path="benchmarks/results/native-only-${tag}.json"
+            local log_path="benchmarks/results/native-only-${tag}.log"
+            set +e
+            PATH="$NO_SCARB_PATH:$PATH" \
+              "$UC_BIN" build \
+                --engine uc \
+                --daemon-mode off \
+                --offline \
+                --manifest-path "$manifest_path" \
+                --report-path "$report_path" \
+                >"$log_path" 2>&1
+            local exit_code=$?
+            set -e
+            if [[ "$exit_code" -ne 0 ]]; then
+              if [[ "$allow_skip_unsupported" == "1" ]] \
+                && grep -E "native compile does not support .* yet" "$log_path" >/dev/null; then
+                echo "native-only gate: skipping unsupported fixture '$tag'"
+                return 0
+              fi
+              echo "native-only gate failed: native require build failed for '$tag'" >&2
+              cat "$log_path" >&2
+              exit 1
+            fi
+            if grep -E "falling back to scarb backend|fell back to scarb backend" "$log_path" >/dev/null; then
+              echo "native-only gate failed: fallback to scarb detected for $tag" >&2
+              cat "$log_path" >&2
+              exit 1
+            fi
+          }
+
+          run_native_only "benchmarks/fixtures/scarb_smoke/Scarb.toml" "smoke"
+          run_native_only "$UC_RESEARCH_ROOT/scarb/examples/hello_world/Scarb.toml" "research-hello-world" "1"
+          run_native_only "$UC_RESEARCH_ROOT/scarb/examples/workspaces/Scarb.toml" "research-workspaces"
+
+      - name: Upload native-only artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-only-results
           path: benchmarks/results/
 
   determinism-matrix:
@@ -63,22 +249,29 @@ jobs:
       UC_SKIP_SCARB_TOOLCHAIN_CHECK: "1"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Scarb
-        uses: software-mansion/setup-scarb@v1
+        uses: software-mansion/setup-scarb@9d86a1616deecc95e8e8435daf902c5d025dc8b8 # v1
 
       - name: Build uc CLI
-        run: cargo build -p uc-cli
+        run: cargo build --release -p uc-cli
+
+      - name: Normalize checkout text mode on Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          git config --global core.autocrlf false
+          git reset --hard HEAD
 
       - name: Capture fingerprint/session key
         shell: bash
         run: |
           mkdir -p benchmarks/results determinism
-          UC_BIN="./target/debug/uc"
+          UC_BIN="./target/release/uc"
           PYTHON_BIN="python3"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
-            UC_BIN="./target/debug/uc.exe"
+            UC_BIN="./target/release/uc.exe"
           fi
           if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
             PYTHON_BIN="python"
@@ -91,17 +284,17 @@ jobs:
             --report-path benchmarks/results/cross-platform-${{ matrix.os }}.json
 
           "$PYTHON_BIN" - <<'PY'
-import json
-from pathlib import Path
+          import json
+          from pathlib import Path
 
-report_path = Path("benchmarks/results/cross-platform-${{ matrix.os }}.json")
-report = json.loads(report_path.read_text(encoding="utf-8"))
-Path("determinism/${{ matrix.os }}.fingerprint.txt").write_text(report["fingerprint"] + "\n", encoding="utf-8")
-Path("determinism/${{ matrix.os }}.session-key.txt").write_text(report["session_key"] + "\n", encoding="utf-8")
-PY
+          report_path = Path("benchmarks/results/cross-platform-${{ matrix.os }}.json")
+          report = json.loads(report_path.read_text(encoding="utf-8"))
+          Path("determinism/${{ matrix.os }}.fingerprint.txt").write_text(report["fingerprint"] + "\n", encoding="utf-8")
+          Path("determinism/${{ matrix.os }}.session-key.txt").write_text(report["session_key"] + "\n", encoding="utf-8")
+          PY
 
       - name: Upload determinism sample
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: determinism-${{ matrix.os }}
           path: determinism/
@@ -111,7 +304,7 @@ PY
     needs: determinism-matrix
     steps:
       - name: Download determinism samples
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: determinism-*
           merge-multiple: true
@@ -123,13 +316,13 @@ PY
           set -euo pipefail
           ls -la determinism
 
-          fp_unique_count="$(cat determinism/*.fingerprint.txt | sort -u | wc -l | tr -d ' ')"
-          sk_unique_count="$(cat determinism/*.session-key.txt | sort -u | wc -l | tr -d ' ')"
+          fp_unique_count="$(cat determinism/*.fingerprint.txt | tr -d '\r' | sort -u | wc -l | tr -d ' ')"
+          sk_unique_count="$(cat determinism/*.session-key.txt | tr -d '\r' | sort -u | wc -l | tr -d ' ')"
 
           if [[ "$fp_unique_count" != "1" ]]; then
             echo "Fingerprint mismatch across OS lanes:" >&2
             for f in determinism/*.fingerprint.txt; do
-              echo "$(basename "$f"): $(cat "$f")" >&2
+              echo "$(basename "$f"): $(tr -d '\r' < "$f")" >&2
             done
             exit 1
           fi
@@ -137,7 +330,7 @@ PY
           if [[ "$sk_unique_count" != "1" ]]; then
             echo "Session key mismatch across OS lanes:" >&2
             for f in determinism/*.session-key.txt; do
-              echo "$(basename "$f"): $(cat "$f")" >&2
+              echo "$(basename "$f"): $(tr -d '\r' < "$f")" >&2
             done
             exit 1
           fi

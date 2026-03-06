@@ -50,7 +50,7 @@ Options:
   --allow-noisy-host           Disable host-noise preflight checks (not recommended)
   --allow-unpinned             Allow running without CPU affinity pinning safeguards
   --lock-baseline              Copy passing stability summary into benchmarks/baselines
-  --gate-config <path>         Optional gate rules JSON path
+  --gate-config <path>         Gate rules JSON path (default: benchmarks/gates/perf-gate-<matrix>.json)
   --help                       Show this help
 USAGE
 }
@@ -193,6 +193,9 @@ fi
 if [[ "$MATRIX" == "research" && -z "$WORKSPACE_ROOT" ]]; then
   echo "--workspace-root is required for research matrix" >&2
   exit 1
+fi
+if [[ -z "$GATE_CONFIG" && "$MATRIX" == "research" ]]; then
+  GATE_CONFIG="$ROOT_DIR/benchmarks/gates/perf-gate-${MATRIX}.json"
 fi
 if [[ "$RUNS" -ne 12 || "$COLD_RUNS" -ne 12 ]]; then
   echo "Stability lane requires --runs 12 and --cold-runs 12 (got runs=$RUNS cold-runs=$COLD_RUNS)." >&2
@@ -447,6 +450,8 @@ if [[ -n "$GATE_CONFIG" ]]; then
   "$ROOT_DIR/benchmarks/scripts/gate_benchmark_summary.sh" \
     --summary "$OUT_JSON" \
     --config "$GATE_CONFIG"
+else
+  echo "Stability gate skipped (no gate config configured for matrix '$MATRIX')."
 fi
 
 if [[ "$LOCK_BASELINE" == "1" ]]; then
