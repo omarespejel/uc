@@ -13,15 +13,13 @@ use cairo_lang_defs::ids::ModuleId;
 #[cfg(feature = "native-compile")]
 use cairo_lang_defs::ids::TopLevelLanguageElementId;
 #[cfg(feature = "native-compile")]
-use cairo_lang_filesystem::db::{init_dev_corelib, FilesGroup};
+use cairo_lang_filesystem::db::{files_group_input, init_dev_corelib, FilesGroup};
 #[cfg(feature = "native-compile")]
 use cairo_lang_filesystem::detect::detect_corelib;
 #[cfg(feature = "native-compile")]
 use cairo_lang_filesystem::ids::CrateInput;
 #[cfg(feature = "native-compile")]
 use cairo_lang_filesystem::ids::{FileId, FileLongId};
-#[cfg(feature = "native-compile")]
-use cairo_lang_filesystem::override_file_content;
 #[cfg(feature = "native-compile")]
 use cairo_lang_lowering::optimizations::config::Optimizations;
 #[cfg(feature = "native-compile")]
@@ -6175,6 +6173,7 @@ fn native_apply_file_keyed_session_updates(
     changed_files: &[String],
     removed_files: &[String],
 ) -> Result<()> {
+    let mut updates = Vec::with_capacity(changed_files.len().saturating_add(removed_files.len()));
     for relative in changed_files {
         let relative_path = Path::new(relative);
         if relative_path.is_absolute() {
@@ -6192,7 +6191,8 @@ fn native_apply_file_keyed_session_updates(
         let content = fs::read_to_string(&absolute_path)
             .with_context(|| format!("failed to read {}", absolute_path.display()))?;
         let file_id = FileId::new(db, FileLongId::OnDisk(absolute_path));
-        override_file_content!(db, file_id, Some(Arc::<str>::from(content)));
+        let file = db.file_input(file_id).clone();
+        updates.push((file, Some(Arc::<str>::from(content))));
     }
     for relative in removed_files {
         let relative_path = Path::new(relative);
@@ -6209,8 +6209,27 @@ fn native_apply_file_keyed_session_updates(
             "native removed-file override path",
         )?;
         let file_id = FileId::new(db, FileLongId::OnDisk(absolute_path));
-        override_file_content!(db, file_id, None);
+        let file = db.file_input(file_id).clone();
+        updates.push((file, None));
     }
+    let mut overrides = files_group_input(db)
+        .file_overrides(db)
+        .clone()
+        .unwrap_or_default();
+    for (file, content) in updates {
+        match content {
+            Some(content) => {
+                overrides.insert(file, content);
+            }
+            None => {
+                overrides.swap_remove(&file);
+            }
+        }
+    }
+    salsa::Setter::to(
+        files_group_input(db).set_file_overrides(db),
+        Some(overrides),
+    );
     Ok(())
 }
 

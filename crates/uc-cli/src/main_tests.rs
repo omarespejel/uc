@@ -4735,6 +4735,111 @@ fn native_changed_files_affect_tracked_contracts_stays_conservative_when_index_i
 
 #[cfg(feature = "native-compile")]
 #[test]
+fn native_apply_file_keyed_session_updates_batches_changed_and_removed_files() {
+    let workspace = unique_test_dir("uc-native-file-keyed-updates");
+    let src_dir = workspace.join("src");
+    fs::create_dir_all(&src_dir).expect("failed to create src dir");
+    let changed_path = src_dir.join("changed.cairo");
+    let removed_path = src_dir.join("removed.cairo");
+    fs::write(&changed_path, "fn current() -> felt252 { 1 }\n")
+        .expect("failed to write changed source");
+    fs::write(&removed_path, "fn stale() -> felt252 { 2 }\n")
+        .expect("failed to write removed source");
+
+    let mut db = RootDatabase::builder()
+        .with_optimizations(Optimizations::enabled_with_default_movable_functions(
+            InliningStrategy::Default,
+        ))
+        .with_default_plugin_suite(starknet_plugin_suite())
+        .build()
+        .expect("failed to build root database");
+
+    native_apply_file_keyed_session_updates(
+        &mut db,
+        &workspace,
+        &[
+            String::from("src/changed.cairo"),
+            String::from("src/removed.cairo"),
+        ],
+        &[],
+    )
+    .expect("initial update should succeed");
+
+    fs::write(&changed_path, "fn current() -> felt252 { 3 }\n")
+        .expect("failed to rewrite changed source");
+    native_apply_file_keyed_session_updates(
+        &mut db,
+        &workspace,
+        &[String::from("src/changed.cairo")],
+        &[String::from("src/removed.cairo")],
+    )
+    .expect("batched update should succeed");
+
+    let changed_file = db
+        .file_input(FileId::new(
+            &db,
+            FileLongId::OnDisk(changed_path.clone()),
+        ))
+        .clone();
+    let removed_file = db
+        .file_input(FileId::new(
+            &db,
+            FileLongId::OnDisk(removed_path.clone()),
+        ))
+        .clone();
+    let overrides = files_group_input(&db)
+        .file_overrides(&db)
+        .clone()
+        .expect("file override map should exist");
+    assert_eq!(
+        overrides.get(&changed_file).map(|content| content.as_ref()),
+        Some("fn current() -> felt252 { 3 }\n"),
+        "changed files should carry the latest override content"
+    );
+    assert!(
+        !overrides.contains_key(&removed_file),
+        "removed files should have overrides cleared in the same batched write"
+    );
+
+    fs::remove_dir_all(&workspace).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_apply_file_keyed_session_updates_rejects_absolute_paths() {
+    let workspace = unique_test_dir("uc-native-file-keyed-absolute");
+    let src_dir = workspace.join("src");
+    fs::create_dir_all(&src_dir).expect("failed to create src dir");
+    let absolute_changed = src_dir
+        .join("absolute.cairo")
+        .canonicalize()
+        .unwrap_or_else(|_| src_dir.join("absolute.cairo"));
+
+    let mut db = RootDatabase::builder()
+        .with_optimizations(Optimizations::enabled_with_default_movable_functions(
+            InliningStrategy::Default,
+        ))
+        .with_default_plugin_suite(starknet_plugin_suite())
+        .build()
+        .expect("failed to build root database");
+
+    let error = native_apply_file_keyed_session_updates(
+        &mut db,
+        &workspace,
+        &[absolute_changed.to_string_lossy().to_string()],
+        &[],
+    )
+    .expect_err("absolute changed-file paths must be rejected");
+    assert!(
+        format!("{error:#}").contains("must be relative"),
+        "error should explain relative-path requirement"
+    );
+
+    fs::remove_dir_all(&workspace).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
 fn native_workspace_relative_cairo_path_from_debug_requires_workspace_cairo_paths() {
     let workspace = PathBuf::from("/tmp/uc-native-debug-paths");
     assert_eq!(
