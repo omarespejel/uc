@@ -4866,6 +4866,147 @@ fn native_compile_session_image_restore_rejects_signature_and_root_mtime_mismatc
 
 #[cfg(feature = "native-compile")]
 #[test]
+fn native_buildinfo_sidecar_round_trip_restores_tracked_sources_and_dependency_index() {
+    let dir = unique_test_dir("uc-native-buildinfo-roundtrip");
+    let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
+    let tracked_sources = BTreeMap::from([
+        (
+            "src/lib.cairo".to_string(),
+            NativeTrackedFileState {
+                size_bytes: 42,
+                modified_unix_ms: 101,
+            },
+        ),
+        (
+            "src/math.cairo".to_string(),
+            NativeTrackedFileState {
+                size_bytes: 12,
+                modified_unix_ms: 102,
+            },
+        ),
+    ]);
+    let tracked_source_bytes = native_tracked_sources_total_bytes(&tracked_sources)
+        .expect("tracked source bytes should be computed");
+    let dependencies = BTreeMap::from([(
+        "demo::token".to_string(),
+        BTreeSet::from(["src/lib.cairo".to_string(), "src/math.cairo".to_string()]),
+    )]);
+    let plans = vec![NativeContractOutputPlan {
+        module_path: "demo::token".to_string(),
+        artifact_id: "id-token".to_string(),
+        package_name: "demo".to_string(),
+        contract_name: "token".to_string(),
+        artifact_file: "demo_token.contract_class.json".to_string(),
+        casm_file: Some("demo_token.compiled_contract_class.json".to_string()),
+    }];
+    let buildinfo = native_buildinfo_file_from_snapshot(
+        native_compile_session_signature_hash(&signature),
+        777,
+        tracked_sources.clone(),
+        tracked_source_bytes,
+        dependencies.clone(),
+        plans.clone(),
+        33,
+    );
+    persist_native_buildinfo_sidecar(&dir, &buildinfo).expect("native buildinfo should persist");
+
+    let restored = try_native_buildinfo_sidecar_restore(&dir, &signature, 777)
+        .expect("matching signature/root mtime should restore buildinfo sidecar");
+    assert_eq!(restored.tracked_sources, tracked_sources);
+    assert_eq!(restored.tracked_source_bytes, tracked_source_bytes);
+    assert_eq!(restored.contract_source_dependencies, dependencies);
+    assert_eq!(restored.contract_output_plans, plans);
+    assert_eq!(restored.journal_cursor_applied, 33);
+
+    let different_signature = native_test_compile_session_signature(&dir, "manifest-blake3:other");
+    assert!(
+        try_native_buildinfo_sidecar_restore(&dir, &different_signature, 777).is_none(),
+        "signature mismatch must invalidate persisted buildinfo sidecar"
+    );
+    assert!(
+        try_native_buildinfo_sidecar_restore(&dir, &signature, 778).is_none(),
+        "source-root mtime mismatch must invalidate persisted buildinfo sidecar"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_source_journal_persistence_round_trip_and_consumption() {
+    let dir = unique_test_dir("uc-native-source-journal-persistence");
+    let initial_state = NativeSourceChangeJournal {
+        changed_files: BTreeSet::from(["src/lib.cairo".to_string(), "src/math.cairo".to_string()]),
+        removed_files: BTreeSet::from(["src/old.cairo".to_string()]),
+        overflowed: false,
+        cursor: 9,
+    };
+    persist_native_source_change_journal(&dir, &initial_state)
+        .expect("native source journal should persist");
+
+    let loaded = load_native_source_change_journal(&dir);
+    assert_eq!(loaded.changed_files, initial_state.changed_files);
+    assert_eq!(loaded.removed_files, initial_state.removed_files);
+    assert_eq!(loaded.cursor, initial_state.cursor);
+
+    let delta = native_take_source_journal_delta(&dir, &[]);
+    match delta {
+        NativeSourceJournalDelta::Changed {
+            changed_files,
+            removed_files,
+        } => {
+            assert_eq!(
+                changed_files,
+                vec!["src/lib.cairo".to_string(), "src/math.cairo".to_string()]
+            );
+            assert_eq!(removed_files, vec!["src/old.cairo".to_string()]);
+        }
+        _ => panic!("expected changed delta from persisted source journal"),
+    }
+
+    let consumed = load_native_source_change_journal(&dir);
+    assert!(
+        consumed.changed_files.is_empty() && consumed.removed_files.is_empty(),
+        "consuming journal delta should clear persisted changed/removed sets"
+    );
+    assert_eq!(
+        consumed.cursor, 9,
+        "cursor should remain monotonic after journal consumption"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_source_journal_overflow_triggers_fallback_and_clears_persisted_state() {
+    let dir = unique_test_dir("uc-native-source-journal-overflow");
+    let initial_state = NativeSourceChangeJournal {
+        changed_files: BTreeSet::from(["src/lib.cairo".to_string()]),
+        removed_files: BTreeSet::new(),
+        overflowed: true,
+        cursor: 15,
+    };
+    persist_native_source_change_journal(&dir, &initial_state)
+        .expect("native source journal should persist");
+
+    let delta = native_take_source_journal_delta(&dir, &[]);
+    assert!(
+        matches!(delta, NativeSourceJournalDelta::FallbackFullScan),
+        "overflow marker should force full-scan fallback"
+    );
+    let cleared = load_native_source_change_journal(&dir);
+    assert!(
+        !cleared.overflowed && cleared.changed_files.is_empty() && cleared.removed_files.is_empty(),
+        "overflow fallback should clear persisted journal state after consumption"
+    );
+    assert_eq!(cleared.cursor, 15);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
 fn native_session_refresh_action_prefers_incremental_for_changed_sets() {
     assert_eq!(
         native_session_refresh_action(false, false, 0, 0),
@@ -5167,7 +5308,7 @@ fn native_apply_file_keyed_session_updates_batches_changed_and_removed_files() {
         .build()
         .expect("failed to build root database");
 
-    native_apply_file_keyed_session_updates(
+    let initial_applied = native_apply_file_keyed_session_updates(
         &mut db,
         &workspace,
         &[
@@ -5177,16 +5318,36 @@ fn native_apply_file_keyed_session_updates_batches_changed_and_removed_files() {
         &[],
     )
     .expect("initial update should succeed");
+    assert!(
+        initial_applied,
+        "initial changed-file batch should apply override updates"
+    );
 
     fs::write(&changed_path, "fn current() -> felt252 { 3 }\n")
         .expect("failed to rewrite changed source");
-    native_apply_file_keyed_session_updates(
+    let update_applied = native_apply_file_keyed_session_updates(
         &mut db,
         &workspace,
         &[String::from("src/changed.cairo")],
         &[String::from("src/removed.cairo")],
     )
     .expect("batched update should succeed");
+    assert!(
+        update_applied,
+        "changed/removed batch should mutate override map"
+    );
+
+    let noop_applied = native_apply_file_keyed_session_updates(
+        &mut db,
+        &workspace,
+        &[String::from("src/changed.cairo")],
+        &[],
+    )
+    .expect("metadata noise no-op batch should succeed");
+    assert!(
+        !noop_applied,
+        "identical content should skip aggregate override-map writes"
+    );
 
     let changed_file = db
         .file_input(FileId::new(&db, FileLongId::OnDisk(changed_path.clone())))

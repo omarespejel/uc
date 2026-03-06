@@ -165,6 +165,14 @@ const DEFAULT_NATIVE_COMPILE_SESSION_MEMORY_BASE_OVERHEAD_BYTES: u64 = 32 * 1024
 const NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION: u32 = 1;
 #[cfg(feature = "native-compile")]
 const MAX_NATIVE_COMPILE_SESSION_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
+#[cfg(feature = "native-compile")]
+const NATIVE_BUILDINFO_SCHEMA_VERSION: u32 = 1;
+#[cfg(feature = "native-compile")]
+const MAX_NATIVE_BUILDINFO_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(feature = "native-compile")]
+const NATIVE_SOURCE_JOURNAL_SCHEMA_VERSION: u32 = 1;
+#[cfg(feature = "native-compile")]
+const MAX_NATIVE_SOURCE_JOURNAL_BYTES: u64 = 1024 * 1024;
 const DEFAULT_DAEMON_SHARED_CACHE_ENABLED: bool = true;
 const DEFAULT_DAEMON_SHARED_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 // Default-off for Scarb's artifact fingerprint check in uc's Scarb-backed path.
@@ -864,12 +872,13 @@ struct NativeCompileSessionImageSnapshot {
     contract_output_plans: Vec<NativeContractOutputPlan>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 #[cfg(feature = "native-compile")]
 struct NativeSourceChangeJournal {
     changed_files: BTreeSet<String>,
     removed_files: BTreeSet<String>,
     overflowed: bool,
+    cursor: u64,
 }
 
 #[cfg(feature = "native-compile")]
@@ -877,6 +886,50 @@ struct NativeSourceChangeWatcher {
     _watcher: Option<RecommendedWatcher>,
     journal: Arc<Mutex<NativeSourceChangeJournal>>,
     watched_roots: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg(feature = "native-compile")]
+struct NativeBuildInfoFile {
+    schema_version: u32,
+    signature_hash: String,
+    source_root_modified_unix_ms: u64,
+    tracked_sources: BTreeMap<String, NativeTrackedFileState>,
+    tracked_source_bytes: u64,
+    tracked_sources_signature: String,
+    #[serde(default)]
+    contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
+    #[serde(default)]
+    contract_output_plans: Vec<NativeContractOutputPlan>,
+    #[serde(default)]
+    journal_cursor_applied: u64,
+    generated_at_epoch_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+#[cfg(feature = "native-compile")]
+struct NativeBuildInfoSnapshot {
+    tracked_sources: BTreeMap<String, NativeTrackedFileState>,
+    tracked_source_bytes: u64,
+    contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
+    contract_output_plans: Vec<NativeContractOutputPlan>,
+    journal_cursor_applied: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg(feature = "native-compile")]
+struct NativeSourceJournalFile {
+    schema_version: u32,
+    #[serde(default)]
+    changed_files: Vec<String>,
+    #[serde(default)]
+    removed_files: Vec<String>,
+    #[serde(default)]
+    overflowed: bool,
+    #[serde(default)]
+    cursor: u64,
+    #[serde(default)]
+    updated_at_epoch_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5044,7 +5097,8 @@ fn native_update_compile_session_post_build_state(
             return;
         }
     };
-    let (estimated_bytes, image_snapshot) = {
+    let journal_cursor = native_current_source_journal_cursor(workspace_root);
+    let (estimated_bytes, image_snapshot, buildinfo_snapshot) = {
         let mut session = session_handle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -5082,11 +5136,15 @@ fn native_update_compile_session_post_build_state(
         (
             native_compile_session_state_estimated_bytes(&session),
             state_changed.then(|| native_compile_session_image_snapshot_from_state(&session)),
+            state_changed.then(|| native_buildinfo_file_from_state(&session, journal_cursor)),
         )
     };
     update_native_compile_session_cached_estimated_bytes(workspace_root, estimated_bytes);
     if let Some(image_snapshot) = image_snapshot {
         persist_native_compile_session_image_snapshot_best_effort(workspace_root, &image_snapshot);
+    }
+    if let Some(buildinfo_snapshot) = buildinfo_snapshot {
+        persist_native_buildinfo_sidecar_best_effort(workspace_root, &buildinfo_snapshot);
     }
 }
 
@@ -5622,6 +5680,402 @@ fn try_native_compile_session_image_restore(
 }
 
 #[cfg(feature = "native-compile")]
+fn native_source_journal_path(workspace_root: &Path) -> Result<PathBuf> {
+    let path = workspace_root.join(".uc/cache/native-session/source-journal-v1.json");
+    ensure_path_within_root(workspace_root, &path, "native source journal path")?;
+    Ok(path)
+}
+
+#[cfg(feature = "native-compile")]
+fn native_buildinfo_sidecar_path(workspace_root: &Path) -> Result<PathBuf> {
+    let path = workspace_root.join(".uc/native-buildinfo.json");
+    ensure_path_within_root(workspace_root, &path, "native buildinfo path")?;
+    Ok(path)
+}
+
+#[cfg(feature = "native-compile")]
+fn native_tracked_sources_signature(
+    tracked_sources: &BTreeMap<String, NativeTrackedFileState>,
+) -> String {
+    let mut hasher = Hasher::new();
+    hasher.update(b"uc-native-tracked-sources-signature-v1");
+    for (path, state) in tracked_sources {
+        hasher.update(path.as_bytes());
+        hasher.update(&state.size_bytes.to_le_bytes());
+        hasher.update(&state.modified_unix_ms.to_le_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+#[cfg(feature = "native-compile")]
+fn native_source_journal_file_from_state(
+    state: &NativeSourceChangeJournal,
+) -> NativeSourceJournalFile {
+    NativeSourceJournalFile {
+        schema_version: NATIVE_SOURCE_JOURNAL_SCHEMA_VERSION,
+        changed_files: state.changed_files.iter().cloned().collect(),
+        removed_files: state.removed_files.iter().cloned().collect(),
+        overflowed: state.overflowed,
+        cursor: state.cursor,
+        updated_at_epoch_ms: epoch_ms_u64().unwrap_or_default(),
+    }
+}
+
+#[cfg(feature = "native-compile")]
+fn native_source_journal_state_from_file(
+    decoded: NativeSourceJournalFile,
+) -> NativeSourceChangeJournal {
+    let changed_overflow = decoded.changed_files.len() > max_fingerprint_files();
+    let removed_overflow = decoded.removed_files.len() > max_fingerprint_files();
+    let changed_files = decoded
+        .changed_files
+        .into_iter()
+        .take(max_fingerprint_files())
+        .collect::<BTreeSet<_>>();
+    let removed_files = decoded
+        .removed_files
+        .into_iter()
+        .take(max_fingerprint_files())
+        .collect::<BTreeSet<_>>();
+    NativeSourceChangeJournal {
+        changed_files,
+        removed_files,
+        overflowed: decoded.overflowed || changed_overflow || removed_overflow,
+        cursor: decoded.cursor,
+    }
+}
+
+#[cfg(feature = "native-compile")]
+fn persist_native_source_change_journal(
+    workspace_root: &Path,
+    state: &NativeSourceChangeJournal,
+) -> Result<()> {
+    let journal_path = native_source_journal_path(workspace_root)?;
+    let parent = journal_path
+        .parent()
+        .context("native source journal path has no parent directory")?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let mut snapshot = state.clone();
+    if snapshot.changed_files.len() > max_fingerprint_files()
+        || snapshot.removed_files.len() > max_fingerprint_files()
+    {
+        snapshot.changed_files.clear();
+        snapshot.removed_files.clear();
+        snapshot.overflowed = true;
+    }
+    let file = native_source_journal_file_from_state(&snapshot);
+    let bytes = serde_json::to_vec(&file).context("failed to encode native source journal")?;
+    if bytes.len() as u64 > MAX_NATIVE_SOURCE_JOURNAL_BYTES {
+        bail!(
+            "native source journal exceeds size limit ({} bytes > {} bytes)",
+            bytes.len(),
+            MAX_NATIVE_SOURCE_JOURNAL_BYTES
+        );
+    }
+    atomic_write_bytes(&journal_path, &bytes, "native source journal")
+}
+
+#[cfg(feature = "native-compile")]
+fn persist_native_source_change_journal_best_effort(
+    workspace_root: &Path,
+    state: &NativeSourceChangeJournal,
+) {
+    if let Err(err) = persist_native_source_change_journal(workspace_root, state) {
+        tracing::warn!(
+            workspace_root = %workspace_root.display(),
+            error = %format!("{err:#}"),
+            "failed to persist native source journal"
+        );
+    }
+}
+
+#[cfg(feature = "native-compile")]
+fn load_native_source_change_journal(workspace_root: &Path) -> NativeSourceChangeJournal {
+    let journal_path = match native_source_journal_path(workspace_root) {
+        Ok(path) => path,
+        Err(err) => {
+            tracing::warn!(
+                workspace_root = %workspace_root.display(),
+                error = %format!("{err:#}"),
+                "native source journal path is invalid; ignoring persisted journal"
+            );
+            return NativeSourceChangeJournal::default();
+        }
+    };
+    let metadata = match fs::metadata(&journal_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return NativeSourceChangeJournal::default()
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %journal_path.display(),
+                error = %err,
+                "failed to stat native source journal; ignoring"
+            );
+            return NativeSourceChangeJournal {
+                overflowed: true,
+                ..NativeSourceChangeJournal::default()
+            };
+        }
+    };
+    if metadata.len() > MAX_NATIVE_SOURCE_JOURNAL_BYTES {
+        tracing::warn!(
+            path = %journal_path.display(),
+            bytes = metadata.len(),
+            max_bytes = MAX_NATIVE_SOURCE_JOURNAL_BYTES,
+            "ignoring oversized native source journal"
+        );
+        let _ = fs::remove_file(&journal_path);
+        return NativeSourceChangeJournal {
+            overflowed: true,
+            ..NativeSourceChangeJournal::default()
+        };
+    }
+    let bytes = match read_bytes_with_limit(
+        &journal_path,
+        MAX_NATIVE_SOURCE_JOURNAL_BYTES,
+        "native source journal",
+    ) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(
+                path = %journal_path.display(),
+                error = %format!("{err:#}"),
+                "failed to read native source journal; ignoring"
+            );
+            return NativeSourceChangeJournal {
+                overflowed: true,
+                ..NativeSourceChangeJournal::default()
+            };
+        }
+    };
+    let decoded = match serde_json::from_slice::<NativeSourceJournalFile>(&bytes) {
+        Ok(file) if file.schema_version == NATIVE_SOURCE_JOURNAL_SCHEMA_VERSION => file,
+        Ok(_) => return NativeSourceChangeJournal::default(),
+        Err(err) => {
+            tracing::warn!(
+                path = %journal_path.display(),
+                error = %err,
+                "failed to decode native source journal; treating as overflow fallback"
+            );
+            return NativeSourceChangeJournal {
+                overflowed: true,
+                ..NativeSourceChangeJournal::default()
+            };
+        }
+    };
+    native_source_journal_state_from_file(decoded)
+}
+
+#[cfg(feature = "native-compile")]
+fn native_current_source_journal_cursor(workspace_root: &Path) -> u64 {
+    let cache_key = native_compile_session_cache_key(workspace_root);
+    if let Some(cursor) = native_source_change_watchers()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&cache_key)
+        .map(|watcher| {
+            watcher
+                .journal
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .cursor
+        })
+    {
+        return cursor;
+    }
+    load_native_source_change_journal(workspace_root).cursor
+}
+
+#[cfg(feature = "native-compile")]
+fn native_buildinfo_file_from_snapshot(
+    signature_hash: String,
+    source_root_modified_unix_ms: u64,
+    tracked_sources: BTreeMap<String, NativeTrackedFileState>,
+    tracked_source_bytes: u64,
+    contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
+    contract_output_plans: Vec<NativeContractOutputPlan>,
+    journal_cursor_applied: u64,
+) -> NativeBuildInfoFile {
+    let tracked_sources_signature = native_tracked_sources_signature(&tracked_sources);
+    NativeBuildInfoFile {
+        schema_version: NATIVE_BUILDINFO_SCHEMA_VERSION,
+        signature_hash,
+        source_root_modified_unix_ms,
+        tracked_sources,
+        tracked_source_bytes,
+        tracked_sources_signature,
+        contract_source_dependencies,
+        contract_output_plans,
+        journal_cursor_applied,
+        generated_at_epoch_ms: epoch_ms_u64().unwrap_or_default(),
+    }
+}
+
+#[cfg(feature = "native-compile")]
+fn native_buildinfo_file_from_state(
+    session: &NativeCompileSessionState,
+    journal_cursor_applied: u64,
+) -> NativeBuildInfoFile {
+    native_buildinfo_file_from_snapshot(
+        native_compile_session_signature_hash(&session.signature),
+        session.source_root_modified_unix_ms,
+        session.tracked_sources.clone(),
+        session.tracked_source_bytes,
+        session.contract_source_dependencies.clone(),
+        session.contract_output_plans.clone(),
+        journal_cursor_applied,
+    )
+}
+
+#[cfg(feature = "native-compile")]
+fn persist_native_buildinfo_sidecar(
+    workspace_root: &Path,
+    buildinfo: &NativeBuildInfoFile,
+) -> Result<()> {
+    let sidecar_path = native_buildinfo_sidecar_path(workspace_root)?;
+    let parent = sidecar_path
+        .parent()
+        .context("native buildinfo path has no parent directory")?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let bytes = serde_json::to_vec(buildinfo).context("failed to encode native buildinfo")?;
+    if bytes.len() as u64 > MAX_NATIVE_BUILDINFO_BYTES {
+        tracing::warn!(
+            path = %sidecar_path.display(),
+            bytes = bytes.len(),
+            max_bytes = MAX_NATIVE_BUILDINFO_BYTES,
+            "skipping native buildinfo write: sidecar exceeds size limit"
+        );
+        return Ok(());
+    }
+    atomic_write_bytes(&sidecar_path, &bytes, "native buildinfo")
+}
+
+#[cfg(feature = "native-compile")]
+fn persist_native_buildinfo_sidecar_best_effort(
+    workspace_root: &Path,
+    buildinfo: &NativeBuildInfoFile,
+) {
+    if let Err(err) = persist_native_buildinfo_sidecar(workspace_root, buildinfo) {
+        tracing::warn!(
+            workspace_root = %workspace_root.display(),
+            error = %format!("{err:#}"),
+            "failed to persist native buildinfo sidecar"
+        );
+    }
+}
+
+#[cfg(feature = "native-compile")]
+fn try_native_buildinfo_sidecar_restore(
+    workspace_root: &Path,
+    signature: &NativeCompileSessionSignature,
+    source_root_modified_unix_ms: u64,
+) -> Option<NativeBuildInfoSnapshot> {
+    let sidecar_path = match native_buildinfo_sidecar_path(workspace_root) {
+        Ok(path) => path,
+        Err(err) => {
+            tracing::warn!(
+                workspace_root = %workspace_root.display(),
+                error = %format!("{err:#}"),
+                "native buildinfo path is invalid; ignoring sidecar"
+            );
+            return None;
+        }
+    };
+    let metadata = match fs::metadata(&sidecar_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            tracing::warn!(
+                path = %sidecar_path.display(),
+                error = %err,
+                "failed to stat native buildinfo sidecar; ignoring"
+            );
+            return None;
+        }
+    };
+    if metadata.len() > MAX_NATIVE_BUILDINFO_BYTES {
+        tracing::warn!(
+            path = %sidecar_path.display(),
+            bytes = metadata.len(),
+            max_bytes = MAX_NATIVE_BUILDINFO_BYTES,
+            "ignoring oversized native buildinfo sidecar"
+        );
+        let _ = fs::remove_file(&sidecar_path);
+        return None;
+    }
+    let bytes = match read_bytes_with_limit(
+        &sidecar_path,
+        MAX_NATIVE_BUILDINFO_BYTES,
+        "native buildinfo sidecar",
+    ) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(
+                path = %sidecar_path.display(),
+                error = %format!("{err:#}"),
+                "failed to read native buildinfo sidecar; ignoring"
+            );
+            return None;
+        }
+    };
+    let decoded = match serde_json::from_slice::<NativeBuildInfoFile>(&bytes) {
+        Ok(file) if file.schema_version == NATIVE_BUILDINFO_SCHEMA_VERSION => file,
+        Ok(_) => return None,
+        Err(err) => {
+            tracing::warn!(
+                path = %sidecar_path.display(),
+                error = %err,
+                "failed to decode native buildinfo sidecar; ignoring"
+            );
+            return None;
+        }
+    };
+    let signature_hash = native_compile_session_signature_hash(signature);
+    if decoded.signature_hash != signature_hash {
+        return None;
+    }
+    if decoded.source_root_modified_unix_ms != source_root_modified_unix_ms {
+        return None;
+    }
+    let tracked_source_bytes = match native_tracked_sources_total_bytes(&decoded.tracked_sources) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(
+                path = %sidecar_path.display(),
+                error = %format!("{err:#}"),
+                "native buildinfo sidecar tracked source set is invalid; ignoring"
+            );
+            return None;
+        }
+    };
+    let tracked_sources_signature = native_tracked_sources_signature(&decoded.tracked_sources);
+    if decoded.tracked_sources_signature != tracked_sources_signature {
+        tracing::warn!(
+            path = %sidecar_path.display(),
+            "native buildinfo sidecar tracked source signature mismatch; ignoring"
+        );
+        return None;
+    }
+    if tracked_source_bytes != decoded.tracked_source_bytes {
+        tracing::warn!(
+            path = %sidecar_path.display(),
+            sidecar_bytes = decoded.tracked_source_bytes,
+            computed_bytes = tracked_source_bytes,
+            "native buildinfo tracked-source byte budget drift; using computed value"
+        );
+    }
+    Some(NativeBuildInfoSnapshot {
+        tracked_sources: decoded.tracked_sources,
+        tracked_source_bytes,
+        contract_source_dependencies: decoded.contract_source_dependencies,
+        contract_output_plans: decoded.contract_output_plans,
+        journal_cursor_applied: decoded.journal_cursor_applied,
+    })
+}
+
+#[cfg(feature = "native-compile")]
 fn build_native_compile_session_state(
     workspace_root: &Path,
     signature: NativeCompileSessionSignature,
@@ -5654,12 +6108,23 @@ fn build_native_compile_session_state(
         &signature,
         source_root_modified_unix_ms,
     );
+    let restored_buildinfo = if restored_image.is_none() {
+        try_native_buildinfo_sidecar_restore(
+            workspace_root,
+            &signature,
+            source_root_modified_unix_ms,
+        )
+    } else {
+        None
+    };
     let (
         tracked_sources,
         tracked_source_bytes,
         contract_source_dependencies,
         contract_output_plans,
         session_image_hit,
+        buildinfo_hit,
+        journal_cursor_applied,
     ) = if let Some(image) = restored_image {
         (
             image.tracked_sources,
@@ -5667,6 +6132,18 @@ fn build_native_compile_session_state(
             image.contract_source_dependencies,
             image.contract_output_plans,
             true,
+            false,
+            native_current_source_journal_cursor(workspace_root),
+        )
+    } else if let Some(buildinfo) = restored_buildinfo {
+        (
+            buildinfo.tracked_sources,
+            buildinfo.tracked_source_bytes,
+            buildinfo.contract_source_dependencies,
+            buildinfo.contract_output_plans,
+            false,
+            true,
+            buildinfo.journal_cursor_applied,
         )
     } else {
         let (tracked_sources, tracked_source_bytes) =
@@ -5677,6 +6154,8 @@ fn build_native_compile_session_state(
             BTreeMap::new(),
             Vec::new(),
             false,
+            false,
+            native_current_source_journal_cursor(workspace_root),
         )
     };
     let source_scan_ms = scan_start.elapsed().as_secs_f64() * 1000.0;
@@ -5686,6 +6165,7 @@ fn build_native_compile_session_state(
         setup_project_ms,
         source_scan_ms,
         session_image_hit,
+        buildinfo_hit,
         tracked_sources = tracked_sources.len(),
         source_roots = ?source_roots
             .iter()
@@ -5706,6 +6186,10 @@ fn build_native_compile_session_state(
     if !session_image_hit {
         let snapshot = native_compile_session_image_snapshot_from_state(&state);
         persist_native_compile_session_image_snapshot_best_effort(workspace_root, &snapshot);
+    }
+    if !buildinfo_hit || !session_image_hit {
+        let buildinfo = native_buildinfo_file_from_state(&state, journal_cursor_applied);
+        persist_native_buildinfo_sidecar_best_effort(workspace_root, &buildinfo);
     }
     Ok(state)
 }
@@ -5881,20 +6365,26 @@ fn native_workspace_relative_cairo_path(workspace_root: &Path, path: &Path) -> O
 
 #[cfg(feature = "native-compile")]
 fn native_record_source_change(
+    workspace_root: &Path,
     journal: &Arc<Mutex<NativeSourceChangeJournal>>,
     relative_path: &str,
     removed: bool,
 ) {
-    let mut state = journal
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if removed {
-        state.changed_files.remove(relative_path);
-        state.removed_files.insert(relative_path.to_string());
-    } else {
-        state.removed_files.remove(relative_path);
-        state.changed_files.insert(relative_path.to_string());
-    }
+    let snapshot = {
+        let mut state = journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if removed {
+            state.changed_files.remove(relative_path);
+            state.removed_files.insert(relative_path.to_string());
+        } else {
+            state.removed_files.remove(relative_path);
+            state.changed_files.insert(relative_path.to_string());
+        }
+        state.cursor = state.cursor.saturating_add(1);
+        state.clone()
+    };
+    persist_native_source_change_journal_best_effort(workspace_root, &snapshot);
 }
 
 #[cfg(feature = "native-compile")]
@@ -5910,7 +6400,7 @@ fn native_record_source_change_event(
         | NotifyEventKind::Modify(NotifyModifyKind::Name(NotifyRenameMode::From)) => {
             for path in paths {
                 if let Some(relative) = as_relative(path) {
-                    native_record_source_change(journal, &relative, true);
+                    native_record_source_change(workspace_root, journal, &relative, true);
                 }
             }
         }
@@ -5918,10 +6408,10 @@ fn native_record_source_change_event(
             if paths.len() >= 2 =>
         {
             if let Some(relative) = as_relative(&paths[0]) {
-                native_record_source_change(journal, &relative, true);
+                native_record_source_change(workspace_root, journal, &relative, true);
             }
             if let Some(relative) = as_relative(&paths[1]) {
-                native_record_source_change(journal, &relative, false);
+                native_record_source_change(workspace_root, journal, &relative, false);
             }
         }
         NotifyEventKind::Modify(NotifyModifyKind::Name(NotifyRenameMode::To))
@@ -5930,7 +6420,7 @@ fn native_record_source_change_event(
         | NotifyEventKind::Any => {
             for path in paths {
                 if let Some(relative) = as_relative(path) {
-                    native_record_source_change(journal, &relative, false);
+                    native_record_source_change(workspace_root, journal, &relative, false);
                 }
             }
         }
@@ -5969,7 +6459,9 @@ fn ensure_native_source_change_watcher(
             watched_roots.push(root.to_path_buf());
         }
     }
-    let journal = Arc::new(Mutex::new(NativeSourceChangeJournal::default()));
+    let journal = Arc::new(Mutex::new(load_native_source_change_journal(
+        workspace_root,
+    )));
     if watched_roots.is_empty() {
         let mut watchers = native_source_change_watchers()
             .lock()
@@ -5999,10 +6491,18 @@ fn ensure_native_source_change_watcher(
                 &event.paths,
             ),
             Err(err) => {
-                let mut state = journal_for_events
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                state.overflowed = true;
+                let snapshot = {
+                    let mut state = journal_for_events
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.overflowed = true;
+                    state.cursor = state.cursor.saturating_add(1);
+                    state.clone()
+                };
+                persist_native_source_change_journal_best_effort(
+                    &workspace_root_for_events,
+                    &snapshot,
+                );
                 tracing::warn!(error = %err, "native source watcher received an error event");
             }
         },
@@ -6071,6 +6571,9 @@ fn native_take_source_journal_delta(
         state.overflowed = false;
         state.changed_files.clear();
         state.removed_files.clear();
+        let snapshot = state.clone();
+        drop(state);
+        persist_native_source_change_journal_best_effort(workspace_root, &snapshot);
         tracing::warn!(
             workspace_root = %workspace_root.display(),
             "native source watcher overflowed; falling back to full source scan"
@@ -6084,6 +6587,9 @@ fn native_take_source_journal_delta(
     let removed_files = state.removed_files.iter().cloned().collect::<Vec<_>>();
     state.changed_files.clear();
     state.removed_files.clear();
+    let snapshot = state.clone();
+    drop(state);
+    persist_native_source_change_journal_best_effort(workspace_root, &snapshot);
     NativeSourceJournalDelta::Changed {
         changed_files,
         removed_files,
@@ -6270,7 +6776,7 @@ fn native_apply_file_keyed_session_updates(
     workspace_root: &Path,
     changed_files: &[String],
     removed_files: &[String],
-) -> Result<()> {
+) -> Result<bool> {
     let mut updates = Vec::with_capacity(changed_files.len().saturating_add(removed_files.len()));
     for relative in changed_files {
         let relative_path = Path::new(relative);
@@ -6314,21 +6820,33 @@ fn native_apply_file_keyed_session_updates(
         .file_overrides(db)
         .clone()
         .unwrap_or_default();
+    let mut overrides_changed = false;
     for (file, content) in updates {
         match content {
             Some(content) => {
-                overrides.insert(file, content);
+                let should_update = overrides
+                    .get(&file)
+                    .is_none_or(|existing| existing.as_ref() != content.as_ref());
+                if should_update {
+                    overrides.insert(file, content);
+                    overrides_changed = true;
+                }
             }
             None => {
-                overrides.swap_remove(&file);
+                if overrides.swap_remove(&file).is_some() {
+                    overrides_changed = true;
+                }
             }
         }
+    }
+    if !overrides_changed {
+        return Ok(false);
     }
     salsa::Setter::to(
         files_group_input(db).set_file_overrides(db),
         Some(overrides),
     );
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(feature = "native-compile")]
@@ -6481,8 +6999,9 @@ fn with_native_compile_session<T>(
         None
     };
     let mut current_source_snapshot = current_source_snapshot;
+    let journal_cursor = native_current_source_journal_cursor(workspace_root);
     let estimated_bytes;
-    let (snapshot, image_snapshot) = {
+    let (snapshot, image_snapshot, buildinfo_snapshot) = {
         let mut session = session_handle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -6512,13 +7031,22 @@ fn with_native_compile_session<T>(
                     &changed_files,
                     &removed_files,
                 ) {
-                    Ok(()) => {
-                        tracing::debug!(
-                            changed_files = changed_files.len(),
-                            removed_files = removed_files.len(),
-                            drift_scan_ms,
-                            "native session applied file-keyed incremental updates"
-                        );
+                    Ok(applied_override_update) => {
+                        if applied_override_update {
+                            tracing::debug!(
+                                changed_files = changed_files.len(),
+                                removed_files = removed_files.len(),
+                                drift_scan_ms,
+                                "native session applied file-keyed incremental updates"
+                            );
+                        } else {
+                            tracing::debug!(
+                                changed_files = changed_files.len(),
+                                removed_files = removed_files.len(),
+                                drift_scan_ms,
+                                "native session file-keyed incremental updates resolved to no-op"
+                            );
+                        }
                     }
                     Err(err) => {
                         tracing::warn!(
@@ -6576,11 +7104,15 @@ fn with_native_compile_session<T>(
                 contract_output_plans: session.contract_output_plans.clone(),
             },
             state_mutated.then(|| native_compile_session_image_snapshot_from_state(&session)),
+            state_mutated.then(|| native_buildinfo_file_from_state(&session, journal_cursor)),
         )
     };
     update_native_compile_session_cached_estimated_bytes(workspace_root, estimated_bytes);
     if let Some(image_snapshot) = image_snapshot {
         persist_native_compile_session_image_snapshot_best_effort(workspace_root, &image_snapshot);
+    }
+    if let Some(buildinfo_snapshot) = buildinfo_snapshot {
+        persist_native_buildinfo_sidecar_best_effort(workspace_root, &buildinfo_snapshot);
     }
     f(&snapshot)
 }
