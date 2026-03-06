@@ -303,7 +303,7 @@ fn validate_supported_contract_class_schema(value: &Value, path: &Path) -> Resul
         validate_contract_class_schema_marker_major(
             version_value,
             "contract_class_version",
-            &["0", "1"],
+            &["0"],
             path,
         )?;
     }
@@ -448,44 +448,105 @@ fn validate_declaration_id_shape(
     match id_value {
         Value::Number(_) => Ok(()),
         Value::Object(map) => {
-            let nested_id = map.get("id").with_context(|| {
-                format!(
-                    "unsupported Sierra schema in {}: {}[{}].id object is missing nested `id`",
-                    path.display(),
-                    section,
-                    index
-                )
-            })?;
-            if extract_numeric_id(Some(nested_id)).is_none() {
-                bail!(
-                    "unsupported Sierra schema in {}: {}[{}].id nested value must be numeric",
-                    path.display(),
-                    section,
-                    index
-                );
-            }
-            if let Some(debug_name) = map.get("debug_name") {
-                if !debug_name.is_string() {
+            if let Some(nested_id) = map.get("id") {
+                if extract_numeric_id(Some(nested_id)).is_none() {
                     bail!(
-                        "unsupported Sierra schema in {}: {}[{}].id.debug_name must be a string",
+                        "unsupported Sierra schema in {}: {}[{}].id nested value must be numeric",
                         path.display(),
                         section,
                         index
                     );
                 }
+                if let Some(debug_name) = map.get("debug_name") {
+                    if !debug_name.is_string() {
+                        bail!(
+                            "unsupported Sierra schema in {}: {}[{}].id.debug_name must be a string",
+                            path.display(),
+                            section,
+                            index
+                        );
+                    }
+                }
+                for key in map.keys() {
+                    if key != "id" && key != "debug_name" {
+                        bail!(
+                            "unsupported Sierra schema in {}: {}[{}].id has unexpected key `{}`",
+                            path.display(),
+                            section,
+                            index,
+                            key
+                        );
+                    }
+                }
+                return Ok(());
             }
-            for key in map.keys() {
-                if key != "id" && key != "debug_name" {
-                    bail!(
-                        "unsupported Sierra schema in {}: {}[{}].id has unexpected key `{}`",
+
+            // Accept tagged enum wrappers emitted by cairo-lang JSON, e.g.
+            // {"ConcreteTypeId": {"id": 11, "debug_name": "felt252"}}.
+            if map.len() == 1 {
+                let (variant, payload) = map
+                    .iter()
+                    .next()
+                    .context("tagged declaration id object should contain one entry")?;
+                let payload_object = payload.as_object().with_context(|| {
+                    format!(
+                        "unsupported Sierra schema in {}: {}[{}].id.{} payload must be an object",
                         path.display(),
                         section,
                         index,
-                        key
+                        variant
+                    )
+                })?;
+                let nested_id = payload_object.get("id").with_context(|| {
+                    format!(
+                        "unsupported Sierra schema in {}: {}[{}].id.{} is missing nested `id`",
+                        path.display(),
+                        section,
+                        index,
+                        variant
+                    )
+                })?;
+                if extract_numeric_id(Some(nested_id)).is_none() {
+                    bail!(
+                        "unsupported Sierra schema in {}: {}[{}].id.{} nested value must be numeric",
+                        path.display(),
+                        section,
+                        index,
+                        variant
                     );
                 }
+                if let Some(debug_name) = payload_object.get("debug_name") {
+                    if !debug_name.is_string() {
+                        bail!(
+                            "unsupported Sierra schema in {}: {}[{}].id.{}.debug_name must be a string",
+                            path.display(),
+                            section,
+                            index,
+                            variant
+                        );
+                    }
+                }
+                for key in payload_object.keys() {
+                    if key != "id" && key != "debug_name" {
+                        bail!(
+                            "unsupported Sierra schema in {}: {}[{}].id.{} has unexpected key `{}`",
+                            path.display(),
+                            section,
+                            index,
+                            variant,
+                            key
+                        );
+                    }
+                }
+                return Ok(());
             }
-            Ok(())
+
+            bail!(
+                "unsupported Sierra schema in {}: {}[{}].id object is missing nested `id`",
+                path.display(),
+                section,
+                index
+            );
         }
         _ => bail!(
             "unsupported Sierra schema in {}: {}[{}].id must be numeric or an object with numeric `id`",
@@ -571,14 +632,41 @@ fn extract_numeric_id(value: Option<&Value>) -> Option<i64> {
         Value::Number(num) => num
             .as_i64()
             .or_else(|| num.as_u64().and_then(|v| i64::try_from(v).ok())),
-        Value::Object(map) => map
-            .get("id")
-            .and_then(|nested| extract_numeric_id(Some(nested))),
+        Value::Object(map) => {
+            if let Some(id_value) = map.get("id") {
+                return extract_numeric_id(Some(id_value));
+            }
+            if map.len() == 1 {
+                return map
+                    .values()
+                    .next()
+                    .and_then(|nested| extract_numeric_id(Some(nested)));
+            }
+            None
+        }
         _ => None,
     }
 }
 
 fn extract_debug_name(item: &Value) -> Option<String> {
+    if let Some(name) = item.get("id").and_then(Value::as_object).and_then(|id| {
+        if let Some(debug_name) = id.get("debug_name").and_then(Value::as_str) {
+            return Some(debug_name.to_string());
+        }
+        if id.len() == 1 {
+            return id
+                .values()
+                .next()
+                .and_then(Value::as_object)
+                .and_then(|variant| variant.get("debug_name"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+        None
+    }) {
+        return Some(name);
+    }
+
     if let Some(name) = item
         .get("id")
         .and_then(Value::as_object)
@@ -728,8 +816,8 @@ mod tests {
             br#"{
                 "contract_class_version":"0.1.0",
                 "sierra_program":["0x1","0x7","0x0","0x2","0x10","0x0","0x2b9"],
-                "type_declarations":[{"id":{"id":11,"debug_name":"felt252"}}],
-                "libfunc_declarations":[{"id":{"id":41,"debug_name":"store_temp<felt252>"}}],
+                "type_declarations":[{"id":{"ConcreteTypeId":{"id":11,"debug_name":"felt252"}}}],
+                "libfunc_declarations":[{"id":{"ConcreteLibfuncId":{"id":41,"debug_name":"store_temp<felt252>"}}}],
                 "entry_points_by_type":{},
                 "abi":""
             }"#,
@@ -906,6 +994,21 @@ mod tests {
         let err = validate_supported_sierra_schema(&value, Path::new("sample.sierra.json"))
             .expect_err("non-numeric declaration IDs should be rejected");
         assert!(format!("{err:#}").contains("unsupported Sierra schema"));
+    }
+
+    #[test]
+    fn sierra_schema_guard_accepts_tagged_declaration_id_wrappers() {
+        let value = json!({
+            "sierra_format_version": "1.0.0",
+            "type_declarations": [{
+                "id": {"ConcreteTypeId": {"id": 7, "debug_name": "felt252"}}
+            }],
+            "libfunc_declarations": [{
+                "id": {"ConcreteLibfuncId": {"id": 9, "debug_name": "store_temp<felt252>"}}
+            }],
+        });
+        validate_supported_sierra_schema(&value, Path::new("sample.sierra.json"))
+            .expect("tagged declaration wrappers should be accepted");
     }
 
     #[test]
@@ -1160,6 +1263,32 @@ mod tests {
         assert_eq!(
             semantic, raw,
             "unsupported contract-class schema should fall back to raw hashing"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn contract_class_semantic_hash_falls_back_for_contract_class_major_one() {
+        let path = unique_test_path("contract-schema-major-one-fallback");
+        let body = json!({
+            "contract_class_version": "1.0.0",
+            "sierra_program": ["0x1", "0x7", "0x0", "0x2", "0x10", "0x0", "0x2b9"],
+            "type_declarations": [{"id": {"id": 11, "debug_name": "felt252"}}],
+            "libfunc_declarations": [{"id": {"id": 41, "debug_name": "store_temp<felt252>"}}],
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec(&body).expect("failed to encode fallback contract"),
+        )
+        .expect("failed to write fallback contract");
+
+        let semantic = hash_contract_class_json_semantic(&path)
+            .expect("semantic hashing should fall back instead of failing");
+        let raw = hash_file_with_limit(&path).expect("raw hash should succeed");
+        assert_eq!(
+            semantic, raw,
+            "unsupported contract_class_version major should fall back to raw hashing"
         );
 
         let _ = fs::remove_file(&path);

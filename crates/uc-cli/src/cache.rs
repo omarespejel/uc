@@ -975,14 +975,18 @@ pub(super) fn hash_file_blake3(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_test_dir(prefix: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock should be after unix epoch")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id()));
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("{prefix}-{}-{nonce}-{counter}", std::process::id()));
         fs::create_dir_all(&dir).expect("failed to create test directory");
         dir
     }

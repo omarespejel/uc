@@ -176,9 +176,9 @@ fn flatten_payload_wrapped_wire_shape(value: &mut serde_json::Value) {
         if key == "type" {
             continue;
         }
-        // Payload fields overwrite same-named root fields, making `payload`
-        // authoritative while preserving the root `type` discriminant.
-        // This keeps payload-wrapped and legacy/hybrid flat shapes compatible.
+        // Skip redundant payload `type`: the root discriminant is authoritative and
+        // must not be overridden by payload-wrapped clients.
+        // Non-discriminant payload fields stay authoritative over root duplicates.
         root.insert(key, item);
     }
 }

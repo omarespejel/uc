@@ -1,40 +1,31 @@
 use super::*;
 
-fn should_capture_metadata_output(args: &MetadataArgs) -> bool {
+fn should_capture_metadata_output_for_local_run(args: &MetadataArgs) -> bool {
     args.report_path.is_some()
-        || matches!(
-            args.daemon_mode,
-            DaemonModeArg::Auto | DaemonModeArg::Require
-        )
 }
 
 pub(crate) fn run_metadata(args: MetadataArgs) -> Result<()> {
     validate_metadata_format_version(args.format_version)?;
     let manifest_path = resolve_manifest_path(&args.manifest_path)?;
-    // Preserve legacy streaming for interactive local runs (`daemon=off` with no report),
-    // but capture output when daemon transport or JSON reporting needs buffered payloads.
-    let capture_output = should_capture_metadata_output(&args);
+    // Keep local fallback streaming by default; capture only when reporting requires buffered IO.
+    let capture_local_output = should_capture_metadata_output_for_local_run(&args);
 
     let run = match args.daemon_mode {
         DaemonModeArg::Off => {
-            run_scarb_metadata_with_uc_cache(&args, &manifest_path, capture_output)?
+            run_scarb_metadata_with_uc_cache(&args, &manifest_path, capture_local_output)?
         }
         DaemonModeArg::Auto => {
-            if let Some(run) =
-                try_uc_metadata_via_daemon(&args, &manifest_path, capture_output, true)?
-            {
+            if let Some(run) = try_uc_metadata_via_daemon(&args, &manifest_path, true, true)? {
                 run
             } else {
-                run_scarb_metadata_with_uc_cache(&args, &manifest_path, capture_output)?
+                run_scarb_metadata_with_uc_cache(&args, &manifest_path, capture_local_output)?
             }
         }
-        DaemonModeArg::Require => {
-            try_uc_metadata_via_daemon(&args, &manifest_path, capture_output, false)?
-                .context("daemon mode is require but daemon is unavailable")?
-        }
+        DaemonModeArg::Require => try_uc_metadata_via_daemon(&args, &manifest_path, true, false)?
+            .context("daemon mode is require but daemon is unavailable")?,
     };
 
-    if capture_output {
+    if !run.stdout.is_empty() || !run.stderr.is_empty() {
         replay_output(&run.stdout, &run.stderr)?;
     }
 
@@ -61,7 +52,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn metadata_capture_output_mode_tracks_daemon_and_report_requirements() {
+    fn metadata_local_capture_output_mode_only_depends_on_report_generation() {
         let base = MetadataArgs {
             manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
             format_version: 1,
@@ -71,22 +62,22 @@ mod tests {
             report_path: None,
         };
         assert!(
-            !should_capture_metadata_output(&base),
+            !should_capture_metadata_output_for_local_run(&base),
             "daemon=off without report should stream output"
         );
 
         let mut with_report = base.clone();
         with_report.report_path = Some(PathBuf::from("/tmp/report.json"));
         assert!(
-            should_capture_metadata_output(&with_report),
+            should_capture_metadata_output_for_local_run(&with_report),
             "report generation requires buffered output capture"
         );
 
         let mut daemon_auto = base;
         daemon_auto.daemon_mode = DaemonModeArg::Auto;
         assert!(
-            should_capture_metadata_output(&daemon_auto),
-            "daemon transport requires buffered output capture"
+            !should_capture_metadata_output_for_local_run(&daemon_auto),
+            "daemon auto fallback to local should stream output when report generation is disabled"
         );
     }
 }

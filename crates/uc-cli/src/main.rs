@@ -156,6 +156,10 @@ const DEFAULT_NATIVE_COMPILE_CONTEXT_CACHE_TTL_MS: u64 = 30 * 60 * 1000;
 const DEFAULT_NATIVE_INCREMENTAL_MAX_CHANGED_FILES: usize = 256;
 #[cfg(feature = "native-compile")]
 const DEFAULT_NATIVE_IMPACTED_SUBSET_ENABLED: bool = true;
+#[cfg(feature = "native-compile")]
+const DEFAULT_NATIVE_COMPILE_SESSION_MEMORY_MULTIPLIER: u64 = 64;
+#[cfg(feature = "native-compile")]
+const DEFAULT_NATIVE_COMPILE_SESSION_MEMORY_BASE_OVERHEAD_BYTES: u64 = 32 * 1024 * 1024;
 const DEFAULT_DAEMON_SHARED_CACHE_ENABLED: bool = true;
 const DEFAULT_DAEMON_SHARED_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 // Default-off for Scarb's artifact fingerprint check in uc's Scarb-backed path.
@@ -814,6 +818,7 @@ struct NativeCompileSessionState {
     tracked_sources: BTreeMap<String, NativeTrackedFileState>,
     tracked_source_bytes: u64,
     source_root_modified_unix_ms: u64,
+    contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
 }
 
 #[cfg(feature = "native-compile")]
@@ -823,6 +828,7 @@ struct NativeCompileSessionSnapshot {
     changed_files: Vec<String>,
     removed_files: Vec<String>,
     journal_fallback_full_scan: bool,
+    contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
 }
 
 #[derive(Debug, Default)]
@@ -1859,6 +1865,29 @@ fn native_impacted_subset_enabled() -> bool {
         parse_env_bool(
             "UC_NATIVE_IMPACTED_SUBSET_ENABLED",
             DEFAULT_NATIVE_IMPACTED_SUBSET_ENABLED,
+        )
+    })
+}
+
+#[cfg(feature = "native-compile")]
+fn native_compile_session_memory_multiplier() -> u64 {
+    static VALUE: OnceLock<u64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_env_u64(
+            "UC_NATIVE_COMPILE_SESSION_MEMORY_MULTIPLIER",
+            DEFAULT_NATIVE_COMPILE_SESSION_MEMORY_MULTIPLIER,
+        )
+        .max(1)
+    })
+}
+
+#[cfg(feature = "native-compile")]
+fn native_compile_session_memory_base_overhead_bytes() -> u64 {
+    static VALUE: OnceLock<u64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_env_u64(
+            "UC_NATIVE_COMPILE_SESSION_MEMORY_BASE_OVERHEAD_BYTES",
+            DEFAULT_NATIVE_COMPILE_SESSION_MEMORY_BASE_OVERHEAD_BYTES,
         )
     })
 }
@@ -4542,12 +4571,31 @@ fn native_diff_tracked_sources(
 }
 
 #[cfg(feature = "native-compile")]
+fn native_compile_session_estimated_heap_bytes(tracked_source_bytes: u64) -> u64 {
+    tracked_source_bytes
+        .saturating_mul(native_compile_session_memory_multiplier())
+        .saturating_add(native_compile_session_memory_base_overhead_bytes())
+}
+
+#[cfg(feature = "native-compile")]
 fn native_compile_session_state_estimated_bytes(state: &NativeCompileSessionState) -> u64 {
     let tracked_meta_bytes = state.tracked_sources.len() as u64 * 96;
-    state
-        .tracked_source_bytes
+    let dependency_bytes =
+        state
+            .contract_source_dependencies
+            .iter()
+            .fold(0_u64, |acc, (module_path, deps)| {
+                let module_bytes = module_path.len() as u64;
+                let deps_bytes = deps
+                    .iter()
+                    .fold(0_u64, |inner, dep| inner.saturating_add(dep.len() as u64));
+                acc.saturating_add(module_bytes.saturating_add(deps_bytes))
+            });
+    // RootDatabase memory is dominated by interned/query state, not raw file bytes.
+    // Use a conservative source-scaled heuristic so byte-based eviction is meaningful.
+    native_compile_session_estimated_heap_bytes(state.tracked_source_bytes)
         .saturating_add(tracked_meta_bytes)
-        .saturating_add(512 * 1024)
+        .saturating_add(dependency_bytes)
 }
 
 #[cfg(feature = "native-compile")]
@@ -4735,24 +4783,200 @@ fn native_contract_source_relative_path(
 }
 
 #[cfg(feature = "native-compile")]
+fn native_workspace_relative_cairo_path_from_debug(
+    workspace_root: &Path,
+    debug_path: &str,
+) -> Option<String> {
+    let path = Path::new(debug_path);
+    let relative = if path.is_absolute() {
+        path.strip_prefix(workspace_root).ok()?
+    } else {
+        path
+    };
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+    let is_cairo = relative
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("cairo"));
+    if !is_cairo {
+        return None;
+    }
+    Some(normalize_fingerprint_path(relative))
+}
+
+#[cfg(feature = "native-compile")]
+fn native_contract_dependency_paths_from_debug_info(
+    workspace_root: &Path,
+    contract_class: &ContractClass,
+) -> BTreeSet<String> {
+    let mut dependencies = BTreeSet::new();
+    let Some(debug_info) = contract_class.sierra_program_debug_info.as_ref() else {
+        return dependencies;
+    };
+    let Some(cairo_coverage) = debug_info
+        .annotations
+        .get("github.com/software-mansion/cairo-coverage")
+    else {
+        return dependencies;
+    };
+    let Some(statements_locations) = cairo_coverage
+        .get("statements_code_locations")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return dependencies;
+    };
+    for locations in statements_locations.values() {
+        let Some(entries) = locations.as_array() else {
+            continue;
+        };
+        for entry in entries {
+            let Some(tuple) = entry.as_array() else {
+                continue;
+            };
+            let Some(path) = tuple.first().and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if let Some(relative) =
+                native_workspace_relative_cairo_path_from_debug(workspace_root, path)
+            {
+                dependencies.insert(relative);
+            }
+        }
+    }
+    dependencies
+}
+
+#[cfg(feature = "native-compile")]
+fn native_collect_contract_dependency_updates(
+    workspace_root: &Path,
+    plans: &[NativeContractOutputPlan],
+    contract_source_paths: &[Option<String>],
+    selected_indices: &[usize],
+    contract_classes: &[ContractClass],
+) -> Vec<(String, BTreeSet<String>)> {
+    selected_indices
+        .iter()
+        .copied()
+        .zip(contract_classes.iter())
+        .map(|(contract_index, contract_class)| {
+            let mut dependencies =
+                native_contract_dependency_paths_from_debug_info(workspace_root, contract_class);
+            if let Some(Some(source_path)) = contract_source_paths.get(contract_index) {
+                dependencies.insert(source_path.clone());
+            }
+            (plans[contract_index].module_path.clone(), dependencies)
+        })
+        .collect()
+}
+
+#[cfg(feature = "native-compile")]
+fn native_update_compile_session_contract_dependencies(
+    workspace_root: &Path,
+    signature: &NativeCompileSessionSignature,
+    dependency_updates: &[(String, BTreeSet<String>)],
+) {
+    if dependency_updates.is_empty() {
+        return;
+    }
+    let session_handle = match native_compile_session_handle(workspace_root, signature) {
+        Ok(handle) => handle,
+        Err(err) => {
+            tracing::warn!(
+                workspace_root = %workspace_root.display(),
+                error = %format!("{err:#}"),
+                "failed to update native contract dependency index after compile"
+            );
+            return;
+        }
+    };
+    let estimated_bytes = {
+        let mut session = session_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if session.signature != *signature {
+            return;
+        }
+        for (module_path, dependencies) in dependency_updates {
+            if dependencies.is_empty() {
+                session.contract_source_dependencies.remove(module_path);
+            } else {
+                session
+                    .contract_source_dependencies
+                    .insert(module_path.clone(), dependencies.clone());
+            }
+        }
+        native_compile_session_state_estimated_bytes(&session)
+    };
+    update_native_compile_session_cached_estimated_bytes(workspace_root, estimated_bytes);
+}
+
+#[cfg(feature = "native-compile")]
 fn native_impacted_contract_indices(
     db: &RootDatabase,
     workspace_root: &Path,
     contracts: &[ContractDeclaration<'_>],
     changed_files: &[String],
     removed_files: &[String],
+    contract_source_dependencies: &BTreeMap<String, BTreeSet<String>>,
 ) -> Option<Vec<usize>> {
     let mut by_source: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut dependency_index_complete = true;
     for (index, contract) in contracts.iter().enumerate() {
+        let module_path = contract.submodule_id.full_path(db);
+        if let Some(dependencies) = contract_source_dependencies.get(&module_path) {
+            if dependencies.is_empty() {
+                dependency_index_complete = false;
+            }
+            for dependency in dependencies {
+                by_source.entry(dependency.clone()).or_default().push(index);
+            }
+            continue;
+        }
+        dependency_index_complete = false;
         let relative = native_contract_source_relative_path(db, workspace_root, contract)?;
         by_source.entry(relative).or_default().push(index);
     }
+    native_impacted_contract_indices_from_source_index(
+        &by_source,
+        changed_files,
+        removed_files,
+        dependency_index_complete,
+    )
+}
+
+#[cfg(feature = "native-compile")]
+fn native_impacted_contract_indices_from_source_index(
+    by_source: &HashMap<String, Vec<usize>>,
+    changed_files: &[String],
+    removed_files: &[String],
+    dependency_index_complete: bool,
+) -> Option<Vec<usize>> {
     let mut impacted = BTreeSet::new();
+    let mut unmatched_source_found = false;
     for source in changed_files.iter().chain(removed_files.iter()) {
-        let indices = by_source.get(source)?;
+        let Some(indices) = by_source.get(source) else {
+            unmatched_source_found = true;
+            continue;
+        };
         for index in indices {
             impacted.insert(*index);
         }
+    }
+    if unmatched_source_found && !dependency_index_complete {
+        tracing::debug!(
+            changed_files = changed_files.len(),
+            removed_files = removed_files.len(),
+            indexed_sources = by_source.len(),
+            "native impacted subset index is incomplete for changed file set; falling back to full compile"
+        );
+        return None;
     }
     Some(impacted.into_iter().collect())
 }
@@ -4929,6 +5153,7 @@ fn build_native_compile_session_state(
         tracked_sources,
         tracked_source_bytes,
         source_root_modified_unix_ms,
+        contract_source_dependencies: BTreeMap::new(),
     })
 }
 
@@ -5649,6 +5874,7 @@ fn with_native_compile_session<T>(
             changed_files: changed_files.clone(),
             removed_files: removed_files.clone(),
             journal_fallback_full_scan,
+            contract_source_dependencies: session.contract_source_dependencies.clone(),
         }
     };
     update_native_compile_session_cached_estimated_bytes(workspace_root, estimated_bytes);
@@ -5743,6 +5969,10 @@ fn native_compiler_config<'a>(
     // Scarb built-in profiles default to `sierra-replace-ids = true` for dev-like
     // profiles and `false` for release; mirror that behavior for parity.
     compiler_config.replace_ids = profile != "release";
+    // Emit statement source locations into Sierra debug annotations so uc can
+    // maintain a contract-to-source dependency index and skip unaffected
+    // contract recompiles on semantic edits.
+    compiler_config.add_statements_code_locations = true;
     compiler_config
 }
 
@@ -5804,6 +6034,7 @@ fn run_native_build_inner(
         compiled_contracts,
         impacted_subset_used,
         journal_fallback_full_scan,
+        dependency_updates,
     ) = with_native_compile_session(workspace_root, &signature, daemon_context, |session| {
         tracing::trace!(
             changed_files = session.changed_files.len(),
@@ -5849,12 +6080,19 @@ fn run_native_build_inner(
                 0_u64,
                 false,
                 session.journal_fallback_full_scan,
+                Vec::new(),
             ));
         }
 
         let module_paths: Vec<String> = contracts
             .iter()
             .map(|contract| contract.submodule_id.full_path(&session.db))
+            .collect();
+        let contract_source_paths: Vec<Option<String>> = contracts
+            .iter()
+            .map(|contract| {
+                native_contract_source_relative_path(&session.db, workspace_root, contract)
+            })
             .collect();
         let contract_stems = native_contract_file_stems(&module_paths);
         let mut all_plans = Vec::with_capacity(module_paths.len());
@@ -5894,8 +6132,9 @@ fn run_native_build_inner(
                 &contracts,
                 &session.changed_files,
                 &session.removed_files,
+                &session.contract_source_dependencies,
             ) {
-                if !impacted_indices.is_empty() && impacted_indices.len() < contracts.len() {
+                if impacted_indices.len() < contracts.len() {
                     let impacted_set = impacted_indices.iter().copied().collect::<BTreeSet<_>>();
                     if let Some((entries, keep_files)) =
                         native_reusable_unaffected_manifest_entries(
@@ -5920,30 +6159,35 @@ fn run_native_build_inner(
             }
         }
 
-        let frontend_compile_start = Instant::now();
-        let contract_refs: Vec<_> = selected_indices
-            .iter()
-            .map(|index| &contracts[*index])
-            .collect();
-        let contract_classes = compile_starknet_prepared_db(
-            &session.db,
-            &contract_refs,
-            native_compiler_config(&session.main_crate_inputs, profile),
-        )
-        .map_err(|err| {
-            mark_native_fallback_eligible_for_external_dependencies(
-                err.context("native starknet compile failed"),
-                &context,
+        let (frontend_compile_ms, contract_classes) = if selected_indices.is_empty() {
+            (0.0, Vec::new())
+        } else {
+            let frontend_compile_start = Instant::now();
+            let contract_refs: Vec<_> = selected_indices
+                .iter()
+                .map(|index| &contracts[*index])
+                .collect();
+            let contract_classes = compile_starknet_prepared_db(
+                &session.db,
+                &contract_refs,
+                native_compiler_config(&session.main_crate_inputs, profile),
             )
-        })?;
-        let frontend_compile_ms = frontend_compile_start.elapsed().as_secs_f64() * 1000.0;
-        if contract_classes.len() != selected_indices.len() {
-            bail!(
-                "native compile returned mismatched contract classes (expected {}, got {})",
-                selected_indices.len(),
-                contract_classes.len()
-            );
-        }
+            .map_err(|err| {
+                mark_native_fallback_eligible_for_external_dependencies(
+                    err.context("native starknet compile failed"),
+                    &context,
+                )
+            })?;
+            let frontend_compile_ms = frontend_compile_start.elapsed().as_secs_f64() * 1000.0;
+            if contract_classes.len() != selected_indices.len() {
+                bail!(
+                    "native compile returned mismatched contract classes (expected {}, got {})",
+                    selected_indices.len(),
+                    contract_classes.len()
+                );
+            }
+            (frontend_compile_ms, contract_classes)
+        };
         #[cfg(debug_assertions)]
         {
             for (result_index, contract_index) in selected_indices.iter().copied().enumerate() {
@@ -5968,6 +6212,13 @@ fn run_native_build_inner(
                 );
             }
         }
+        let dependency_updates = native_collect_contract_dependency_updates(
+            workspace_root,
+            &all_plans,
+            &contract_source_paths,
+            &selected_indices,
+            &contract_classes,
+        );
         let artifact_pipeline_start = Instant::now();
         let mut casm_ms = 0.0;
         let mut serialized_artifacts = Vec::with_capacity(contract_classes.len().saturating_mul(2));
@@ -6053,8 +6304,14 @@ fn run_native_build_inner(
             compiled_contracts,
             impacted_subset_used,
             session.journal_fallback_full_scan,
+            dependency_updates,
         ))
     })?;
+    native_update_compile_session_contract_dependencies(
+        workspace_root,
+        &signature,
+        &dependency_updates,
+    );
     let compile_ms = compile_start.elapsed().as_secs_f64() * 1000.0;
     let session_scope_ms = session_scope_start.elapsed().as_secs_f64() * 1000.0;
     let session_prepare_ms =

@@ -204,19 +204,38 @@ fn prune_daemon_local_probe_hints(hint_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_hint_file_if_changed(path: &Path, contents: &str) -> Result<()> {
+fn prune_legacy_daemon_probe_hint_root_if_needed(workspace_root: &Path, active_hint_dir: &Path) {
+    let Ok(root_dir) = daemon_probe_hint_root_dir(workspace_root) else {
+        return;
+    };
+    if root_dir == active_hint_dir {
+        return;
+    }
+    if let Err(err) = prune_daemon_local_probe_hints(&root_dir) {
+        tracing::warn!(
+            error = %format!("{err:#}"),
+            hint_dir = %root_dir.display(),
+            "failed to prune legacy daemon probe hint root"
+        );
+    }
+}
+
+fn write_hint_file_if_changed(path: &Path, contents: &str) -> Result<bool> {
     match fs::read_to_string(path) {
-        Ok(existing) if existing == contents => return Ok(()),
+        Ok(existing) if existing == contents => return Ok(false),
         Ok(_) => {}
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => {
-            return Err(err)
-                .with_context(|| format!("failed to read existing hint {}", path.display()));
+            tracing::warn!(
+                error = %err,
+                hint_path = %path.display(),
+                "failed to read existing hint file; attempting overwrite"
+            );
         }
     }
     fs::write(path, contents)
         .with_context(|| format!("failed to write hint file {}", path.display()))?;
-    Ok(())
+    Ok(true)
 }
 
 fn persist_daemon_local_probe_hint(
@@ -242,7 +261,14 @@ fn persist_daemon_local_probe_hint(
             parent.display()
         )
     })?;
-    write_hint_file_if_changed(&hint_path, &format!("{hinted_session_key}\n"))?;
+    if let Err(err) = write_hint_file_if_changed(&hint_path, &format!("{hinted_session_key}\n")) {
+        tracing::warn!(
+            error = %format!("{err:#}"),
+            hint_path = %hint_path.display(),
+            "failed to persist daemon probe hint"
+        );
+        return Ok(());
+    }
     if let Err(err) = prune_daemon_local_probe_hints(parent) {
         tracing::warn!(
             error = %format!("{err:#}"),
@@ -250,6 +276,7 @@ fn persist_daemon_local_probe_hint(
             "failed to prune daemon probe hints"
         );
     }
+    prune_legacy_daemon_probe_hint_root_if_needed(workspace_root, parent);
     Ok(())
 }
 
@@ -326,7 +353,14 @@ fn persist_daemon_local_native_supported_hint(
             parent.display()
         )
     })?;
-    write_hint_file_if_changed(&hint_path, "1\n")?;
+    if let Err(err) = write_hint_file_if_changed(&hint_path, "1\n") {
+        tracing::warn!(
+            error = %format!("{err:#}"),
+            hint_path = %hint_path.display(),
+            "failed to persist native-supported hint"
+        );
+        return Ok(());
+    }
     if let Err(err) = prune_daemon_local_probe_hints(parent) {
         tracing::warn!(
             error = %format!("{err:#}"),
@@ -334,6 +368,7 @@ fn persist_daemon_local_native_supported_hint(
             "failed to prune daemon probe hints"
         );
     }
+    prune_legacy_daemon_probe_hint_root_if_needed(workspace_root, parent);
     Ok(())
 }
 
@@ -1160,57 +1195,63 @@ mod tests {
     }
 
     #[test]
-    fn persist_native_supported_hint_keeps_mtime_when_contents_unchanged() {
-        let workspace = unique_test_dir("uc-daemon-native-supported-hint-mtime");
-        let primary_session_key = "9".repeat(SESSION_KEY_LEN);
-
-        persist_daemon_local_native_supported_hint(&workspace, &primary_session_key)
-            .expect("failed to persist native-supported hint");
-        let hint_path = daemon_local_native_supported_hint_path(&workspace, &primary_session_key)
-            .expect("failed to compute native-supported hint path");
-        let first_modified = fs::metadata(&hint_path)
-            .and_then(|metadata| metadata.modified())
-            .expect("failed to read native-supported hint mtime");
-
-        std::thread::sleep(Duration::from_millis(1_100));
-        persist_daemon_local_native_supported_hint(&workspace, &primary_session_key)
-            .expect("failed to persist native-supported hint a second time");
-        let second_modified = fs::metadata(&hint_path)
-            .and_then(|metadata| metadata.modified())
-            .expect("failed to read native-supported hint mtime after second persist");
-
-        assert_eq!(
-            first_modified, second_modified,
-            "persisting identical native-supported hint should not rewrite and refresh mtime"
-        );
-
+    fn write_hint_file_if_changed_reports_noop_for_equal_contents() {
+        let workspace = unique_test_dir("uc-daemon-hint-write-noop");
+        let path = workspace.join("hint.txt");
+        fs::write(&path, "hello\n").expect("failed to write initial hint");
+        let wrote = write_hint_file_if_changed(&path, "hello\n")
+            .expect("no-op write should succeed for unchanged contents");
+        assert!(!wrote, "unchanged hint content should not trigger rewrite");
         fs::remove_dir_all(&workspace).ok();
     }
 
     #[test]
-    fn persist_probe_hint_keeps_mtime_when_contents_unchanged() {
-        let workspace = unique_test_dir("uc-daemon-probe-hint-mtime");
+    fn persist_probe_hint_tolerates_unwritable_existing_hint_path() {
+        let workspace = unique_test_dir("uc-daemon-probe-hint-unwritable");
         let primary_session_key = "0".repeat(SESSION_KEY_LEN);
         let hinted_session_key = "1".repeat(SESSION_KEY_LEN);
-
-        persist_daemon_local_probe_hint(&workspace, &primary_session_key, &hinted_session_key)
-            .expect("failed to persist probe hint");
         let hint_path = daemon_local_probe_hint_path(&workspace, &primary_session_key)
             .expect("failed to compute probe hint path");
-        let first_modified = fs::metadata(&hint_path)
-            .and_then(|metadata| metadata.modified())
-            .expect("failed to read probe hint mtime");
-
-        std::thread::sleep(Duration::from_millis(1_100));
+        fs::create_dir_all(&hint_path).expect("failed to create directory at hint path");
         persist_daemon_local_probe_hint(&workspace, &primary_session_key, &hinted_session_key)
-            .expect("failed to persist probe hint a second time");
-        let second_modified = fs::metadata(&hint_path)
-            .and_then(|metadata| metadata.modified())
-            .expect("failed to read probe hint mtime after second persist");
+            .expect("persist should not fail when probe hint path is unwritable");
+        fs::remove_dir_all(&workspace).ok();
+    }
 
-        assert_eq!(
-            first_modified, second_modified,
-            "persisting identical probe hint should not rewrite and refresh mtime"
+    #[test]
+    fn persist_probe_hint_prunes_legacy_root_hint_files() {
+        let workspace = unique_test_dir("uc-daemon-probe-hint-legacy-prune");
+        let root = daemon_probe_hint_root_dir(&workspace).expect("failed to compute root hint dir");
+        fs::create_dir_all(&root).expect("failed to create root hint dir");
+
+        for index in 0..(DAEMON_LOCAL_PROBE_HINT_MAX_ENTRIES + 8) {
+            let legacy_session_key = format!("{index:0>64x}");
+            let legacy_hint = root.join(format!(
+                "{legacy_session_key}{DAEMON_LOCAL_PROBE_HINT_SUFFIX}"
+            ));
+            fs::write(&legacy_hint, format!("{}\n", "f".repeat(SESSION_KEY_LEN)))
+                .expect("failed to write legacy root hint");
+        }
+
+        let primary_session_key = "a".repeat(SESSION_KEY_LEN);
+        let hinted_session_key = "b".repeat(SESSION_KEY_LEN);
+        persist_daemon_local_probe_hint(&workspace, &primary_session_key, &hinted_session_key)
+            .expect("failed to persist probe hint");
+
+        let legacy_count = fs::read_dir(&root)
+            .expect("failed to read root hint dir")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.path().is_file()
+                    && entry
+                        .file_name()
+                        .to_string_lossy()
+                        .ends_with(DAEMON_LOCAL_PROBE_HINT_SUFFIX)
+            })
+            .count();
+        assert!(
+            legacy_count <= DAEMON_LOCAL_PROBE_HINT_MAX_ENTRIES,
+            "legacy root hints should be pruned to configured entry budget"
         );
 
         fs::remove_dir_all(&workspace).ok();

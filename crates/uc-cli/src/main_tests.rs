@@ -1,5 +1,5 @@
 use super::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fs;
 use std::sync::{Arc, Mutex, OnceLock as TestOnceLock};
@@ -237,6 +237,21 @@ fn daemon_build_request_roundtrip_preserves_async_cache_persist() {
     assert_eq!(restored.profile, common.profile);
     assert_eq!(request.compile_backend, DaemonBuildBackend::Native);
     assert!(request.native_fallback_to_scarb);
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_compile_session_heap_estimate_scales_with_tracked_source_bytes() {
+    let small = native_compile_session_estimated_heap_bytes(1024);
+    let large = native_compile_session_estimated_heap_bytes(2 * 1024 * 1024);
+    assert!(
+        small >= 1024 + native_compile_session_memory_base_overhead_bytes(),
+        "small estimate should include tracked bytes and base overhead"
+    );
+    assert!(
+        large > small,
+        "larger tracked source snapshots should consume larger estimated session memory"
+    );
 }
 
 #[test]
@@ -4349,6 +4364,143 @@ fn native_impacted_subset_used_requires_partial_compile() {
     assert!(
         native_impacted_subset_used(4, 2),
         "partial compiles should be marked as impacted-subset compiles"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_impacted_source_index_requires_complete_dependency_index_for_unmatched_changes() {
+    let by_source = HashMap::from([
+        (
+            "src/contract_patterns.cairo".to_string(),
+            vec![0_usize, 1_usize],
+        ),
+        ("src/math.cairo".to_string(), vec![1_usize]),
+    ]);
+
+    let incomplete = native_impacted_contract_indices_from_source_index(
+        &by_source,
+        &[String::from("src/lib.cairo")],
+        &[],
+        false,
+    );
+    assert!(
+        incomplete.is_none(),
+        "unmatched changes must force full compile when dependency index is incomplete"
+    );
+
+    let complete = native_impacted_contract_indices_from_source_index(
+        &by_source,
+        &[String::from("src/lib.cairo")],
+        &[],
+        true,
+    )
+    .expect("complete index should return impacted subset decision");
+    assert!(
+        complete.is_empty(),
+        "unmatched changes should be treated as no-op for contracts when dependency index is complete"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_workspace_relative_cairo_path_from_debug_requires_workspace_cairo_paths() {
+    let workspace = PathBuf::from("/tmp/uc-native-debug-paths");
+    assert_eq!(
+        native_workspace_relative_cairo_path_from_debug(
+            &workspace,
+            "/tmp/uc-native-debug-paths/src/lib.cairo"
+        )
+        .as_deref(),
+        Some("src/lib.cairo")
+    );
+    assert!(
+        native_workspace_relative_cairo_path_from_debug(
+            &workspace,
+            "/tmp/uc-native-debug-paths/src/lib.txt"
+        )
+        .is_none(),
+        "non-cairo files should be ignored"
+    );
+    assert!(
+        native_workspace_relative_cairo_path_from_debug(&workspace, "/tmp/elsewhere/src/lib.cairo")
+            .is_none(),
+        "files outside workspace root must be ignored"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_contract_dependency_paths_from_debug_info_extracts_workspace_cairo_sources() {
+    let workspace = PathBuf::from("/tmp/uc-native-contract-deps");
+    let class: ContractClass = serde_json::from_value(serde_json::json!({
+        "sierra_program": [],
+        "sierra_program_debug_info": {
+            "type_names": [],
+            "libfunc_names": [],
+            "user_func_names": [],
+            "annotations": {
+                "github.com/software-mansion/cairo-coverage": {
+                    "statements_code_locations": {
+                        "0": [
+                            ["/tmp/uc-native-contract-deps/src/lib.cairo", {"start":{"line":0,"col":0},"end":{"line":0,"col":1}}, false],
+                            ["/tmp/uc-native-contract-deps/src/math.cairo", {"start":{"line":1,"col":0},"end":{"line":1,"col":1}}, false]
+                        ],
+                        "1": [
+                            ["/tmp/uc-native-contract-deps/src/lib.cairo", {"start":{"line":2,"col":0},"end":{"line":2,"col":1}}, false]
+                        ]
+                    }
+                }
+            },
+            "executables": {}
+        },
+        "contract_class_version": "0.1.0",
+        "entry_points_by_type": {
+            "EXTERNAL": [],
+            "L1_HANDLER": [],
+            "CONSTRUCTOR": []
+        },
+        "abi": null
+    }))
+    .expect("contract class debug info fixture should deserialize");
+    let deps = native_contract_dependency_paths_from_debug_info(&workspace, &class);
+    assert_eq!(
+        deps,
+        BTreeSet::from(["src/lib.cairo".to_string(), "src/math.cairo".to_string()])
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_collect_contract_dependency_updates_preserves_contract_source_fallback() {
+    let workspace = PathBuf::from("/tmp/uc-native-dependency-updates");
+    let plans = vec![NativeContractOutputPlan {
+        module_path: "pkg::token".to_string(),
+        artifact_id: "id-token".to_string(),
+        package_name: "pkg".to_string(),
+        contract_name: "token".to_string(),
+        artifact_file: "pkg_token.contract_class.json".to_string(),
+        casm_file: Some("pkg_token.compiled_contract_class.json".to_string()),
+    }];
+    let classes = vec![ContractClass {
+        sierra_program: Vec::new(),
+        sierra_program_debug_info: None,
+        contract_class_version: "0.1.0".to_string(),
+        entry_points_by_type: Default::default(),
+        abi: None,
+    }];
+    let updates = native_collect_contract_dependency_updates(
+        &workspace,
+        &plans,
+        &[Some("src/contract_patterns.cairo".to_string())],
+        &[0_usize],
+        &classes,
+    );
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].0, "pkg::token");
+    assert!(
+        updates[0].1.contains("src/contract_patterns.cairo"),
+        "contract source path must be retained even when debug annotation map is empty"
     );
 }
 
