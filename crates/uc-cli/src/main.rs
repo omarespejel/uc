@@ -5175,21 +5175,6 @@ fn native_update_compile_session_post_build_state(
     }
 }
 
-#[cfg(all(feature = "native-compile", test))]
-fn native_contract_dependency_index_complete(
-    contract_output_plans: &[NativeContractOutputPlan],
-    contract_source_dependencies: &BTreeMap<String, BTreeSet<String>>,
-) -> bool {
-    if contract_output_plans.is_empty() {
-        return false;
-    }
-    contract_output_plans.iter().all(|plan| {
-        contract_source_dependencies
-            .get(&plan.module_path)
-            .is_some_and(|dependencies| !dependencies.is_empty())
-    })
-}
-
 #[cfg(feature = "native-compile")]
 fn native_contract_source_index_for_module_paths(
     module_paths: &[String],
@@ -5253,6 +5238,20 @@ fn native_collect_impacted_contract_indices_from_source_index(
 }
 
 #[cfg(feature = "native-compile")]
+fn native_indexed_source_metric(
+    changed_files: &[String],
+    removed_files: &[String],
+    unmatched_sources: &BTreeSet<String>,
+) -> usize {
+    // Logging-only metric: duplicates across changed/removed paths are uncommon and
+    // acceptable for this coarse visibility counter.
+    changed_files
+        .len()
+        .saturating_add(removed_files.len())
+        .saturating_sub(unmatched_sources.len())
+}
+
+#[cfg(feature = "native-compile")]
 fn native_filter_changed_files_to_contract_source_index(
     changed_files: &[String],
     removed_files: &[String],
@@ -5313,13 +5312,8 @@ fn native_impacted_contract_indices_from_source_index(
         tracing::debug!(
             changed_files = changed_files.len(),
             removed_files = removed_files.len(),
-            indexed_sources = changed_files
-                .iter()
-                .chain(removed_files.iter())
-                .map(String::as_str)
-                .collect::<HashSet<_>>()
-                .len()
-                .saturating_sub(unmatched_sources.len()),
+            indexed_sources =
+                native_indexed_source_metric(changed_files, removed_files, &unmatched_sources),
             "native impacted subset index is incomplete for changed file set; falling back to full compile"
         );
         return None;
@@ -5346,6 +5340,19 @@ fn native_impacted_contract_indices(
             changed_files,
             removed_files,
         );
+    if dependency_index_complete {
+        // With a complete dependency index, unmatched changed/removed paths are
+        // intentionally treated as non-impacting to tracked contracts.
+        debug_assert!(
+            unmatched_sources.iter().all(|source| {
+                !contract_source_paths
+                    .iter()
+                    .flatten()
+                    .any(|tracked_source| tracked_source == source)
+            }),
+            "dependency index marked complete but a tracked contract source is missing from the index"
+        );
+    }
     if !unmatched_sources.is_empty() && !dependency_index_complete {
         for (index, source_path) in contract_source_paths.iter().enumerate() {
             let Some(source_path) = source_path else {
@@ -5359,13 +5366,8 @@ fn native_impacted_contract_indices(
             tracing::debug!(
                 changed_files = changed_files.len(),
                 removed_files = removed_files.len(),
-                indexed_sources = changed_files
-                    .iter()
-                    .chain(removed_files.iter())
-                    .map(String::as_str)
-                    .collect::<HashSet<_>>()
-                    .len()
-                    .saturating_sub(unmatched_sources.len()),
+                indexed_sources =
+                    native_indexed_source_metric(changed_files, removed_files, &unmatched_sources),
                 "native impacted subset index is incomplete for changed file set; falling back to full compile"
             );
             return None;
@@ -7134,6 +7136,8 @@ fn with_native_compile_session<T>(
                     &scoped_removed_files,
                 ) {
                     Ok(applied_override_update) => {
+                        // Intentionally narrow the downstream snapshot scope on success:
+                        // only tracked sources that reached keyed DB updates should be seen as changed.
                         changed_files = scoped_changed_files;
                         removed_files = scoped_removed_files;
                         if applied_override_update {
@@ -7153,6 +7157,8 @@ fn with_native_compile_session<T>(
                         }
                     }
                     Err(err) => {
+                        // Keep the original (non-scoped) changed/removed sets on keyed-update
+                        // failure so downstream compilation stays conservative.
                         tracing::warn!(
                             workspace_root = %workspace_root.display(),
                             changed_files = changed_files.len(),
