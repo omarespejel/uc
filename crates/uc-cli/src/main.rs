@@ -5101,6 +5101,48 @@ fn native_impacted_contract_indices(
 }
 
 #[cfg(feature = "native-compile")]
+fn native_contract_dependency_index_complete(
+    contract_output_plans: &[NativeContractOutputPlan],
+    contract_source_dependencies: &BTreeMap<String, BTreeSet<String>>,
+) -> bool {
+    if contract_output_plans.is_empty() {
+        return false;
+    }
+    contract_output_plans.iter().all(|plan| {
+        contract_source_dependencies
+            .get(&plan.module_path)
+            .is_some_and(|dependencies| !dependencies.is_empty())
+    })
+}
+
+#[cfg(feature = "native-compile")]
+fn native_changed_files_affect_tracked_contracts(
+    changed_files: &[String],
+    removed_files: &[String],
+    contract_output_plans: &[NativeContractOutputPlan],
+    contract_source_dependencies: &BTreeMap<String, BTreeSet<String>>,
+) -> bool {
+    if changed_files.is_empty() && removed_files.is_empty() {
+        return false;
+    }
+    if !native_contract_dependency_index_complete(
+        contract_output_plans,
+        contract_source_dependencies,
+    ) {
+        // Keep the conservative behavior when dependency coverage is incomplete.
+        return true;
+    }
+    let mut indexed_sources = HashSet::new();
+    for dependencies in contract_source_dependencies.values() {
+        indexed_sources.extend(dependencies.iter().map(String::as_str));
+    }
+    changed_files
+        .iter()
+        .chain(removed_files.iter())
+        .any(|path| indexed_sources.contains(path.as_str()))
+}
+
+#[cfg(feature = "native-compile")]
 fn native_impacted_contract_indices_from_source_index(
     by_source: &HashMap<String, Vec<usize>>,
     changed_files: &[String],
@@ -6193,8 +6235,8 @@ fn with_native_compile_session<T>(
     };
     let drift_scan_start = Instant::now();
     let (
-        changed_files,
-        removed_files,
+        mut changed_files,
+        mut removed_files,
         current_source_snapshot,
         source_root_mtime,
         journal_fallback_full_scan,
@@ -6321,38 +6363,56 @@ fn with_native_compile_session<T>(
             refresh_action,
             NativeSessionRefreshAction::IncrementalChangedSet
         ) {
-            // Prefer file-keyed override updates for changed files to avoid coarse
-            // full-DB invalidation on every incremental refresh.
-            match native_apply_file_keyed_session_updates(
-                &mut session.db,
-                workspace_root,
+            if native_changed_files_affect_tracked_contracts(
                 &changed_files,
                 &removed_files,
+                &session.contract_output_plans,
+                &session.contract_source_dependencies,
             ) {
-                Ok(()) => {
-                    tracing::debug!(
-                        changed_files = changed_files.len(),
-                        removed_files = removed_files.len(),
-                        drift_scan_ms,
-                        "native session applied file-keyed incremental updates"
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        workspace_root = %workspace_root.display(),
-                        changed_files = changed_files.len(),
-                        removed_files = removed_files.len(),
-                        error = %format!("{err:#}"),
-                        "native file-keyed update failed; rebuilding native compile session state"
-                    );
-                    if let Some(state) = rebuilt_state.take() {
-                        *session = state;
-                    } else {
-                        *session =
-                            build_native_compile_session_state(workspace_root, signature.clone())?;
+                // Prefer file-keyed override updates for relevant source changes to avoid coarse
+                // full-DB invalidation on every incremental refresh.
+                match native_apply_file_keyed_session_updates(
+                    &mut session.db,
+                    workspace_root,
+                    &changed_files,
+                    &removed_files,
+                ) {
+                    Ok(()) => {
+                        tracing::debug!(
+                            changed_files = changed_files.len(),
+                            removed_files = removed_files.len(),
+                            drift_scan_ms,
+                            "native session applied file-keyed incremental updates"
+                        );
                     }
-                    state_mutated = true;
+                    Err(err) => {
+                        tracing::warn!(
+                            workspace_root = %workspace_root.display(),
+                            changed_files = changed_files.len(),
+                            removed_files = removed_files.len(),
+                            error = %format!("{err:#}"),
+                            "native file-keyed update failed; rebuilding native compile session state"
+                        );
+                        if let Some(state) = rebuilt_state.take() {
+                            *session = state;
+                        } else {
+                            *session = build_native_compile_session_state(
+                                workspace_root,
+                                signature.clone(),
+                            )?;
+                        }
+                        state_mutated = true;
+                    }
                 }
+            } else {
+                tracing::debug!(
+                    changed_files = changed_files.len(),
+                    removed_files = removed_files.len(),
+                    drift_scan_ms,
+                    "native changed-file set does not affect tracked contracts; skipping file-keyed session update"
+                );
+                changed_files.clear();
+                removed_files.clear();
             }
             if let Some((tracked_sources, tracked_source_bytes)) = current_source_snapshot.take() {
                 session.tracked_sources = tracked_sources;

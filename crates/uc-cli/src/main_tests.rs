@@ -4634,6 +4634,107 @@ fn native_impacted_source_index_requires_complete_dependency_index_for_unmatched
 
 #[cfg(feature = "native-compile")]
 #[test]
+fn native_changed_files_affect_tracked_contracts_skips_unrelated_changes_when_index_complete() {
+    let plans = vec![
+        NativeContractOutputPlan {
+            module_path: "pkg::contract_a".to_string(),
+            artifact_id: "a".to_string(),
+            package_name: "pkg".to_string(),
+            contract_name: "contract_a".to_string(),
+            artifact_file: "pkg_contract_a.contract_class.json".to_string(),
+            casm_file: Some("pkg_contract_a.compiled_contract_class.json".to_string()),
+        },
+        NativeContractOutputPlan {
+            module_path: "pkg::contract_b".to_string(),
+            artifact_id: "b".to_string(),
+            package_name: "pkg".to_string(),
+            contract_name: "contract_b".to_string(),
+            artifact_file: "pkg_contract_b.contract_class.json".to_string(),
+            casm_file: Some("pkg_contract_b.compiled_contract_class.json".to_string()),
+        },
+    ];
+    let dependencies = BTreeMap::from([
+        (
+            "pkg::contract_a".to_string(),
+            BTreeSet::from([
+                "src/contract_a.cairo".to_string(),
+                "src/shared_types.cairo".to_string(),
+            ]),
+        ),
+        (
+            "pkg::contract_b".to_string(),
+            BTreeSet::from(["src/contract_b.cairo".to_string()]),
+        ),
+    ]);
+
+    assert!(
+        !native_changed_files_affect_tracked_contracts(
+            &[String::from("src/math.cairo")],
+            &[],
+            &plans,
+            &dependencies
+        ),
+        "complete dependency indexes should treat unrelated source edits as no-op for contracts"
+    );
+    assert!(
+        native_changed_files_affect_tracked_contracts(
+            &[String::from("src/shared_types.cairo")],
+            &[],
+            &plans,
+            &dependencies
+        ),
+        "indexed changed files should still trigger contract refresh"
+    );
+    assert!(
+        native_changed_files_affect_tracked_contracts(
+            &[],
+            &[String::from("src/contract_b.cairo")],
+            &plans,
+            &dependencies
+        ),
+        "indexed removed files should still trigger contract refresh"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_changed_files_affect_tracked_contracts_stays_conservative_when_index_incomplete() {
+    let plans = vec![
+        NativeContractOutputPlan {
+            module_path: "pkg::contract_a".to_string(),
+            artifact_id: "a".to_string(),
+            package_name: "pkg".to_string(),
+            contract_name: "contract_a".to_string(),
+            artifact_file: "pkg_contract_a.contract_class.json".to_string(),
+            casm_file: Some("pkg_contract_a.compiled_contract_class.json".to_string()),
+        },
+        NativeContractOutputPlan {
+            module_path: "pkg::contract_b".to_string(),
+            artifact_id: "b".to_string(),
+            package_name: "pkg".to_string(),
+            contract_name: "contract_b".to_string(),
+            artifact_file: "pkg_contract_b.contract_class.json".to_string(),
+            casm_file: Some("pkg_contract_b.compiled_contract_class.json".to_string()),
+        },
+    ];
+    let dependencies = BTreeMap::from([(
+        "pkg::contract_a".to_string(),
+        BTreeSet::from(["src/contract_a.cairo".to_string()]),
+    )]);
+
+    assert!(
+        native_changed_files_affect_tracked_contracts(
+            &[String::from("src/math.cairo")],
+            &[],
+            &plans,
+            &dependencies
+        ),
+        "incomplete dependency indexes should keep conservative contract refresh behavior"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
 fn native_workspace_relative_cairo_path_from_debug_requires_workspace_cairo_paths() {
     let workspace = PathBuf::from("/tmp/uc-native-debug-paths");
     assert_eq!(
