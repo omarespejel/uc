@@ -15,7 +15,7 @@
 - Executes metadata resolution path.
 - Supports: `--manifest-path`, `--format-version`, `--offline`, `--global-cache-dir`.
 - Optional `--report-path` writes execution report JSON.
-- In daemon `auto|require` modes, captured metadata `stdout/stderr` is replayed to terminal by default (even without `--report-path`); local fallback keeps streaming behavior unless report capture is requested.
+- Behavior note (2026-03-06): in daemon `auto|require` modes, captured metadata `stdout/stderr` is replayed to terminal by default (even without `--report-path`); local fallback keeps streaming behavior unless report capture is requested.
 
 3. `uc compare-build`
 - Runs direct Scarb build vs `uc build` wrapper on same manifest.

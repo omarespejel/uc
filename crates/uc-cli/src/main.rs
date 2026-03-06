@@ -3115,6 +3115,35 @@ fn store_metadata_result_cache_entry(
     Ok(())
 }
 
+fn manifest_has_workspace_table(manifest_path: &Path) -> bool {
+    let Ok(contents) = fs::read_to_string(manifest_path) else {
+        return false;
+    };
+    let Ok(manifest) = toml::from_str::<TomlValue>(&contents) else {
+        return false;
+    };
+    manifest.get("workspace").is_some()
+}
+
+fn metadata_cache_workspace_root(manifest_path: &Path) -> Result<PathBuf> {
+    let manifest_parent = manifest_path
+        .parent()
+        .context("manifest path has no parent")?;
+    for ancestor in manifest_parent.ancestors() {
+        let ancestor_manifest = ancestor.join("Scarb.toml");
+        if !ancestor_manifest.is_file() {
+            continue;
+        }
+        if ancestor.join("Scarb.lock").is_file() {
+            return Ok(ancestor.to_path_buf());
+        }
+        if ancestor != manifest_parent && manifest_has_workspace_table(&ancestor_manifest) {
+            return Ok(ancestor.to_path_buf());
+        }
+    }
+    Ok(manifest_parent.to_path_buf())
+}
+
 fn run_scarb_metadata_with_uc_cache(
     args: &MetadataArgs,
     manifest_path: &Path,
@@ -3125,17 +3154,15 @@ fn run_scarb_metadata_with_uc_cache(
         return run_command_status(command, command_vec);
     }
 
-    let workspace_root = manifest_path
-        .parent()
-        .context("manifest path has no parent")?
-        .to_path_buf();
+    let workspace_root = metadata_cache_workspace_root(manifest_path)?;
     let cache_root = workspace_root.join(".uc/cache");
     ensure_path_within_root(&workspace_root, &cache_root, "metadata cache root")?;
     let manifest_metadata = fs::metadata(manifest_path)
         .with_context(|| format!("failed to stat {}", manifest_path.display()))?;
     let manifest_size_bytes = manifest_metadata.len();
     let manifest_modified_unix_ms = metadata_modified_unix_ms(&manifest_metadata)?;
-    let (_, _, lock_hash) = daemon_lock_state(manifest_path)?;
+    let workspace_manifest_path = workspace_root.join("Scarb.toml");
+    let (_, _, lock_hash) = daemon_lock_state(&workspace_manifest_path)?;
     let workspace_manifests_hash = metadata_workspace_manifests_hash(&workspace_root)?;
     let scarb_version = scarb_version_line()?;
     let build_env_fingerprint = current_build_env_fingerprint();

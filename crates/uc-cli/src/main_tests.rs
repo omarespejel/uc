@@ -840,6 +840,18 @@ fn read_line_limited_rejects_oversized_line() {
 }
 
 #[test]
+fn read_line_limited_rejects_exact_limit_without_newline() {
+    let payload = vec![b'a'; 8];
+    let mut reader = std::io::BufReader::with_capacity(8, std::io::Cursor::new(payload));
+    let err = read_line_limited(&mut reader, 8, "test line")
+        .expect_err("line should fail when exact limit is reached without newline terminator");
+    assert!(
+        format!("{err:#}").contains("exceeds size limit"),
+        "unexpected error: {err:#}"
+    );
+}
+
+#[test]
 fn read_line_limited_rejects_extra_bytes_after_exact_limit_without_newline() {
     let payload = [vec![b'a'; 8], vec![b'b']].concat();
     let mut reader = std::io::BufReader::with_capacity(8, std::io::Cursor::new(payload));
@@ -2465,6 +2477,60 @@ opt-level = 1
     assert!(
         hit.is_none(),
         "cache must miss when workspace member manifest changes even if lock hash is unchanged"
+    );
+
+    fs::remove_dir_all(&workspace).ok();
+}
+
+#[test]
+fn metadata_cache_workspace_root_prefers_workspace_lock_ancestor_for_member_manifest() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let workspace = unique_test_dir("uc-metadata-workspace-root-member-manifest");
+    let member_dir = workspace.join("member");
+    fs::create_dir_all(&member_dir).expect("failed to create member directory");
+    fs::write(
+        workspace.join("Scarb.toml"),
+        "[workspace]\nmembers = [\"member\"]\n",
+    )
+    .expect("failed to write workspace manifest");
+    fs::write(workspace.join("Scarb.lock"), "version = 1\n").expect("failed to write lock file");
+    let member_manifest = member_dir.join("Scarb.toml");
+    fs::write(
+        &member_manifest,
+        "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n",
+    )
+    .expect("failed to write member manifest");
+
+    let resolved = metadata_cache_workspace_root(&member_manifest)
+        .expect("workspace root resolution should succeed");
+    assert_eq!(
+        resolved, workspace,
+        "member-scoped manifest should resolve metadata cache root to workspace lock ancestor"
+    );
+
+    fs::remove_dir_all(&workspace).ok();
+}
+
+#[test]
+fn metadata_cache_workspace_root_falls_back_to_manifest_parent_without_workspace_lock() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let workspace = unique_test_dir("uc-metadata-workspace-root-fallback");
+    let manifest_path = workspace.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        "[package]\nname = \"standalone\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n",
+    )
+    .expect("failed to write standalone manifest");
+
+    let resolved = metadata_cache_workspace_root(&manifest_path)
+        .expect("workspace root resolution should succeed");
+    assert_eq!(
+        resolved, workspace,
+        "without workspace lock ancestor metadata cache root should remain manifest parent"
     );
 
     fs::remove_dir_all(&workspace).ok();
