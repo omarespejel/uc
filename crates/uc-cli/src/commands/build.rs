@@ -519,6 +519,23 @@ fn daemon_backend_policy_with_hint_state(
     }
 }
 
+fn native_auto_preflight_hint_reason(
+    workspace_root: &Path,
+    native_session_key: &str,
+) -> Result<Option<String>> {
+    let native_supported_hint =
+        daemon_local_native_supported_hint(workspace_root, native_session_key)?;
+    if native_supported_hint {
+        return Ok(None);
+    }
+    if load_daemon_local_probe_hint(workspace_root, native_session_key)?.is_some() {
+        return Ok(Some(format!(
+            "cached fallback hint present for session key {native_session_key}"
+        )));
+    }
+    Ok(None)
+}
+
 fn daemon_socket_available_for_client() -> Result<bool> {
     #[cfg(not(unix))]
     {
@@ -616,13 +633,27 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             let configured_native_mode = native_build_mode();
             let disallow_native_fallback = native_disallow_scarb_fallback();
             let native_auto_preflight_error = if configured_native_mode == NativeBuildMode::Auto {
-                match native_compile_preflight(&common, &manifest_path, &workspace_root) {
-                    Ok(()) => None,
-                    Err(err) => {
-                        if native_error_allows_scarb_fallback(&err) {
-                            Some(format!("{err:#}"))
-                        } else {
-                            return Err(err);
+                let native_compiler_version = native_compiler_version_line();
+                let native_session_key = build_session_input_with_compiler_version(
+                    &common,
+                    &manifest_path,
+                    &profile,
+                    &native_compiler_version,
+                )?
+                .deterministic_key_hex();
+                if let Some(reason) =
+                    native_auto_preflight_hint_reason(&workspace_root, &native_session_key)?
+                {
+                    Some(reason)
+                } else {
+                    match native_compile_preflight(&common, &manifest_path, &workspace_root) {
+                        Ok(()) => None,
+                        Err(err) => {
+                            if native_error_allows_scarb_fallback(&err) {
+                                Some(format!("{err:#}"))
+                            } else {
+                                return Err(err);
+                            }
                         }
                     }
                 }
@@ -1662,5 +1693,53 @@ mod tests {
             format!("{err:#}").contains("native fallback is disallowed"),
             "unexpected error: {err:#}"
         );
+    }
+
+    #[test]
+    fn native_auto_preflight_hint_reason_short_circuits_when_fallback_hint_exists() {
+        let _guard = env_var_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _retry_interval_guard =
+            ScopedEnvVar::set(UC_NATIVE_FALLBACK_HINT_RETRY_SECS_ENV, "1800");
+        let workspace = unique_test_dir("uc-native-preflight-hint-short-circuit");
+        let primary_session_key = "2".repeat(SESSION_KEY_LEN);
+        let hinted_session_key = "3".repeat(SESSION_KEY_LEN);
+        persist_daemon_local_probe_hint(&workspace, &primary_session_key, &hinted_session_key)
+            .expect("failed to persist daemon fallback hint");
+
+        let reason = native_auto_preflight_hint_reason(&workspace, &primary_session_key)
+            .expect("failed to resolve native preflight hint reason");
+        assert!(
+            reason.is_some(),
+            "fallback hint should short-circuit native auto preflight"
+        );
+
+        fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[test]
+    fn native_auto_preflight_hint_reason_prefers_native_supported_hint() {
+        let _guard = env_var_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _retry_interval_guard =
+            ScopedEnvVar::set(UC_NATIVE_FALLBACK_HINT_RETRY_SECS_ENV, "1800");
+        let workspace = unique_test_dir("uc-native-preflight-hint-native-supported");
+        let primary_session_key = "4".repeat(SESSION_KEY_LEN);
+        let hinted_session_key = "5".repeat(SESSION_KEY_LEN);
+        persist_daemon_local_probe_hint(&workspace, &primary_session_key, &hinted_session_key)
+            .expect("failed to persist daemon fallback hint");
+        persist_daemon_local_native_supported_hint(&workspace, &primary_session_key)
+            .expect("failed to persist native-supported hint");
+
+        let reason = native_auto_preflight_hint_reason(&workspace, &primary_session_key)
+            .expect("failed to resolve native preflight hint reason");
+        assert!(
+            reason.is_none(),
+            "native-supported hint should keep native preflight eligible"
+        );
+
+        fs::remove_dir_all(&workspace).ok();
     }
 }
