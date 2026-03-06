@@ -461,7 +461,7 @@ pub(super) fn handle_daemon_connection(
         }
         DaemonRequest::Shutdown => {
             record_daemon_success(health);
-            should_shutdown.store(true, Ordering::Relaxed);
+            should_shutdown.store(true, Ordering::Release);
             DaemonResponse::Ack
         }
         DaemonRequest::Build { payload } => match execute_daemon_build(payload) {

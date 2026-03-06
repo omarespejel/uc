@@ -1561,6 +1561,11 @@ version = "2.0.0"
         fallback_a.starts_with("lockhash-"),
         "fallback marker should be namespaced and explicit: {fallback_a}"
     );
+    assert_eq!(
+        fallback_a.len(),
+        "lockhash-".len() + 32,
+        "fallback marker should include a 128-bit lock hash prefix"
+    );
 }
 
 #[test]

@@ -433,20 +433,38 @@ fn clear_cache_object_hash_memo_for_test() {
         .clear();
 }
 
+fn cache_object_hash_memo_keys_to_evict(
+    mut age_and_keys: Vec<(u64, String)>,
+    remove_count: usize,
+) -> Vec<String> {
+    if remove_count == 0 || age_and_keys.is_empty() {
+        return Vec::new();
+    }
+    age_and_keys.sort_unstable_by_key(|(age, _)| *age);
+    age_and_keys
+        .into_iter()
+        .take(remove_count)
+        .map(|(_, key)| key)
+        .collect()
+}
+
+#[cfg(test)]
 pub(super) fn evict_oldest_cache_object_hash_memo_entries(
     cache: &mut HashMap<String, CacheObjectHashMemoEntry>,
     max_entries: usize,
 ) {
-    if cache.len() <= max_entries {
+    let remove_count = cache.len().saturating_sub(max_entries);
+    if remove_count == 0 {
         return;
     }
-    let remove_count = cache.len().saturating_sub(max_entries);
-    let mut keys_by_age: Vec<(u64, String)> = cache
-        .iter()
-        .map(|(key, entry)| (entry.last_access_epoch_ms, key.clone()))
-        .collect();
-    keys_by_age.sort_unstable_by_key(|(age, _)| *age);
-    for (_, key) in keys_by_age.into_iter().take(remove_count) {
+    let keys_to_evict = cache_object_hash_memo_keys_to_evict(
+        cache
+            .iter()
+            .map(|(key, entry)| (entry.last_access_epoch_ms, key.clone()))
+            .collect(),
+        remove_count,
+    );
+    for key in keys_to_evict {
         cache.remove(&key);
     }
 }
@@ -477,19 +495,43 @@ fn store_cache_object_hash(object_path: &Path, metadata: &fs::Metadata, hash: &s
     let modified_unix_ms = metadata_modified_unix_ms(metadata)?;
     let now_ms = epoch_ms_u64().unwrap_or_default();
     let key = cache_object_hash_memo_key(object_path);
-    let mut cache = cache_object_hash_memo()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    cache.insert(
-        key,
-        CacheObjectHashMemoEntry {
-            size_bytes: metadata.len(),
-            modified_unix_ms,
-            blake3_hex: hash.to_ascii_lowercase(),
-            last_access_epoch_ms: now_ms,
-        },
-    );
-    evict_oldest_cache_object_hash_memo_entries(&mut cache, cache_object_hash_memo_max_entries());
+    let max_entries = cache_object_hash_memo_max_entries();
+    let eviction_snapshot: Option<Vec<(u64, String)>> = {
+        let mut cache = cache_object_hash_memo()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.insert(
+            key,
+            CacheObjectHashMemoEntry {
+                size_bytes: metadata.len(),
+                modified_unix_ms,
+                blake3_hex: hash.to_ascii_lowercase(),
+                last_access_epoch_ms: now_ms,
+            },
+        );
+        if cache.len() <= max_entries {
+            None
+        } else {
+            Some(
+                cache
+                    .iter()
+                    .map(|(entry_key, entry)| (entry.last_access_epoch_ms, entry_key.clone()))
+                    .collect(),
+            )
+        }
+    };
+    if let Some(snapshot) = eviction_snapshot {
+        let remove_count = snapshot.len().saturating_sub(max_entries);
+        let keys_to_evict = cache_object_hash_memo_keys_to_evict(snapshot, remove_count);
+        if !keys_to_evict.is_empty() {
+            let mut cache = cache_object_hash_memo()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for eviction_key in keys_to_evict {
+                cache.remove(&eviction_key);
+            }
+        }
+    }
     Ok(())
 }
 

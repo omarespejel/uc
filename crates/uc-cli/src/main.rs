@@ -1554,7 +1554,7 @@ fn native_lockfile_fallback_version(lockfile: &str) -> String {
     let mut hasher = Hasher::new();
     hasher.update(lockfile.as_bytes());
     let digest = hasher.finalize().to_hex().to_string();
-    format!("lockhash-{}", &digest[..16])
+    format!("lockhash-{}", &digest[..32])
 }
 
 #[cfg(feature = "native-compile")]
@@ -2458,7 +2458,7 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
         prewarm_daemon_compiler_version_cache();
 
         loop {
-            if should_shutdown.load(Ordering::Relaxed) {
+            if should_shutdown.load(Ordering::Acquire) {
                 break;
             }
             match listener.accept() {
@@ -2486,7 +2486,7 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
                 }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(err) => {
-                    if should_shutdown.load(Ordering::Relaxed) {
+                    if should_shutdown.load(Ordering::Acquire) {
                         break;
                     }
                     tracing::error!(error = %err, "daemon socket accept failed");

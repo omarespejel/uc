@@ -228,7 +228,9 @@ fn hash_contract_class_json_semantic(path: &Path) -> Result<(String, u64)> {
         tracing::warn!(
             path = %path.display(),
             error = %format!("{schema_err:#}"),
-            "unsupported contract-class schema; falling back to raw hash"
+            supported_contract_class_version_major = "0",
+            supported_sierra_format_version_major = "1",
+            "unsupported contract-class schema; falling back to raw hash (semantic compare disabled for this artifact). if this persists after upgrading uc, please open an issue with this schema/version"
         );
         return hash_file_with_limit(path);
     }

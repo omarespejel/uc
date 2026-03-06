@@ -4,7 +4,9 @@ const DAEMON_LOCAL_PROBE_HINT_SUFFIX: &str = ".fallback-session-key";
 const DAEMON_LOCAL_NATIVE_SUPPORTED_HINT_SUFFIX: &str = ".native-supported";
 const DAEMON_LOCAL_PROBE_HINT_DIR: &str = "fallback-keys";
 const DAEMON_LOCAL_NATIVE_SUPPORTED_HINT_DIR: &str = "native-supported";
-const DAEMON_LOCAL_PROBE_HINT_MAX_ENTRIES: usize = 256;
+// Budget applies per hint directory (`fallback-keys/` and `native-supported/`),
+// so total footprint can be up to 2x this value across both directories.
+const DAEMON_LOCAL_PROBE_HINT_MAX_ENTRIES_PER_DIR: usize = 256;
 const DAEMON_LOCAL_PROBE_HINT_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 
 fn daemon_probe_hint_root_dir(workspace_root: &Path) -> Result<PathBuf> {
@@ -157,7 +159,7 @@ fn load_daemon_local_probe_hint(
     Ok(Some(hinted_session_key.to_string()))
 }
 
-fn prune_daemon_local_probe_hints(hint_dir: &Path) -> Result<()> {
+fn prune_daemon_local_probe_hints(hint_dir: &Path, suffixes: &[&str]) -> Result<()> {
     if !hint_dir.exists() {
         return Ok(());
     }
@@ -170,9 +172,7 @@ fn prune_daemon_local_probe_hints(hint_dir: &Path) -> Result<()> {
         let entry = entry.with_context(|| format!("failed to read {}", hint_dir.display()))?;
         let path = entry.path();
         let file_name = entry.file_name().to_string_lossy().to_string();
-        if !file_name.ends_with(DAEMON_LOCAL_PROBE_HINT_SUFFIX)
-            && !file_name.ends_with(DAEMON_LOCAL_NATIVE_SUPPORTED_HINT_SUFFIX)
-        {
+        if !suffixes.iter().any(|suffix| file_name.ends_with(suffix)) {
             continue;
         }
         let metadata = match fs::metadata(&path) {
@@ -197,7 +197,7 @@ fn prune_daemon_local_probe_hints(hint_dir: &Path) -> Result<()> {
     entries.sort_by_key(|(_, modified)| *modified);
     let stale_count = entries
         .len()
-        .saturating_sub(DAEMON_LOCAL_PROBE_HINT_MAX_ENTRIES);
+        .saturating_sub(DAEMON_LOCAL_PROBE_HINT_MAX_ENTRIES_PER_DIR);
     for (path, _) in entries.into_iter().take(stale_count) {
         let _ = fs::remove_file(path);
     }
@@ -211,7 +211,13 @@ fn prune_legacy_daemon_probe_hint_root_if_needed(workspace_root: &Path, active_h
     if root_dir == active_hint_dir {
         return;
     }
-    if let Err(err) = prune_daemon_local_probe_hints(&root_dir) {
+    if let Err(err) = prune_daemon_local_probe_hints(
+        &root_dir,
+        &[
+            DAEMON_LOCAL_PROBE_HINT_SUFFIX,
+            DAEMON_LOCAL_NATIVE_SUPPORTED_HINT_SUFFIX,
+        ],
+    ) {
         tracing::warn!(
             error = %format!("{err:#}"),
             hint_dir = %root_dir.display(),
@@ -255,12 +261,14 @@ fn persist_daemon_local_probe_hint(
     let parent = hint_path
         .parent()
         .context("daemon local probe hint path has no parent directory")?;
-    fs::create_dir_all(parent).with_context(|| {
-        format!(
-            "failed to create daemon probe hint dir {}",
-            parent.display()
-        )
-    })?;
+    if let Err(err) = fs::create_dir_all(parent) {
+        tracing::warn!(
+            error = %err,
+            dir = %parent.display(),
+            "failed to create daemon probe hint dir; skipping hint persistence"
+        );
+        return Ok(());
+    }
     if let Err(err) = write_hint_file_if_changed(&hint_path, &format!("{hinted_session_key}\n")) {
         tracing::warn!(
             error = %format!("{err:#}"),
@@ -269,7 +277,7 @@ fn persist_daemon_local_probe_hint(
         );
         return Ok(());
     }
-    if let Err(err) = prune_daemon_local_probe_hints(parent) {
+    if let Err(err) = prune_daemon_local_probe_hints(parent, &[DAEMON_LOCAL_PROBE_HINT_SUFFIX]) {
         tracing::warn!(
             error = %format!("{err:#}"),
             hint_dir = %parent.display(),
@@ -349,12 +357,14 @@ fn persist_daemon_local_native_supported_hint(
     let parent = hint_path
         .parent()
         .context("native-supported hint path has no parent directory")?;
-    fs::create_dir_all(parent).with_context(|| {
-        format!(
-            "failed to create native-supported hint dir {}",
-            parent.display()
-        )
-    })?;
+    if let Err(err) = fs::create_dir_all(parent) {
+        tracing::warn!(
+            error = %err,
+            dir = %parent.display(),
+            "failed to create native-supported hint dir; skipping hint persistence"
+        );
+        return Ok(());
+    }
     if let Err(err) = write_hint_file_if_changed(&hint_path, "1\n") {
         tracing::warn!(
             error = %format!("{err:#}"),
@@ -363,7 +373,9 @@ fn persist_daemon_local_native_supported_hint(
         );
         return Ok(());
     }
-    if let Err(err) = prune_daemon_local_probe_hints(parent) {
+    if let Err(err) =
+        prune_daemon_local_probe_hints(parent, &[DAEMON_LOCAL_NATIVE_SUPPORTED_HINT_SUFFIX])
+    {
         tracing::warn!(
             error = %format!("{err:#}"),
             hint_dir = %parent.display(),
@@ -1319,7 +1331,7 @@ mod tests {
         let root = daemon_probe_hint_root_dir(&workspace).expect("failed to compute root hint dir");
         fs::create_dir_all(&root).expect("failed to create root hint dir");
 
-        for index in 0..(DAEMON_LOCAL_PROBE_HINT_MAX_ENTRIES + 8) {
+        for index in 0..(DAEMON_LOCAL_PROBE_HINT_MAX_ENTRIES_PER_DIR + 8) {
             let legacy_session_key = format!("{index:0>64x}");
             let legacy_hint = root.join(format!(
                 "{legacy_session_key}{DAEMON_LOCAL_PROBE_HINT_SUFFIX}"
@@ -1345,7 +1357,7 @@ mod tests {
             })
             .count();
         assert!(
-            legacy_count <= DAEMON_LOCAL_PROBE_HINT_MAX_ENTRIES,
+            legacy_count <= DAEMON_LOCAL_PROBE_HINT_MAX_ENTRIES_PER_DIR,
             "legacy root hints should be pruned to configured entry budget"
         );
 
@@ -1371,7 +1383,7 @@ mod tests {
         std::os::unix::fs::symlink(&missing_target, &dangling_hint)
             .expect("failed to create dangling hint symlink");
 
-        prune_daemon_local_probe_hints(&hint_dir)
+        prune_daemon_local_probe_hints(&hint_dir, &[DAEMON_LOCAL_PROBE_HINT_SUFFIX])
             .expect("prune should ignore dangling hint entries");
         assert!(
             valid_hint.exists(),
