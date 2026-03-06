@@ -496,40 +496,29 @@ fn store_cache_object_hash(object_path: &Path, metadata: &fs::Metadata, hash: &s
     let now_ms = epoch_ms_u64().unwrap_or_default();
     let key = cache_object_hash_memo_key(object_path);
     let max_entries = cache_object_hash_memo_max_entries();
-    let eviction_snapshot: Option<Vec<(u64, String)>> = {
-        let mut cache = cache_object_hash_memo()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cache.insert(
-            key,
-            CacheObjectHashMemoEntry {
-                size_bytes: metadata.len(),
-                modified_unix_ms,
-                blake3_hex: hash.to_ascii_lowercase(),
-                last_access_epoch_ms: now_ms,
-            },
+    let mut cache = cache_object_hash_memo()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.insert(
+        key,
+        CacheObjectHashMemoEntry {
+            size_bytes: metadata.len(),
+            modified_unix_ms,
+            blake3_hex: hash.to_ascii_lowercase(),
+            last_access_epoch_ms: now_ms,
+        },
+    );
+    let remove_count = cache.len().saturating_sub(max_entries);
+    if remove_count > 0 {
+        let keys_to_evict = cache_object_hash_memo_keys_to_evict(
+            cache
+                .iter()
+                .map(|(entry_key, entry)| (entry.last_access_epoch_ms, entry_key.clone()))
+                .collect(),
+            remove_count,
         );
-        if cache.len() <= max_entries {
-            None
-        } else {
-            Some(
-                cache
-                    .iter()
-                    .map(|(entry_key, entry)| (entry.last_access_epoch_ms, entry_key.clone()))
-                    .collect(),
-            )
-        }
-    };
-    if let Some(snapshot) = eviction_snapshot {
-        let remove_count = snapshot.len().saturating_sub(max_entries);
-        let keys_to_evict = cache_object_hash_memo_keys_to_evict(snapshot, remove_count);
-        if !keys_to_evict.is_empty() {
-            let mut cache = cache_object_hash_memo()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for eviction_key in keys_to_evict {
-                cache.remove(&eviction_key);
-            }
+        for eviction_key in keys_to_evict {
+            cache.remove(&eviction_key);
         }
     }
     Ok(())

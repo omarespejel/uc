@@ -785,6 +785,7 @@ struct MetadataResultCacheEntry {
     manifest_size_bytes: u64,
     manifest_modified_unix_ms: u64,
     lock_hash: String,
+    workspace_manifests_hash: String,
     run: CommandRun,
     last_access_epoch_ms: u64,
     estimated_bytes: u64,
@@ -891,6 +892,8 @@ struct MetadataResultCacheFile {
     manifest_size_bytes: u64,
     manifest_modified_unix_ms: u64,
     lock_hash: String,
+    #[serde(default)]
+    workspace_manifests_hash: String,
     run: CommandRun,
 }
 
@@ -2891,6 +2894,7 @@ fn try_metadata_result_cache_hit(
     manifest_size_bytes: u64,
     manifest_modified_unix_ms: u64,
     lock_hash: &str,
+    workspace_manifests_hash: &str,
 ) -> Result<Option<CommandRun>> {
     let now_ms = epoch_ms_u64().unwrap_or_default();
     {
@@ -2903,6 +2907,7 @@ fn try_metadata_result_cache_hit(
                 manifest_size_bytes,
                 manifest_modified_unix_ms,
                 lock_hash,
+                workspace_manifests_hash,
             ) {
                 entry.last_access_epoch_ms = now_ms;
                 return Ok(Some(entry.run.clone()));
@@ -2959,6 +2964,7 @@ fn try_metadata_result_cache_hit(
         manifest_size_bytes,
         manifest_modified_unix_ms,
         lock_hash,
+        workspace_manifests_hash,
     ) {
         return Ok(None);
     }
@@ -2974,6 +2980,7 @@ fn try_metadata_result_cache_hit(
                 manifest_size_bytes,
                 manifest_modified_unix_ms,
                 lock_hash: lock_hash.to_string(),
+                workspace_manifests_hash: workspace_manifests_hash.to_string(),
                 run: decoded.run.clone(),
                 last_access_epoch_ms: now_ms,
                 estimated_bytes,
@@ -2995,6 +3002,7 @@ struct MetadataResultCacheWriteContext<'a> {
     manifest_size_bytes: u64,
     manifest_modified_unix_ms: u64,
     lock_hash: &'a str,
+    workspace_manifests_hash: &'a str,
 }
 
 fn store_metadata_result_cache_entry(
@@ -3006,6 +3014,7 @@ fn store_metadata_result_cache_entry(
         manifest_size_bytes: context.manifest_size_bytes,
         manifest_modified_unix_ms: context.manifest_modified_unix_ms,
         lock_hash: context.lock_hash.to_string(),
+        workspace_manifests_hash: context.workspace_manifests_hash.to_string(),
         run: run.clone(),
     };
     let bytes =
@@ -3038,6 +3047,7 @@ fn store_metadata_result_cache_entry(
                 manifest_size_bytes: context.manifest_size_bytes,
                 manifest_modified_unix_ms: context.manifest_modified_unix_ms,
                 lock_hash: context.lock_hash.to_string(),
+                workspace_manifests_hash: context.workspace_manifests_hash.to_string(),
                 run: run.clone(),
                 last_access_epoch_ms: now_ms,
                 estimated_bytes,
@@ -3073,6 +3083,7 @@ fn run_scarb_metadata_with_uc_cache(
     let manifest_size_bytes = manifest_metadata.len();
     let manifest_modified_unix_ms = metadata_modified_unix_ms(&manifest_metadata)?;
     let (_, _, lock_hash) = daemon_lock_state(manifest_path)?;
+    let workspace_manifests_hash = metadata_workspace_manifests_hash(&workspace_root)?;
     let scarb_version = scarb_version_line()?;
     let build_env_fingerprint = current_build_env_fingerprint();
     let cache_key =
@@ -3087,6 +3098,7 @@ fn run_scarb_metadata_with_uc_cache(
         manifest_size_bytes,
         manifest_modified_unix_ms,
         &lock_hash,
+        &workspace_manifests_hash,
     )? {
         cached_run.elapsed_ms = lookup_start.elapsed().as_secs_f64() * 1000.0;
         tracing::debug!(
@@ -3123,6 +3135,7 @@ fn run_scarb_metadata_with_uc_cache(
             manifest_size_bytes,
             manifest_modified_unix_ms,
             lock_hash: &lock_hash,
+            workspace_manifests_hash: &workspace_manifests_hash,
         };
         store_metadata_result_cache_entry(&write_context, &run)?;
         tracing::debug!(
@@ -8074,15 +8087,52 @@ fn metadata_run_estimated_bytes(run: &CommandRun) -> u64 {
         + 256
 }
 
+fn metadata_workspace_manifests_hash(workspace_root: &Path) -> Result<String> {
+    let mut manifests = Vec::new();
+    let walker = WalkDir::new(workspace_root)
+        .follow_links(false)
+        .max_depth(MAX_FINGERPRINT_DEPTH)
+        .into_iter()
+        .filter_entry(|entry| !is_ignored_entry(workspace_root, entry.path()));
+    for entry in walker.filter_map(|entry| entry.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if entry.file_name() == "Scarb.toml" {
+            manifests.push(entry.into_path());
+        }
+    }
+    manifests.sort();
+    let mut hasher = Hasher::new();
+    hasher.update(b"uc-metadata-workspace-manifests-v1");
+    for manifest in manifests {
+        let rel = manifest
+            .strip_prefix(workspace_root)
+            .map(normalize_fingerprint_path)
+            .unwrap_or_else(|_| normalize_fingerprint_path(&manifest));
+        let metadata = fs::metadata(&manifest)
+            .with_context(|| format!("failed to stat {}", manifest.display()))?;
+        hasher.update(rel.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(metadata.len().to_string().as_bytes());
+        hasher.update(b"\n");
+        hasher.update(metadata_modified_unix_ms(&metadata)?.to_string().as_bytes());
+        hasher.update(b"\n");
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
 fn metadata_cache_entry_matches(
     entry: &MetadataResultCacheEntry,
     manifest_size_bytes: u64,
     manifest_modified_unix_ms: u64,
     lock_hash: &str,
+    workspace_manifests_hash: &str,
 ) -> bool {
     entry.manifest_size_bytes == manifest_size_bytes
         && entry.manifest_modified_unix_ms == manifest_modified_unix_ms
         && entry.lock_hash == lock_hash
+        && entry.workspace_manifests_hash == workspace_manifests_hash
 }
 
 fn metadata_cache_file_matches(
@@ -8090,10 +8140,12 @@ fn metadata_cache_file_matches(
     manifest_size_bytes: u64,
     manifest_modified_unix_ms: u64,
     lock_hash: &str,
+    workspace_manifests_hash: &str,
 ) -> bool {
     entry.manifest_size_bytes == manifest_size_bytes
         && entry.manifest_modified_unix_ms == manifest_modified_unix_ms
         && entry.lock_hash == lock_hash
+        && entry.workspace_manifests_hash == workspace_manifests_hash
 }
 
 fn daemon_build_plan_cache_key(

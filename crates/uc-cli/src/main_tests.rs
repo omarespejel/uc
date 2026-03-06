@@ -1771,6 +1771,7 @@ fn metadata_result_cache_eviction_respects_entry_and_byte_budgets() {
             manifest_size_bytes: 1,
             manifest_modified_unix_ms: 1,
             lock_hash: "a".repeat(64),
+            workspace_manifests_hash: "workspace-a".to_string(),
             run: run("a", 1024),
             last_access_epoch_ms: 1,
             estimated_bytes: 2048,
@@ -1782,6 +1783,7 @@ fn metadata_result_cache_eviction_respects_entry_and_byte_budgets() {
             manifest_size_bytes: 1,
             manifest_modified_unix_ms: 1,
             lock_hash: "b".repeat(64),
+            workspace_manifests_hash: "workspace-b".to_string(),
             run: run("b", 1024),
             last_access_epoch_ms: 2,
             estimated_bytes: 2048,
@@ -1793,6 +1795,7 @@ fn metadata_result_cache_eviction_respects_entry_and_byte_budgets() {
             manifest_size_bytes: 1,
             manifest_modified_unix_ms: 1,
             lock_hash: "c".repeat(64),
+            workspace_manifests_hash: "workspace-c".to_string(),
             run: run("c", 1024),
             last_access_epoch_ms: 3,
             estimated_bytes: 2048,
@@ -2109,6 +2112,8 @@ edition = "2024_07"
         metadata_modified_unix_ms(&manifest_metadata).expect("failed to read manifest mtime");
     let (_, _, lock_hash) =
         daemon_lock_state(&manifest_path).expect("failed to resolve lock state");
+    let workspace_manifests_hash =
+        metadata_workspace_manifests_hash(&workspace).expect("workspace manifest hash");
 
     let args = MetadataArgs {
         manifest_path: Some(manifest_path.clone()),
@@ -2140,6 +2145,7 @@ edition = "2024_07"
         manifest_size_bytes,
         manifest_modified_unix_ms,
         lock_hash: &lock_hash,
+        workspace_manifests_hash: &workspace_manifests_hash,
     };
     store_metadata_result_cache_entry(&write_context, &run)
         .expect("failed to store metadata cache entry");
@@ -2150,6 +2156,7 @@ edition = "2024_07"
         manifest_size_bytes,
         manifest_modified_unix_ms,
         &lock_hash,
+        &workspace_manifests_hash,
     )
     .expect("cache lookup should succeed")
     .expect("cache entry should still hit when lock hash is unchanged");
@@ -2193,6 +2200,8 @@ edition = "2024_07"
         metadata_modified_unix_ms(&manifest_metadata).expect("failed to read manifest mtime");
     let (_, _, lock_hash) =
         daemon_lock_state(&manifest_path).expect("failed to resolve lock state");
+    let workspace_manifests_hash =
+        metadata_workspace_manifests_hash(&workspace).expect("workspace manifest hash");
 
     let args = MetadataArgs {
         manifest_path: Some(manifest_path.clone()),
@@ -2225,6 +2234,7 @@ edition = "2024_07"
         manifest_size_bytes,
         manifest_modified_unix_ms,
         lock_hash: &lock_hash,
+        workspace_manifests_hash: &workspace_manifests_hash,
     };
     store_metadata_result_cache_entry(&write_context, &run)
         .expect("failed to store metadata cache entry");
@@ -2236,6 +2246,7 @@ edition = "2024_07"
         manifest_size_bytes,
         manifest_modified_unix_ms,
         &lock_hash,
+        &workspace_manifests_hash,
     )
     .expect("cache lookup should succeed")
     .expect("cache entry should hit");
@@ -2280,6 +2291,8 @@ edition = "2024_07"
         metadata_modified_unix_ms(&manifest_metadata).expect("failed to read manifest mtime");
     let (_, _, lock_hash) =
         daemon_lock_state(&manifest_path).expect("failed to resolve lock state");
+    let workspace_manifests_hash =
+        metadata_workspace_manifests_hash(&workspace).expect("workspace manifest hash");
 
     let args = MetadataArgs {
         manifest_path: Some(manifest_path.clone()),
@@ -2311,6 +2324,7 @@ edition = "2024_07"
         manifest_size_bytes,
         manifest_modified_unix_ms,
         lock_hash: &lock_hash,
+        workspace_manifests_hash: &workspace_manifests_hash,
     };
     store_metadata_result_cache_entry(&write_context, &run)
         .expect("failed to store metadata cache entry");
@@ -2327,11 +2341,130 @@ edition = "2024_07"
         manifest_size_bytes,
         manifest_modified_unix_ms,
         &new_lock_hash,
+        &workspace_manifests_hash,
     )
     .expect("cache lookup should succeed");
     assert!(
         hit.is_none(),
         "cache must miss when lock hash changes for the same key"
+    );
+
+    fs::remove_dir_all(&workspace).ok();
+}
+
+#[test]
+fn metadata_result_cache_misses_when_workspace_member_manifest_changes() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    metadata_result_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+    daemon_lock_hash_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+
+    let workspace = unique_test_dir("uc-metadata-cache-workspace-member-change");
+    let manifest_path = workspace.join("Scarb.toml");
+    let lock_path = workspace.join("Scarb.lock");
+    let member_dir = workspace.join("member");
+    fs::create_dir_all(&member_dir).expect("failed to create workspace member directory");
+    fs::write(
+        &manifest_path,
+        r#"[workspace]
+members = ["member"]
+"#,
+    )
+    .expect("failed to write workspace manifest");
+    fs::write(
+        member_dir.join("Scarb.toml"),
+        r#"[package]
+name = "member"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("failed to write workspace member manifest");
+    fs::write(&lock_path, "version = 1\n").expect("failed to write lock file");
+
+    let manifest_metadata = fs::metadata(&manifest_path).expect("failed to stat manifest");
+    let manifest_size_bytes = manifest_metadata.len();
+    let manifest_modified_unix_ms =
+        metadata_modified_unix_ms(&manifest_metadata).expect("failed to read manifest mtime");
+    let (_, _, lock_hash) =
+        daemon_lock_state(&manifest_path).expect("failed to resolve lock state");
+    let workspace_manifests_hash_before =
+        metadata_workspace_manifests_hash(&workspace).expect("workspace manifest hash");
+
+    let args = MetadataArgs {
+        manifest_path: Some(manifest_path.clone()),
+        format_version: 1,
+        daemon_mode: DaemonModeArg::Off,
+        offline: false,
+        global_cache_dir: None,
+        report_path: None,
+    };
+    let cache_key = metadata_result_cache_key(
+        &args,
+        &manifest_path,
+        "scarb 2.14.0 (metadata-cache-test)",
+        "env:fingerprint",
+    );
+    let cache_root = workspace.join(".uc/cache");
+    let entry_path = metadata_cache_entry_path(&workspace, &cache_key);
+    let run = CommandRun {
+        command: vec!["scarb".to_string(), "metadata".to_string()],
+        exit_code: 0,
+        elapsed_ms: 42.0,
+        stdout: "{\"packages\":[]}\n".to_string(),
+        stderr: String::new(),
+    };
+    let write_context = MetadataResultCacheWriteContext {
+        cache_key: &cache_key,
+        cache_root: &cache_root,
+        entry_path: &entry_path,
+        manifest_size_bytes,
+        manifest_modified_unix_ms,
+        lock_hash: &lock_hash,
+        workspace_manifests_hash: &workspace_manifests_hash_before,
+    };
+    store_metadata_result_cache_entry(&write_context, &run)
+        .expect("failed to store metadata cache entry");
+
+    std::thread::sleep(Duration::from_millis(5));
+    fs::write(
+        member_dir.join("Scarb.toml"),
+        r#"[package]
+name = "member"
+version = "0.1.0"
+edition = "2024_07"
+
+[profile.dev]
+opt-level = 1
+"#,
+    )
+    .expect("failed to mutate workspace member manifest");
+    let workspace_manifests_hash_after =
+        metadata_workspace_manifests_hash(&workspace).expect("workspace manifest hash");
+    assert_ne!(
+        workspace_manifests_hash_before, workspace_manifests_hash_after,
+        "workspace manifest digest must change when member manifest changes"
+    );
+
+    let hit = try_metadata_result_cache_hit(
+        &cache_key,
+        &entry_path,
+        manifest_size_bytes,
+        manifest_modified_unix_ms,
+        &lock_hash,
+        &workspace_manifests_hash_after,
+    )
+    .expect("cache lookup should succeed");
+    assert!(
+        hit.is_none(),
+        "cache must miss when workspace member manifest changes even if lock hash is unchanged"
     );
 
     fs::remove_dir_all(&workspace).ok();
