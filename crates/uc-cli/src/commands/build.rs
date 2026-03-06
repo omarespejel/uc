@@ -468,6 +468,59 @@ fn daemon_socket_available_for_client() -> Result<bool> {
     }
 }
 
+fn daemon_socket_override_present_for_client() -> bool {
+    std::env::var_os("UC_DAEMON_SOCKET_PATH").is_some()
+}
+
+fn daemon_autostart_policy(
+    daemon_mode: DaemonModeArg,
+    native_mode: NativeBuildMode,
+    daemon_socket_override_present: bool,
+) -> bool {
+    matches!(daemon_mode, DaemonModeArg::Auto)
+        && !matches!(native_mode, NativeBuildMode::Off)
+        && !daemon_socket_override_present
+}
+
+fn maybe_autostart_daemon_for_build(
+    daemon_mode: DaemonModeArg,
+    native_mode: NativeBuildMode,
+) -> Result<bool> {
+    if !daemon_autostart_policy(
+        daemon_mode,
+        native_mode,
+        daemon_socket_override_present_for_client(),
+    ) {
+        return Ok(false);
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (daemon_mode, native_mode);
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        let socket_path = daemon_socket_path(None)?;
+        if socket_path.exists() {
+            return Ok(true);
+        }
+        match run_daemon_start(DaemonSocketArgs {
+            socket_path: Some(socket_path.clone()),
+        }) {
+            Ok(()) => Ok(socket_path.exists()),
+            Err(err) => {
+                tracing::debug!(
+                    error = %format!("{err:#}"),
+                    socket_path = %socket_path.display(),
+                    "uc build auto mode failed to auto-start daemon; using local fallback"
+                );
+                Ok(false)
+            }
+        }
+    }
+}
+
 pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
     let common = args.common;
     let report_path = args.report_path;
@@ -885,7 +938,11 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                     (run, cache_hit, fingerprint)
                 }
                 DaemonModeArg::Auto => {
-                    let daemon_socket_available = daemon_socket_available_for_client()?;
+                    let mut daemon_socket_available = daemon_socket_available_for_client()?;
+                    if !daemon_socket_available {
+                        daemon_socket_available =
+                            maybe_autostart_daemon_for_build(DaemonModeArg::Auto, native_mode)?;
+                    }
                     if !should_probe_local_before_daemon(
                         DaemonModeArg::Auto,
                         daemon_socket_available,
@@ -1351,6 +1408,34 @@ mod tests {
         assert!(
             should_probe_local_before_daemon(DaemonModeArg::Require, true),
             "daemon require should probe local cache when daemon is available"
+        );
+    }
+
+    #[test]
+    fn daemon_autostart_policy_prefers_auto_mode_for_native_builds_without_socket_override() {
+        assert!(
+            daemon_autostart_policy(DaemonModeArg::Auto, NativeBuildMode::Auto, false),
+            "auto daemon mode with native auto should allow daemon auto-start"
+        );
+        assert!(
+            daemon_autostart_policy(DaemonModeArg::Auto, NativeBuildMode::Require, false),
+            "auto daemon mode with native require should allow daemon auto-start"
+        );
+        assert!(
+            !daemon_autostart_policy(DaemonModeArg::Auto, NativeBuildMode::Off, false),
+            "native off mode should not auto-start daemon"
+        );
+        assert!(
+            !daemon_autostart_policy(DaemonModeArg::Off, NativeBuildMode::Auto, false),
+            "daemon off should never auto-start daemon"
+        );
+        assert!(
+            !daemon_autostart_policy(DaemonModeArg::Require, NativeBuildMode::Auto, false),
+            "daemon require mode should keep explicit startup semantics"
+        );
+        assert!(
+            !daemon_autostart_policy(DaemonModeArg::Auto, NativeBuildMode::Auto, true),
+            "explicit daemon socket overrides should disable implicit auto-start"
         );
     }
 

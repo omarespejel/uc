@@ -433,7 +433,7 @@ struct BuildArgs {
     #[arg(long, value_enum, default_value_t = EngineArg::Uc)]
     engine: EngineArg,
 
-    #[arg(long, value_enum, default_value_t = DaemonModeArg::Off)]
+    #[arg(long, value_enum, default_value_t = DaemonModeArg::Auto)]
     daemon_mode: DaemonModeArg,
 
     #[arg(long)]

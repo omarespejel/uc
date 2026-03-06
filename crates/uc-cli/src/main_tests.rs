@@ -180,6 +180,15 @@ fn run_smoke_cached_build(
 }
 
 #[test]
+fn build_cli_defaults_daemon_mode_to_auto() {
+    let cli = Cli::try_parse_from(["uc", "build"]).expect("build args should parse");
+    let Commands::Build(args) = cli.command else {
+        panic!("expected build command");
+    };
+    assert_eq!(args.daemon_mode as u8, DaemonModeArg::Auto as u8);
+}
+
+#[test]
 fn daemon_metadata_request_roundtrip_preserves_fields() {
     let args = MetadataArgs {
         manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
