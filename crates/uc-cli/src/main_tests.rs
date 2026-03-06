@@ -4462,12 +4462,15 @@ fn native_cairo_project_toml_defaults_global_and_override_edition_when_unspecifi
         }],
         None,
     );
+    let expected = format!("[config.global]\nedition = \"{DEFAULT_CAIRO_EDITION}\"");
     assert!(
-        rendered.contains("[config.global]\nedition = \"2024_07\""),
+        rendered.contains(&expected),
         "missing manifest edition should fall back to default global edition: {rendered}"
     );
+    let expected_override =
+        format!("[config.override.demo]\nedition = \"{DEFAULT_CAIRO_EDITION}\"");
     assert!(
-        rendered.contains("[config.override.demo]\nedition = \"2024_07\""),
+        rendered.contains(&expected_override),
         "crate override should always emit an effective edition: {rendered}"
     );
 }

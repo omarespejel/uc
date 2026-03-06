@@ -110,7 +110,9 @@ const DEFAULT_CACHE_BUDGET_MIN_INTERVAL_MS: u64 = 5 * 60 * 1000;
 const FINGERPRINT_INDEX_SCHEMA_VERSION: u32 = 2;
 const ARTIFACT_INDEX_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_DIAGNOSTICS_SIMILARITY_THRESHOLD: f64 = 99.5;
-const DEFAULT_CAIRO_EDITION: &str = "2024_07";
+// Match Scarb's default package edition when manifests omit `[package].edition`.
+// Keep this aligned to Scarb defaults for output parity in native mode.
+const DEFAULT_CAIRO_EDITION: &str = "2023_01";
 const DAEMON_REQUEST_SIZE_LIMIT_BYTES: usize = 1024 * 1024;
 const DAEMON_RESPONSE_SIZE_OVERHEAD_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_DAEMON_RESPONSE_SIZE_LIMIT_BYTES: usize = (MAX_CAPTURE_STDOUT_BYTES as usize)

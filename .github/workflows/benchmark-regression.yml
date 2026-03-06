@@ -227,7 +227,7 @@ jobs:
 
           run_native_only "benchmarks/fixtures/scarb_smoke/Scarb.toml" "smoke"
           run_native_only "$UC_RESEARCH_ROOT/scarb/examples/hello_world/Scarb.toml" "research-hello-world" "1"
-          run_native_only "$UC_RESEARCH_ROOT/scarb/examples/workspaces/Scarb.toml" "research-workspaces" "1"
+          run_native_only "$UC_RESEARCH_ROOT/scarb/examples/workspaces/Scarb.toml" "research-workspaces"
 
       - name: Upload native-only artifacts
         if: always()

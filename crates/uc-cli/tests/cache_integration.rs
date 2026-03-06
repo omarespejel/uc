@@ -64,6 +64,23 @@ fn fixture_source() -> PathBuf {
         .expect("failed to resolve scarb_smoke fixture path")
 }
 
+fn research_workspaces_fixture_source() -> Option<PathBuf> {
+    if let Ok(raw) = std::env::var("UC_RESEARCH_ROOT") {
+        let candidate = PathBuf::from(raw).join("scarb/examples/workspaces");
+        if candidate.join("Scarb.toml").is_file() {
+            return candidate.canonicalize().ok().or(Some(candidate));
+        }
+    }
+
+    let candidate =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../scarb/examples/workspaces");
+    if candidate.join("Scarb.toml").is_file() {
+        return candidate.canonicalize().ok().or(Some(candidate));
+    }
+
+    None
+}
+
 fn local_native_corelib_src() -> Option<PathBuf> {
     if let Ok(raw) = std::env::var("UC_NATIVE_CORELIB_SRC") {
         let candidate = PathBuf::from(raw);
@@ -86,6 +103,22 @@ fn make_test_workspace(name: &str) -> TestWorkspace {
         std::process::id()
     ));
     copy_dir_recursive(&source, &root).expect("failed to create test workspace");
+    let _ = fs::remove_dir_all(root.join(".uc"));
+    let _ = fs::remove_dir_all(root.join("target"));
+    let _ = fs::remove_dir_all(root.join(".scarb"));
+    TestWorkspace { root }
+}
+
+fn make_test_workspace_from_source(name: &str, source: &Path) -> TestWorkspace {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be after unix epoch")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "uc-cli-integration-{name}-{}-{nonce}",
+        std::process::id()
+    ));
+    copy_dir_recursive(source, &root).expect("failed to create test workspace from source");
     let _ = fs::remove_dir_all(root.join(".uc"));
     let _ = fs::remove_dir_all(root.join("target"));
     let _ = fs::remove_dir_all(root.join(".scarb"));
@@ -1252,6 +1285,78 @@ fn integration_native_require_mode_succeeds_without_scarb_on_supported_fixture()
     assert!(
         warm_report.cache_hit,
         "native require warm build should hit cache without scarb available"
+    );
+}
+
+#[test]
+fn integration_native_require_mode_succeeds_without_scarb_on_research_workspaces_fixture() {
+    let _guard = serial_guard();
+    let Some(corelib_src) = local_native_corelib_src() else {
+        eprintln!(
+            "skipping integration_native_require_mode_succeeds_without_scarb_on_research_workspaces_fixture: compatible local cairo corelib not found"
+        );
+        return;
+    };
+    let Some(source) = research_workspaces_fixture_source() else {
+        eprintln!(
+            "skipping integration_native_require_mode_succeeds_without_scarb_on_research_workspaces_fixture: research workspaces fixture not found"
+        );
+        return;
+    };
+    let workspace = make_test_workspace_from_source("native-require-research-workspaces", &source);
+    let manifest = workspace.root.join("Scarb.toml");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be after unix epoch")
+        .as_nanos();
+    let no_scarb_path = std::env::temp_dir().join(format!(
+        "uc-it-no-scarb-native-require-workspaces-{}-{nonce}",
+        std::process::id()
+    ));
+
+    let (output, report) = run_uc_build_for_root_with_env_overrides(
+        &workspace.root,
+        &manifest,
+        "native-require-research-workspaces-no-scarb",
+        "off",
+        None,
+        BuildEnvOverrides {
+            path_override: Some(&no_scarb_path),
+            native_mode_override: Some("require"),
+            native_corelib_override: Some(&corelib_src),
+            native_disallow_scarb_fallback_override: Some("1"),
+            ..BuildEnvOverrides::default()
+        },
+    );
+    assert_success(
+        &output,
+        "native require build without scarb on research workspaces fixture",
+    );
+    assert_eq!(report.exit_code, 0);
+    let combined = output_to_utf8(&output);
+    assert!(
+        !combined.contains("falling back to scarb backend")
+            && !combined.contains("daemon fell back to scarb backend"),
+        "native require build should not fallback to scarb: {combined}"
+    );
+
+    let (_warm_output, warm_report) = run_uc_build_for_root_with_env_overrides(
+        &workspace.root,
+        &manifest,
+        "native-require-research-workspaces-no-scarb-warm",
+        "off",
+        None,
+        BuildEnvOverrides {
+            path_override: Some(&no_scarb_path),
+            native_mode_override: Some("require"),
+            native_corelib_override: Some(&corelib_src),
+            native_disallow_scarb_fallback_override: Some("1"),
+            ..BuildEnvOverrides::default()
+        },
+    );
+    assert!(
+        warm_report.cache_hit,
+        "native require warm build on research workspaces fixture should hit cache"
     );
 }
 
