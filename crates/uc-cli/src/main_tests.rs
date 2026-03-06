@@ -4561,8 +4561,9 @@ fn native_collect_tracked_sources_tracks_only_cairo_files() {
     )
     .expect("failed to write manifest");
 
-    let (tracked, total_bytes) =
-        native_collect_tracked_sources(&dir).expect("source tracking should succeed");
+    let source_roots = vec![dir.join("src")];
+    let (tracked, total_bytes) = native_collect_tracked_sources(&dir, &source_roots)
+        .expect("source tracking should succeed");
     assert_eq!(tracked.len(), 1, "only cairo files should be tracked");
     assert!(
         tracked.contains_key("src/lib.cairo"),
@@ -4575,6 +4576,84 @@ fn native_collect_tracked_sources_tracks_only_cairo_files() {
     assert!(total_bytes > 0, "tracked source bytes should be non-zero");
 
     fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_collect_tracked_sources_limits_to_declared_roots() {
+    let dir = unique_test_dir("uc-native-track-sources-roots");
+    let root_src = dir.join("src");
+    let dep_src = dir.join("deps/local-dep/src");
+    let other_src = dir.join("packages/other/src");
+    fs::create_dir_all(&root_src).expect("failed to create root src directory");
+    fs::create_dir_all(&dep_src).expect("failed to create dependency src directory");
+    fs::create_dir_all(&other_src).expect("failed to create other src directory");
+    fs::write(root_src.join("lib.cairo"), "fn root() {}\n").expect("failed to write root cairo");
+    fs::write(dep_src.join("lib.cairo"), "fn dep() {}\n")
+        .expect("failed to write dependency cairo");
+    fs::write(other_src.join("lib.cairo"), "fn other() {}\n")
+        .expect("failed to write unrelated cairo");
+
+    let source_roots = vec![root_src, dep_src];
+    let (tracked, _total_bytes) = native_collect_tracked_sources(&dir, &source_roots)
+        .expect("source tracking should succeed");
+    assert!(
+        tracked.contains_key("src/lib.cairo"),
+        "tracked source set should include root crate source"
+    );
+    assert!(
+        tracked.contains_key("deps/local-dep/src/lib.cairo"),
+        "tracked source set should include dependency source roots"
+    );
+    assert!(
+        !tracked.contains_key("packages/other/src/lib.cairo"),
+        "source files outside declared roots must be ignored to avoid unrelated workspace churn"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_compile_source_roots_include_main_and_dependency_roots_without_duplicates() {
+    let workspace_root = PathBuf::from("/tmp/uc-native-source-roots");
+    let duplicate_dep_root = workspace_root.join("deps/shared/src");
+    let context = NativeCompileContext {
+        package_name: "demo".to_string(),
+        crate_name: "demo".to_string(),
+        cairo_project_dir: workspace_root.join(".uc/native-project"),
+        corelib_src: workspace_root.join("toolchain/corelib/src"),
+        starknet_target: NativeStarknetTargetProps {
+            sierra: true,
+            casm: true,
+        },
+        manifest_content_hash: "manifest-blake3:demo".to_string(),
+        external_non_starknet_dependencies: Vec::new(),
+        path_dependency_roots: vec![
+            NativePathDependencyRoot {
+                crate_name: "shared_a".to_string(),
+                source_root: duplicate_dep_root.clone(),
+            },
+            NativePathDependencyRoot {
+                crate_name: "shared_b".to_string(),
+                source_root: duplicate_dep_root.clone(),
+            },
+        ],
+        crate_dependency_configs: Vec::new(),
+    };
+
+    let roots = native_compile_source_roots(&workspace_root, &context);
+    let normalized = roots
+        .iter()
+        .map(|path| normalize_fingerprint_path(path))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        normalized,
+        vec![
+            normalize_fingerprint_path(&workspace_root.join("deps/shared/src")),
+            normalize_fingerprint_path(&workspace_root.join("src")),
+        ],
+        "source roots should include main + dependency roots and deduplicate identical paths"
+    );
 }
 
 #[cfg(feature = "native-compile")]

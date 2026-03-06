@@ -843,6 +843,7 @@ struct NativeSourceChangeJournal {
 struct NativeSourceChangeWatcher {
     _watcher: Option<RecommendedWatcher>,
     journal: Arc<Mutex<NativeSourceChangeJournal>>,
+    watched_roots: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4466,48 +4467,84 @@ fn mark_native_fallback_eligible_for_external_dependencies(
 }
 
 #[cfg(feature = "native-compile")]
-fn native_source_root_modified_unix_ms(workspace_root: &Path) -> Result<u64> {
-    let source_root = workspace_root.join("src");
-    let metadata = match fs::metadata(&source_root) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
-        Err(err) => {
-            return Err(err).with_context(|| format!("failed to stat {}", source_root.display()));
+fn native_compile_source_roots(
+    workspace_root: &Path,
+    context: &NativeCompileContext,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::with_capacity(context.path_dependency_roots.len().saturating_add(1));
+    roots.push(workspace_root.join("src"));
+    roots.extend(
+        context
+            .path_dependency_roots
+            .iter()
+            .map(|root| root.source_root.clone()),
+    );
+    roots.sort_by_key(|path| normalize_fingerprint_path(path));
+    roots.dedup_by(|left, right| {
+        normalize_fingerprint_path(left) == normalize_fingerprint_path(right)
+    });
+    roots
+}
+
+#[cfg(feature = "native-compile")]
+fn native_source_roots_modified_unix_ms(
+    workspace_root: &Path,
+    source_roots: &[PathBuf],
+) -> Result<u64> {
+    let mut latest = 0_u64;
+    for source_root in source_roots {
+        ensure_path_within_root(workspace_root, source_root, "native tracked source root")?;
+        let metadata = match fs::metadata(source_root) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to stat {}", source_root.display()));
+            }
+        };
+        if !metadata.is_dir() {
+            continue;
         }
-    };
-    if !metadata.is_dir() {
-        return Ok(0);
+        let modified_unix_ms = metadata_modified_unix_ms(&metadata)?;
+        latest = latest.max(modified_unix_ms);
     }
-    metadata_modified_unix_ms(&metadata)
+    Ok(latest)
 }
 
 #[cfg(feature = "native-compile")]
 fn native_collect_tracked_sources(
     workspace_root: &Path,
+    source_roots: &[PathBuf],
 ) -> Result<(BTreeMap<String, NativeTrackedFileState>, u64)> {
     let mut files = Vec::new();
-    let walker = WalkDir::new(workspace_root)
-        .follow_links(false)
-        .max_depth(MAX_FINGERPRINT_DEPTH)
-        .into_iter()
-        .filter_entry(|entry| !is_ignored_entry(workspace_root, entry.path()));
-    for entry in walker.filter_map(|entry| entry.ok()) {
-        if !entry.file_type().is_file() {
+    for source_root in source_roots {
+        ensure_path_within_root(workspace_root, source_root, "native tracked source root")?;
+        if !source_root.is_dir() {
             continue;
         }
-        let path = entry.path();
-        let is_cairo = path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("cairo"));
-        if is_cairo {
-            if files.len() >= max_fingerprint_files() {
-                bail!(
-                    "native source tracker found too many files (>{}); refusing to continue",
-                    max_fingerprint_files()
-                );
+        let walker = WalkDir::new(source_root)
+            .follow_links(false)
+            .max_depth(MAX_FINGERPRINT_DEPTH)
+            .into_iter()
+            .filter_entry(|entry| !is_ignored_entry(workspace_root, entry.path()));
+        for entry in walker.filter_map(|entry| entry.ok()) {
+            if !entry.file_type().is_file() {
+                continue;
             }
-            files.push(path.to_path_buf());
+            let path = entry.path();
+            let is_cairo = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("cairo"));
+            if is_cairo {
+                if files.len() >= max_fingerprint_files() {
+                    bail!(
+                        "native source tracker found too many files (>{}); refusing to continue",
+                        max_fingerprint_files()
+                    );
+                }
+                files.push(path.to_path_buf());
+            }
         }
     }
     files.sort();
@@ -5115,6 +5152,7 @@ fn build_native_compile_session_state(
     workspace_root: &Path,
     signature: NativeCompileSessionSignature,
 ) -> Result<NativeCompileSessionState> {
+    let source_roots = native_compile_source_roots(workspace_root, &signature.context);
     let db_start = Instant::now();
     let mut db = RootDatabase::builder()
         .with_optimizations(Optimizations::enabled_with_default_movable_functions(
@@ -5135,15 +5173,21 @@ fn build_native_compile_session_state(
         })?;
     let setup_project_ms = setup_start.elapsed().as_secs_f64() * 1000.0;
     let scan_start = Instant::now();
-    let (tracked_sources, tracked_source_bytes) = native_collect_tracked_sources(workspace_root)?;
+    let (tracked_sources, tracked_source_bytes) =
+        native_collect_tracked_sources(workspace_root, &source_roots)?;
     let source_scan_ms = scan_start.elapsed().as_secs_f64() * 1000.0;
-    let source_root_modified_unix_ms = native_source_root_modified_unix_ms(workspace_root)?;
+    let source_root_modified_unix_ms =
+        native_source_roots_modified_unix_ms(workspace_root, &source_roots)?;
     tracing::debug!(
         workspace_root = %workspace_root.display(),
         db_init_ms,
         setup_project_ms,
         source_scan_ms,
         tracked_sources = tracked_sources.len(),
+        source_roots = ?source_roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect::<Vec<_>>(),
         "native session state built"
     );
     Ok(NativeCompileSessionState {
@@ -5388,30 +5432,53 @@ fn native_record_source_change_event(
 #[cfg(feature = "native-compile")]
 fn ensure_native_source_change_watcher(
     workspace_root: &Path,
+    source_roots: &[PathBuf],
 ) -> Result<Arc<Mutex<NativeSourceChangeJournal>>> {
     let cache_key = native_compile_session_cache_key(workspace_root);
+    let mut normalized_roots = source_roots
+        .iter()
+        .map(|path| normalize_fingerprint_path(path))
+        .collect::<Vec<_>>();
+    normalized_roots.sort();
+    normalized_roots.dedup();
     {
+        let mut watchers = native_source_change_watchers()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = watchers.get(&cache_key) {
+            if existing.watched_roots == normalized_roots {
+                return Ok(existing.journal.clone());
+            }
+        }
+        watchers.remove(&cache_key);
+    }
+
+    let mut watched_roots = Vec::new();
+    for root in source_roots {
+        ensure_path_within_root(workspace_root, root, "native source watcher root")?;
+        if root.is_dir() {
+            watched_roots.push(root.to_path_buf());
+        }
+    }
+    let journal = Arc::new(Mutex::new(NativeSourceChangeJournal::default()));
+    if watched_roots.is_empty() {
         let mut watchers = native_source_change_watchers()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(existing) = watchers.get(&cache_key) {
             return Ok(existing.journal.clone());
         }
-        let source_root = workspace_root.join("src");
-        if !source_root.is_dir() {
-            let journal = Arc::new(Mutex::new(NativeSourceChangeJournal::default()));
-            watchers.insert(
-                cache_key,
-                NativeSourceChangeWatcher {
-                    _watcher: None,
-                    journal: journal.clone(),
-                },
-            );
-            return Ok(journal);
-        }
+        watchers.insert(
+            cache_key,
+            NativeSourceChangeWatcher {
+                _watcher: None,
+                journal: journal.clone(),
+                watched_roots: normalized_roots,
+            },
+        );
+        return Ok(journal);
     }
 
-    let journal = Arc::new(Mutex::new(NativeSourceChangeJournal::default()));
     let journal_for_events = journal.clone();
     let workspace_root_for_events = workspace_root.to_path_buf();
     let mut watcher = RecommendedWatcher::new(
@@ -5433,26 +5500,30 @@ fn ensure_native_source_change_watcher(
         notify::Config::default(),
     )
     .context("failed to create native source watcher")?;
-    let source_root = workspace_root.join("src");
-    watcher
-        .watch(&source_root, RecursiveMode::Recursive)
-        .with_context(|| {
-            format!(
-                "failed to watch native source root {}",
-                source_root.display()
-            )
-        })?;
+    for source_root in &watched_roots {
+        watcher
+            .watch(source_root, RecursiveMode::Recursive)
+            .with_context(|| {
+                format!(
+                    "failed to watch native source root {}",
+                    source_root.display()
+                )
+            })?;
+    }
     let mut watchers = native_source_change_watchers()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(existing) = watchers.get(&cache_key) {
-        return Ok(existing.journal.clone());
+        if existing.watched_roots == normalized_roots {
+            return Ok(existing.journal.clone());
+        }
     }
     watchers.insert(
         cache_key,
         NativeSourceChangeWatcher {
             _watcher: Some(watcher),
             journal: journal.clone(),
+            watched_roots: normalized_roots,
         },
     );
     Ok(journal)
@@ -5469,8 +5540,11 @@ enum NativeSourceJournalDelta {
 }
 
 #[cfg(feature = "native-compile")]
-fn native_take_source_journal_delta(workspace_root: &Path) -> NativeSourceJournalDelta {
-    let journal = match ensure_native_source_change_watcher(workspace_root) {
+fn native_take_source_journal_delta(
+    workspace_root: &Path,
+    source_roots: &[PathBuf],
+) -> NativeSourceJournalDelta {
+    let journal = match ensure_native_source_change_watcher(workspace_root, source_roots) {
         Ok(journal) => journal,
         Err(err) => {
             tracing::warn!(
@@ -5686,6 +5760,7 @@ fn with_native_compile_session<T>(
     daemon_context: bool,
     f: impl FnOnce(&NativeCompileSessionSnapshot) -> Result<T>,
 ) -> Result<T> {
+    let source_roots = native_compile_source_roots(workspace_root, &signature.context);
     let session_handle = native_compile_session_handle(workspace_root, signature)?;
     let (needs_full_rebuild, previous_sources) = {
         let session = session_handle
@@ -5707,7 +5782,7 @@ fn with_native_compile_session<T>(
     ) = if needs_full_rebuild {
         (Vec::new(), Vec::new(), None, 0_u64, false)
     } else if daemon_context {
-        match native_take_source_journal_delta(workspace_root) {
+        match native_take_source_journal_delta(workspace_root, &source_roots) {
             NativeSourceJournalDelta::NoChanges => (Vec::new(), Vec::new(), None, 0_u64, false),
             NativeSourceJournalDelta::Changed {
                 changed_files,
@@ -5733,11 +5808,11 @@ fn with_native_compile_session<T>(
                             "native source watcher delta rejected; falling back to full source scan"
                         );
                         let (current_sources, current_source_bytes) =
-                            native_collect_tracked_sources(workspace_root)?;
+                            native_collect_tracked_sources(workspace_root, &source_roots)?;
                         let (changed_files, removed_files) =
                             native_diff_tracked_sources(&previous_sources, &current_sources);
                         let source_root_mtime =
-                            native_source_root_modified_unix_ms(workspace_root)?;
+                            native_source_roots_modified_unix_ms(workspace_root, &source_roots)?;
                         (
                             changed_files,
                             removed_files,
@@ -5750,10 +5825,11 @@ fn with_native_compile_session<T>(
             }
             NativeSourceJournalDelta::FallbackFullScan => {
                 let (current_sources, current_source_bytes) =
-                    native_collect_tracked_sources(workspace_root)?;
+                    native_collect_tracked_sources(workspace_root, &source_roots)?;
                 let (changed_files, removed_files) =
                     native_diff_tracked_sources(&previous_sources, &current_sources);
-                let source_root_mtime = native_source_root_modified_unix_ms(workspace_root)?;
+                let source_root_mtime =
+                    native_source_roots_modified_unix_ms(workspace_root, &source_roots)?;
                 (
                     changed_files,
                     removed_files,
@@ -5765,10 +5841,11 @@ fn with_native_compile_session<T>(
         }
     } else {
         let (current_sources, current_source_bytes) =
-            native_collect_tracked_sources(workspace_root)?;
+            native_collect_tracked_sources(workspace_root, &source_roots)?;
         let (changed_files, removed_files) =
             native_diff_tracked_sources(&previous_sources, &current_sources);
-        let source_root_mtime = native_source_root_modified_unix_ms(workspace_root)?;
+        let source_root_mtime =
+            native_source_roots_modified_unix_ms(workspace_root, &source_roots)?;
         (
             changed_files,
             removed_files,
