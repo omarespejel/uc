@@ -5467,13 +5467,14 @@ fn native_apply_source_change_journal_delta_updates_snapshot() {
             },
         ),
     ]);
-    let (updated, total_bytes) = native_apply_source_change_journal_delta(
-        &dir,
-        &previous,
-        &["src/lib.cairo".to_string(), "src/new.cairo".to_string()],
-        &["src/old.cairo".to_string()],
-    )
-    .expect("journal delta application should succeed");
+    let (updated, total_bytes, effective_changed, effective_removed) =
+        native_apply_source_change_journal_delta(
+            &dir,
+            &previous,
+            &["src/lib.cairo".to_string(), "src/new.cairo".to_string()],
+            &["src/old.cairo".to_string()],
+        )
+        .expect("journal delta application should succeed");
     assert!(
         updated.contains_key("src/lib.cairo"),
         "updated snapshot must include changed file"
@@ -5489,6 +5490,54 @@ fn native_apply_source_change_journal_delta_updates_snapshot() {
     assert!(
         total_bytes > 0,
         "tracked source budget should stay non-zero"
+    );
+    assert_eq!(
+        effective_changed,
+        vec!["src/lib.cairo".to_string(), "src/new.cairo".to_string()],
+        "effective changed set should include new/updated files"
+    );
+    assert_eq!(
+        effective_removed,
+        vec!["src/old.cairo".to_string()],
+        "effective removed set should include deleted files"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_apply_source_change_journal_delta_filters_metadata_noop_events() {
+    let dir = unique_test_dir("uc-native-source-journal-noop-events");
+    fs::create_dir_all(dir.join("src")).expect("failed to create src directory");
+    let source_path = dir.join("src/lib.cairo");
+    fs::write(&source_path, "fn lib() {}\n").expect("failed to write lib.cairo");
+    let metadata = fs::metadata(&source_path).expect("failed to stat lib.cairo");
+    let previous = BTreeMap::from([(
+        "src/lib.cairo".to_string(),
+        NativeTrackedFileState {
+            size_bytes: metadata.len(),
+            modified_unix_ms: metadata_modified_unix_ms(&metadata)
+                .expect("failed to read modified time"),
+        },
+    )]);
+
+    let (updated, total_bytes, effective_changed, effective_removed) =
+        native_apply_source_change_journal_delta(
+            &dir,
+            &previous,
+            &["src/lib.cairo".to_string()],
+            &[],
+        )
+        .expect("journal delta application should succeed");
+    assert_eq!(
+        updated, previous,
+        "tracked source snapshot should remain unchanged for metadata-noop watcher events"
+    );
+    assert_eq!(effective_changed, Vec::<String>::new());
+    assert_eq!(effective_removed, Vec::<String>::new());
+    assert!(
+        total_bytes >= metadata.len(),
+        "tracked source byte accounting should remain valid"
     );
     fs::remove_dir_all(&dir).ok();
 }

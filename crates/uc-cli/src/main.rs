@@ -6105,10 +6105,20 @@ fn native_apply_source_change_journal_delta(
     previous_sources: &BTreeMap<String, NativeTrackedFileState>,
     changed_files: &[String],
     removed_files: &[String],
-) -> Result<(BTreeMap<String, NativeTrackedFileState>, u64)> {
+) -> Result<(
+    BTreeMap<String, NativeTrackedFileState>,
+    u64,
+    Vec<String>,
+    Vec<String>,
+)> {
     let mut tracked_sources = previous_sources.clone();
+    let mut effective_changed = BTreeSet::new();
+    let mut effective_removed = BTreeSet::new();
     for relative in removed_files {
-        tracked_sources.remove(relative);
+        if tracked_sources.remove(relative).is_some() {
+            effective_removed.insert(relative.clone());
+            effective_changed.remove(relative);
+        }
     }
     for relative in changed_files {
         let relative_path = Path::new(relative);
@@ -6131,7 +6141,10 @@ fn native_apply_source_change_journal_delta(
         let metadata = match fs::metadata(&absolute_path) {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                tracked_sources.remove(relative);
+                if tracked_sources.remove(relative).is_some() {
+                    effective_removed.insert(relative.clone());
+                    effective_changed.remove(relative);
+                }
                 continue;
             }
             Err(err) => {
@@ -6144,7 +6157,10 @@ fn native_apply_source_change_journal_delta(
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| extension.eq_ignore_ascii_case("cairo"));
         if !metadata.is_file() || !is_cairo {
-            tracked_sources.remove(relative);
+            if tracked_sources.remove(relative).is_some() {
+                effective_removed.insert(relative.clone());
+                effective_changed.remove(relative);
+            }
             continue;
         }
         let size_bytes = metadata.len();
@@ -6156,16 +6172,27 @@ fn native_apply_source_change_journal_delta(
                 max_fingerprint_file_bytes()
             );
         }
-        tracked_sources.insert(
-            relative.clone(),
-            NativeTrackedFileState {
-                size_bytes,
-                modified_unix_ms: metadata_modified_unix_ms(&metadata)?,
-            },
-        );
+        let next_state = NativeTrackedFileState {
+            size_bytes,
+            modified_unix_ms: metadata_modified_unix_ms(&metadata)?,
+        };
+        tracked_sources.insert(relative.clone(), next_state.clone());
+        if previous_sources.get(relative) == Some(&next_state) {
+            // Watcher noise can emit modify events without semantic/metadata drift.
+            effective_changed.remove(relative);
+            effective_removed.remove(relative);
+        } else {
+            effective_removed.remove(relative);
+            effective_changed.insert(relative.clone());
+        }
     }
     let total_bytes = native_tracked_sources_total_bytes(&tracked_sources)?;
-    Ok((tracked_sources, total_bytes))
+    Ok((
+        tracked_sources,
+        total_bytes,
+        effective_changed.into_iter().collect(),
+        effective_removed.into_iter().collect(),
+    ))
 }
 
 #[cfg(feature = "native-compile")]
@@ -6309,9 +6336,14 @@ fn with_native_compile_session<T>(
                     &changed_files,
                     &removed_files,
                 ) {
-                    Ok((tracked_sources, tracked_source_bytes)) => (
-                        changed_files,
-                        removed_files,
+                    Ok((
+                        tracked_sources,
+                        tracked_source_bytes,
+                        effective_changed_files,
+                        effective_removed_files,
+                    )) => (
+                        effective_changed_files,
+                        effective_removed_files,
                         Some((tracked_sources, tracked_source_bytes)),
                         0_u64,
                         false,
