@@ -1793,6 +1793,7 @@ fn native_compile_context_cache_ttl_eviction_prunes_stale_entries() {
     let context = NativeCompileContext {
         package_name: "demo".to_string(),
         crate_name: "demo".to_string(),
+        workspace_mode_supported: false,
         cairo_project_dir: PathBuf::from("/tmp/demo/.uc/native-project"),
         corelib_src: PathBuf::from("/tmp/demo/corelib/src"),
         starknet_target: NativeStarknetTargetProps {
@@ -4040,6 +4041,102 @@ edition = "2024_07"
         cairo_project.contains("[config.global]\nedition = \"2024_07\""),
         "manifest edition should be propagated into cairo_project.toml: {cairo_project}"
     );
+    assert!(
+        !context.workspace_mode_supported,
+        "plain package manifests should not be treated as --workspace-safe in native mode"
+    );
+
+    std::env::remove_var("UC_NATIVE_CORELIB_SRC");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn build_native_compile_context_allows_workspace_for_single_member_workspace_root() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = unique_test_dir("uc-native-context-workspace-single");
+    let manifest_path = dir.join("Scarb.toml");
+    fs::create_dir_all(dir.join("src")).expect("failed to create src directory");
+    fs::write(dir.join("src/lib.cairo"), "fn main() {}\n").expect("failed to write lib.cairo");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo-native"
+version = "0.1.0"
+edition = "2024_07"
+
+[workspace]
+members = ["."]
+"#,
+    )
+    .expect("failed to write manifest");
+
+    let fake_corelib_src = dir.join("toolchain/corelib/src");
+    create_mock_native_corelib(&fake_corelib_src);
+    std::env::set_var("UC_NATIVE_CORELIB_SRC", &fake_corelib_src);
+
+    let common = BuildCommonArgs {
+        manifest_path: Some(manifest_path.clone()),
+        package: None,
+        workspace: true,
+        features: Vec::new(),
+        offline: true,
+        release: false,
+        profile: None,
+    };
+    let context =
+        build_native_compile_context(&common, &manifest_path, &dir).expect("context should build");
+    assert!(
+        context.workspace_mode_supported,
+        "single-package workspace roots should stay on native backend with --workspace"
+    );
+
+    std::env::remove_var("UC_NATIVE_CORELIB_SRC");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn build_native_compile_context_rejects_workspace_for_multi_member_workspace_root() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = unique_test_dir("uc-native-context-workspace-multi");
+    let manifest_path = dir.join("Scarb.toml");
+    fs::create_dir_all(dir.join("src")).expect("failed to create src directory");
+    fs::write(dir.join("src/lib.cairo"), "fn main() {}\n").expect("failed to write lib.cairo");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo-native"
+version = "0.1.0"
+edition = "2024_07"
+
+[workspace]
+members = [".", "packages/other"]
+"#,
+    )
+    .expect("failed to write manifest");
+
+    let fake_corelib_src = dir.join("toolchain/corelib/src");
+    create_mock_native_corelib(&fake_corelib_src);
+    std::env::set_var("UC_NATIVE_CORELIB_SRC", &fake_corelib_src);
+
+    let common = BuildCommonArgs {
+        manifest_path: Some(manifest_path.clone()),
+        package: None,
+        workspace: true,
+        features: Vec::new(),
+        offline: true,
+        release: false,
+        profile: None,
+    };
+    let err = build_native_compile_context(&common, &manifest_path, &dir)
+        .expect_err("multi-member workspace should remain fallback-eligible");
+    assert!(
+        format!("{err:#}").contains("does not support --workspace"),
+        "unexpected error: {err:#}"
+    );
 
     std::env::remove_var("UC_NATIVE_CORELIB_SRC");
     fs::remove_dir_all(&dir).ok();
@@ -4620,6 +4717,7 @@ fn native_compile_source_roots_include_main_and_dependency_roots_without_duplica
     let context = NativeCompileContext {
         package_name: "demo".to_string(),
         crate_name: "demo".to_string(),
+        workspace_mode_supported: true,
         cairo_project_dir: workspace_root.join(".uc/native-project"),
         corelib_src: workspace_root.join("toolchain/corelib/src"),
         starknet_target: NativeStarknetTargetProps {
@@ -5080,6 +5178,7 @@ fn mark_native_fallback_eligible_for_external_dependencies_only_marks_when_prese
     let base_context = NativeCompileContext {
         package_name: "demo".to_string(),
         crate_name: "demo".to_string(),
+        workspace_mode_supported: false,
         cairo_project_dir: PathBuf::from("/tmp/demo/.uc/native-project"),
         corelib_src: PathBuf::from("/tmp/demo/corelib/src"),
         starknet_target: NativeStarknetTargetProps {

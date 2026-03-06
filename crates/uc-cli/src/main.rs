@@ -570,6 +570,7 @@ struct BuildCacheRunContext<'a> {
 struct NativeCompileContext {
     package_name: String,
     crate_name: String,
+    workspace_mode_supported: bool,
     cairo_project_dir: PathBuf,
     corelib_src: PathBuf,
     starknet_target: NativeStarknetTargetProps,
@@ -3789,11 +3790,6 @@ fn build_native_compile_context(
     manifest_path: &Path,
     workspace_root: &Path,
 ) -> Result<NativeCompileContext> {
-    if common.workspace {
-        return Err(native_fallback_eligible_error(
-            "native compile does not support --workspace yet",
-        ));
-    }
     if !common.features.is_empty() {
         return Err(native_fallback_eligible_error(
             "native compile does not support --features yet",
@@ -3836,6 +3832,7 @@ fn build_native_compile_context(
                     common.package.as_deref(),
                     &entry.context.package_name,
                 )?;
+                validate_native_workspace_mode(common.workspace, &entry.context)?;
                 return Ok(entry.context.clone());
             }
         }
@@ -3843,6 +3840,7 @@ fn build_native_compile_context(
 
     let context = build_native_compile_context_uncached(manifest_path, workspace_root)?;
     validate_native_requested_package(common.package.as_deref(), &context.package_name)?;
+    validate_native_workspace_mode(common.workspace, &context)?;
     {
         let mut cache = native_compile_context_cache()
             .lock()
@@ -3913,6 +3911,48 @@ fn validate_native_requested_package(
                 package_name, requested_package
             )));
         }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native-compile")]
+fn native_manifest_workspace_mode_supported(manifest: &TomlValue) -> bool {
+    if manifest
+        .get("package")
+        .and_then(TomlValue::as_table)
+        .is_none()
+    {
+        return false;
+    }
+    let Some(workspace_table) = manifest.get("workspace").and_then(TomlValue::as_table) else {
+        return false;
+    };
+    match workspace_table.get("members") {
+        None => true,
+        Some(members_value) => {
+            let Some(members) = members_value.as_array() else {
+                return false;
+            };
+            !members.is_empty()
+                && members.iter().all(|member| {
+                    member
+                        .as_str()
+                        .map(str::trim)
+                        .is_some_and(|entry| matches!(entry, "." | "./"))
+                })
+        }
+    }
+}
+
+#[cfg(feature = "native-compile")]
+fn validate_native_workspace_mode(
+    workspace_requested: bool,
+    context: &NativeCompileContext,
+) -> Result<()> {
+    if workspace_requested && !context.workspace_mode_supported {
+        return Err(native_fallback_eligible_error(
+            "native compile does not support --workspace for multi-package or non-workspace manifests yet",
+        ));
     }
     Ok(())
 }
@@ -4298,6 +4338,7 @@ fn build_native_compile_context_uncached(
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .context("native compile requires [package].name in Scarb.toml")?;
+    let workspace_mode_supported = native_manifest_workspace_mode_supported(&manifest);
     let dependency_surface =
         collect_native_dependency_surface(&manifest, manifest_path, workspace_root);
     let external_non_starknet_dependencies = dependency_surface.external_non_starknet_dependencies;
@@ -4391,6 +4432,7 @@ fn build_native_compile_context_uncached(
     Ok(NativeCompileContext {
         package_name,
         crate_name,
+        workspace_mode_supported,
         cairo_project_dir,
         corelib_src,
         starknet_target,
