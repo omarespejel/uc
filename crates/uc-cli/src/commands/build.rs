@@ -4,6 +4,8 @@ const DAEMON_LOCAL_PROBE_HINT_SUFFIX: &str = ".fallback-session-key";
 const DAEMON_LOCAL_NATIVE_SUPPORTED_HINT_SUFFIX: &str = ".native-supported";
 const DAEMON_LOCAL_PROBE_HINT_DIR: &str = "fallback-keys";
 const DAEMON_LOCAL_NATIVE_SUPPORTED_HINT_DIR: &str = "native-supported";
+const UC_NATIVE_FALLBACK_HINT_RETRY_SECS_ENV: &str = "UC_NATIVE_FALLBACK_HINT_RETRY_SECS";
+const DEFAULT_UC_NATIVE_FALLBACK_HINT_RETRY_SECS: u64 = 30 * 60;
 // Budget applies per hint directory (`fallback-keys/` and `native-supported/`),
 // so total footprint can be up to 2x this value across both directories.
 const DAEMON_LOCAL_PROBE_HINT_MAX_ENTRIES_PER_DIR: usize = 256;
@@ -91,6 +93,45 @@ fn daemon_local_probe_hint_path(
     Ok(hint_path)
 }
 
+fn daemon_local_probe_hint_retry_interval_secs() -> u64 {
+    parse_env_u64(
+        UC_NATIVE_FALLBACK_HINT_RETRY_SECS_ENV,
+        DEFAULT_UC_NATIVE_FALLBACK_HINT_RETRY_SECS,
+    )
+}
+
+fn daemon_local_probe_hint_is_stale(hint_path: &Path, retry_interval_secs: u64) -> bool {
+    if retry_interval_secs == 0 {
+        return true;
+    }
+    let metadata = match fs::metadata(hint_path) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                hint_path = %hint_path.display(),
+                "failed to stat daemon fallback hint; treating as stale"
+            );
+            return true;
+        }
+    };
+    let modified = match metadata.modified() {
+        Ok(modified) => modified,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                hint_path = %hint_path.display(),
+                "failed to read daemon fallback hint mtime; treating as stale"
+            );
+            return true;
+        }
+    };
+    let hint_age = SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or_default();
+    hint_age > Duration::from_secs(retry_interval_secs)
+}
+
 fn daemon_local_native_supported_hint_legacy_path(
     workspace_root: &Path,
     primary_session_key: &str,
@@ -113,13 +154,13 @@ fn load_daemon_local_probe_hint(
     primary_session_key: &str,
 ) -> Result<Option<String>> {
     let hint_path = daemon_local_probe_hint_path(workspace_root, primary_session_key)?;
-    let contents = match fs::read_to_string(&hint_path) {
-        Ok(contents) => contents,
+    let (contents, loaded_hint_path) = match fs::read_to_string(&hint_path) {
+        Ok(contents) => (contents, hint_path.clone()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             let legacy_hint_path =
                 daemon_local_probe_hint_legacy_path(workspace_root, primary_session_key)?;
             match fs::read_to_string(&legacy_hint_path) {
-                Ok(contents) => contents,
+                Ok(contents) => (contents, legacy_hint_path),
                 Err(legacy_err) if legacy_err.kind() == io::ErrorKind::NotFound => return Ok(None),
                 Err(legacy_err) => {
                     tracing::warn!(
@@ -140,6 +181,16 @@ fn load_daemon_local_probe_hint(
             return Ok(None);
         }
     };
+    let retry_interval_secs = daemon_local_probe_hint_retry_interval_secs();
+    if daemon_local_probe_hint_is_stale(&loaded_hint_path, retry_interval_secs) {
+        tracing::debug!(
+            hint_path = %loaded_hint_path.display(),
+            retry_interval_secs,
+            "ignoring stale daemon fallback hint and retrying native build path"
+        );
+        let _ = clear_daemon_local_probe_hint(workspace_root, primary_session_key);
+        return Ok(None);
+    }
     let hinted_session_key = contents.trim();
     if hinted_session_key.is_empty() || hinted_session_key == primary_session_key {
         return Ok(None);
@@ -1142,6 +1193,8 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
 
     fn unique_test_dir(prefix: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -1151,6 +1204,33 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
         fs::create_dir_all(&dir).expect("failed to create test directory");
         dir
+    }
+
+    fn env_var_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            match self.previous.as_ref() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
     }
 
     #[test]
@@ -1189,6 +1269,11 @@ mod tests {
 
     #[test]
     fn load_daemon_local_probe_hint_reads_legacy_hint_location() {
+        let _guard = env_var_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _retry_interval_guard =
+            ScopedEnvVar::set(UC_NATIVE_FALLBACK_HINT_RETRY_SECS_ENV, "1800");
         let workspace = unique_test_dir("uc-daemon-probe-hint-legacy-load");
         let primary_session_key = "a".repeat(SESSION_KEY_LEN);
         let hinted_session_key = "b".repeat(SESSION_KEY_LEN);
@@ -1213,7 +1298,45 @@ mod tests {
     }
 
     #[test]
+    fn load_daemon_local_probe_hint_ignores_stale_hint_when_retry_interval_is_zero() {
+        let _guard = env_var_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _retry_interval_guard = ScopedEnvVar::set(UC_NATIVE_FALLBACK_HINT_RETRY_SECS_ENV, "0");
+        let workspace = unique_test_dir("uc-daemon-probe-hint-stale");
+        let primary_session_key = "e".repeat(SESSION_KEY_LEN);
+        let hinted_session_key = "f".repeat(SESSION_KEY_LEN);
+        let hint_path = daemon_local_probe_hint_path(&workspace, &primary_session_key)
+            .expect("failed to compute probe hint path");
+
+        persist_daemon_local_probe_hint(&workspace, &primary_session_key, &hinted_session_key)
+            .expect("failed to persist daemon local probe hint");
+        assert!(
+            hint_path.is_file(),
+            "probe hint should be created before stale check"
+        );
+
+        let loaded = load_daemon_local_probe_hint(&workspace, &primary_session_key)
+            .expect("failed to load daemon local probe hint");
+        assert!(
+            loaded.is_none(),
+            "stale fallback hint should be ignored to retry native path"
+        );
+        assert!(
+            !hint_path.exists(),
+            "stale fallback hint should be cleared after being ignored"
+        );
+
+        fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[test]
     fn daemon_local_probe_hint_roundtrip_and_clear() {
+        let _guard = env_var_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _retry_interval_guard =
+            ScopedEnvVar::set(UC_NATIVE_FALLBACK_HINT_RETRY_SECS_ENV, "1800");
         let workspace = unique_test_dir("uc-daemon-probe-hint");
         let primary_session_key = "a".repeat(SESSION_KEY_LEN);
         let hinted_session_key = "b".repeat(SESSION_KEY_LEN);
