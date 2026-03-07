@@ -7237,7 +7237,7 @@ fn build_native_compile_session_state(
         })
         .collect::<Vec<_>>();
     if !tracked_inputs.is_empty() {
-        let inserted = ensure_keyed_file_override_slots(&mut db, tracked_inputs.into_iter());
+        let inserted = ensure_keyed_file_override_slots(&mut db, tracked_inputs);
         tracing::debug!(
             inserted_slots = inserted,
             tracked_sources = tracked_sources.len(),
