@@ -1902,6 +1902,9 @@ fn native_compile_context_cache_ttl_eviction_prunes_stale_entries() {
             manifest_size_bytes: 1,
             manifest_modified_unix_ms: 1,
             manifest_change_unix_ms: Some(1),
+            workspace_manifest_size_bytes: None,
+            workspace_manifest_modified_unix_ms: None,
+            workspace_manifest_change_unix_ms: None,
             context: context.clone(),
             last_access_epoch_ms: 10,
             estimated_bytes: 1024,
@@ -1913,6 +1916,9 @@ fn native_compile_context_cache_ttl_eviction_prunes_stale_entries() {
             manifest_size_bytes: 1,
             manifest_modified_unix_ms: 1,
             manifest_change_unix_ms: Some(1),
+            workspace_manifest_size_bytes: None,
+            workspace_manifest_modified_unix_ms: None,
+            workspace_manifest_change_unix_ms: None,
             context,
             last_access_epoch_ms: 120,
             estimated_bytes: 1024,
@@ -2697,9 +2703,10 @@ edition = "2024_07"
     fs::create_dir_all(&no_scarb_path).expect("failed to create no-scarb path");
     let _path = ScopedEnvVar::set_with_lock(&_guard, "PATH", &no_scarb_path);
 
-    let surface = collect_native_dependency_surface_from_scarb_metadata(&manifest_path, "demo")
-        .expect("native dependency surface collection should succeed")
-        .expect("metadata cache hit should provide dependency surface");
+    let surface =
+        collect_native_dependency_surface_from_scarb_metadata(&manifest_path, "demo", false)
+            .expect("native dependency surface collection should succeed")
+            .expect("metadata cache hit should provide dependency surface");
     assert!(
         surface.external_non_starknet_dependencies.is_empty(),
         "cached metadata should not infer external dependencies for this fixture"
@@ -2714,6 +2721,530 @@ edition = "2024_07"
             .iter()
             .any(|config| config.crate_name == "demo"),
         "cached metadata should include root crate dependency configuration"
+    );
+
+    fs::remove_dir_all(&workspace).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_dependency_surface_merges_manifest_external_deps_with_cached_metadata() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    metadata_result_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+    daemon_lock_hash_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+
+    let workspace = unique_test_dir("uc-native-dependency-surface-metadata-external-merge");
+    let manifest_path = workspace.join("Scarb.toml");
+    let lock_path = workspace.join("Scarb.lock");
+    let source_dir = workspace.join("src");
+    fs::create_dir_all(&source_dir).expect("failed to create src directory");
+    let source_path = source_dir.join("lib.cairo");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+
+[dependencies]
+alexandria = "0.9.0"
+"#,
+    )
+    .expect("failed to write manifest");
+    fs::write(&lock_path, "version = 1\n").expect("failed to write lock file");
+    fs::write(&source_path, "fn main() -> felt252 { 1 }\n").expect("failed to write source file");
+
+    let metadata_args = MetadataArgs {
+        manifest_path: Some(manifest_path.clone()),
+        format_version: 1,
+        daemon_mode: DaemonModeArg::Off,
+        offline: false,
+        global_cache_dir: None,
+        report_path: None,
+    };
+    let _scarb_version =
+        ScopedEnvVar::set_with_lock(&_guard, "UC_SCARB_VERSION_LINE", "scarb 2.16.0 (test)");
+    let scarb_version = scarb_version_line().expect("scarb version override should resolve");
+    let build_env = current_build_env_fingerprint();
+    let cache_key =
+        metadata_result_cache_key(&metadata_args, &manifest_path, &scarb_version, &build_env);
+
+    let manifest_metadata = fs::metadata(&manifest_path).expect("failed to stat manifest");
+    let manifest_size_bytes = manifest_metadata.len();
+    let manifest_modified_unix_ms =
+        metadata_modified_unix_ms(&manifest_metadata).expect("failed to read manifest mtime");
+    let (_, _, lock_hash) =
+        daemon_lock_state(&manifest_path).expect("failed to resolve lock state");
+    let workspace_manifests_hash =
+        metadata_workspace_manifests_hash(&workspace).expect("workspace manifests hash");
+
+    let package_id = "demo 0.1.0 (path+file://demo)";
+    let cached_metadata = serde_json::json!({
+        "packages": [{
+            "id": package_id,
+            "manifest_path": manifest_path.display().to_string(),
+            "edition": "2024_07"
+        }],
+        "compilation_units": [{
+            "package": package_id,
+            "target": { "kind": "starknet-contract" },
+            "components_data": [{
+                "id": package_id,
+                "name": "demo",
+                "source_path": source_path.display().to_string(),
+                "dependencies": []
+            }]
+        }]
+    })
+    .to_string();
+    let run = CommandRun {
+        command: vec![
+            "scarb".to_string(),
+            "metadata".to_string(),
+            "--format-version".to_string(),
+            "1".to_string(),
+        ],
+        exit_code: 0,
+        elapsed_ms: 1.0,
+        stdout: cached_metadata,
+        stderr: String::new(),
+    };
+    let cache_root = workspace.join(".uc/cache");
+    let entry_path = metadata_cache_entry_path(&workspace, &cache_key);
+    let write_context = MetadataResultCacheWriteContext {
+        cache_key: &cache_key,
+        cache_root: &cache_root,
+        entry_path: &entry_path,
+        manifest_size_bytes,
+        manifest_modified_unix_ms,
+        lock_hash: &lock_hash,
+        workspace_manifests_hash: &workspace_manifests_hash,
+    };
+    store_metadata_result_cache_entry(&write_context, &run)
+        .expect("failed to persist metadata cache entry");
+
+    let no_scarb_path = workspace.join("no-scarb-path");
+    fs::create_dir_all(&no_scarb_path).expect("failed to create no-scarb path");
+    let _path = ScopedEnvVar::set_with_lock(&_guard, "PATH", &no_scarb_path);
+
+    let manifest_text = fs::read_to_string(&manifest_path).expect("failed to read manifest");
+    let manifest: TomlValue = toml::from_str(&manifest_text).expect("manifest should parse");
+    let surface = collect_native_dependency_surface(
+        &manifest,
+        Some(&manifest),
+        &manifest_path,
+        &workspace,
+        "demo",
+        false,
+    );
+    assert_eq!(
+        surface.external_non_starknet_dependencies,
+        vec!["[dependencies].alexandria".to_string()],
+        "manifest external dependency set should remain visible when metadata path is cached"
+    );
+    assert!(
+        surface.path_dependency_roots.is_empty(),
+        "metadata fixture has no local path dependencies"
+    );
+
+    fs::remove_dir_all(&workspace).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_should_use_dependency_metadata_with_flags_requires_explicit_enable() {
+    assert!(
+        !native_should_use_dependency_metadata_with_flags(false, 1, 0),
+        "metadata lookup should remain disabled unless explicitly enabled"
+    );
+    assert!(
+        native_should_use_dependency_metadata_with_flags(false, 0, 1),
+        "external dependencies should always enable metadata lookup for native coverage"
+    );
+    assert!(
+        !native_should_use_dependency_metadata_with_flags(true, 0, 0),
+        "metadata lookup should be skipped when dependency surface is empty"
+    );
+    assert!(
+        native_should_use_dependency_metadata_with_flags(true, 1, 0),
+        "metadata lookup should be allowed when enabled and dependencies exist"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_dependency_surface_uses_metadata_for_external_deps_by_default() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    metadata_result_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+    daemon_lock_hash_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+
+    let workspace = unique_test_dir("uc-native-dependency-surface-external-default-metadata");
+    let manifest_path = workspace.join("Scarb.toml");
+    let lock_path = workspace.join("Scarb.lock");
+    let source_dir = workspace.join("src");
+    let external_dep_src = workspace.join("deps/openzeppelin/src");
+    fs::create_dir_all(&source_dir).expect("failed to create src directory");
+    fs::create_dir_all(&external_dep_src).expect("failed to create external dep src directory");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+
+[dependencies]
+openzeppelin = "0.20.0"
+"#,
+    )
+    .expect("failed to write manifest");
+    fs::write(&lock_path, "version = 1\n").expect("failed to write lock file");
+    fs::write(
+        source_dir.join("lib.cairo"),
+        "fn main() -> felt252 { 1 }\n",
+    )
+    .expect("failed to write source file");
+    fs::write(
+        workspace.join("deps/openzeppelin/Scarb.toml"),
+        r#"[package]
+name = "openzeppelin"
+version = "0.20.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("failed to write external dep manifest");
+    fs::write(
+        external_dep_src.join("lib.cairo"),
+        "fn helper() -> felt252 { 2 }\n",
+    )
+    .expect("failed to write external dep source file");
+
+    let metadata_args = MetadataArgs {
+        manifest_path: Some(manifest_path.clone()),
+        format_version: 1,
+        daemon_mode: DaemonModeArg::Off,
+        offline: false,
+        global_cache_dir: None,
+        report_path: None,
+    };
+    let _scarb_version =
+        ScopedEnvVar::set_with_lock(&_guard, "UC_SCARB_VERSION_LINE", "scarb 2.16.0 (test)");
+    let scarb_version = scarb_version_line().expect("scarb version override should resolve");
+    let build_env = current_build_env_fingerprint();
+    let cache_key =
+        metadata_result_cache_key(&metadata_args, &manifest_path, &scarb_version, &build_env);
+
+    let manifest_metadata = fs::metadata(&manifest_path).expect("failed to stat manifest");
+    let manifest_size_bytes = manifest_metadata.len();
+    let manifest_modified_unix_ms =
+        metadata_modified_unix_ms(&manifest_metadata).expect("failed to read manifest mtime");
+    let (_, _, lock_hash) =
+        daemon_lock_state(&manifest_path).expect("failed to resolve lock state");
+    let workspace_manifests_hash =
+        metadata_workspace_manifests_hash(&workspace).expect("workspace manifests hash");
+
+    let root_id = "demo 0.1.0 (path+file://demo)";
+    let external_id = "openzeppelin 0.20.0 (registry+https://example.test)";
+    let cached_metadata = serde_json::json!({
+        "packages": [
+            {
+                "id": root_id,
+                "manifest_path": manifest_path.display().to_string(),
+                "edition": "2024_07"
+            },
+            {
+                "id": external_id,
+                "manifest_path": workspace.join("deps/openzeppelin/Scarb.toml").display().to_string(),
+                "edition": "2024_07"
+            }
+        ],
+        "compilation_units": [{
+            "package": root_id,
+            "target": { "kind": "starknet-contract" },
+            "components_data": [
+                {
+                    "id": root_id,
+                    "name": "demo",
+                    "source_path": source_dir.join("lib.cairo").display().to_string(),
+                    "dependencies": [
+                        { "id": external_id }
+                    ]
+                },
+                {
+                    "id": external_id,
+                    "name": "openzeppelin",
+                    "source_path": external_dep_src.join("lib.cairo").display().to_string(),
+                    "dependencies": []
+                }
+            ]
+        }]
+    })
+    .to_string();
+    let run = CommandRun {
+        command: vec![
+            "scarb".to_string(),
+            "metadata".to_string(),
+            "--format-version".to_string(),
+            "1".to_string(),
+        ],
+        exit_code: 0,
+        elapsed_ms: 1.0,
+        stdout: cached_metadata,
+        stderr: String::new(),
+    };
+    let cache_root = workspace.join(".uc/cache");
+    let entry_path = metadata_cache_entry_path(&workspace, &cache_key);
+    let write_context = MetadataResultCacheWriteContext {
+        cache_key: &cache_key,
+        cache_root: &cache_root,
+        entry_path: &entry_path,
+        manifest_size_bytes,
+        manifest_modified_unix_ms,
+        lock_hash: &lock_hash,
+        workspace_manifests_hash: &workspace_manifests_hash,
+    };
+    store_metadata_result_cache_entry(&write_context, &run)
+        .expect("failed to persist metadata cache entry");
+
+    let no_scarb_path = workspace.join("no-scarb-path");
+    fs::create_dir_all(&no_scarb_path).expect("failed to create no-scarb path");
+    let _path = ScopedEnvVar::set_with_lock(&_guard, "PATH", &no_scarb_path);
+
+    let manifest_text = fs::read_to_string(&manifest_path).expect("failed to read manifest");
+    let manifest: TomlValue = toml::from_str(&manifest_text).expect("manifest should parse");
+    let surface = collect_native_dependency_surface(
+        &manifest,
+        Some(&manifest),
+        &manifest_path,
+        &workspace,
+        "demo",
+        false,
+    );
+    assert!(
+        surface
+            .path_dependency_roots
+            .iter()
+            .any(|root| root.crate_name == "openzeppelin"),
+        "external dependency metadata should hydrate native crate roots by default"
+    );
+    assert_eq!(
+        surface.external_non_starknet_dependencies,
+        vec!["[dependencies].openzeppelin".to_string()],
+        "manifest external dependency markers should remain visible for policy checks"
+    );
+
+    fs::remove_dir_all(&workspace).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_dependency_surface_defaults_to_manifest_only_when_metadata_cache_exists() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    metadata_result_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+    daemon_lock_hash_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+
+    let workspace = unique_test_dir("uc-native-dependency-surface-manifest-only-default");
+    let manifest_path = workspace.join("Scarb.toml");
+    let lock_path = workspace.join("Scarb.lock");
+    let source_dir = workspace.join("src");
+    let local_dep_src = workspace.join("deps/local-dep/src");
+    let metadata_dep_src = workspace.join("deps/metadata-only/src");
+    fs::create_dir_all(&source_dir).expect("failed to create src directory");
+    fs::create_dir_all(&local_dep_src).expect("failed to create local dep src directory");
+    fs::create_dir_all(&metadata_dep_src).expect("failed to create metadata dep src directory");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+
+[dependencies]
+local-dep = { path = "deps/local-dep" }
+"#,
+    )
+    .expect("failed to write manifest");
+    fs::write(&lock_path, "version = 1\n").expect("failed to write lock file");
+    fs::write(source_dir.join("lib.cairo"), "fn main() -> felt252 { 1 }\n")
+        .expect("failed to write root source");
+    fs::write(
+        workspace.join("deps/local-dep/Scarb.toml"),
+        r#"[package]
+name = "local-dep"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("failed to write local dep manifest");
+    fs::write(
+        local_dep_src.join("lib.cairo"),
+        "fn value() -> felt252 { 2 }\n",
+    )
+    .expect("failed to write local dep source");
+    fs::write(
+        workspace.join("deps/metadata-only/Scarb.toml"),
+        r#"[package]
+name = "metadata-only"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("failed to write metadata dep manifest");
+    fs::write(
+        metadata_dep_src.join("lib.cairo"),
+        "fn value() -> felt252 { 3 }\n",
+    )
+    .expect("failed to write metadata dep source");
+
+    let metadata_args = MetadataArgs {
+        manifest_path: Some(manifest_path.clone()),
+        format_version: 1,
+        daemon_mode: DaemonModeArg::Off,
+        offline: false,
+        global_cache_dir: None,
+        report_path: None,
+    };
+    let _scarb_version =
+        ScopedEnvVar::set_with_lock(&_guard, "UC_SCARB_VERSION_LINE", "scarb 2.16.0 (test)");
+    let scarb_version = scarb_version_line().expect("scarb version override should resolve");
+    let build_env = current_build_env_fingerprint();
+    let cache_key =
+        metadata_result_cache_key(&metadata_args, &manifest_path, &scarb_version, &build_env);
+
+    let manifest_metadata = fs::metadata(&manifest_path).expect("failed to stat manifest");
+    let manifest_size_bytes = manifest_metadata.len();
+    let manifest_modified_unix_ms =
+        metadata_modified_unix_ms(&manifest_metadata).expect("failed to read manifest mtime");
+    let (_, _, lock_hash) =
+        daemon_lock_state(&manifest_path).expect("failed to resolve lock state");
+    let workspace_manifests_hash =
+        metadata_workspace_manifests_hash(&workspace).expect("workspace manifests hash");
+
+    let root_id = "demo 0.1.0 (path+file://demo)";
+    let local_dep_id = "local-dep 0.1.0 (path+file://local-dep)";
+    let metadata_dep_id = "metadata-only 0.1.0 (path+file://metadata-only)";
+    let cached_metadata = serde_json::json!({
+        "packages": [
+            {
+                "id": root_id,
+                "manifest_path": manifest_path.display().to_string(),
+                "edition": "2024_07"
+            },
+            {
+                "id": local_dep_id,
+                "manifest_path": workspace.join("deps/local-dep/Scarb.toml").display().to_string(),
+                "edition": "2024_07"
+            },
+            {
+                "id": metadata_dep_id,
+                "manifest_path": workspace.join("deps/metadata-only/Scarb.toml").display().to_string(),
+                "edition": "2024_07"
+            }
+        ],
+        "compilation_units": [{
+            "package": root_id,
+            "target": { "kind": "starknet-contract" },
+            "components_data": [
+                {
+                    "id": root_id,
+                    "name": "demo",
+                    "source_path": workspace.join("src/lib.cairo").display().to_string(),
+                    "dependencies": [
+                        { "id": local_dep_id },
+                        { "id": metadata_dep_id }
+                    ]
+                },
+                {
+                    "id": local_dep_id,
+                    "name": "local-dep",
+                    "source_path": workspace.join("deps/local-dep/src/lib.cairo").display().to_string(),
+                    "dependencies": []
+                },
+                {
+                    "id": metadata_dep_id,
+                    "name": "metadata-only",
+                    "source_path": workspace.join("deps/metadata-only/src/lib.cairo").display().to_string(),
+                    "dependencies": []
+                }
+            ]
+        }]
+    })
+    .to_string();
+    let run = CommandRun {
+        command: vec![
+            "scarb".to_string(),
+            "metadata".to_string(),
+            "--format-version".to_string(),
+            "1".to_string(),
+        ],
+        exit_code: 0,
+        elapsed_ms: 1.0,
+        stdout: cached_metadata,
+        stderr: String::new(),
+    };
+    let cache_root = workspace.join(".uc/cache");
+    let entry_path = metadata_cache_entry_path(&workspace, &cache_key);
+    let write_context = MetadataResultCacheWriteContext {
+        cache_key: &cache_key,
+        cache_root: &cache_root,
+        entry_path: &entry_path,
+        manifest_size_bytes,
+        manifest_modified_unix_ms,
+        lock_hash: &lock_hash,
+        workspace_manifests_hash: &workspace_manifests_hash,
+    };
+    store_metadata_result_cache_entry(&write_context, &run)
+        .expect("failed to persist metadata cache entry");
+
+    let no_scarb_path = workspace.join("no-scarb-path");
+    fs::create_dir_all(&no_scarb_path).expect("failed to create no-scarb path");
+    let _path = ScopedEnvVar::set_with_lock(&_guard, "PATH", &no_scarb_path);
+
+    let manifest_text = fs::read_to_string(&manifest_path).expect("failed to read manifest");
+    let manifest: TomlValue = toml::from_str(&manifest_text).expect("manifest should parse");
+    let surface = collect_native_dependency_surface(
+        &manifest,
+        Some(&manifest),
+        &manifest_path,
+        &workspace,
+        "demo",
+        false,
+    );
+    let crates = surface
+        .path_dependency_roots
+        .iter()
+        .map(|root| root.crate_name.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        crates.contains(&"local_dep"),
+        "manifest path dependency should be present in native dependency surface"
+    );
+    assert!(
+        !crates.contains(&"metadata_only"),
+        "metadata-only dependency should not be injected when metadata lookup is disabled"
     );
 
     fs::remove_dir_all(&workspace).ok();
@@ -4152,6 +4683,7 @@ dojo = "1.2.3"
         &manifest_path,
         &workspace_root,
         "demo",
+        false,
     );
     assert!(surface.path_dependency_roots.is_empty());
     assert_eq!(
@@ -4202,8 +4734,14 @@ alexandria = "0.9.0"
     .expect("failed to write manifest");
     let manifest_text = fs::read_to_string(&manifest_path).expect("failed to read manifest");
     let manifest: TomlValue = toml::from_str(&manifest_text).expect("manifest should parse");
-    let surface =
-        collect_native_dependency_surface(&manifest, Some(&manifest), &manifest_path, &dir, "demo");
+    let surface = collect_native_dependency_surface(
+        &manifest,
+        Some(&manifest),
+        &manifest_path,
+        &dir,
+        "demo",
+        false,
+    );
 
     assert_eq!(
         surface.external_non_starknet_dependencies,
@@ -4266,8 +4804,14 @@ shared-dep = { workspace = true }
     .expect("failed to write package manifest");
     let manifest_text = fs::read_to_string(&manifest_path).expect("failed to read manifest");
     let manifest: TomlValue = toml::from_str(&manifest_text).expect("manifest should parse");
-    let surface =
-        collect_native_dependency_surface(&manifest, Some(&manifest), &manifest_path, &dir, "demo");
+    let surface = collect_native_dependency_surface(
+        &manifest,
+        Some(&manifest),
+        &manifest_path,
+        &dir,
+        "demo",
+        false,
+    );
 
     assert!(
         surface.external_non_starknet_dependencies.is_empty(),
@@ -4351,8 +4895,14 @@ local-dep = { path = "deps/local-dep" }
 
     let manifest_text = fs::read_to_string(&manifest_path).expect("failed to read root manifest");
     let manifest: TomlValue = toml::from_str(&manifest_text).expect("manifest should parse");
-    let surface =
-        collect_native_dependency_surface(&manifest, Some(&manifest), &manifest_path, &dir, "demo");
+    let surface = collect_native_dependency_surface(
+        &manifest,
+        Some(&manifest),
+        &manifest_path,
+        &dir,
+        "demo",
+        false,
+    );
 
     assert!(
         surface.external_non_starknet_dependencies.is_empty(),
@@ -4412,8 +4962,14 @@ serde = "1.0.0"
     .expect("failed to write manifest");
     let manifest_text = fs::read_to_string(&manifest_path).expect("failed to read manifest");
     let manifest: TomlValue = toml::from_str(&manifest_text).expect("manifest should parse");
-    let surface =
-        collect_native_dependency_surface(&manifest, Some(&manifest), &manifest_path, &dir, "demo");
+    let surface = collect_native_dependency_surface(
+        &manifest,
+        Some(&manifest),
+        &manifest_path,
+        &dir,
+        "demo",
+        false,
+    );
 
     assert!(
         surface.external_non_starknet_dependencies.is_empty(),
@@ -4490,8 +5046,14 @@ shared-dep = { path = "deps/shared-dep" }
 
     let manifest_text = fs::read_to_string(&manifest_path).expect("failed to read root manifest");
     let manifest: TomlValue = toml::from_str(&manifest_text).expect("manifest should parse");
-    let surface =
-        collect_native_dependency_surface(&manifest, Some(&manifest), &manifest_path, &dir, "demo");
+    let surface = collect_native_dependency_surface(
+        &manifest,
+        Some(&manifest),
+        &manifest_path,
+        &dir,
+        "demo",
+        false,
+    );
 
     assert!(
         surface.external_non_starknet_dependencies.is_empty(),
@@ -4750,6 +5312,89 @@ edition = "2024_07"
     fs::remove_dir_all(&dir).ok();
 }
 
+#[cfg(feature = "native-compile")]
+#[test]
+fn resolve_native_effective_manifest_path_requires_package_for_multi_member_workspace() {
+    let dir = unique_test_dir("uc-native-resolve-workspace-package-required");
+    let workspace_manifest = dir.join("Scarb.toml");
+    let alpha = dir.join("packages/alpha");
+    let beta = dir.join("packages/beta");
+    fs::create_dir_all(&alpha).expect("failed to create alpha workspace member");
+    fs::create_dir_all(&beta).expect("failed to create beta workspace member");
+    fs::write(
+        &workspace_manifest,
+        r#"[workspace]
+members = ["packages/alpha", "packages/beta"]
+"#,
+    )
+    .expect("failed to write workspace manifest");
+    fs::write(
+        alpha.join("Scarb.toml"),
+        r#"[package]
+name = "alpha"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("failed to write alpha manifest");
+    fs::write(
+        beta.join("Scarb.toml"),
+        r#"[package]
+name = "beta"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("failed to write beta manifest");
+
+    let err = resolve_native_effective_manifest_path(&workspace_manifest, &dir, None)
+        .expect_err("multi-member workspace should require explicit --package");
+    assert!(
+        format!("{err:#}").contains("requires --package"),
+        "unexpected error: {err:#}"
+    );
+
+    let selected = resolve_native_effective_manifest_path(&workspace_manifest, &dir, Some("beta"))
+        .expect("explicit package selection should resolve workspace member manifest");
+    assert_eq!(
+        normalize_fingerprint_path(
+            &selected
+                .canonicalize()
+                .expect("selected member manifest should canonicalize"),
+        ),
+        normalize_fingerprint_path(
+            &beta
+                .join("Scarb.toml")
+                .canonicalize()
+                .expect("beta manifest should canonicalize"),
+        )
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn resolve_native_effective_manifest_path_skips_parent_dir_workspace_members() {
+    let dir = unique_test_dir("uc-native-resolve-workspace-parent-dir");
+    let workspace_manifest = dir.join("Scarb.toml");
+    fs::write(
+        &workspace_manifest,
+        r#"[workspace]
+members = ["../outside"]
+"#,
+    )
+    .expect("failed to write workspace manifest");
+    let err = resolve_native_effective_manifest_path(&workspace_manifest, &dir, None)
+        .expect_err("parent-dir workspace members must be ignored");
+    assert!(
+        format!("{err:#}").contains("could not resolve a package-bearing workspace member"),
+        "unexpected error: {err:#}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn build_native_compile_context_cache_tracks_corelib_override_changes() {
     let _guard = integration_env_lock()
@@ -4794,6 +5439,128 @@ edition = "2024_07"
     assert_ne!(
         context_a.corelib_src, context_b.corelib_src,
         "cache key should include corelib override so override changes invalidate cache"
+    );
+
+    std::env::remove_var("UC_NATIVE_CORELIB_SRC");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn build_native_compile_context_cache_tracks_workspace_manifest_changes() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = unique_test_dir("uc-native-context-cache-workspace-manifest");
+    let member_dir = dir.join("member");
+    let member_manifest_path = member_dir.join("Scarb.toml");
+    let workspace_manifest_path = dir.join("Scarb.toml");
+    fs::create_dir_all(member_dir.join("src")).expect("failed to create member src directory");
+    fs::write(member_dir.join("src/lib.cairo"), "fn main() {}\n")
+        .expect("failed to write member lib.cairo");
+
+    let dep_a = dir.join("deps/shared-a");
+    let dep_b = dir.join("deps/shared-bbbbb");
+    fs::create_dir_all(dep_a.join("src")).expect("failed to create dep A src directory");
+    fs::create_dir_all(dep_b.join("src")).expect("failed to create dep B src directory");
+    fs::write(dep_a.join("src/lib.cairo"), "fn dep_a() {}\n").expect("failed to write dep A");
+    fs::write(dep_b.join("src/lib.cairo"), "fn dep_b() {}\n").expect("failed to write dep B");
+    fs::write(
+        dep_a.join("Scarb.toml"),
+        r#"[package]
+name = "shared-dep"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("failed to write dep A manifest");
+    fs::write(
+        dep_b.join("Scarb.toml"),
+        r#"[package]
+name = "shared-dep"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("failed to write dep B manifest");
+
+    fs::write(
+        &member_manifest_path,
+        r#"[package]
+name = "member"
+version = "0.1.0"
+edition = "2024_07"
+
+[dependencies]
+shared-dep = { workspace = true }
+"#,
+    )
+    .expect("failed to write member manifest");
+
+    fs::write(
+        &workspace_manifest_path,
+        r#"[workspace]
+members = ["member"]
+
+[workspace.dependencies]
+shared-dep = { path = "deps/shared-a" }
+"#,
+    )
+    .expect("failed to write workspace manifest");
+
+    let corelib = dir.join("mock-corelib/src");
+    create_mock_native_corelib(&corelib);
+    std::env::set_var("UC_NATIVE_CORELIB_SRC", &corelib);
+
+    let common = BuildCommonArgs {
+        manifest_path: Some(member_manifest_path.clone()),
+        package: None,
+        workspace: false,
+        features: Vec::new(),
+        offline: true,
+        release: false,
+        profile: None,
+    };
+
+    let context_a = build_native_compile_context(&common, &member_manifest_path, &dir)
+        .expect("context A should build");
+    let source_root_a = context_a
+        .path_dependency_roots
+        .iter()
+        .find(|root| root.crate_name == "shared_dep")
+        .map(|root| normalize_fingerprint_path(&root.source_root))
+        .expect("workspace dependency root should resolve from initial workspace manifest");
+    assert!(
+        source_root_a.ends_with("deps/shared-a/src"),
+        "unexpected initial dependency root: {source_root_a}"
+    );
+
+    fs::write(
+        &workspace_manifest_path,
+        r#"[workspace]
+members = ["member"]
+
+[workspace.dependencies]
+shared-dep = { path = "deps/shared-bbbbb" }
+"#,
+    )
+    .expect("failed to update workspace manifest");
+
+    let context_b = build_native_compile_context(&common, &member_manifest_path, &dir)
+        .expect("context B should rebuild after workspace manifest change");
+    let source_root_b = context_b
+        .path_dependency_roots
+        .iter()
+        .find(|root| root.crate_name == "shared_dep")
+        .map(|root| normalize_fingerprint_path(&root.source_root))
+        .expect("workspace dependency root should resolve after workspace manifest change");
+    assert!(
+        source_root_b.ends_with("deps/shared-bbbbb/src"),
+        "dependency root should reflect workspace manifest update: {source_root_b}"
+    );
+    assert_ne!(
+        source_root_a, source_root_b,
+        "native context cache should invalidate when workspace manifest changes"
     );
 
     std::env::remove_var("UC_NATIVE_CORELIB_SRC");
@@ -5196,6 +5963,100 @@ fn native_buildinfo_sidecar_round_trip_restores_tracked_sources_and_dependency_i
 }
 
 #[cfg(feature = "native-compile")]
+#[test]
+fn native_buildinfo_sidecar_journal_replay_seed_restores_when_pending_delta_exists() {
+    let dir = unique_test_dir("uc-native-buildinfo-journal-replay-seed");
+    let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
+    let tracked_sources = BTreeMap::from([(
+        "src/lib.cairo".to_string(),
+        NativeTrackedFileState {
+            size_bytes: 42,
+            modified_unix_ms: 101,
+        },
+    )]);
+    let tracked_source_bytes = native_tracked_sources_total_bytes(&tracked_sources)
+        .expect("tracked source bytes should be computed");
+    let buildinfo = native_buildinfo_file_from_snapshot(
+        native_compile_session_signature_hash(&signature),
+        777,
+        tracked_sources.clone(),
+        tracked_source_bytes,
+        BTreeMap::new(),
+        Vec::new(),
+        10,
+    );
+    persist_native_buildinfo_sidecar(&dir, &buildinfo).expect("native buildinfo should persist");
+    persist_native_source_change_journal(
+        &dir,
+        &NativeSourceChangeJournal {
+            changed_files: BTreeSet::from(["src/lib.cairo".to_string()]),
+            removed_files: BTreeSet::new(),
+            overflowed: false,
+            cursor: 12,
+            applied_cursor: 10,
+        },
+    )
+    .expect("native source journal should persist");
+
+    let replay_seed =
+        try_native_buildinfo_sidecar_restore_with_journal_replay(&dir, &signature, 778)
+            .expect("sidecar should be usable as journal replay seed");
+    assert_eq!(replay_seed.tracked_sources, tracked_sources);
+    assert_eq!(replay_seed.tracked_source_bytes, tracked_source_bytes);
+    assert_eq!(replay_seed.journal_cursor_applied, 10);
+    assert!(
+        try_native_buildinfo_sidecar_restore_with_journal_replay(&dir, &signature, 777).is_none(),
+        "matching source-root mtime should use strict restore path instead of replay seed"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_buildinfo_sidecar_journal_replay_seed_rejects_ambiguous_cursor_state() {
+    let dir = unique_test_dir("uc-native-buildinfo-journal-replay-ambiguous");
+    let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
+    let tracked_sources = BTreeMap::from([(
+        "src/lib.cairo".to_string(),
+        NativeTrackedFileState {
+            size_bytes: 5,
+            modified_unix_ms: 11,
+        },
+    )]);
+    let tracked_source_bytes = native_tracked_sources_total_bytes(&tracked_sources)
+        .expect("tracked source bytes should be computed");
+    let buildinfo = native_buildinfo_file_from_snapshot(
+        native_compile_session_signature_hash(&signature),
+        800,
+        tracked_sources,
+        tracked_source_bytes,
+        BTreeMap::new(),
+        Vec::new(),
+        9,
+    );
+    persist_native_buildinfo_sidecar(&dir, &buildinfo).expect("native buildinfo should persist");
+    persist_native_source_change_journal(
+        &dir,
+        &NativeSourceChangeJournal {
+            changed_files: BTreeSet::from(["src/lib.cairo".to_string()]),
+            removed_files: BTreeSet::new(),
+            overflowed: false,
+            cursor: 12,
+            applied_cursor: 8,
+        },
+    )
+    .expect("native source journal should persist");
+
+    assert!(
+        try_native_buildinfo_sidecar_restore_with_journal_replay(&dir, &signature, 801).is_none(),
+        "seed cursor ahead of journal applied cursor must be rejected to avoid ambiguous replay"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
 fn native_test_db_with_single_real_crate(
     workspace_root: &Path,
     crate_name: &str,
@@ -5361,9 +6222,8 @@ fn native_source_journal_persistence_round_trip_and_consumption() {
     assert_eq!(loaded.removed_files, initial_state.removed_files);
     assert_eq!(loaded.cursor, initial_state.cursor);
 
-    let commit;
     let delta = native_take_source_journal_delta(&dir, &[], 4);
-    match delta {
+    let commit = match delta {
         NativeSourceJournalDelta::Changed {
             changed_files,
             removed_files,
@@ -5374,10 +6234,10 @@ fn native_source_journal_persistence_round_trip_and_consumption() {
                 vec!["src/lib.cairo".to_string(), "src/math.cairo".to_string()]
             );
             assert_eq!(removed_files, vec!["src/old.cairo".to_string()]);
-            commit = delta_commit;
+            delta_commit
         }
         _ => panic!("expected changed delta from persisted source journal"),
-    }
+    };
 
     let pre_commit = load_native_source_change_journal(&dir);
     assert_eq!(
@@ -5443,7 +6303,7 @@ fn native_source_journal_overflow_triggers_fallback_and_clears_persisted_state()
 
 #[cfg(feature = "native-compile")]
 #[test]
-fn native_source_journal_replay_skips_stale_entries_when_session_cursor_is_ahead() {
+fn native_source_journal_replay_ahead_cursor_forces_conservative_full_scan() {
     let dir = unique_test_dir("uc-native-source-journal-replay-stale");
     let initial_state = NativeSourceChangeJournal {
         changed_files: BTreeSet::from(["src/lib.cairo".to_string()]),
@@ -5457,9 +6317,9 @@ fn native_source_journal_replay_skips_stale_entries_when_session_cursor_is_ahead
 
     let delta = native_take_source_journal_delta(&dir, &[], 8);
     let commit = match delta {
-        NativeSourceJournalDelta::NoChanges { commit } => commit,
+        NativeSourceJournalDelta::FallbackFullScan { commit } => commit,
         _ => {
-            panic!("session cursors ahead of journal cursor should treat pending entries as stale")
+            panic!("session cursors ahead of journal cursor must force conservative full scan")
         }
     };
     let pre_commit = load_native_source_change_journal(&dir);
@@ -5471,7 +6331,7 @@ fn native_source_journal_replay_skips_stale_entries_when_session_cursor_is_ahead
     let cleared = load_native_source_change_journal(&dir);
     assert!(
         cleared.changed_files.is_empty() && cleared.removed_files.is_empty() && !cleared.overflowed,
-        "stale replay guard should clear journal sets without forcing overflow fallback"
+        "ahead-cursor replay fallback should clear journal state after successful full scan"
     );
     assert_eq!(cleared.applied_cursor, 5);
 
@@ -5518,7 +6378,7 @@ fn native_source_journal_replay_gap_forces_full_scan_for_ambiguous_cursor_range(
 
 #[cfg(feature = "native-compile")]
 #[test]
-fn native_source_journal_delta_skips_external_roots_without_fallback() {
+fn native_source_journal_delta_external_roots_force_conservative_full_scan() {
     let workspace = unique_test_dir("uc-native-source-journal-external-root-workspace");
     let external = unique_test_dir("uc-native-source-journal-external-root-dep");
     let external_src = external.join("src");
@@ -5528,13 +6388,58 @@ fn native_source_journal_delta_skips_external_roots_without_fallback() {
 
     let delta = native_take_source_journal_delta(&workspace, &[external_src], 0);
     match delta {
-        NativeSourceJournalDelta::NoChanges { .. } => {}
-        _ => panic!("external-only roots should not force journal fallback"),
+        NativeSourceJournalDelta::FallbackFullScan { commit } => {
+            assert!(
+                commit.apply_cursor.is_none(),
+                "external-root fallback should avoid cursor commits from watcher state"
+            );
+        }
+        _ => panic!("external-only roots should force conservative full-scan fallback"),
     }
 
     clear_native_source_change_watcher(&workspace);
     fs::remove_dir_all(&workspace).ok();
     fs::remove_dir_all(&external).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_commit_source_journal_delta_keeps_newer_events_when_apply_cursor_is_stale() {
+    let dir = unique_test_dir("uc-native-source-journal-commit-stale-apply-cursor");
+    let initial_state = NativeSourceChangeJournal {
+        changed_files: BTreeSet::from(["src/lib.cairo".to_string(), "src/math.cairo".to_string()]),
+        removed_files: BTreeSet::new(),
+        overflowed: true,
+        cursor: 12,
+        applied_cursor: 7,
+    };
+    persist_native_source_change_journal(&dir, &initial_state)
+        .expect("native source journal should persist");
+
+    native_commit_source_journal_delta(
+        &dir,
+        &[],
+        NativeSourceJournalCommit {
+            apply_cursor: Some(9),
+            clear_changed_sets: true,
+            clear_overflow: true,
+        },
+    );
+    let post_commit = load_native_source_change_journal(&dir);
+    assert!(
+        !post_commit.changed_files.is_empty(),
+        "newer watcher events must not be dropped when commit cursor is stale"
+    );
+    assert!(
+        post_commit.overflowed,
+        "overflow marker must remain until a commit reaches the latest cursor"
+    );
+    assert_eq!(
+        post_commit.applied_cursor, 9,
+        "applied cursor should still advance to acknowledged boundary"
+    );
+
+    fs::remove_dir_all(&dir).ok();
 }
 
 #[cfg(feature = "native-compile")]
@@ -5706,7 +6611,7 @@ fn native_contract_source_index_for_module_paths_tracks_per_source_indices_and_c
         &vec![0_usize]
     );
     assert!(
-        by_source.get("src/contract_b.cairo").is_none(),
+        !by_source.contains_key("src/contract_b.cairo"),
         "contracts without dependency entries must not create synthetic source-index mappings"
     );
 }
@@ -6017,7 +6922,7 @@ fn native_apply_file_keyed_session_updates_batches_changed_and_removed_files() {
     assert!(
         legacy_overrides
             .as_ref()
-            .map_or(true, |overrides| overrides.is_empty()),
+            .is_none_or(|overrides| overrides.is_empty()),
         "keyed invalidation path should not rewrite the aggregate file override map"
     );
 
@@ -6026,10 +6931,13 @@ fn native_apply_file_keyed_session_updates_batches_changed_and_removed_files() {
 
 #[cfg(feature = "native-compile")]
 #[test]
-fn native_apply_file_keyed_session_updates_marks_new_removed_slot_as_change() {
+fn native_apply_file_keyed_session_updates_skips_untracked_removed_file_slots() {
     let workspace = unique_test_dir("uc-native-file-keyed-removed-slot");
     let src_dir = workspace.join("src");
     fs::create_dir_all(&src_dir).expect("failed to create src dir");
+    let tracked_path = src_dir.join("tracked.cairo");
+    fs::write(&tracked_path, "fn tracked() -> felt252 { 7 }\n")
+        .expect("failed to write tracked source");
 
     let mut db = RootDatabase::builder()
         .with_optimizations(Optimizations::enabled_with_default_movable_functions(
@@ -6039,6 +6947,21 @@ fn native_apply_file_keyed_session_updates_marks_new_removed_slot_as_change() {
         .build()
         .expect("failed to build root database");
 
+    let tracked_applied = native_apply_file_keyed_session_updates(
+        &mut db,
+        &workspace,
+        &[String::from("src/tracked.cairo")],
+        &[],
+    )
+    .expect("tracked source update should succeed");
+    assert!(
+        tracked_applied,
+        "tracked source update should apply keyed override"
+    );
+    let tracked_before = db
+        .file_content(FileId::new(&db, FileLongId::OnDisk(tracked_path.clone())))
+        .map(str::to_string);
+
     let first_removed = native_apply_file_keyed_session_updates(
         &mut db,
         &workspace,
@@ -6047,8 +6970,15 @@ fn native_apply_file_keyed_session_updates_marks_new_removed_slot_as_change() {
     )
     .expect("first removed-file update should succeed");
     assert!(
-        first_removed,
-        "first removed-file update should report mutation due to keyed slot insertion"
+        !first_removed,
+        "removing an untracked file should not trigger keyed slot insertion churn"
+    );
+    let tracked_after_first = db
+        .file_content(FileId::new(&db, FileLongId::OnDisk(tracked_path)))
+        .map(str::to_string);
+    assert_eq!(
+        tracked_before, tracked_after_first,
+        "untracked tombstone handling must not perturb unrelated tracked content"
     );
 
     let second_removed = native_apply_file_keyed_session_updates(
@@ -6060,7 +6990,7 @@ fn native_apply_file_keyed_session_updates_marks_new_removed_slot_as_change() {
     .expect("second removed-file update should succeed");
     assert!(
         !second_removed,
-        "repeating removed-file update with existing tombstone should be a no-op"
+        "repeating removed-file update for untracked file should remain a no-op"
     );
 
     fs::remove_dir_all(&workspace).ok();
@@ -6448,17 +7378,24 @@ fn native_compile_source_roots_include_main_and_dependency_roots_without_duplica
 
 #[cfg(feature = "native-compile")]
 #[test]
-fn native_workspace_relative_cairo_path_accepts_src_cairo_only() {
+fn native_workspace_relative_cairo_path_accepts_workspace_src_segments() {
     let dir = unique_test_dir("uc-native-source-relpath");
     fs::create_dir_all(dir.join("src")).expect("failed to create src directory");
+    fs::create_dir_all(dir.join("packages/member/src")).expect("failed to create nested src");
     let cairo_path = dir.join("src/lib.cairo");
+    let nested_cairo_path = dir.join("packages/member/src/lib.cairo");
     let txt_path = dir.join("src/readme.txt");
     fs::write(&cairo_path, "fn main() {}\n").expect("failed to write cairo file");
+    fs::write(&nested_cairo_path, "fn nested() {}\n").expect("failed to write nested cairo file");
     fs::write(&txt_path, "ignore me\n").expect("failed to write txt file");
 
     assert_eq!(
         native_workspace_relative_cairo_path(&dir, &cairo_path).as_deref(),
         Some("src/lib.cairo")
+    );
+    assert_eq!(
+        native_workspace_relative_cairo_path(&dir, &nested_cairo_path).as_deref(),
+        Some("packages/member/src/lib.cairo")
     );
     assert!(
         native_workspace_relative_cairo_path(&dir, &txt_path).is_none(),
@@ -6836,19 +7773,62 @@ fn native_cached_noop_keep_files_requires_complete_manifest_artifacts() {
 #[test]
 fn native_compiler_config_sets_replace_ids_by_profile() {
     let empty_inputs: Vec<CrateInput> = Vec::new();
-    let dev_config = native_compiler_config(&empty_inputs, "dev");
+    let dev_config = native_compiler_config(&empty_inputs, "dev", true);
     assert!(
-        !dev_config.add_statements_code_locations,
-        "statement-location annotations should be disabled by default for Scarb parity"
+        dev_config.add_statements_code_locations,
+        "statement-location annotations should be enabled by default to support impacted-unit compile"
     );
     assert!(
         dev_config.replace_ids,
         "dev profile should default to replace IDs"
     );
-    let release_config = native_compiler_config(&empty_inputs, "release");
+    let release_config = native_compiler_config(&empty_inputs, "release", false);
+    assert!(
+        !release_config.add_statements_code_locations,
+        "statement-location annotations should honor explicit compile configuration"
+    );
     assert!(
         !release_config.replace_ids,
         "release profile should not replace IDs by default"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_should_capture_statement_locations_with_flags_disables_when_base_disabled() {
+    let changed = vec!["src/lib.cairo".to_string()];
+    let removed = Vec::new();
+    assert!(
+        !native_should_capture_statement_locations_with_flags(
+            false, true, &changed, &removed, false
+        ),
+        "base disabled must always disable statement-location capture"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_should_capture_statement_locations_with_flags_defaults_off_on_cold() {
+    let changed = vec!["src/lib.cairo".to_string()];
+    let removed = Vec::new();
+    assert!(
+        !native_should_capture_statement_locations_with_flags(
+            true, false, &changed, &removed, true
+        ),
+        "cold compile should follow capture-on-cold flag"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_should_capture_statement_locations_with_flags_keeps_incremental_enabled() {
+    let changed = vec!["src/lib.cairo".to_string()];
+    let removed = Vec::new();
+    assert!(
+        native_should_capture_statement_locations_with_flags(
+            true, false, &changed, &removed, false
+        ),
+        "incremental changed-file builds should keep capture enabled for dependency indexing"
     );
 }
 

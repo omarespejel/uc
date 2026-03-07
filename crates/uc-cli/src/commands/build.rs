@@ -521,6 +521,7 @@ fn daemon_backend_policy_with_hint_state(
     }
 }
 
+#[cfg(test)]
 fn native_auto_preflight_hint_reason(
     workspace_root: &Path,
     native_session_key: &str,
@@ -554,8 +555,10 @@ fn native_auto_preflight_hint_state(
     if native_supported_hint {
         return Ok(NativeAutoPreflightHintState::Supported);
     }
-    if let Some(reason) = native_auto_preflight_hint_reason(workspace_root, native_session_key)? {
-        return Ok(NativeAutoPreflightHintState::FallbackHint(reason));
+    if load_daemon_local_probe_hint(workspace_root, native_session_key)?.is_some() {
+        return Ok(NativeAutoPreflightHintState::FallbackHint(format!(
+            "cached fallback hint present for session key {native_session_key}"
+        )));
     }
     Ok(NativeAutoPreflightHintState::Unknown)
 }

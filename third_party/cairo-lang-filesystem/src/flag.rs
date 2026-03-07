@@ -39,14 +39,14 @@ impl Flag {
 
 /// Extracts the value of a flag given the flag string and the expected variant.
 /// Returns `None` if the flag is missing.
-/// Panics if there is a variant mismatch.
+/// Returns `None` when a variant mismatch is detected.
 macro_rules! extract_flag_value {
     ($db:ident, $flag:ident, $variant:ident) => {{
         let flag = FlagId::new($db, FlagLongId(Flag::$flag.into()));
         match $db.get_flag(flag) {
             None => None,
             Some(Flag::$variant(value)) => Some(value),
-            Some(other) => panic!("Unexpected flag variant for `{}`: {other:?}", Flag::$flag),
+            Some(_) => None,
         }
     }};
 }
@@ -116,7 +116,10 @@ pub trait FlagsGroup: Database {
     /// Sets the given flag value. None value removes the flag.
     fn set_flag(&mut self, flag: FlagLongId, value: Option<Flag>) {
         let db_ref = self.as_dyn_database();
-        let mut flags = files_group_input(db_ref).flags(db_ref).clone().unwrap();
+        let mut flags = files_group_input(db_ref)
+            .flags(db_ref)
+            .clone()
+            .unwrap_or_default();
         match value {
             Some(value) => flags.insert(flag, value),
             None => flags.swap_remove(&flag),

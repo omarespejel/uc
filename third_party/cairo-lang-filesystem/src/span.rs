@@ -150,6 +150,11 @@ pub struct TextSpan {
 impl TextSpan {
     /// Creates a `TextSpan` from a start and end offset.
     pub fn new(start: TextOffset, end: TextOffset) -> Self {
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
         Self { start, end }
     }
     /// Creates a `TextSpan` from a start offset and a width.
@@ -215,18 +220,15 @@ pub struct TextPosition {
 impl TextOffset {
     fn get_line_number(self, db: &dyn Database, file: FileId<'_>) -> Option<usize> {
         let summary = db.file_summary(file)?;
-        assert!(
-            self <= summary.last_offset,
-            "TextOffset out of range. {:?} > {:?}.",
-            self.0,
-            summary.last_offset.0
-        );
-        Some(
-            summary
-                .line_offsets
-                .binary_search(&self)
-                .unwrap_or_else(|x| x - 1),
-        )
+        if self > summary.last_offset {
+            return None;
+        }
+        let line_idx = match summary.line_offsets.binary_search(&self) {
+            Ok(idx) => idx,
+            Err(0) => return None,
+            Err(idx) => idx - 1,
+        };
+        Some(line_idx)
     }
 
     /// Convert this offset to an equivalent [`TextPosition`] in the file.

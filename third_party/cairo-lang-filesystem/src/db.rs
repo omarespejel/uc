@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use cairo_lang_utils::Intern;
 use cairo_lang_utils::ordered_hash_map::OrderedHashMap;
@@ -260,6 +260,7 @@ pub fn files_group_input(db: &dyn Database) -> FilesGroupInput {
 
 #[salsa::input]
 pub struct FileOverrideSlot {
+    pub present: bool,
     #[returns(ref)]
     pub content: Option<Arc<str>>,
 }
@@ -331,6 +332,7 @@ pub trait FilesGroup: Database {
 
 impl<T: Database + ?Sized> FilesGroup for T {}
 
+/// Initializes filesystem-group salsa inputs to empty defaults.
 pub fn init_files_group<'db>(db: &mut (dyn Database + 'db)) {
     // Initialize inputs.
     let inp = files_group_input(db);
@@ -342,55 +344,92 @@ pub fn init_files_group<'db>(db: &mut (dyn Database + 'db)) {
     inp.set_cfg_set(db).to(Some(Default::default()));
 }
 
+/// Sets crate configuration input map for standalone use.
 pub fn set_crate_configs_input(
     db: &mut dyn Database,
-    crate_configs: Option<OrderedHashMap<CrateInput, CrateConfigurationInput>>,
+    crate_configs: OrderedHashMap<CrateInput, CrateConfigurationInput>,
 ) {
     files_group_input(db)
         .set_crate_configs(db)
-        .to(crate_configs);
+        .to(Some(crate_configs));
 }
 
-fn keyed_file_override_slot(db: &mut dyn Database, file: FileInput) -> FileOverrideSlot {
+/// Ensures keyed override slots exist for the provided files.
+///
+/// Returns the number of newly inserted slots.
+pub fn ensure_keyed_file_override_slots(
+    db: &mut dyn Database,
+    files: impl IntoIterator<Item = FileInput>,
+) -> usize {
     let db_ref: &dyn Database = db;
-    if let Some(slot) = files_group_input(db_ref)
-        .keyed_file_overrides(db_ref)
-        .as_ref()
-        .and_then(|overrides| overrides.get(&file).cloned())
-    {
-        return slot;
-    }
-    let slot = FileOverrideSlot::new(db, None);
     let mut overrides = files_group_input(db_ref)
         .keyed_file_overrides(db_ref)
         .clone()
         .unwrap_or_default();
-    overrides.insert(file, slot);
-    files_group_input(db_ref)
-        .set_keyed_file_overrides(db)
-        .to(Some(overrides));
-    slot
+    let mut inserted = 0_usize;
+    for file in files {
+        if !overrides.contains_key(&file) {
+            overrides.insert(file, FileOverrideSlot::new(db, false, None));
+            inserted = inserted.saturating_add(1);
+        }
+    }
+    if inserted > 0 {
+        files_group_input(db_ref)
+            .set_keyed_file_overrides(db)
+            .to(Some(overrides));
+    }
+    inserted
 }
 
+fn keyed_file_override_slot(db: &mut dyn Database, file: FileInput) -> (FileOverrideSlot, bool) {
+    if let Some(slot) = {
+        let db_ref: &dyn Database = db;
+        files_group_input(db_ref)
+            .keyed_file_overrides(db_ref)
+            .as_ref()
+            .and_then(|overrides| overrides.get(&file).cloned())
+    } {
+        return (slot, false);
+    }
+    let inserted = ensure_keyed_file_override_slots(db, std::iter::once(file.clone()));
+    let db_ref: &dyn Database = db;
+    let slot = files_group_input(db_ref)
+        .keyed_file_overrides(db_ref)
+        .as_ref()
+        .and_then(|overrides| overrides.get(&file).cloned())
+        .expect("keyed override slot should exist after insertion");
+    (slot, inserted > 0)
+}
+
+/// Sets keyed override content for a single file.
+///
+/// Returns `true` when database state changed (slot insertion and/or content change).
 pub fn set_file_override_content_keyed(
     db: &mut dyn Database,
     file: FileInput,
     content: Option<Arc<str>>,
 ) -> bool {
-    let slot = keyed_file_override_slot(db, file);
-    if slot.content(db).as_deref() == content.as_deref() {
-        return false;
+    let (slot, inserted) = keyed_file_override_slot(db, file);
+    let current_present = slot.present(db);
+    let current_content = slot.content(db).clone();
+    if current_present && current_content.as_deref() == content.as_deref() {
+        return inserted;
+    }
+    if !current_present {
+        slot.set_present(db).to(true);
     }
     slot.set_content(db).to(content);
     true
 }
 
 #[salsa::tracked(returns(ref))]
+/// Returns aggregate (legacy) file overrides.
 pub fn file_overrides<'db>(db: &'db dyn Database) -> OrderedHashMap<FileId<'db>, ArcStr> {
     let inp = files_group_input(db)
         .file_overrides(db)
         .as_ref()
-        .expect("file_overrides is not set");
+        .cloned()
+        .unwrap_or_default();
     inp.iter()
         .map(|(file_id, content)| {
             (
@@ -402,13 +441,15 @@ pub fn file_overrides<'db>(db: &'db dyn Database) -> OrderedHashMap<FileId<'db>,
 }
 
 #[salsa::tracked(returns(ref))]
+/// Returns crate configurations keyed by interned crate ids.
 pub fn crate_configs<'db>(
     db: &'db dyn Database,
 ) -> OrderedHashMap<CrateId<'db>, CrateConfiguration<'db>> {
     let inp = files_group_input(db)
         .crate_configs(db)
         .as_ref()
-        .expect("crate_configs is not set");
+        .cloned()
+        .unwrap_or_default();
     inp.iter()
         .map(|(crate_input, config)| {
             (
@@ -445,6 +486,7 @@ fn crate_configuration_input<'db>(
     crate_configuration_input_helper(db, (), config)
 }
 
+/// Initializes `core` crate configuration in the current database.
 pub fn init_dev_corelib(db: &mut dyn salsa::Database, core_lib_dir: PathBuf) {
     let core = CrateLongId::core(db).intern(db);
     let root = CrateConfiguration {
@@ -466,7 +508,7 @@ pub fn init_dev_corelib(db: &mut dyn salsa::Database, core_lib_dir: PathBuf) {
         cache_file: None,
     };
     let crate_configs = update_crate_configuration_input_helper(db, core, Some(root));
-    set_crate_configs_input(db, Some(crate_configs));
+    set_crate_configs_input(db, crate_configs);
 }
 
 /// Updates crate configuration input for standalone use.
@@ -480,7 +522,7 @@ pub fn update_crate_configuration_input_helper(
     let mut crate_configs = files_group_input(db_ref)
         .crate_configs(db_ref)
         .clone()
-        .unwrap();
+        .unwrap_or_default();
     match root {
         Some(root) => crate_configs.insert(crt.clone(), db.crate_configuration_input(root).clone()),
         None => crate_configs.swap_remove(crt),
@@ -493,7 +535,7 @@ pub fn update_crate_configuration_input_helper(
 macro_rules! set_crate_config {
     ($self:expr, $crt:expr, $root:expr) => {
         let crate_configs = $crate::db::update_crate_configuration_input_helper($self, $crt, $root);
-        $crate::db::set_crate_configs_input($self, Some(crate_configs));
+        $crate::db::set_crate_configs_input($self, crate_configs);
     };
 }
 
@@ -507,7 +549,7 @@ pub fn update_file_overrides_input_helper(
     let mut overrides = files_group_input(db_ref)
         .file_overrides(db_ref)
         .clone()
-        .unwrap();
+        .unwrap_or_default();
     match content {
         Some(content) => overrides.insert(file, content),
         None => overrides.swap_remove(&file),
@@ -525,10 +567,11 @@ macro_rules! override_file_content {
 }
 
 fn cfg_set_helper(db: &dyn Database) -> &CfgSet {
+    static EMPTY_CFG_SET: OnceLock<CfgSet> = OnceLock::new();
     files_group_input(db)
         .cfg_set(db)
         .as_ref()
-        .expect("cfg_set is not set")
+        .unwrap_or_else(|| EMPTY_CFG_SET.get_or_init(CfgSet::default))
 }
 
 #[salsa::tracked(returns(ref))]
@@ -555,7 +598,7 @@ fn crate_config_helper<'db>(
                 files: BTreeMap::from([("lib.cairo".to_string(), *file_id)]),
                 dirs: Default::default(),
             },
-            settings: toml::from_str(settings).expect("Failed to parse virtual crate settings."),
+            settings: toml::from_str(settings).ok()?,
             cache_file: *cache_file,
         }),
     }
@@ -611,13 +654,17 @@ fn file_summary_helper<'db>(db: &'db dyn Database, file: FileId<'db>) -> Option<
 #[salsa::tracked(returns(ref))]
 fn file_content<'db>(db: &'db dyn Database, file_id: FileId<'db>) -> Option<Arc<str>> {
     let file = db.file_input(file_id).clone();
-    if let Some(content) = files_group_input(db)
-        .keyed_file_overrides(db)
-        .as_ref()
-        .and_then(|overrides| overrides.get(&file))
-        .and_then(|slot| slot.content(db).clone())
+    if let Some(overrides) = files_group_input(db).keyed_file_overrides(db).as_ref()
+        && let Some(slot) = overrides.get(&file)
     {
-        return Some(content);
+        if !slot.present(db) {
+            // Slot exists for keyed invalidation bookkeeping only; no override is active.
+        } else if let Some(content) = slot.content(db).clone() {
+            return Some(content);
+        } else {
+            // Keyed `None` is an explicit tombstone and must not fall through.
+            return None;
+        }
     }
     let overrides = db.file_overrides();
     overrides

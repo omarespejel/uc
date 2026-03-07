@@ -333,7 +333,7 @@ impl<'db> FileLongId<'db> {
     }
     pub fn full_path(&self, db: &'db dyn Database) -> String {
         match self {
-            FileLongId::OnDisk(path) => path.to_str().unwrap_or("<unknown>").to_string(),
+            FileLongId::OnDisk(path) => path.to_string_lossy().into_owned(),
             FileLongId::Virtual(vf) => vf.full_path(db),
             FileLongId::External(external_id) => ext_as_virtual(db, *external_id).full_path(db),
         }
@@ -435,6 +435,9 @@ impl std::fmt::Debug for ArcStr {
 
 unsafe impl salsa::Update for ArcStr {
     unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
+        // SAFETY:
+        // `old_pointer` is provided by salsa and points to a valid, uniquely mutable `ArcStr`
+        // slot for the duration of this call. Replacing `*old_pointer` is therefore safe.
         let old_str: &mut Self = unsafe { &mut *old_pointer };
 
         // Fast path: same allocation => unchanged.
@@ -606,7 +609,8 @@ impl<'db> DebugWithDb<'db> for SpanInFile<'db> {
                 if let Some(ending_text_pos) = self.span.end.position_in_file(db, self.file_id)
                     && starting_text_pos.line != ending_text_pos.line
                 {
-                    ending_pos = format!("-{}:{}", ending_text_pos.line + 1, ending_text_pos.col);
+                    ending_pos =
+                        format!("-{}:{}", ending_text_pos.line + 1, ending_text_pos.col + 1);
                 }
                 marks = get_location_marks(db, self, true);
                 format!(

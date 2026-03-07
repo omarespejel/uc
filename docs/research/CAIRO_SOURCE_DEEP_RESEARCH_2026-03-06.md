@@ -63,17 +63,17 @@ These are the right structural pieces, but they do not yet capture the largest c
 1. Rebuild fresh `RootDatabase`.
 2. Run `setup_project`.
 3. Rehydrate source tracking metadata.
-4. Compile without reusing persisted lowering/semantic crate cache blobs.
+4. Rebuild dependency/compiler state when cache compatibility guardrails reject reuse.
 
-Scarb already wires this cache lifecycle (fingerprint + load + inject + save) around Cairo lowering caches. `uc` currently does not.
+Scarb wires cache lifecycle (fingerprint + load + inject + save) around Cairo lowering caches. `uc` now implements this lifecycle too, but still needs stronger compatibility-key hardening and broader benchmark-verified wins in cold paths.
 
 ## Highest-ROI recommendation
 
-Implement a native crate-cache lifecycle in `uc` using Cairo lowering cache APIs:
+Harden and expand the native crate-cache lifecycle in `uc` using Cairo lowering cache APIs:
 
-1. Load cached crate blobs at session rebuild and inject as `cache_file`.
-2. Save refreshed crate blobs after successful native compile for affected crates.
-3. Guard loads with strict compatibility keys to avoid stale cache misuse.
+1. Keep loading cached crate blobs at session rebuild and inject as `cache_file`.
+2. Keep saving refreshed crate blobs after successful native compile for affected crates.
+3. Tighten compatibility keys and rejection telemetry so reuse is safe and explainable.
 
 This is the largest remaining structural win before more invasive compiler changes.
 
@@ -139,6 +139,8 @@ Run locked benchmark gate only on pinned hosts:
 
 ## Expected impact (realistic)
 
+Current caveat: the latest locked benchmark gate in this PR branch did not pass cleanly (cold-path regressions/outliers are still present), so the expectations below remain directional until the gate is green on pinned hosts.
+
 Conservative expectation after Phase 1+2:
 
 1. Largest gains on session rebuild and cold-like invocations where DB state must be rebuilt.
@@ -187,3 +189,73 @@ Wrapper-level improvements reduce overhead in low milliseconds. The remaining bo
 7. ThinLTO incremental cache and pruning: <https://clang.llvm.org/docs/ThinLTO.html>
 8. TypeScript persisted incremental build state (`.tsbuildinfo`): <https://www.typescriptlang.org/tsconfig/incremental.html>
 9. Bazel remote cache AC/CAS model: <https://bazel.build/versions/6.4.0/remote/caching>
+
+## Implementation update (2026-03-07)
+
+Applied in `uc` after the source audit:
+
+1. Added a restart-safe buildinfo replay-seed path:
+   - when sidecar source-root mtime mismatches, `uc` can still seed from persisted buildinfo only if a replayable source-journal delta exists (non-overflowed, pending, unambiguous cursor boundary).
+   - this avoids unnecessary full workspace scans on daemon/session rebuild when changed-file replay is available.
+2. Made eager keyed override slot priming opt-in:
+   - default is now lazy slot creation (`UC_NATIVE_EAGER_KEYED_SLOT_PRIME=0` by default).
+   - this removes cold-start startup work that scaled with total tracked source files.
+3. Added TDD regression tests for replay-seed safety:
+   - positive case: replay seed accepted only with pending journal delta.
+   - negative case: ambiguous cursor boundary is rejected.
+
+## SOTA refresh update (2026-03-07, Linux/macOS focus)
+
+### Additional primary-source findings
+
+1. Persistent worker architecture is still the highest ROI for startup-heavy builds.
+   - Bazel documents persistent workers as a direct way to avoid repeated process startup and reports large gains in practice.
+   - Swift driver supports compile-server mode for similar reasons.
+2. Fine-grained invalidation + persisted incremental state is the durable pattern.
+   - Rust incremental (red-green) and TypeScript `.tsbuildinfo` both keep durable keyed state and avoid recomputing unaffected units.
+3. File watcher semantics must be cursor-based and restart-safe.
+   - Watchman `since`/fresh-instance semantics reinforce the need for conservative fallback when cursor continuity is ambiguous.
+4. Cold-path compile flags matter.
+   - Clang docs show reduced debug-info modes (`-gline-tables-only`) to cut work when full debug metadata is not required.
+5. Fast build tools minimize orchestration overhead and rely on precise dependency metadata.
+   - Ninja emphasizes low overhead and explicit incremental scheduling.
+
+### Applied in this pass
+
+1. Added cold-path statement-location gating for native compile:
+   - new env: `UC_NATIVE_CAPTURE_STATEMENT_LOCATIONS_ON_COLD` (default: `false`)
+   - incremental changed-file builds still capture statement locations by default for impacted-unit precision.
+2. Wired compile config explicitly with per-request capture decision:
+   - `native_compiler_config(..., capture_statement_locations)` now receives the decision instead of always enabling.
+3. Skipped dependency extraction work when statement-location capture is disabled:
+   - avoids extra cold-path traversal of debug-info annotations when not needed.
+4. Added tests:
+   - `native_should_capture_statement_locations_with_flags_disables_when_base_disabled`
+   - `native_should_capture_statement_locations_with_flags_defaults_off_on_cold`
+   - `native_should_capture_statement_locations_with_flags_keeps_incremental_enabled`
+5. Made dependency metadata probing opt-in on native path:
+   - new env: `UC_NATIVE_DEPENDENCY_METADATA_ENABLED` (default: `false`)
+   - by default `uc` now uses manifest-only dependency discovery and skips Scarb metadata probing during native context build, reducing cold startup overhead on supported cases.
+
+### Measurement note
+
+Quick smoke runs remain consistent on warm wins and noisy on cold:
+
+1. warm_noop: strong win
+2. warm_edit: strong win
+3. warm_edit_semantic: modest win
+4. cold: still behind Scarb and variable with short sample lanes
+
+Conclusion: to move cold from "sometimes better" to "durably better", the next step is still deeper compiler-side reuse (persisted keyed compiler artifacts), not only wrapper-level startup cuts.
+
+### Sources used in this refresh
+
+1. Bazel persistent workers: <https://bazel.build/versions/7.1.0/remote/persistent>
+2. Bazel scalability/perf concepts: <https://bazel.build/versions/8.4.0/rules/performance>
+3. Rust incremental model: <https://rustc-dev-guide.rust-lang.org/queries/incremental-compilation-in-detail.html>
+4. Swift driver internals (compile server): <https://github.com/swiftlang/swift-driver/blob/main/Sources/SwiftDriver/Driver/Driver.swift>
+5. Watchman query semantics: <https://facebook.github.io/watchman/docs/cmd/query>
+6. Ninja manual: <https://ninja-build.org/manual>
+7. TypeScript incremental buildinfo: <https://www.typescriptlang.org/tsconfig/incremental.html>
+8. Clang users manual: <https://clang.llvm.org/docs/UsersManual.html>
+9. sccache README: <https://github.com/mozilla/sccache/blob/main/README.md>

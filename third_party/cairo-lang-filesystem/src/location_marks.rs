@@ -16,47 +16,46 @@ pub fn get_location_marks(
     skip_middle_lines: bool,
 ) -> String {
     let span = &location.span;
-    let summary = db
-        .file_summary(location.file_id)
-        .expect("File missing from DB.");
+    let Some(summary) = db.file_summary(location.file_id) else {
+        return String::new();
+    };
     let TextPosition {
         line: first_line_idx,
         col: _,
-    } = span
-        .start
-        .position_in_file(db, location.file_id)
-        .expect("Failed to find location in file.");
-    if span.end <= summary.last_offset {
-        let TextPosition {
-            line: last_line_idx,
-            col: _,
-        } = span
-            .end
-            .position_in_file(db, location.file_id)
-            .expect("Failed to find location in file.");
-        if first_line_idx != last_line_idx {
-            return get_multiple_lines_location_marks(db, location, skip_middle_lines);
-        }
+    } = match span.start.position_in_file(db, location.file_id) {
+        Some(position) => position,
+        None => return String::new(),
+    };
+    let clamped_end = std::cmp::min(span.end, summary.last_offset);
+    let TextPosition {
+        line: last_line_idx,
+        col: _,
+    } = match clamped_end.position_in_file(db, location.file_id) {
+        Some(position) => position,
+        None => return String::new(),
+    };
+    if first_line_idx != last_line_idx {
+        return get_multiple_lines_location_marks(db, location, skip_middle_lines);
     }
     get_single_line_location_marks(db, location)
 }
 
 /// Given a single line diagnostic location, returns a string with the location marks.
 fn get_single_line_location_marks(db: &dyn Database, location: &SpanInFile<'_>) -> String {
-    let content = db
-        .file_content(location.file_id)
-        .expect("File missing from DB.");
-    let summary = db
-        .file_summary(location.file_id)
-        .expect("File missing from DB.");
+    let Some(content) = db.file_content(location.file_id) else {
+        return String::new();
+    };
+    let Some(summary) = db.file_summary(location.file_id) else {
+        return String::new();
+    };
     let span = &location.span;
     let TextPosition {
         line: first_line_idx,
         col,
-    } = span
-        .start
-        .position_in_file(db, location.file_id)
-        .expect("Failed to find location in file.");
+    } = match span.start.position_in_file(db, location.file_id) {
+        Some(position) => position,
+        None => return String::new(),
+    };
     let first_line_start = summary.line_offsets[first_line_idx];
     let first_line_end = match summary.line_offsets.get(first_line_idx + 1) {
         Some(offset) => offset.sub_width(TextWidth::from_char('\n')),
@@ -81,21 +80,21 @@ fn get_multiple_lines_location_marks(
     location: &SpanInFile<'_>,
     skip_middle_lines: bool,
 ) -> String {
-    let content = db
-        .file_content(location.file_id)
-        .expect("File missing from DB.");
-    let summary = db
-        .file_summary(location.file_id)
-        .expect("File missing from DB.");
+    let Some(content) = db.file_content(location.file_id) else {
+        return String::new();
+    };
+    let Some(summary) = db.file_summary(location.file_id) else {
+        return String::new();
+    };
 
     let span = &location.span;
     let TextPosition {
         line: first_line_idx,
         col,
-    } = span
-        .start
-        .position_in_file(db, location.file_id)
-        .expect("Failed to find location in file.");
+    } = match span.start.position_in_file(db, location.file_id) {
+        Some(position) => position,
+        None => return String::new(),
+    };
     let mut res = get_line_content(summary, first_line_idx, content, true);
     res += " _";
     res.extend(repeat_n('_', col));
@@ -103,10 +102,10 @@ fn get_multiple_lines_location_marks(
     let TextPosition {
         line: last_line_idx,
         col: end_line_col,
-    } = span
-        .end
-        .position_in_file(db, location.file_id)
-        .expect("Failed to find location in file.");
+    } = match std::cmp::min(span.end, summary.last_offset).position_in_file(db, location.file_id) {
+        Some(position) => position,
+        None => return String::new(),
+    };
 
     const LINES_TO_REPLACE_MIDDLE: usize = 3;
     if !skip_middle_lines || first_line_idx + LINES_TO_REPLACE_MIDDLE > last_line_idx {

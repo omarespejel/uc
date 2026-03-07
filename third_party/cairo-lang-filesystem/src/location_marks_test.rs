@@ -1,4 +1,3 @@
-use cairo_lang_test_utils::test;
 use cairo_lang_utils::Intern;
 use indoc::indoc;
 use pretty_assertions::assert_eq;

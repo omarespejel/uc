@@ -69,7 +69,7 @@ version = "0.3.2"
 default-features = false
 
 [dependencies.toml]
-version = "0.9.5"
+version = "0.8"
 
 [dev-dependencies.indoc]
 version = "2.0.6"

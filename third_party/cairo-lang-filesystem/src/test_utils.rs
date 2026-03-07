@@ -1,6 +1,9 @@
 use crate::db::init_files_group;
 
-// Test salsa database.
+/// Test Salsa database used by filesystem unit tests.
+///
+/// It is pre-initialized via [`init_files_group`] and can be cloned safely
+/// across test helpers that need `#[salsa::db]` storage access.
 #[salsa::db]
 #[derive(Clone)]
 pub struct FilesDatabaseForTesting {
