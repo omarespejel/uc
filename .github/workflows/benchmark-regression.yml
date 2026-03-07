@@ -216,7 +216,8 @@ jobs:
             local exit_code=$?
             set -e
             if [[ "$exit_code" -ne 0 ]]; then
-              if [[ "$allow_skip_unsupported" == "1" ]]; then
+              if [[ "$allow_skip_unsupported" == "1" ]] \
+                && grep -E "native compile does not support .* yet" "$log_path" >/dev/null; then
                 echo "native-only gate: skipping unsupported fixture '$tag'"
                 return 0
               fi

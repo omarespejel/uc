@@ -6257,6 +6257,85 @@ fn native_crate_cache_restore_rejects_signature_mismatch() {
 
 #[cfg(feature = "native-compile")]
 #[test]
+fn native_crate_cache_descriptor_invalidates_after_in_place_source_edit() {
+    let dir = unique_test_dir("uc-native-crate-cache-root-fingerprint");
+    let source_file = dir.join("src/lib.cairo");
+    fs::create_dir_all(
+        source_file
+            .parent()
+            .expect("source file path should have parent directory"),
+    )
+    .expect("failed to create source root");
+    fs::write(&source_file, "fn value() -> felt252 { 1 }\n")
+        .expect("failed to write baseline source file");
+
+    let (db, crate_input) = native_test_db_with_single_real_crate(&dir, "demo");
+    let crate_id = CrateInput::into_crate_ids(&db, [crate_input.clone()])
+        .into_iter()
+        .next()
+        .expect("crate id should be interned");
+    let descriptor_before = native_crate_cache_descriptor_for_crate(&db, crate_id)
+        .expect("real crate config should produce cache descriptor");
+
+    fs::write(
+        &source_file,
+        "fn value() -> felt252 { 1234 }\nfn helper() -> felt252 { 9 }\n",
+    )
+    .expect("failed to rewrite source file with new contents");
+    let descriptor_after = native_crate_cache_descriptor_for_crate(&db, crate_id)
+        .expect("real crate config should produce cache descriptor after edit");
+
+    assert_ne!(
+        descriptor_before.cache_key, descriptor_after.cache_key,
+        "in-place source edits must invalidate crate cache descriptor keys"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_prune_crate_cache_files_removes_blob_metadata_companions() {
+    let workspace = unique_test_dir("uc-native-crate-cache-prune-companion");
+    let root = native_crate_cache_root_path(&workspace).expect("cache root path should resolve");
+    fs::create_dir_all(&root).expect("failed to create cache root");
+
+    let old_blob = root.join("old-entry.bin");
+    let old_meta = root.join("old-entry.json");
+    fs::write(&old_blob, vec![1_u8; 128]).expect("failed to write old cache blob");
+    fs::write(&old_meta, vec![2_u8; 96]).expect("failed to write old cache metadata");
+
+    thread::sleep(Duration::from_millis(1100));
+
+    let new_blob = root.join("new-entry.bin");
+    let new_meta = root.join("new-entry.json");
+    fs::write(&new_blob, vec![3_u8; 64]).expect("failed to write new cache blob");
+    fs::write(&new_meta, vec![4_u8; 64]).expect("failed to write new cache metadata");
+
+    let keep_bytes = fs::metadata(&new_blob)
+        .expect("failed to stat new cache blob")
+        .len()
+        .saturating_add(
+            fs::metadata(&new_meta)
+                .expect("failed to stat new cache metadata")
+                .len(),
+        );
+    native_prune_crate_cache_files(&workspace, keep_bytes).expect("cache prune should succeed");
+
+    assert!(
+        !old_blob.exists() && !old_meta.exists(),
+        "pruning should remove old blob/metadata companions together"
+    );
+    assert!(
+        new_blob.exists() && new_meta.exists(),
+        "newest blob/metadata pair should remain within budget"
+    );
+
+    fs::remove_dir_all(&workspace).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
 fn native_source_journal_persistence_round_trip_and_consumption() {
     let dir = unique_test_dir("uc-native-source-journal-persistence");
     let initial_state = NativeSourceChangeJournal {
@@ -6430,7 +6509,7 @@ fn native_source_journal_replay_gap_forces_full_scan_for_ambiguous_cursor_range(
 
 #[cfg(feature = "native-compile")]
 #[test]
-fn native_source_journal_delta_external_roots_force_conservative_full_scan() {
+fn native_source_journal_delta_external_roots_use_watcher_state() {
     let workspace = unique_test_dir("uc-native-source-journal-external-root-workspace");
     let external = unique_test_dir("uc-native-source-journal-external-root-dep");
     let external_src = external.join("src");
@@ -6440,13 +6519,16 @@ fn native_source_journal_delta_external_roots_force_conservative_full_scan() {
 
     let delta = native_take_source_journal_delta(&workspace, &[external_src], 0);
     match delta {
-        NativeSourceJournalDelta::FallbackFullScan { commit } => {
+        NativeSourceJournalDelta::NoChanges { commit } => {
             assert!(
                 commit.apply_cursor.is_none(),
-                "external-root fallback should avoid cursor commits from watcher state"
+                "empty watcher state should not advance cursor commits"
             );
         }
-        _ => panic!("external-only roots should force conservative full-scan fallback"),
+        NativeSourceJournalDelta::Changed { .. } => {}
+        NativeSourceJournalDelta::FallbackFullScan { .. } => {
+            panic!("external roots should no longer force conservative full-scan fallback")
+        }
     }
 
     clear_native_source_change_watcher(&workspace);
@@ -7389,6 +7471,87 @@ fn native_collect_tracked_sources_tracks_only_cairo_files() {
         "manifest changes are handled by session signature and should not be tracked as source files"
     );
     assert!(total_bytes > 0, "tracked source bytes should be non-zero");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_collect_tracked_sources_with_source_root_mtime_matches_individual_scans() {
+    let dir = unique_test_dir("uc-native-track-sources-with-mtime");
+    fs::create_dir_all(dir.join("src/nested")).expect("failed to create source directories");
+    fs::write(dir.join("src/lib.cairo"), "fn root() -> felt252 { 1 }\n")
+        .expect("failed to write root cairo file");
+    fs::write(
+        dir.join("src/nested/helper.cairo"),
+        "fn helper() -> felt252 { 2 }\n",
+    )
+    .expect("failed to write nested cairo file");
+
+    let source_roots = vec![dir.join("src")];
+    let (combined_tracked, combined_bytes, combined_latest) =
+        native_collect_tracked_sources_with_source_root_mtime(&dir, &source_roots)
+            .expect("combined source tracking scan should succeed");
+    let (tracked, total_bytes) = native_collect_tracked_sources(&dir, &source_roots)
+        .expect("source tracking should succeed");
+    let latest = native_source_roots_modified_unix_ms(&dir, &source_roots)
+        .expect("source-root freshness scan should succeed");
+
+    assert_eq!(
+        combined_tracked, tracked,
+        "combined scan should preserve tracked source set"
+    );
+    assert_eq!(
+        combined_bytes, total_bytes,
+        "combined scan should preserve tracked source byte accounting"
+    );
+    assert_eq!(
+        combined_latest, latest,
+        "combined scan should preserve source-root freshness marker"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_has_persisted_session_state_hints_detects_session_image_and_buildinfo() {
+    let dir = unique_test_dir("uc-native-session-state-hints");
+    fs::create_dir_all(&dir).expect("failed to create workspace root");
+
+    assert!(
+        !native_has_persisted_session_state_hints(&dir),
+        "workspace without persisted session hints should report false"
+    );
+
+    let image_path =
+        native_compile_session_image_path(&dir).expect("session image path should resolve");
+    fs::create_dir_all(
+        image_path
+            .parent()
+            .expect("session image path should have parent directory"),
+    )
+    .expect("failed to create session image parent");
+    fs::write(&image_path, "{}\n").expect("failed to write session image hint");
+    assert!(
+        native_has_persisted_session_state_hints(&dir),
+        "session image hint should enable persisted-state detection"
+    );
+    fs::remove_file(&image_path).expect("failed to remove session image hint");
+
+    let buildinfo_path =
+        native_buildinfo_sidecar_path(&dir).expect("buildinfo path should resolve");
+    fs::create_dir_all(
+        buildinfo_path
+            .parent()
+            .expect("buildinfo path should have parent directory"),
+    )
+    .expect("failed to create buildinfo parent");
+    fs::write(&buildinfo_path, "{}\n").expect("failed to write buildinfo hint");
+    assert!(
+        native_has_persisted_session_state_hints(&dir),
+        "buildinfo hint should enable persisted-state detection"
+    );
 
     fs::remove_dir_all(&dir).ok();
 }

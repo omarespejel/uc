@@ -170,7 +170,7 @@ const DEFAULT_NATIVE_CAPTURE_STATEMENT_LOCATIONS_ON_COLD: bool = false;
 #[cfg(feature = "native-compile")]
 const DEFAULT_NATIVE_DEPENDENCY_METADATA_ENABLED: bool = false;
 #[cfg(feature = "native-compile")]
-const DEFAULT_NATIVE_EAGER_KEYED_SLOT_PRIME: bool = false;
+const DEFAULT_NATIVE_EAGER_KEYED_SLOT_PRIME: bool = true;
 #[cfg(feature = "native-compile")]
 const DEFAULT_NATIVE_COMPILE_SESSION_MEMORY_MULTIPLIER: u64 = 64;
 #[cfg(feature = "native-compile")]
@@ -5440,10 +5440,19 @@ fn native_compile_source_roots(context: &NativeCompileContext) -> Vec<PathBuf> {
 }
 
 #[cfg(feature = "native-compile")]
-fn native_source_roots_modified_unix_ms(
+struct NativeTrackedSourceScanResult {
+    tracked_sources: BTreeMap<String, NativeTrackedFileState>,
+    tracked_source_bytes: u64,
+    latest_source_root_modified_unix_ms: u64,
+}
+
+#[cfg(feature = "native-compile")]
+fn native_scan_tracked_sources(
     workspace_root: &Path,
     source_roots: &[PathBuf],
-) -> Result<u64> {
+) -> Result<NativeTrackedSourceScanResult> {
+    let mut tracked_files = Vec::new();
+    let mut tracked_source_bytes = 0_u64;
     let mut latest = 0_u64;
     for source_root in source_roots {
         let metadata = match fs::metadata(source_root) {
@@ -5488,9 +5497,64 @@ fn native_source_roots_modified_unix_ms(
             let modified_unix_ms = metadata_modified_unix_ms(&metadata)?;
             let change_unix_ms = metadata_change_unix_ms(&metadata).unwrap_or(modified_unix_ms);
             latest = latest.max(modified_unix_ms.max(change_unix_ms));
+            if tracked_files.len() >= max_fingerprint_files() {
+                bail!(
+                    "native source tracker found too many files (>{}); refusing to continue",
+                    max_fingerprint_files()
+                );
+            }
+            let size_bytes = metadata.len();
+            if size_bytes > max_fingerprint_file_bytes() {
+                bail!(
+                    "native source tracker file {} exceeds size limit ({} bytes > {} bytes)",
+                    path.display(),
+                    size_bytes,
+                    max_fingerprint_file_bytes()
+                );
+            }
+            tracked_source_bytes = tracked_source_bytes.saturating_add(size_bytes);
+            if tracked_source_bytes > max_fingerprint_total_bytes() {
+                bail!(
+                    "native source tracker budget exceeded ({} bytes > {} bytes)",
+                    tracked_source_bytes,
+                    max_fingerprint_total_bytes()
+                );
+            }
+            tracked_files.push((
+                path.to_path_buf(),
+                NativeTrackedFileState {
+                    size_bytes,
+                    modified_unix_ms,
+                },
+            ));
         }
     }
-    Ok(latest)
+    tracked_files.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+    let mut tracked_sources = BTreeMap::new();
+    for (path, state) in tracked_files {
+        let relative = path
+            .strip_prefix(workspace_root)
+            .unwrap_or(&path)
+            .to_path_buf();
+        let relative = normalize_fingerprint_path(&relative);
+        tracked_sources.insert(relative, state);
+    }
+
+    Ok(NativeTrackedSourceScanResult {
+        tracked_sources,
+        tracked_source_bytes,
+        latest_source_root_modified_unix_ms: latest,
+    })
+}
+
+#[cfg(feature = "native-compile")]
+fn native_source_roots_modified_unix_ms(
+    workspace_root: &Path,
+    source_roots: &[PathBuf],
+) -> Result<u64> {
+    Ok(native_scan_tracked_sources(workspace_root, source_roots)?
+        .latest_source_root_modified_unix_ms)
 }
 
 #[cfg(feature = "native-compile")]
@@ -5498,74 +5562,21 @@ fn native_collect_tracked_sources(
     workspace_root: &Path,
     source_roots: &[PathBuf],
 ) -> Result<(BTreeMap<String, NativeTrackedFileState>, u64)> {
-    let mut files = Vec::new();
-    for source_root in source_roots {
-        if !source_root.is_dir() {
-            continue;
-        }
-        let walker = WalkDir::new(source_root)
-            .follow_links(false)
-            .max_depth(MAX_FINGERPRINT_DEPTH)
-            .into_iter()
-            .filter_entry(|entry| !is_ignored_entry(workspace_root, entry.path()));
-        for entry in walker.filter_map(|entry| entry.ok()) {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            let is_cairo = path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("cairo"));
-            if is_cairo {
-                if files.len() >= max_fingerprint_files() {
-                    bail!(
-                        "native source tracker found too many files (>{}); refusing to continue",
-                        max_fingerprint_files()
-                    );
-                }
-                files.push(path.to_path_buf());
-            }
-        }
-    }
-    files.sort();
+    let scan = native_scan_tracked_sources(workspace_root, source_roots)?;
+    Ok((scan.tracked_sources, scan.tracked_source_bytes))
+}
 
-    let mut tracked = BTreeMap::new();
-    let mut total_bytes = 0_u64;
-    for path in files {
-        let rel = path
-            .strip_prefix(workspace_root)
-            .unwrap_or(&path)
-            .to_path_buf();
-        let rel = normalize_fingerprint_path(&rel);
-        let metadata =
-            fs::metadata(&path).with_context(|| format!("failed to stat {}", path.display()))?;
-        let size_bytes = metadata.len();
-        if size_bytes > max_fingerprint_file_bytes() {
-            bail!(
-                "native source tracker file {} exceeds size limit ({} bytes > {} bytes)",
-                path.display(),
-                size_bytes,
-                max_fingerprint_file_bytes()
-            );
-        }
-        total_bytes = total_bytes.saturating_add(size_bytes);
-        if total_bytes > max_fingerprint_total_bytes() {
-            bail!(
-                "native source tracker budget exceeded ({} bytes > {} bytes)",
-                total_bytes,
-                max_fingerprint_total_bytes()
-            );
-        }
-        tracked.insert(
-            rel,
-            NativeTrackedFileState {
-                size_bytes,
-                modified_unix_ms: metadata_modified_unix_ms(&metadata)?,
-            },
-        );
-    }
-    Ok((tracked, total_bytes))
+#[cfg(feature = "native-compile")]
+fn native_collect_tracked_sources_with_source_root_mtime(
+    workspace_root: &Path,
+    source_roots: &[PathBuf],
+) -> Result<(BTreeMap<String, NativeTrackedFileState>, u64, u64)> {
+    let scan = native_scan_tracked_sources(workspace_root, source_roots)?;
+    Ok((
+        scan.tracked_sources,
+        scan.tracked_source_bytes,
+        scan.latest_source_root_modified_unix_ms,
+    ))
 }
 
 #[cfg(feature = "native-compile")]
@@ -6612,6 +6623,16 @@ fn native_buildinfo_sidecar_path(workspace_root: &Path) -> Result<PathBuf> {
 }
 
 #[cfg(feature = "native-compile")]
+fn native_has_persisted_session_state_hints(workspace_root: &Path) -> bool {
+    native_compile_session_image_path(workspace_root)
+        .ok()
+        .is_some_and(|path| path.is_file())
+        || native_buildinfo_sidecar_path(workspace_root)
+            .ok()
+            .is_some_and(|path| path.is_file())
+}
+
+#[cfg(feature = "native-compile")]
 fn native_tracked_sources_signature(
     tracked_sources: &BTreeMap<String, NativeTrackedFileState>,
 ) -> String {
@@ -7081,20 +7102,73 @@ fn native_crate_cache_entry_paths(
 }
 
 #[cfg(feature = "native-compile")]
+fn native_crate_cache_root_fingerprint(root: &Path) -> Result<String> {
+    let metadata = fs::metadata(root)
+        .with_context(|| format!("failed to stat crate cache root {}", root.display()))?;
+    if !metadata.is_dir() {
+        bail!("crate cache root is not a directory: {}", root.display());
+    }
+    let mut files = Vec::<(String, u64, u64, u64)>::new();
+    for entry in WalkDir::new(root).follow_links(false).into_iter().flatten() {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let is_cairo = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("cairo"));
+        if !is_cairo {
+            continue;
+        }
+        if files.len() >= max_fingerprint_files() {
+            bail!(
+                "native crate cache fingerprint found too many files (>{}) under {}",
+                max_fingerprint_files(),
+                root.display()
+            );
+        }
+        let metadata = fs::metadata(path).with_context(|| {
+            format!(
+                "failed to stat crate cache fingerprint file {}",
+                path.display()
+            )
+        })?;
+        let modified_unix_ms = metadata_modified_unix_ms(&metadata)?;
+        let change_unix_ms = metadata_change_unix_ms(&metadata).unwrap_or(modified_unix_ms);
+        let relative = path.strip_prefix(root).unwrap_or(path);
+        files.push((
+            normalize_fingerprint_path(relative),
+            metadata.len(),
+            modified_unix_ms,
+            change_unix_ms,
+        ));
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = Hasher::new();
+    hasher.update(b"uc-native-crate-cache-root-fingerprint-v1");
+    hasher.update(normalize_fingerprint_path(root).as_bytes());
+    hasher.update(&(files.len() as u64).to_le_bytes());
+    for (path, size_bytes, modified_unix_ms, change_unix_ms) in files {
+        hasher.update(path.as_bytes());
+        hasher.update(&size_bytes.to_le_bytes());
+        hasher.update(&modified_unix_ms.to_le_bytes());
+        hasher.update(&change_unix_ms.to_le_bytes());
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+#[cfg(feature = "native-compile")]
 fn native_crate_cache_descriptor_for_crate(
     db: &dyn FilesGroup,
     crate_id: cairo_lang_filesystem::ids::CrateId<'_>,
 ) -> Option<NativeCrateCacheDescriptor> {
     let crate_config = db.crate_config(crate_id)?;
-    let (root, root_modified_unix_ms) = match &crate_config.root {
-        Directory::Real(path) => {
-            let root = normalize_fingerprint_path(path);
-            let modified = fs::metadata(path)
-                .ok()
-                .and_then(|metadata| metadata_modified_unix_ms(&metadata).ok())
-                .unwrap_or_default();
-            (root, modified)
-        }
+    let (root, root_fingerprint) = match &crate_config.root {
+        Directory::Real(path) => (
+            normalize_fingerprint_path(path),
+            native_crate_cache_root_fingerprint(path).ok()?,
+        ),
         Directory::Virtual { .. } => return None,
     };
     let (name, discriminator) = match crate_id.long(db) {
@@ -7107,7 +7181,7 @@ fn native_crate_cache_descriptor_for_crate(
         ),
         CrateLongId::Virtual { .. } => return None,
     };
-    let cache_key = format!("real:{name}:{discriminator}:{root}:{root_modified_unix_ms}");
+    let cache_key = format!("real:{name}:{discriminator}:{root}:{root_fingerprint}");
     let label = format!(
         "real:{name}{}@{root}",
         if discriminator.is_empty() {
@@ -7257,6 +7331,7 @@ fn native_prune_crate_cache_files(workspace_root: &Path, max_bytes: u64) -> Resu
         return Ok(());
     }
     let mut files = Vec::new();
+    let mut sizes_by_path = HashMap::<PathBuf, u64>::new();
     let mut total_bytes = 0_u64;
     for entry in WalkDir::new(&root)
         .follow_links(false)
@@ -7272,19 +7347,49 @@ fn native_prune_crate_cache_files(workspace_root: &Path, max_bytes: u64) -> Resu
         let modified = metadata_modified_unix_ms(&metadata).unwrap_or_default();
         let size = metadata.len();
         total_bytes = total_bytes.saturating_add(size);
-        files.push((modified, size, path.to_path_buf()));
+        let path = path.to_path_buf();
+        sizes_by_path.insert(path.clone(), size);
+        files.push((modified, path));
     }
     if total_bytes <= max_bytes {
         return Ok(());
     }
-    files.sort_by_key(|(modified, _, _)| *modified);
-    for (_modified, size, path) in files {
+    files.sort_by_key(|(modified, _)| *modified);
+    let mut removed = HashSet::<PathBuf>::new();
+    for (_modified, path) in files {
         if total_bytes <= max_bytes {
             break;
         }
+        if removed.contains(&path) {
+            continue;
+        }
         ensure_path_within_root(workspace_root, &path, "native crate cache prune path")?;
         if fs::remove_file(&path).is_ok() {
-            total_bytes = total_bytes.saturating_sub(size);
+            removed.insert(path.clone());
+            if let Some(size) = sizes_by_path.get(&path) {
+                total_bytes = total_bytes.saturating_sub(*size);
+            }
+            if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
+                let companion_extension = match extension {
+                    "bin" => Some("json"),
+                    "json" => Some("bin"),
+                    _ => None,
+                };
+                if let Some(companion_extension) = companion_extension {
+                    let companion = path.with_extension(companion_extension);
+                    ensure_path_within_root(
+                        workspace_root,
+                        &companion,
+                        "native crate cache companion prune path",
+                    )?;
+                    if fs::remove_file(&companion).is_ok() {
+                        removed.insert(companion.clone());
+                        if let Some(size) = sizes_by_path.get(&companion) {
+                            total_bytes = total_bytes.saturating_sub(*size);
+                        }
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -7357,8 +7462,8 @@ fn native_persist_crate_cache_entries(
             stats.skipped = stats.skipped.saturating_add(1);
             continue;
         }
-        atomic_write_bytes(&blob_path, &blob, "native crate cache blob")?;
         atomic_write_bytes(&entry_path, &entry_bytes, "native crate cache metadata")?;
+        atomic_write_bytes(&blob_path, &blob, "native crate cache blob")?;
         stats.saved = stats.saved.saturating_add(1);
         stats.bytes_written = stats.bytes_written.saturating_add(blob.len() as u64);
     }
@@ -7480,9 +7585,17 @@ fn build_native_compile_session_state(
     let crate_cache_restore_stats =
         native_restore_crate_cache_into_db(workspace_root, &signature_hash, &mut db);
     let crate_cache_restore_ms = crate_cache_restore_start.elapsed().as_secs_f64() * 1000.0;
-    let source_root_modified_unix_ms =
-        native_source_roots_modified_unix_ms(workspace_root, &source_roots)?;
     let scan_start = Instant::now();
+    let mut precollected_tracked_sources: Option<(BTreeMap<String, NativeTrackedFileState>, u64)> =
+        None;
+    let source_root_modified_unix_ms = if native_has_persisted_session_state_hints(workspace_root) {
+        native_source_roots_modified_unix_ms(workspace_root, &source_roots)?
+    } else {
+        let (tracked_sources, tracked_source_bytes, latest_source_root_modified_unix_ms) =
+            native_collect_tracked_sources_with_source_root_mtime(workspace_root, &source_roots)?;
+        precollected_tracked_sources = Some((tracked_sources, tracked_source_bytes));
+        latest_source_root_modified_unix_ms
+    };
     let restored_image = try_native_compile_session_image_restore(
         workspace_root,
         &signature,
@@ -7550,7 +7663,13 @@ fn build_native_compile_session_state(
         )
     } else {
         let (tracked_sources, tracked_source_bytes) =
-            native_collect_tracked_sources(workspace_root, &source_roots)?;
+            if let Some((tracked_sources, tracked_source_bytes)) =
+                precollected_tracked_sources.take()
+            {
+                (tracked_sources, tracked_source_bytes)
+            } else {
+                native_collect_tracked_sources(workspace_root, &source_roots)?
+            };
         (
             tracked_sources,
             tracked_source_bytes,
@@ -7768,16 +7887,19 @@ fn native_workspace_relative_cairo_path(workspace_root: &Path, path: &Path) -> O
     } else {
         workspace_root.join(path)
     };
-    let relative = absolute.strip_prefix(workspace_root).ok()?;
-    if relative.components().any(|component| {
-        matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        )
-    }) {
+    let tracked_path = absolute
+        .strip_prefix(workspace_root)
+        .ok()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| absolute.clone());
+    if tracked_path.is_relative()
+        && tracked_path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
         return None;
     }
-    let contains_src_segment = relative.components().any(|component| {
+    let contains_src_segment = tracked_path.components().any(|component| {
         component
             .as_os_str()
             .to_str()
@@ -7786,14 +7908,14 @@ fn native_workspace_relative_cairo_path(workspace_root: &Path, path: &Path) -> O
     if !contains_src_segment {
         return None;
     }
-    let is_cairo = relative
+    let is_cairo = tracked_path
         .extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("cairo"));
     if !is_cairo {
         return None;
     }
-    Some(normalize_fingerprint_path(relative))
+    Some(normalize_fingerprint_path(&tracked_path))
 }
 
 #[cfg(feature = "native-compile")]
@@ -7895,14 +8017,6 @@ fn ensure_native_source_change_watcher(
 
     let mut watched_roots = Vec::new();
     for root in source_roots {
-        if !root.starts_with(workspace_root) {
-            tracing::debug!(
-                workspace_root = %workspace_root.display(),
-                root = %root.display(),
-                "skipping native watcher for source root outside workspace"
-            );
-            continue;
-        }
         if root.is_dir() {
             watched_roots.push(root.to_path_buf());
         }
@@ -8015,18 +8129,6 @@ fn native_take_source_journal_delta(
     source_roots: &[PathBuf],
     session_applied_cursor: u64,
 ) -> NativeSourceJournalDelta {
-    if source_roots
-        .iter()
-        .any(|source_root| !source_root.starts_with(workspace_root))
-    {
-        return NativeSourceJournalDelta::FallbackFullScan {
-            commit: NativeSourceJournalCommit {
-                apply_cursor: None,
-                clear_changed_sets: false,
-                clear_overflow: false,
-            },
-        };
-    }
     let journal = match ensure_native_source_change_watcher(workspace_root, source_roots) {
         Ok(journal) => journal,
         Err(err) => {
