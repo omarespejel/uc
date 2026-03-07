@@ -300,6 +300,17 @@ jobs:
             echo "starknet-agentic SHA mismatch: got $AGENTIC_HEAD (expected $AGENTIC_FIXTURE_SHA)" >&2
             exit 1
           fi
+
+          git init "$REAL_REPOS_ROOT/monero-starknet-atomic-swap"
+          git -C "$REAL_REPOS_ROOT/monero-starknet-atomic-swap" remote add origin \
+            https://github.com/omarespejel/monero-starknet-atomic-swap.git
+          git -C "$REAL_REPOS_ROOT/monero-starknet-atomic-swap" fetch --depth 1 origin "$MONERO_FIXTURE_SHA"
+          git -C "$REAL_REPOS_ROOT/monero-starknet-atomic-swap" checkout --detach FETCH_HEAD
+          MONERO_HEAD="$(git -C "$REAL_REPOS_ROOT/monero-starknet-atomic-swap" rev-parse HEAD)"
+          if [[ "$MONERO_HEAD" != "$MONERO_FIXTURE_SHA" ]]; then
+            echo "monero-starknet-atomic-swap SHA mismatch: got $MONERO_HEAD (expected $MONERO_FIXTURE_SHA)" >&2
+            exit 1
+          fi
           echo "UC_REAL_REPOS_ROOT=$REAL_REPOS_ROOT" >> "$GITHUB_ENV"
 
       - name: Native strict smoke on starknet-agentic
@@ -354,6 +365,52 @@ jobs:
           run_native_strict "contracts/erc8004-cairo/Scarb.toml" "erc8004-cairo"
           run_native_strict "contracts/agent-account/Scarb.toml" "agent-account"
           run_native_strict "contracts/session-account/Scarb.toml" "session-account"
+
+      - name: UC smoke on monero-starknet-atomic-swap (controlled fallback allowed)
+        env:
+          UC_NATIVE_BUILD_MODE: auto
+          UC_NATIVE_DISALLOW_SCARB_FALLBACK: "0"
+          UC_NATIVE_CORELIB_SRC: ${{ env.UC_NATIVE_CORELIB_SRC }}
+        run: |
+          set -euo pipefail
+          mkdir -p benchmarks/results
+          UC_BIN="./target/release/uc"
+          MONERO_MANIFEST="$UC_REAL_REPOS_ROOT/monero-starknet-atomic-swap/cairo/Scarb.toml"
+          REPORT_PATH="benchmarks/results/native-real-monero-cairo.json"
+          LOG_PATH="benchmarks/results/native-real-monero-cairo.log"
+
+          "$UC_BIN" build \
+            --engine uc \
+            --daemon-mode off \
+            --manifest-path "$MONERO_MANIFEST" \
+            --report-path "$REPORT_PATH" \
+            >"$LOG_PATH" 2>&1
+
+          if [[ ! -f "$REPORT_PATH" ]]; then
+            echo "real-repo smoke failed: report missing for monero-starknet-atomic-swap" >&2
+            cat "$LOG_PATH" >&2
+            exit 1
+          fi
+
+          python3 - <<'PY' "$REPORT_PATH"
+          import json
+          import sys
+          from pathlib import Path
+
+          report_path = Path(sys.argv[1])
+          report = json.loads(report_path.read_text(encoding="utf-8"))
+          if report.get("exit_code") != 0:
+              raise SystemExit(
+                  f"real-repo smoke failed: non-zero report exit code for monero fixture: {report.get('exit_code')}"
+              )
+          command = report.get("command") or []
+          backend = command[0] if command else ""
+          if backend not in {"scarb", "uc-native"}:
+              raise SystemExit(
+                  f"real-repo smoke failed: unexpected backend command for monero fixture: {command!r}"
+              )
+          print(f"monero fixture backend={backend}")
+          PY
 
       - name: Native auto fallback remains controlled for semver cairo-version requirements
         env:
