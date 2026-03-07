@@ -1612,7 +1612,7 @@ fn parse_cairo_version_major_minor_handles_common_formats() {
 
 #[cfg(feature = "native-compile")]
 #[test]
-fn ensure_native_manifest_cairo_version_supported_rejects_mismatched_major_minor() {
+fn ensure_native_manifest_cairo_version_supported_accepts_older_minor_and_rejects_incompatible() {
     let (compiler_major, compiler_minor) =
         parse_cairo_version_major_minor(native_cairo_lang_compiler_version())
             .expect("compiler version should parse");
@@ -1629,6 +1629,21 @@ cairo-version = "{compiler_major}.{compiler_minor}.0"
     ensure_native_manifest_cairo_version_supported(&compatible_manifest)
         .expect("matching major/minor cairo-version should be accepted");
 
+    if compiler_minor > 0 {
+        let older_minor_manifest: TomlValue = toml::from_str(&format!(
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+cairo-version = "{compiler_major}.{}.0"
+"#,
+            compiler_minor - 1
+        ))
+        .expect("older-minor manifest should parse");
+        ensure_native_manifest_cairo_version_supported(&older_minor_manifest)
+            .expect("same-major older-minor cairo-version should be accepted");
+    }
+
     let incompatible_manifest: TomlValue = toml::from_str(&format!(
         r#"[package]
 name = "demo"
@@ -1640,7 +1655,7 @@ cairo-version = "{compiler_major}.{}.0"
     ))
     .expect("incompatible manifest should parse");
     let err = ensure_native_manifest_cairo_version_supported(&incompatible_manifest)
-        .expect_err("mismatched major/minor cairo-version should be rejected");
+        .expect_err("newer minor cairo-version should be rejected");
     assert!(
         format!("{err:#}").contains("incompatible with package cairo-version"),
         "error should describe cairo-version mismatch"
@@ -1648,6 +1663,23 @@ cairo-version = "{compiler_major}.{}.0"
     assert!(
         native_error_allows_scarb_fallback(&err),
         "cairo-version mismatch should allow scarb fallback"
+    );
+
+    let incompatible_major_manifest: TomlValue = toml::from_str(&format!(
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+cairo-version = "{}.{compiler_minor}.0"
+"#,
+        compiler_major.saturating_add(1)
+    ))
+    .expect("incompatible-major manifest should parse");
+    let major_err = ensure_native_manifest_cairo_version_supported(&incompatible_major_manifest)
+        .expect_err("major mismatch should be rejected");
+    assert!(
+        native_error_allows_scarb_fallback(&major_err),
+        "major cairo-version mismatch should allow scarb fallback"
     );
 }
 

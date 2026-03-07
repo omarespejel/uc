@@ -1743,11 +1743,20 @@ fn ensure_native_manifest_cairo_version_supported(manifest: &TomlValue) -> Resul
     let Some(compiler_major_minor) = parse_cairo_version_major_minor(compiler) else {
         return Ok(());
     };
-    if compiler_major_minor == requested_major_minor {
+    let (compiler_major, compiler_minor) = compiler_major_minor;
+    let (requested_major, requested_minor) = requested_major_minor;
+    if compiler_major == requested_major && compiler_minor >= requested_minor {
+        if compiler_minor > requested_minor {
+            tracing::debug!(
+                compiler = %compiler,
+                requested = %requested,
+                "native cairo compiler minor is newer than manifest cairo-version; accepting compatibility"
+            );
+        }
         return Ok(());
     }
     Err(native_fallback_eligible_error(format!(
-        "native cairo-lang {compiler} is incompatible with package cairo-version {requested}; native fallback to scarb is required"
+        "native cairo-lang {compiler} is incompatible with package cairo-version {requested}; native requires same major and compiler minor >= requested minor"
     )))
 }
 
