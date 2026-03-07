@@ -6525,19 +6525,23 @@ fn native_session_refresh_action_prefers_incremental_for_changed_sets() {
 #[test]
 fn native_force_full_rebuild_on_empty_delta_applies_only_when_requested() {
     assert!(
-        native_should_force_full_rebuild_on_empty_delta(true, false, false),
-        "cache-miss compile path should force a conservative rebuild when no source drift is reported"
+        native_should_force_full_rebuild_on_empty_delta(true, true, false, false),
+        "cached session with empty source delta should force a conservative rebuild when requested"
     );
     assert!(
-        !native_should_force_full_rebuild_on_empty_delta(false, false, false),
+        !native_should_force_full_rebuild_on_empty_delta(true, false, false, false),
+        "freshly created sessions should not trigger redundant rebuild-on-empty-delta work"
+    );
+    assert!(
+        !native_should_force_full_rebuild_on_empty_delta(false, true, false, false),
         "feature flag disabled should preserve previous no-op behavior"
     );
     assert!(
-        !native_should_force_full_rebuild_on_empty_delta(true, false, true),
+        !native_should_force_full_rebuild_on_empty_delta(true, true, false, true),
         "changed-file deltas should continue through incremental refresh path"
     );
     assert!(
-        !native_should_force_full_rebuild_on_empty_delta(true, true, false),
+        !native_should_force_full_rebuild_on_empty_delta(true, true, true, false),
         "signature rebuild path already performs a full refresh"
     );
 }

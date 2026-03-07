@@ -5909,7 +5909,7 @@ fn native_update_compile_session_post_build_state(
         return;
     }
     let session_handle = match native_compile_session_handle(workspace_root, signature) {
-        Ok(handle) => handle,
+        Ok((handle, _session_cache_hit)) => handle,
         Err(err) => {
             tracing::warn!(
                 workspace_root = %workspace_root.display(),
@@ -7393,7 +7393,7 @@ fn native_persist_crate_cache_after_build_best_effort(
     }
     let signature_hash = native_compile_session_signature_hash(signature);
     let session_handle = match native_compile_session_handle(workspace_root, signature) {
-        Ok(handle) => handle,
+        Ok((handle, _session_cache_hit)) => handle,
         Err(err) => {
             tracing::warn!(
                 workspace_root = %workspace_root.display(),
@@ -7653,7 +7653,7 @@ fn release_native_compile_session_build_lock(cache_key: &str, build_lock: &Arc<M
 fn native_compile_session_handle(
     workspace_root: &Path,
     signature: &NativeCompileSessionSignature,
-) -> Result<Arc<Mutex<NativeCompileSessionState>>> {
+) -> Result<(Arc<Mutex<NativeCompileSessionState>>, bool)> {
     let cache_key = native_compile_session_cache_key(workspace_root);
     let now_ms = epoch_ms_u64().unwrap_or_default();
     {
@@ -7667,7 +7667,7 @@ fn native_compile_session_handle(
         );
         if let Some(entry) = cache.get_mut(&cache_key) {
             entry.last_access_epoch_ms = now_ms;
-            return Ok(entry.session.clone());
+            return Ok((entry.session.clone(), true));
         }
     }
 
@@ -7677,7 +7677,7 @@ fn native_compile_session_handle(
     let build_guard = build_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let build_result = (|| -> Result<Arc<Mutex<NativeCompileSessionState>>> {
+    let build_result = (|| -> Result<(Arc<Mutex<NativeCompileSessionState>>, bool)> {
         let now_ms = epoch_ms_u64().unwrap_or_default();
         {
             let mut cache = native_compile_session_cache()
@@ -7690,7 +7690,7 @@ fn native_compile_session_handle(
             );
             if let Some(entry) = cache.get_mut(&cache_key) {
                 entry.last_access_epoch_ms = now_ms;
-                return Ok(entry.session.clone());
+                return Ok((entry.session.clone(), true));
             }
         }
 
@@ -7720,7 +7720,7 @@ fn native_compile_session_handle(
                 native_compile_session_cache_max_bytes(),
             );
         }
-        Ok(session)
+        Ok((session, false))
     })();
     drop(build_guard);
     release_native_compile_session_build_lock(&cache_key, &build_lock);
@@ -8306,10 +8306,14 @@ fn native_session_refresh_action(
 #[cfg(feature = "native-compile")]
 fn native_should_force_full_rebuild_on_empty_delta(
     rebuild_on_empty_delta: bool,
+    session_cache_hit: bool,
     needs_full_rebuild: bool,
     changed_source_set_detected: bool,
 ) -> bool {
-    rebuild_on_empty_delta && !needs_full_rebuild && !changed_source_set_detected
+    rebuild_on_empty_delta
+        && session_cache_hit
+        && !needs_full_rebuild
+        && !changed_source_set_detected
 }
 
 #[cfg(feature = "native-compile")]
@@ -8408,7 +8412,8 @@ fn with_native_compile_session<T>(
     f: impl FnOnce(&NativeCompileSessionSnapshot) -> Result<T>,
 ) -> Result<T> {
     let source_roots = native_compile_source_roots(&signature.context);
-    let session_handle = native_compile_session_handle(workspace_root, signature)?;
+    let (session_handle, session_cache_hit) =
+        native_compile_session_handle(workspace_root, signature)?;
     let (needs_full_rebuild, session_applied_cursor) = {
         let session = session_handle
             .lock()
@@ -8538,6 +8543,7 @@ fn with_native_compile_session<T>(
     let changed_source_set_detected = !changed_files.is_empty() || !removed_files.is_empty();
     let force_full_rebuild_on_empty_delta = native_should_force_full_rebuild_on_empty_delta(
         rebuild_on_empty_delta,
+        session_cache_hit,
         needs_full_rebuild,
         changed_source_set_detected,
     );
