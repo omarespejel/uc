@@ -950,7 +950,10 @@ run_build_returning_cold() {
   build_command_for_manifest_with_mode "$seed_manifest" "$BUILD_OFFLINE"
   seed_command=("${CMD_REPLY[@]}")
   command_string="$(command_to_string "${seed_command[@]}")"
-  measure_command_ms "$seed_dir" "${seed_command[@]}" >/dev/null
+  if ! measure_command_ms "$seed_dir" "${seed_command[@]}" >/dev/null; then
+    echo "ERROR: returning-cold seed build failed for $workload (${seed_command[*]})" >&2
+    return 1
+  fi
 
   for i in $(seq 1 "$runs"); do
     local run_dir="$run_root/run-$i"

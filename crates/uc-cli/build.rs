@@ -164,8 +164,10 @@ fn corelib_candidate_paths() -> Vec<PathBuf> {
         candidates.push(PathBuf::from(&home).join(".cairo/corelib/src"));
     }
 
-    candidates.sort();
-    candidates.dedup();
+    // Dedup while preserving insertion order (priority).  Do NOT sort —
+    // `find_corelib_src` returns the first match, so order encodes precedence.
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|p| seen.insert(p.clone()));
     candidates
 }
 
@@ -237,7 +239,7 @@ fn find_corelib_src(candidates: &[PathBuf]) -> Option<PathBuf> {
 
     // 3. Search relative to workspace root (mirrors runtime candidate search)
     for candidate in candidates {
-        if let Some(p) = try_candidate(candidate) {
+        if let Some(p) = try_candidate(candidate.as_path()) {
             return Some(p);
         }
     }

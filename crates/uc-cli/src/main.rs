@@ -4331,13 +4331,32 @@ fn acquire_embedded_corelib_extraction_lock(cache_dir: &Path, version: &str) -> 
         .write(true)
         .open(&lock_path)
         .with_context(|| format!("failed to open {}", lock_path.display()))?;
-    let lock_result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
-    if lock_result != 0 {
-        bail!(
-            "failed to lock embedded corelib extraction file {}: {}",
-            lock_path.display(),
-            io::Error::last_os_error()
-        );
+    // Try non-blocking first so we can log a diagnostic if another process holds it.
+    // SAFETY: `lock_file` is a valid open fd; flock is signal-safe.
+    let nb_result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if nb_result != 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::WouldBlock {
+            tracing::info!(
+                path = %lock_path.display(),
+                "phase-5: another process is extracting the embedded corelib; waiting for lock"
+            );
+            // SAFETY: same fd, blocking this time.
+            let blocking_result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
+            if blocking_result != 0 {
+                bail!(
+                    "failed to lock embedded corelib extraction file {}: {}",
+                    lock_path.display(),
+                    io::Error::last_os_error()
+                );
+            }
+        } else {
+            bail!(
+                "failed to lock embedded corelib extraction file {}: {}",
+                lock_path.display(),
+                err
+            );
+        }
     }
     Ok(lock_file)
 }
@@ -4380,6 +4399,24 @@ fn extract_embedded_corelib() -> Result<PathBuf> {
             "phase-5: using previously extracted embedded corelib after lock acquisition"
         );
         return Ok(target_dir);
+    }
+
+    // Clean up stale staging directories left behind by killed processes.
+    let tmp_prefix = format!("corelib-v{version}.tmp-");
+    if let Ok(entries) = fs::read_dir(&cache_dir) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&tmp_prefix)
+            {
+                tracing::debug!(
+                    path = %entry.path().display(),
+                    "phase-5: removing stale staging directory"
+                );
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
     }
 
     let stage_root = cache_dir.join(format!(
@@ -4653,10 +4690,38 @@ fn try_restore_corelib_sierra_blob(db: &mut RootDatabase, corelib_src: &Path) ->
     }
 }
 
+/// Cheap check: does any corelib sierra blob for the current compiler version
+/// already exist in the global cache?  This avoids computing the expensive
+/// content-hash fingerprint on warm builds where the blob was already persisted.
+#[cfg(feature = "native-compile")]
+fn corelib_sierra_blob_likely_exists(corelib_src: &Path) -> bool {
+    let _ = corelib_src; // used only for consistency with the full path helper
+    let version = native_cairo_lang_compiler_version();
+    let cache_dir = match uc_global_cache_dir() {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    let prefix = format!("corelib-sierra-v{version}-");
+    match std::fs::read_dir(&cache_dir) {
+        Ok(entries) => entries
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with(&prefix)),
+        Err(_) => false,
+    }
+}
+
 /// Generate and persist the corelib's lowering cache blob to the global cache.
 /// Called after a successful build.
 #[cfg(feature = "native-compile")]
 fn persist_corelib_sierra_blob_best_effort(db: &RootDatabase, corelib_src: &Path) {
+    // Fast path: skip the expensive fingerprint computation if a blob for this
+    // compiler version already exists.  The fingerprint only changes when
+    // corelib source files change, which implies a compiler version bump.
+    if corelib_sierra_blob_likely_exists(corelib_src) {
+        tracing::debug!("phase-6: corelib sierra blob already exists (fast check); skipping persist");
+        return;
+    }
+
     let blob_path = match corelib_sierra_blob_path(corelib_src) {
         Ok(p) => p,
         Err(e) => {
@@ -4665,7 +4730,7 @@ fn persist_corelib_sierra_blob_best_effort(db: &RootDatabase, corelib_src: &Path
         }
     };
 
-    // Skip if already persisted.
+    // Skip if already persisted (exact fingerprint match).
     if blob_path.is_file() {
         tracing::debug!(
             path = %blob_path.display(),
