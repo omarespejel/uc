@@ -259,3 +259,41 @@ Conclusion: to move cold from "sometimes better" to "durably better", the next s
 7. TypeScript incremental buildinfo: <https://www.typescriptlang.org/tsconfig/incremental.html>
 8. Clang users manual: <https://clang.llvm.org/docs/UsersManual.html>
 9. sccache README: <https://github.com/mozilla/sccache/blob/main/README.md>
+
+## Scarb contract-scope fidelity update (2026-03-07)
+
+### What was audited
+
+Scarb Starknet contract selection paths were re-read directly in source:
+
+1. `collect_main_crate_ids` returns only the main component crate id.
+2. `find_project_contracts` composes:
+   - internal contracts from main crate ids
+   - optional external contracts from `build_external_contracts` selectors.
+
+Primary references:
+
+1. <https://github.com/software-mansion/scarb/blob/main/scarb/src/compiler/helpers.rs>
+2. <https://github.com/software-mansion/scarb/blob/main/scarb/src/compiler/compilers/starknet_contract/compiler.rs>
+
+### Experiment result
+
+A naive `uc` optimization attempt was made to force native `find_contracts` to root-crate-only scope (to mirror `collect_main_crate_ids`), then validated against real fixture parity.
+
+Observed result (isolated A/B runs):
+
+1. Prior state (before root-only patch): `0` artifact mismatches vs Scarb on `starknet-agentic/contracts/agent-account`.
+2. Root-only patch: `10/11` artifact mismatches vs Scarb on the same fixture.
+
+This means naive root-only scoping is not Scarb-equivalent in practice for our current native path.
+
+### Decision
+
+The root-only scope patch was reverted. `uc` must keep parity first and only ship contract-scope narrowing once Scarb-equivalent external contract selection is implemented.
+
+### Correct production path (next implementation)
+
+1. Parse and support `build_external_contracts` selectors in native path.
+2. Resolve selector package -> crate ids using metadata components/discriminators.
+3. Reproduce Scarb `find_project_contracts` behavior exactly (main + explicit external selectors).
+4. Add locked parity tests proving no artifact drift before any speed claim.
