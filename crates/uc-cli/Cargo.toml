@@ -9,7 +9,7 @@ name = "uc"
 path = "src/main.rs"
 
 [features]
-default = ["native-compile"]
+default = ["native-compile", "mimalloc"]
 native-compile = [
   "dep:cairo-lang-compiler",
   "dep:cairo-lang-defs",
@@ -20,6 +20,7 @@ native-compile = [
   "dep:notify",
   "dep:scarb-stable-hash",
 ]
+mimalloc = ["dep:mimalloc"]
 dev-benchmark-command = []
 
 [dependencies]
@@ -33,7 +34,9 @@ cairo-lang-starknet = { workspace = true, optional = true }
 cairo-lang-starknet-classes = { workspace = true, optional = true }
 clap.workspace = true
 libc.workspace = true
+mimalloc = { workspace = true, optional = true }
 notify = { workspace = true, optional = true }
+postcard.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 scarb-stable-hash = { workspace = true, optional = true }

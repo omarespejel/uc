@@ -22,7 +22,9 @@ cairo-lang-starknet = "2.16.0"
 cairo-lang-starknet-classes = "2.16.0"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
+mimalloc = { version = "0.1", default-features = false }
 notify = "6"
+postcard = { version = "1", features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 scarb-stable-hash = "1.0.0"

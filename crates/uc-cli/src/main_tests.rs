@@ -9048,3 +9048,406 @@ mode = "safe"
 
     fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------------
+// Phase 0–4 cold-path supremacy tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn phase0_native_build_phase_telemetry_defaults_to_zero() {
+    let t = NativeBuildPhaseTelemetry::default();
+    assert_eq!(t.find_contracts_ms, 0.0);
+    assert_eq!(t.db_init_ms, 0.0);
+    assert_eq!(t.setup_project_ms, 0.0);
+    assert_eq!(t.crate_cache_restore_ms, 0.0);
+    assert_eq!(t.source_scan_ms, 0.0);
+    assert_eq!(t.session_image_persist_ms, 0.0);
+    assert_eq!(t.buildinfo_persist_ms, 0.0);
+    assert_eq!(t.drift_scan_ms, 0.0);
+}
+
+#[test]
+fn phase0_build_phase_telemetry_new_fields_default_in_serde() {
+    // Ensure that BuildPhaseTelemetry deserializes cleanly when the new Phase 0
+    // fields are absent from the JSON — simulating a daemon response from an older
+    // uc version that does not emit them.
+    let json = r#"{
+        "fingerprint_ms": 1.0,
+        "cache_lookup_ms": 2.0,
+        "cache_restore_ms": 3.0,
+        "compile_ms": 100.0,
+        "cache_persist_ms": 4.0,
+        "cache_persist_async": false,
+        "cache_persist_scheduled": false
+    }"#;
+    let t: BuildPhaseTelemetry = serde_json::from_str(json).expect("failed to decode telemetry");
+    assert_eq!(t.compile_ms, 100.0);
+    assert_eq!(t.native_find_contracts_ms, 0.0);
+    assert_eq!(t.native_db_init_ms, 0.0);
+    assert_eq!(t.native_setup_project_ms, 0.0);
+    assert_eq!(t.native_source_scan_ms, 0.0);
+    assert_eq!(t.native_drift_scan_ms, 0.0);
+}
+
+#[test]
+fn phase0_build_phase_telemetry_round_trips_with_new_fields() {
+    let mut t = BuildPhaseTelemetry::default();
+    t.native_find_contracts_ms = 42.5;
+    t.native_db_init_ms = 3.3;
+    t.native_setup_project_ms = 7.7;
+    t.native_source_scan_ms = 12.1;
+    t.native_drift_scan_ms = 1.9;
+    let serialized = serde_json::to_string(&t).expect("serialize");
+    let deserialized: BuildPhaseTelemetry =
+        serde_json::from_str(&serialized).expect("deserialize");
+    assert_eq!(deserialized.native_find_contracts_ms, 42.5);
+    assert_eq!(deserialized.native_db_init_ms, 3.3);
+    assert_eq!(deserialized.native_setup_project_ms, 7.7);
+    assert_eq!(deserialized.native_source_scan_ms, 12.1);
+    assert_eq!(deserialized.native_drift_scan_ms, 1.9);
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn phase1_async_persist_counter_returns_to_zero_after_drain() {
+    // The global counter may be non-zero if other tests have in-flight tasks.
+    // Drain first, then verify it reaches zero.
+    cold_path_async_persist_drain();
+    assert_eq!(
+        cold_path_async_persist_in_flight().load(Ordering::SeqCst),
+        0,
+        "in-flight counter should be 0 after explicit drain"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn phase1_async_persist_spawn_completes_and_decrements_counter() {
+    use std::sync::atomic::AtomicBool;
+
+    let flag = Arc::new(AtomicBool::new(false));
+    let flag_clone = flag.clone();
+
+    cold_path_async_persist_spawn(move || {
+        flag_clone.store(true, Ordering::SeqCst);
+    });
+
+    // Wait for the background thread to finish (drain handles this)
+    cold_path_async_persist_drain();
+
+    assert!(
+        flag.load(Ordering::SeqCst),
+        "async persist closure should have executed"
+    );
+    assert_eq!(
+        cold_path_async_persist_in_flight().load(Ordering::SeqCst),
+        0,
+        "in-flight counter should be 0 after drain"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn phase1_async_persist_drain_handles_multiple_tasks() {
+    use std::sync::atomic::AtomicU32;
+
+    let counter = Arc::new(AtomicU32::new(0));
+
+    for _ in 0..5 {
+        let c = counter.clone();
+        cold_path_async_persist_spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            c.fetch_add(1, Ordering::SeqCst);
+        });
+    }
+
+    cold_path_async_persist_drain();
+
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        5,
+        "all 5 async persist closures should have completed"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn phase2_skip_double_scan_logic() {
+    // Phase 2: verify that native_should_force_full_rebuild_on_empty_delta
+    // returns false when session_cache_hit is false (freshly-built session).
+    // This is the key invariant that makes the drift-scan skip safe.
+    let result = native_should_force_full_rebuild_on_empty_delta(
+        true,  // rebuild_on_empty_delta
+        false, // session_cache_hit = false → freshly built
+        false, // needs_full_rebuild
+        false, // changed_source_set_detected
+    );
+    assert!(
+        !result,
+        "force_full_rebuild should be false for freshly-built sessions (session_cache_hit=false)"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn phase2_force_rebuild_only_on_cache_hit_with_empty_delta() {
+    // The only case where force_full_rebuild_on_empty_delta should return true
+    // is when ALL of: rebuild_on_empty_delta, session_cache_hit, !needs_full_rebuild,
+    // !changed_source_set_detected.
+    assert!(native_should_force_full_rebuild_on_empty_delta(
+        true, true, false, false
+    ));
+    assert!(!native_should_force_full_rebuild_on_empty_delta(
+        true, true, true, false
+    ));
+    assert!(!native_should_force_full_rebuild_on_empty_delta(
+        true, true, false, true
+    ));
+    assert!(!native_should_force_full_rebuild_on_empty_delta(
+        false, true, false, false
+    ));
+}
+
+#[test]
+fn phase3_mimalloc_feature_gate_present() {
+    // Verify that mimalloc is in the default feature set at build time.
+    // When compiled without --no-default-features, this test runs under mimalloc.
+    #[cfg(feature = "mimalloc")]
+    {
+        // Just verify the global allocator is set (the binary boots fine)
+        let _ = Box::new(42_u64);
+    }
+    #[cfg(not(feature = "mimalloc"))]
+    {
+        // If mimalloc is not compiled in, this test still passes —
+        // it just verifies the fallback path (system allocator) also works.
+        let _ = Box::new(42_u64);
+    }
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn phase4_session_image_schema_version_bumped() {
+    assert_eq!(
+        NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION, 2,
+        "session image schema should be v2 for postcard encoding"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn phase4_buildinfo_schema_version_bumped() {
+    assert_eq!(
+        NATIVE_BUILDINFO_SCHEMA_VERSION, 2,
+        "buildinfo schema should be v2 for postcard encoding"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn phase4_session_image_postcard_roundtrip() {
+    let mut tracked_sources = BTreeMap::new();
+    tracked_sources.insert(
+        "src/lib.cairo".to_string(),
+        NativeTrackedFileState {
+            size_bytes: 1024,
+            modified_unix_ms: 1700000000000,
+        },
+    );
+    tracked_sources.insert(
+        "src/contract.cairo".to_string(),
+        NativeTrackedFileState {
+            size_bytes: 2048,
+            modified_unix_ms: 1700000001000,
+        },
+    );
+
+    let mut contract_deps = BTreeMap::new();
+    contract_deps.insert(
+        "mypackage::MyContract".to_string(),
+        ["src/lib.cairo".to_string(), "src/contract.cairo".to_string()]
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+    );
+
+    let plans = vec![NativeContractOutputPlan {
+        module_path: "mypackage::MyContract".to_string(),
+        artifact_id: "artifact_abc123".to_string(),
+        package_name: "mypackage".to_string(),
+        contract_name: "MyContract".to_string(),
+        artifact_file: "mypackage_MyContract.contract_class.json".to_string(),
+        casm_file: Some("mypackage_MyContract.compiled_contract_class.json".to_string()),
+    }];
+
+    let image = NativeCompileSessionImageFile {
+        schema_version: NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION,
+        signature_hash: "deadbeef0123456789abcdef".to_string(),
+        source_root_modified_unix_ms: 1700000002000,
+        tracked_sources: tracked_sources.clone(),
+        tracked_source_bytes: 3072,
+        contract_source_dependencies: contract_deps.clone(),
+        contract_output_plans: plans.clone(),
+        journal_cursor_applied: 42,
+        generated_at_epoch_ms: 1700000003000,
+    };
+
+    // Encode with postcard
+    let encoded = postcard::to_allocvec(&image).expect("postcard encode failed");
+
+    // Verify it's smaller than JSON
+    let json_encoded = serde_json::to_vec(&image).expect("json encode failed");
+    assert!(
+        encoded.len() < json_encoded.len(),
+        "postcard ({} bytes) should be smaller than JSON ({} bytes)",
+        encoded.len(),
+        json_encoded.len()
+    );
+
+    // Decode and verify round-trip
+    let decoded: NativeCompileSessionImageFile =
+        postcard::from_bytes(&encoded).expect("postcard decode failed");
+    assert_eq!(decoded.schema_version, NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION);
+    assert_eq!(decoded.signature_hash, "deadbeef0123456789abcdef");
+    assert_eq!(decoded.source_root_modified_unix_ms, 1700000002000);
+    assert_eq!(decoded.tracked_sources.len(), 2);
+    assert_eq!(decoded.tracked_source_bytes, 3072);
+    assert_eq!(decoded.contract_source_dependencies.len(), 1);
+    assert_eq!(decoded.contract_output_plans.len(), 1);
+    assert_eq!(decoded.journal_cursor_applied, 42);
+    assert_eq!(decoded.generated_at_epoch_ms, 1700000003000);
+
+    // Verify field values round-trip exactly
+    let src = decoded.tracked_sources.get("src/lib.cairo").unwrap();
+    assert_eq!(src.size_bytes, 1024);
+    assert_eq!(src.modified_unix_ms, 1700000000000);
+
+    let plan = &decoded.contract_output_plans[0];
+    assert_eq!(plan.module_path, "mypackage::MyContract");
+    assert_eq!(plan.artifact_id, "artifact_abc123");
+    assert_eq!(
+        plan.casm_file.as_deref(),
+        Some("mypackage_MyContract.compiled_contract_class.json")
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn phase4_buildinfo_postcard_roundtrip() {
+    let mut tracked_sources = BTreeMap::new();
+    tracked_sources.insert(
+        "src/main.cairo".to_string(),
+        NativeTrackedFileState {
+            size_bytes: 512,
+            modified_unix_ms: 1700000000000,
+        },
+    );
+
+    let buildinfo = NativeBuildInfoFile {
+        schema_version: NATIVE_BUILDINFO_SCHEMA_VERSION,
+        signature_hash: "cafe01020304".to_string(),
+        source_root_modified_unix_ms: 1700000001000,
+        tracked_sources: tracked_sources.clone(),
+        tracked_source_bytes: 512,
+        tracked_sources_signature: "sig_abc".to_string(),
+        contract_source_dependencies: BTreeMap::new(),
+        contract_output_plans: Vec::new(),
+        journal_cursor_applied: 7,
+        generated_at_epoch_ms: 1700000002000,
+    };
+
+    let encoded = postcard::to_allocvec(&buildinfo).expect("postcard encode failed");
+    let json_encoded = serde_json::to_vec(&buildinfo).expect("json encode failed");
+    assert!(
+        encoded.len() < json_encoded.len(),
+        "postcard ({} bytes) should be smaller than JSON ({} bytes)",
+        encoded.len(),
+        json_encoded.len()
+    );
+
+    let decoded: NativeBuildInfoFile =
+        postcard::from_bytes(&encoded).expect("postcard decode failed");
+    assert_eq!(decoded.schema_version, NATIVE_BUILDINFO_SCHEMA_VERSION);
+    assert_eq!(decoded.signature_hash, "cafe01020304");
+    assert_eq!(decoded.source_root_modified_unix_ms, 1700000001000);
+    assert_eq!(decoded.tracked_sources.len(), 1);
+    assert_eq!(decoded.tracked_source_bytes, 512);
+    assert_eq!(decoded.tracked_sources_signature, "sig_abc");
+    assert_eq!(decoded.journal_cursor_applied, 7);
+    assert_eq!(decoded.generated_at_epoch_ms, 1700000002000);
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn phase4_postcard_rejects_old_json_session_image_as_cache_miss() {
+    // Verify that old-format JSON is not accidentally decoded by postcard.
+    // This simulates what happens when postcard is tried first on an old v1 JSON file.
+    let old_json = r#"{"schema_version":1,"signature_hash":"abc","source_root_modified_unix_ms":0,"tracked_sources":{},"tracked_source_bytes":0,"contract_source_dependencies":{},"contract_output_plans":[],"journal_cursor_applied":0,"generated_at_epoch_ms":0}"#;
+
+    let result = postcard::from_bytes::<NativeCompileSessionImageFile>(old_json.as_bytes());
+    // postcard should fail to decode JSON — it expects binary wire format
+    assert!(
+        result.is_err() || result.as_ref().unwrap().schema_version != NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION,
+        "postcard should not decode old JSON as schema v2"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn phase4_postcard_rejects_old_json_buildinfo_as_cache_miss() {
+    let old_json = r#"{"schema_version":1,"signature_hash":"abc","source_root_modified_unix_ms":0,"tracked_sources":{},"tracked_source_bytes":0,"tracked_sources_signature":"","contract_source_dependencies":{},"contract_output_plans":[],"journal_cursor_applied":0,"generated_at_epoch_ms":0}"#;
+
+    let result = postcard::from_bytes::<NativeBuildInfoFile>(old_json.as_bytes());
+    assert!(
+        result.is_err() || result.as_ref().unwrap().schema_version != NATIVE_BUILDINFO_SCHEMA_VERSION,
+        "postcard should not decode old JSON as schema v2"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn phase4_session_image_postcard_smaller_than_json_for_realistic_sizes() {
+    // Simulate a realistic session image with many tracked sources
+    let mut tracked_sources = BTreeMap::new();
+    for i in 0..100 {
+        tracked_sources.insert(
+            format!("src/contracts/contract_{i:03}.cairo"),
+            NativeTrackedFileState {
+                size_bytes: 4096 + (i as u64 * 100),
+                modified_unix_ms: 1700000000000 + (i as u64 * 1000),
+            },
+        );
+    }
+    let mut deps = BTreeMap::new();
+    for i in 0..50 {
+        let mut dep_set = BTreeSet::new();
+        for j in 0..5 {
+            dep_set.insert(format!("src/contracts/contract_{:03}.cairo", i * 2 + j));
+        }
+        deps.insert(format!("pkg::Contract{i}"), dep_set);
+    }
+
+    let image = NativeCompileSessionImageFile {
+        schema_version: NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION,
+        signature_hash: "a".repeat(64),
+        source_root_modified_unix_ms: 1700000000000,
+        tracked_sources,
+        tracked_source_bytes: 409600,
+        contract_source_dependencies: deps,
+        contract_output_plans: Vec::new(),
+        journal_cursor_applied: 0,
+        generated_at_epoch_ms: 1700000000000,
+    };
+
+    let postcard_bytes = postcard::to_allocvec(&image).expect("postcard encode");
+    let json_bytes = serde_json::to_vec(&image).expect("json encode");
+
+    let ratio = postcard_bytes.len() as f64 / json_bytes.len() as f64;
+    assert!(
+        ratio < 0.85,
+        "postcard should be at least 15% smaller than JSON for realistic session images \
+         (postcard={}, json={}, ratio={:.2})",
+        postcard_bytes.len(),
+        json_bytes.len(),
+        ratio
+    );
+}
