@@ -166,7 +166,7 @@ const DEFAULT_NATIVE_IMPACTED_SUBSET_ENABLED: bool = true;
 #[cfg(feature = "native-compile")]
 const DEFAULT_NATIVE_CAPTURE_STATEMENT_LOCATIONS: bool = true;
 #[cfg(feature = "native-compile")]
-const DEFAULT_NATIVE_CAPTURE_STATEMENT_LOCATIONS_ON_COLD: bool = true;
+const DEFAULT_NATIVE_CAPTURE_STATEMENT_LOCATIONS_ON_COLD: bool = false;
 #[cfg(feature = "native-compile")]
 const DEFAULT_NATIVE_DEPENDENCY_METADATA_ENABLED: bool = false;
 #[cfg(feature = "native-compile")]
@@ -7358,20 +7358,37 @@ fn native_persist_crate_cache_entries(
 }
 
 #[cfg(feature = "native-compile")]
+fn native_should_persist_crate_cache_after_build(
+    daemon_context: bool,
+    changed_files_count: u64,
+    removed_files_count: u64,
+    compiled_contracts: u64,
+) -> bool {
+    daemon_context
+        && native_crate_cache_enabled()
+        && compiled_contracts != 0
+        && changed_files_count == 0
+        && removed_files_count == 0
+}
+
+#[cfg(feature = "native-compile")]
 fn native_persist_crate_cache_after_build_best_effort(
     workspace_root: &Path,
     signature: &NativeCompileSessionSignature,
+    daemon_context: bool,
     changed_files_count: u64,
     removed_files_count: u64,
     compiled_contracts: u64,
 ) {
-    if !native_crate_cache_enabled() {
-        return;
-    }
-    if compiled_contracts == 0 {
-        return;
-    }
-    if changed_files_count != 0 || removed_files_count != 0 {
+    if !native_should_persist_crate_cache_after_build(
+        daemon_context,
+        changed_files_count,
+        removed_files_count,
+        compiled_contracts,
+    ) {
+        // Non-daemon invocations should minimize synchronous cold-path overhead.
+        // Keeping crate-cache persistence daemon-scoped preserves warm worker use
+        // while avoiding heavy per-invocation writes in CLI mode.
         return;
     }
     let signature_hash = native_compile_session_signature_hash(signature);
@@ -8287,6 +8304,24 @@ fn native_session_refresh_action(
 }
 
 #[cfg(feature = "native-compile")]
+fn native_should_force_full_rebuild_on_empty_delta(
+    rebuild_on_empty_delta: bool,
+    needs_full_rebuild: bool,
+    changed_source_set_detected: bool,
+) -> bool {
+    rebuild_on_empty_delta && !needs_full_rebuild && !changed_source_set_detected
+}
+
+#[cfg(feature = "native-compile")]
+fn native_should_try_cached_noop_reuse(
+    changed_files: &[String],
+    removed_files: &[String],
+    journal_fallback_full_scan: bool,
+) -> bool {
+    changed_files.is_empty() && removed_files.is_empty() && !journal_fallback_full_scan
+}
+
+#[cfg(feature = "native-compile")]
 fn native_impacted_subset_used(total_contracts: usize, compiled_contracts: usize) -> bool {
     compiled_contracts > 0 && compiled_contracts < total_contracts
 }
@@ -8369,6 +8404,7 @@ fn with_native_compile_session<T>(
     workspace_root: &Path,
     signature: &NativeCompileSessionSignature,
     daemon_context: bool,
+    rebuild_on_empty_delta: bool,
     f: impl FnOnce(&NativeCompileSessionSnapshot) -> Result<T>,
 ) -> Result<T> {
     let source_roots = native_compile_source_roots(&signature.context);
@@ -8396,7 +8432,7 @@ fn with_native_compile_session<T>(
         removed_files,
         current_source_snapshot,
         source_root_mtime,
-        journal_fallback_full_scan,
+        mut journal_fallback_full_scan,
     ) = if needs_full_rebuild {
         (Vec::new(), Vec::new(), None, 0_u64, false)
     } else if daemon_context {
@@ -8500,12 +8536,31 @@ fn with_native_compile_session<T>(
     let drift_scan_ms = drift_scan_start.elapsed().as_secs_f64() * 1000.0;
 
     let changed_source_set_detected = !changed_files.is_empty() || !removed_files.is_empty();
-    let refresh_action = native_session_refresh_action(
+    let force_full_rebuild_on_empty_delta = native_should_force_full_rebuild_on_empty_delta(
+        rebuild_on_empty_delta,
         needs_full_rebuild,
         changed_source_set_detected,
-        changed_files.len(),
-        removed_files.len(),
     );
+    if force_full_rebuild_on_empty_delta {
+        // Cache-miss compile paths should not trust an empty changed-file delta.
+        // File watcher latency or coarse filesystem mtimes can transiently hide edits.
+        journal_fallback_full_scan = true;
+        tracing::debug!(
+            changed_files = changed_files.len(),
+            removed_files = removed_files.len(),
+            "native compile forcing conservative full rebuild on empty changed-file delta"
+        );
+    }
+    let refresh_action = if force_full_rebuild_on_empty_delta {
+        NativeSessionRefreshAction::FullRebuild
+    } else {
+        native_session_refresh_action(
+            needs_full_rebuild,
+            changed_source_set_detected,
+            changed_files.len(),
+            removed_files.len(),
+        )
+    };
     if matches!(refresh_action, NativeSessionRefreshAction::FullRebuild)
         && changed_source_set_detected
     {
@@ -8880,330 +8935,348 @@ fn run_native_build_inner(
         journal_fallback_full_scan,
         dependency_updates,
         contract_output_plans,
-    ) = with_native_compile_session(workspace_root, &signature, daemon_context, |session| {
-        tracing::trace!(
-            changed_files = session.changed_files.len(),
-            removed_files = session.removed_files.len(),
-            "native session snapshot delta"
-        );
-        // Keep statement-location capture enabled by default on cold boots so dependency indexing
-        // is ready after daemon restarts; incremental builds still honor explicit opt-out flags.
-        let capture_statement_locations = native_should_capture_statement_locations(
-            &session.changed_files,
-            &session.removed_files,
-            session.contract_output_plans.is_empty(),
-        );
-        if session.changed_files.is_empty() && session.removed_files.is_empty() {
-            if let Some(keep_files) = native_cached_noop_keep_files(
-                &target_dir,
-                &context.package_name,
-                &session.contract_output_plans,
-            )? {
-                let produced_paths = keep_files.iter().cloned().collect::<Vec<_>>();
-                tracing::debug!(
-                    contracts = session.contract_output_plans.len(),
-                    "native compile reused cached artifacts for unchanged source set"
-                );
-                return Ok((
-                    keep_files.len(),
-                    0.0,
-                    0.0,
-                    0.0,
-                    produced_paths,
-                    0_u64,
-                    0_u64,
-                    session.contract_output_plans.len() as u64,
-                    0_u64,
-                    false,
-                    session.journal_fallback_full_scan,
-                    Vec::new(),
-                    None,
-                ));
-            }
-        }
-        let crate_ids =
-            CrateInput::into_crate_ids(&session.db, session.main_crate_inputs.iter().cloned());
-        let contracts = find_contracts(&session.db, &crate_ids);
-
-        if contracts.is_empty() {
-            let frontend_compile_start = Instant::now();
-            let program = compile_prepared_db_program(
-                &session.db,
-                crate_ids,
-                native_compiler_config(
-                    &session.main_crate_inputs,
-                    profile,
-                    capture_statement_locations,
-                ),
-            )
-            .map_err(|err| {
-                mark_native_fallback_eligible_for_external_dependencies(
-                    err.context("native cairo compile failed"),
-                    &context,
-                )
-            })?;
-            let frontend_compile_ms = frontend_compile_start.elapsed().as_secs_f64() * 1000.0;
-            let artifact_write_start = Instant::now();
-            let output_name = format!("{}.sierra", context.package_name);
-            write_native_sierra_artifact(
-                &target_dir,
-                &context.package_name,
-                &output_name,
-                &program.to_string(),
-            )?;
-            let artifact_write_ms = artifact_write_start.elapsed().as_secs_f64() * 1000.0;
-            return Ok((
-                1,
-                frontend_compile_ms,
-                0.0,
-                artifact_write_ms,
-                vec![output_name],
-                session.changed_files.len() as u64,
-                session.removed_files.len() as u64,
-                0_u64,
-                0_u64,
-                false,
-                session.journal_fallback_full_scan,
-                Vec::new(),
-                Some(Vec::new()),
-            ));
-        }
-
-        let module_paths: Vec<String> = contracts
-            .iter()
-            .map(|contract| contract.submodule_id.full_path(&session.db))
-            .collect();
-        let contract_source_paths: Vec<Option<String>> = contracts
-            .iter()
-            .map(|contract| {
-                native_contract_source_relative_path(&session.db, workspace_root, contract)
-            })
-            .collect();
-        let contract_stems = native_contract_file_stems(&module_paths);
-        let mut all_plans = Vec::with_capacity(module_paths.len());
-        for (module_path, contract_stem) in module_paths.iter().zip(contract_stems.iter()) {
-            let package_name = native_contract_package_name(module_path).to_string();
-            let contract_name = native_contract_name(module_path).to_string();
-            let artifact_id = native_starknet_artifact_id(&package_name, module_path);
-            let file_stem = format!(
-                "{}_{}",
-                context.package_name,
-                sanitize_artifact_component(contract_stem)
+    ) = with_native_compile_session(
+        workspace_root,
+        &signature,
+        daemon_context,
+        true,
+        |session| {
+            tracing::trace!(
+                changed_files = session.changed_files.len(),
+                removed_files = session.removed_files.len(),
+                "native session snapshot delta"
             );
-            let artifact_file = format!("{file_stem}.contract_class.json");
-            let casm_file = context
-                .starknet_target
-                .casm
-                .then(|| format!("{file_stem}.compiled_contract_class.json"));
-            all_plans.push(NativeContractOutputPlan {
-                module_path: module_path.clone(),
-                artifact_id,
-                package_name,
-                contract_name,
-                artifact_file,
-                casm_file,
-            });
-        }
-
-        let mut selected_indices: Vec<usize> = (0..contracts.len()).collect();
-        let mut reused_contract_entries = Vec::new();
-        let mut reused_keep_files = BTreeSet::new();
-        if native_impacted_subset_enabled()
-            && (!session.changed_files.is_empty() || !session.removed_files.is_empty())
-        {
-            if let Some(impacted_indices) = native_impacted_contract_indices(
-                &module_paths,
-                &contract_source_paths,
+            // Keep incremental changed-file builds captured for dependency indexing, but let cold/noop
+            // behavior follow the dedicated cold flag to control startup overhead.
+            let capture_statement_locations = native_should_capture_statement_locations(
                 &session.changed_files,
                 &session.removed_files,
-                &session.contract_source_dependencies,
+                session.contract_output_plans.is_empty(),
+            );
+            if native_should_try_cached_noop_reuse(
+                &session.changed_files,
+                &session.removed_files,
+                session.journal_fallback_full_scan,
             ) {
-                if impacted_indices.len() < contracts.len() {
-                    let impacted_set = impacted_indices.iter().copied().collect::<BTreeSet<_>>();
-                    if let Some((entries, keep_files)) =
-                        native_reusable_unaffected_manifest_entries(
-                            &target_dir,
-                            &context.package_name,
-                            &all_plans,
-                            &impacted_set,
-                        )?
-                    {
-                        tracing::debug!(
-                            impacted_contracts = impacted_indices.len(),
-                            total_contracts = contracts.len(),
-                            changed_files = session.changed_files.len(),
-                            removed_files = session.removed_files.len(),
-                            "native compile selected impacted contract subset"
-                        );
-                        selected_indices = impacted_indices;
-                        reused_contract_entries = entries;
-                        reused_keep_files = keep_files;
-                    }
+                if let Some(keep_files) = native_cached_noop_keep_files(
+                    &target_dir,
+                    &context.package_name,
+                    &session.contract_output_plans,
+                )? {
+                    let produced_paths = keep_files.iter().cloned().collect::<Vec<_>>();
+                    tracing::debug!(
+                        contracts = session.contract_output_plans.len(),
+                        "native compile reused cached artifacts for unchanged source set"
+                    );
+                    return Ok((
+                        keep_files.len(),
+                        0.0,
+                        0.0,
+                        0.0,
+                        produced_paths,
+                        0_u64,
+                        0_u64,
+                        session.contract_output_plans.len() as u64,
+                        0_u64,
+                        false,
+                        session.journal_fallback_full_scan,
+                        Vec::new(),
+                        None,
+                    ));
                 }
             }
-        }
+            let crate_ids =
+                CrateInput::into_crate_ids(&session.db, session.main_crate_inputs.iter().cloned());
+            let contracts = find_contracts(&session.db, &crate_ids);
 
-        let (frontend_compile_ms, contract_classes) = if selected_indices.is_empty() {
-            (0.0, Vec::new())
-        } else {
-            let frontend_compile_start = Instant::now();
-            let contract_refs: Vec<_> = selected_indices
-                .iter()
-                .map(|index| &contracts[*index])
-                .collect();
-            let contract_classes = compile_starknet_prepared_db(
-                &session.db,
-                &contract_refs,
-                native_compiler_config(
-                    &session.main_crate_inputs,
-                    profile,
-                    capture_statement_locations,
-                ),
-            )
-            .map_err(|err| {
-                mark_native_fallback_eligible_for_external_dependencies(
-                    err.context("native starknet compile failed"),
-                    &context,
-                )
-            })?;
-            let frontend_compile_ms = frontend_compile_start.elapsed().as_secs_f64() * 1000.0;
-            if contract_classes.len() != selected_indices.len() {
-                bail!(
-                    "native compile returned mismatched contract classes (expected {}, got {})",
-                    selected_indices.len(),
-                    contract_classes.len()
-                );
-            }
-            (frontend_compile_ms, contract_classes)
-        };
-        #[cfg(debug_assertions)]
-        {
-            for (result_index, contract_index) in selected_indices.iter().copied().enumerate() {
-                let contract = &contracts[contract_index];
-                let mut single_class = compile_starknet_prepared_db(
+            if contracts.is_empty() {
+                let frontend_compile_start = Instant::now();
+                let program = compile_prepared_db_program(
                     &session.db,
-                    &[contract],
+                    crate_ids,
                     native_compiler_config(
                         &session.main_crate_inputs,
                         profile,
                         capture_statement_locations,
                     ),
                 )
-                .with_context(|| {
-                    format!(
-                        "failed to validate native contract ordering for {}",
-                        contract.submodule_id.full_path(&session.db)
+                .map_err(|err| {
+                    mark_native_fallback_eligible_for_external_dependencies(
+                        err.context("native cairo compile failed"),
+                        &context,
                     )
                 })?;
-                let expected_class = single_class
-                    .pop()
-                    .context("single-contract native compile returned no output")?;
-                debug_assert_eq!(
-                    expected_class, contract_classes[result_index],
-                    "compile_starknet_prepared_db returned classes in unexpected order"
-                );
+                let frontend_compile_ms = frontend_compile_start.elapsed().as_secs_f64() * 1000.0;
+                let artifact_write_start = Instant::now();
+                let output_name = format!("{}.sierra", context.package_name);
+                write_native_sierra_artifact(
+                    &target_dir,
+                    &context.package_name,
+                    &output_name,
+                    &program.to_string(),
+                )?;
+                let artifact_write_ms = artifact_write_start.elapsed().as_secs_f64() * 1000.0;
+                return Ok((
+                    1,
+                    frontend_compile_ms,
+                    0.0,
+                    artifact_write_ms,
+                    vec![output_name],
+                    session.changed_files.len() as u64,
+                    session.removed_files.len() as u64,
+                    0_u64,
+                    0_u64,
+                    false,
+                    session.journal_fallback_full_scan,
+                    Vec::new(),
+                    Some(Vec::new()),
+                ));
             }
-        }
-        let dependency_updates = if capture_statement_locations {
-            native_collect_contract_dependency_updates(
-                workspace_root,
-                &all_plans,
-                &contract_source_paths,
-                &selected_indices,
-                &contract_classes,
-            )
-        } else {
-            Vec::new()
-        };
-        let artifact_pipeline_start = Instant::now();
-        let mut casm_ms = 0.0;
-        let mut serialized_artifacts = Vec::with_capacity(contract_classes.len().saturating_mul(2));
-        let mut keep_files = reused_keep_files;
-        let mut contracts_manifest = reused_contract_entries;
-        for (contract_index, contract_class) in selected_indices
-            .iter()
-            .copied()
-            .zip(contract_classes.into_iter())
-        {
-            let plan = &all_plans[contract_index];
-            let artifact_bytes = serde_json::to_vec(&contract_class)
-                .with_context(|| format!("failed to serialize {}", plan.artifact_file))?;
-            serialized_artifacts.push((plan.artifact_file.clone(), artifact_bytes));
-            keep_files.insert(plan.artifact_file.clone());
 
-            let casm_file = if context.starknet_target.casm {
-                let casm_compile_start = Instant::now();
-                let casm_contract =
-                    compile_native_casm_contract(contract_class, native_max_casm_bytecode_size())?;
-                casm_ms += casm_compile_start.elapsed().as_secs_f64() * 1000.0;
-                let file_name = plan.casm_file.clone().context(
+            let module_paths: Vec<String> = contracts
+                .iter()
+                .map(|contract| contract.submodule_id.full_path(&session.db))
+                .collect();
+            let contract_source_paths: Vec<Option<String>> = contracts
+                .iter()
+                .map(|contract| {
+                    native_contract_source_relative_path(&session.db, workspace_root, contract)
+                })
+                .collect();
+            let contract_stems = native_contract_file_stems(&module_paths);
+            let mut all_plans = Vec::with_capacity(module_paths.len());
+            for (module_path, contract_stem) in module_paths.iter().zip(contract_stems.iter()) {
+                let package_name = native_contract_package_name(module_path).to_string();
+                let contract_name = native_contract_name(module_path).to_string();
+                let artifact_id = native_starknet_artifact_id(&package_name, module_path);
+                let file_stem = format!(
+                    "{}_{}",
+                    context.package_name,
+                    sanitize_artifact_component(contract_stem)
+                );
+                let artifact_file = format!("{file_stem}.contract_class.json");
+                let casm_file = context
+                    .starknet_target
+                    .casm
+                    .then(|| format!("{file_stem}.compiled_contract_class.json"));
+                all_plans.push(NativeContractOutputPlan {
+                    module_path: module_path.clone(),
+                    artifact_id,
+                    package_name,
+                    contract_name,
+                    artifact_file,
+                    casm_file,
+                });
+            }
+
+            let mut selected_indices: Vec<usize> = (0..contracts.len()).collect();
+            let mut reused_contract_entries = Vec::new();
+            let mut reused_keep_files = BTreeSet::new();
+            if native_impacted_subset_enabled()
+                && (!session.changed_files.is_empty() || !session.removed_files.is_empty())
+            {
+                if let Some(impacted_indices) = native_impacted_contract_indices(
+                    &module_paths,
+                    &contract_source_paths,
+                    &session.changed_files,
+                    &session.removed_files,
+                    &session.contract_source_dependencies,
+                ) {
+                    if impacted_indices.len() < contracts.len() {
+                        let impacted_set =
+                            impacted_indices.iter().copied().collect::<BTreeSet<_>>();
+                        if let Some((entries, keep_files)) =
+                            native_reusable_unaffected_manifest_entries(
+                                &target_dir,
+                                &context.package_name,
+                                &all_plans,
+                                &impacted_set,
+                            )?
+                        {
+                            tracing::debug!(
+                                impacted_contracts = impacted_indices.len(),
+                                total_contracts = contracts.len(),
+                                changed_files = session.changed_files.len(),
+                                removed_files = session.removed_files.len(),
+                                "native compile selected impacted contract subset"
+                            );
+                            selected_indices = impacted_indices;
+                            reused_contract_entries = entries;
+                            reused_keep_files = keep_files;
+                        }
+                    }
+                }
+            }
+
+            let (frontend_compile_ms, contract_classes) = if selected_indices.is_empty() {
+                (0.0, Vec::new())
+            } else {
+                let frontend_compile_start = Instant::now();
+                let contract_refs: Vec<_> = selected_indices
+                    .iter()
+                    .map(|index| &contracts[*index])
+                    .collect();
+                let contract_classes = compile_starknet_prepared_db(
+                    &session.db,
+                    &contract_refs,
+                    native_compiler_config(
+                        &session.main_crate_inputs,
+                        profile,
+                        capture_statement_locations,
+                    ),
+                )
+                .map_err(|err| {
+                    mark_native_fallback_eligible_for_external_dependencies(
+                        err.context("native starknet compile failed"),
+                        &context,
+                    )
+                })?;
+                let frontend_compile_ms = frontend_compile_start.elapsed().as_secs_f64() * 1000.0;
+                if contract_classes.len() != selected_indices.len() {
+                    bail!(
+                        "native compile returned mismatched contract classes (expected {}, got {})",
+                        selected_indices.len(),
+                        contract_classes.len()
+                    );
+                }
+                (frontend_compile_ms, contract_classes)
+            };
+            #[cfg(debug_assertions)]
+            {
+                for (result_index, contract_index) in selected_indices.iter().copied().enumerate() {
+                    let contract = &contracts[contract_index];
+                    let mut single_class = compile_starknet_prepared_db(
+                        &session.db,
+                        &[contract],
+                        native_compiler_config(
+                            &session.main_crate_inputs,
+                            profile,
+                            capture_statement_locations,
+                        ),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "failed to validate native contract ordering for {}",
+                            contract.submodule_id.full_path(&session.db)
+                        )
+                    })?;
+                    let expected_class = single_class
+                        .pop()
+                        .context("single-contract native compile returned no output")?;
+                    debug_assert_eq!(
+                        expected_class, contract_classes[result_index],
+                        "compile_starknet_prepared_db returned classes in unexpected order"
+                    );
+                }
+            }
+            let dependency_updates = if capture_statement_locations {
+                native_collect_contract_dependency_updates(
+                    workspace_root,
+                    &all_plans,
+                    &contract_source_paths,
+                    &selected_indices,
+                    &contract_classes,
+                )
+            } else {
+                Vec::new()
+            };
+            let artifact_pipeline_start = Instant::now();
+            let mut casm_ms = 0.0;
+            let mut serialized_artifacts =
+                Vec::with_capacity(contract_classes.len().saturating_mul(2));
+            let mut keep_files = reused_keep_files;
+            let mut contracts_manifest = reused_contract_entries;
+            for (contract_index, contract_class) in selected_indices
+                .iter()
+                .copied()
+                .zip(contract_classes.into_iter())
+            {
+                let plan = &all_plans[contract_index];
+                let artifact_bytes = serde_json::to_vec(&contract_class)
+                    .with_context(|| format!("failed to serialize {}", plan.artifact_file))?;
+                serialized_artifacts.push((plan.artifact_file.clone(), artifact_bytes));
+                keep_files.insert(plan.artifact_file.clone());
+
+                let casm_file = if context.starknet_target.casm {
+                    let casm_compile_start = Instant::now();
+                    let casm_contract = compile_native_casm_contract(
+                        contract_class,
+                        native_max_casm_bytecode_size(),
+                    )?;
+                    casm_ms += casm_compile_start.elapsed().as_secs_f64() * 1000.0;
+                    let file_name = plan.casm_file.clone().context(
                     "native contract output plan missing CASM file while CASM target is enabled",
                 )?;
-                let casm_bytes = serde_json::to_vec(&casm_contract)
-                    .with_context(|| format!("failed to serialize {}", file_name))?;
-                serialized_artifacts.push((file_name.clone(), casm_bytes));
-                keep_files.insert(file_name.clone());
-                Some(file_name)
-            } else {
-                None
-            };
+                    let casm_bytes = serde_json::to_vec(&casm_contract)
+                        .with_context(|| format!("failed to serialize {}", file_name))?;
+                    serialized_artifacts.push((file_name.clone(), casm_bytes));
+                    keep_files.insert(file_name.clone());
+                    Some(file_name)
+                } else {
+                    None
+                };
 
-            contracts_manifest.push(StarknetArtifactEntry {
-                id: plan.artifact_id.clone(),
-                package_name: plan.package_name.clone(),
-                contract_name: plan.contract_name.clone(),
-                module_path: plan.module_path.clone(),
-                artifacts: StarknetArtifactFiles {
-                    sierra: plan.artifact_file.clone(),
-                    casm: casm_file,
-                },
-            });
-        }
-        contracts_manifest.sort_by(|left, right| left.id.cmp(&right.id));
-        let manifest = StarknetArtifactsManifest {
-            version: 1,
-            contracts: contracts_manifest,
-        };
-        let manifest_name = format!("{}.starknet_artifacts.json", context.package_name);
-        keep_files.insert(manifest_name.clone());
-        for (file_name, bytes) in serialized_artifacts {
-            let artifact_path = target_dir.join(&file_name);
-            ensure_path_within_root(&target_dir, &artifact_path, "native artifact output path")?;
-            fs::write(&artifact_path, bytes)
-                .with_context(|| format!("failed to write {}", artifact_path.display()))?;
-        }
-        let manifest_path = target_dir.join(&manifest_name);
-        ensure_path_within_root(
-            &target_dir,
-            &manifest_path,
-            "native starknet artifacts manifest path",
-        )?;
-        write_json_file_compact(&manifest_path, &manifest)
-            .with_context(|| format!("failed to write {}", manifest_path.display()))?;
-        prune_native_target_outputs(&target_dir, &context.package_name, &keep_files)?;
-        let artifact_pipeline_ms = artifact_pipeline_start.elapsed().as_secs_f64() * 1000.0;
-        let artifact_write_ms = (artifact_pipeline_ms - casm_ms).max(0.0);
-        let produced_paths = keep_files.iter().cloned().collect::<Vec<_>>();
-        let compiled_contracts = selected_indices.len() as u64;
-        let total_contracts = contracts.len() as u64;
-        let impacted_subset_used =
-            native_impacted_subset_used(total_contracts as usize, compiled_contracts as usize);
-        Ok((
-            keep_files.len(),
-            frontend_compile_ms,
-            casm_ms,
-            artifact_write_ms,
-            produced_paths,
-            session.changed_files.len() as u64,
-            session.removed_files.len() as u64,
-            total_contracts,
-            compiled_contracts,
-            impacted_subset_used,
-            session.journal_fallback_full_scan,
-            dependency_updates,
-            Some(all_plans),
-        ))
-    })?;
+                contracts_manifest.push(StarknetArtifactEntry {
+                    id: plan.artifact_id.clone(),
+                    package_name: plan.package_name.clone(),
+                    contract_name: plan.contract_name.clone(),
+                    module_path: plan.module_path.clone(),
+                    artifacts: StarknetArtifactFiles {
+                        sierra: plan.artifact_file.clone(),
+                        casm: casm_file,
+                    },
+                });
+            }
+            contracts_manifest.sort_by(|left, right| left.id.cmp(&right.id));
+            let manifest = StarknetArtifactsManifest {
+                version: 1,
+                contracts: contracts_manifest,
+            };
+            let manifest_name = format!("{}.starknet_artifacts.json", context.package_name);
+            keep_files.insert(manifest_name.clone());
+            for (file_name, bytes) in serialized_artifacts {
+                let artifact_path = target_dir.join(&file_name);
+                ensure_path_within_root(
+                    &target_dir,
+                    &artifact_path,
+                    "native artifact output path",
+                )?;
+                fs::write(&artifact_path, bytes)
+                    .with_context(|| format!("failed to write {}", artifact_path.display()))?;
+            }
+            let manifest_path = target_dir.join(&manifest_name);
+            ensure_path_within_root(
+                &target_dir,
+                &manifest_path,
+                "native starknet artifacts manifest path",
+            )?;
+            write_json_file_compact(&manifest_path, &manifest)
+                .with_context(|| format!("failed to write {}", manifest_path.display()))?;
+            prune_native_target_outputs(&target_dir, &context.package_name, &keep_files)?;
+            let artifact_pipeline_ms = artifact_pipeline_start.elapsed().as_secs_f64() * 1000.0;
+            let artifact_write_ms = (artifact_pipeline_ms - casm_ms).max(0.0);
+            let produced_paths = keep_files.iter().cloned().collect::<Vec<_>>();
+            let compiled_contracts = selected_indices.len() as u64;
+            let total_contracts = contracts.len() as u64;
+            let impacted_subset_used =
+                native_impacted_subset_used(total_contracts as usize, compiled_contracts as usize);
+            Ok((
+                keep_files.len(),
+                frontend_compile_ms,
+                casm_ms,
+                artifact_write_ms,
+                produced_paths,
+                session.changed_files.len() as u64,
+                session.removed_files.len() as u64,
+                total_contracts,
+                compiled_contracts,
+                impacted_subset_used,
+                session.journal_fallback_full_scan,
+                dependency_updates,
+                Some(all_plans),
+            ))
+        },
+    )?;
     native_update_compile_session_post_build_state(
         workspace_root,
         &signature,
@@ -9213,6 +9286,7 @@ fn run_native_build_inner(
     native_persist_crate_cache_after_build_best_effort(
         workspace_root,
         &signature,
+        daemon_context,
         changed_files_count,
         removed_files_count,
         compiled_contracts,

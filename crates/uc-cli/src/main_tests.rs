@@ -6523,6 +6523,45 @@ fn native_session_refresh_action_prefers_incremental_for_changed_sets() {
 
 #[cfg(feature = "native-compile")]
 #[test]
+fn native_force_full_rebuild_on_empty_delta_applies_only_when_requested() {
+    assert!(
+        native_should_force_full_rebuild_on_empty_delta(true, false, false),
+        "cache-miss compile path should force a conservative rebuild when no source drift is reported"
+    );
+    assert!(
+        !native_should_force_full_rebuild_on_empty_delta(false, false, false),
+        "feature flag disabled should preserve previous no-op behavior"
+    );
+    assert!(
+        !native_should_force_full_rebuild_on_empty_delta(true, false, true),
+        "changed-file deltas should continue through incremental refresh path"
+    );
+    assert!(
+        !native_should_force_full_rebuild_on_empty_delta(true, true, false),
+        "signature rebuild path already performs a full refresh"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_cached_noop_reuse_is_disabled_for_fallback_full_scans() {
+    let no_changes = Vec::<String>::new();
+    assert!(
+        native_should_try_cached_noop_reuse(&no_changes, &no_changes, false),
+        "stable no-change deltas may reuse cached artifacts"
+    );
+    assert!(
+        !native_should_try_cached_noop_reuse(&no_changes, &no_changes, true),
+        "fallback full-scan cycles must not reuse cached artifacts without recompiling"
+    );
+    assert!(
+        !native_should_try_cached_noop_reuse(&["src/lib.cairo".to_string()], &no_changes, false),
+        "explicit changed-file deltas must compile"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
 fn native_impacted_subset_used_requires_partial_compile() {
     assert!(
         !native_impacted_subset_used(0, 0),
@@ -7861,10 +7900,10 @@ fn native_should_capture_statement_locations_with_flags_disables_when_base_disab
 
 #[cfg(feature = "native-compile")]
 #[test]
-fn native_capture_statement_locations_on_cold_default_is_enabled() {
+fn native_capture_statement_locations_on_cold_default_is_disabled() {
     assert!(
-        DEFAULT_NATIVE_CAPTURE_STATEMENT_LOCATIONS_ON_COLD,
-        "cold statement-location capture should default on for restart-safe dependency indexing"
+        !DEFAULT_NATIVE_CAPTURE_STATEMENT_LOCATIONS_ON_COLD,
+        "cold statement-location capture should default off to reduce cold-start overhead"
     );
 }
 
@@ -7891,6 +7930,50 @@ fn native_should_capture_statement_locations_with_flags_keeps_incremental_enable
             true, false, &changed, &removed, false
         ),
         "incremental changed-file builds should keep capture enabled for dependency indexing"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_should_persist_crate_cache_after_build_requires_daemon_context() {
+    let guard = integration_env_lock()
+        .lock()
+        .expect("failed to acquire integration env lock");
+    let _cache_enabled = ScopedEnvVar::set_with_lock(&guard, "UC_NATIVE_CRATE_CACHE_ENABLED", "1");
+
+    assert!(
+        !native_should_persist_crate_cache_after_build(true, 1, 0, 1),
+        "changed-file builds must not persist crate cache"
+    );
+    assert!(
+        !native_should_persist_crate_cache_after_build(true, 0, 1, 1),
+        "removed-file builds must not persist crate cache"
+    );
+    assert!(
+        !native_should_persist_crate_cache_after_build(true, 0, 0, 0),
+        "empty compile output must not persist crate cache"
+    );
+    assert!(
+        !native_should_persist_crate_cache_after_build(false, 0, 0, 1),
+        "non-daemon build must not persist crate cache"
+    );
+    assert!(
+        native_should_persist_crate_cache_after_build(true, 0, 0, 1),
+        "daemon build with no changed files and compiled contracts should persist crate cache"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_should_persist_crate_cache_after_build_respects_cache_toggle() {
+    let guard = integration_env_lock()
+        .lock()
+        .expect("failed to acquire integration env lock");
+    let _cache_disabled = ScopedEnvVar::set_with_lock(&guard, "UC_NATIVE_CRATE_CACHE_ENABLED", "0");
+
+    assert!(
+        !native_should_persist_crate_cache_after_build(true, 0, 0, 1),
+        "crate-cache persistence must remain disabled when feature toggle is off"
     );
 }
 
