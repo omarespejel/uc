@@ -7,10 +7,13 @@ on:
     branches: [main]
 
 env:
+  SCARB_TOOLCHAIN_VERSION: 2.16.0
   SCARB_FIXTURE_TAG: v2.16.0
   CAIRO_CORELIB_TAG: v2.16.0
   SCARB_FIXTURE_SHA: 231227f3fe49cc813b1b018a67cf3b7080766e24
   CAIRO_CORELIB_SHA: 6a43d7c9419481fcb82376447fecf85c44d8fbbf
+  AGENTIC_FIXTURE_SHA: 86679251313346279bf32d313536d851aaab932f
+  MONERO_FIXTURE_SHA: fef80441c930f96134bd55c2ac9aad059ef3a149
 
 jobs:
   benchmark-smoke:
@@ -34,6 +37,8 @@ jobs:
 
       - name: Install Scarb
         uses: software-mansion/setup-scarb@9d86a1616deecc95e8e8435daf902c5d025dc8b8 # v1
+        with:
+          scarb-version: ${{ env.SCARB_TOOLCHAIN_VERSION }}
 
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
@@ -88,6 +93,8 @@ jobs:
 
       - name: Install Scarb
         uses: software-mansion/setup-scarb@9d86a1616deecc95e8e8435daf902c5d025dc8b8 # v1
+        with:
+          scarb-version: ${{ env.SCARB_TOOLCHAIN_VERSION }}
 
       - name: Install benchmark tools
         run: sudo apt-get update && sudo apt-get install -y jq util-linux
@@ -218,11 +225,25 @@ jobs:
               cat "$log_path" >&2
               exit 1
             fi
-            if grep -E "falling back to scarb backend|fell back to scarb backend" "$log_path" >/dev/null; then
-              echo "native-only gate failed: fallback to scarb detected for $tag" >&2
+            if [[ ! -f "$report_path" ]]; then
+              echo "native-only gate failed: report missing for '$tag'" >&2
               cat "$log_path" >&2
               exit 1
             fi
+          python3 - <<'PY' "$report_path" "$tag"
+          import json
+          import sys
+          from pathlib import Path
+
+          report_path = Path(sys.argv[1])
+          tag = sys.argv[2]
+          report = json.loads(report_path.read_text(encoding="utf-8"))
+          if report.get("exit_code") != 0:
+              raise SystemExit(f"native-only gate failed: non-zero report exit code for {tag}: {report.get('exit_code')}")
+          command = report.get("command") or []
+          if command and command[0] == "scarb":
+              raise SystemExit(f"native-only gate failed: fallback to scarb detected for {tag}")
+          PY
           }
 
           run_native_only "benchmarks/fixtures/scarb_smoke/Scarb.toml" "smoke"
@@ -236,15 +257,268 @@ jobs:
           name: native-only-results
           path: benchmarks/results/
 
+  native-real-repos-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Scarb
+        uses: software-mansion/setup-scarb@9d86a1616deecc95e8e8435daf902c5d025dc8b8 # v1
+        with:
+          scarb-version: ${{ env.SCARB_TOOLCHAIN_VERSION }}
+
+      - name: Prepare native corelib source
+        run: |
+          set -euo pipefail
+          CAIRO_ROOT="$RUNNER_TEMP/cairo-workspace"
+          git clone --depth 1 --branch "$CAIRO_CORELIB_TAG" \
+            https://github.com/starkware-libs/cairo.git "$CAIRO_ROOT/cairo"
+          CAIRO_HEAD="$(git -C "$CAIRO_ROOT/cairo" rev-parse HEAD)"
+          if [[ "$CAIRO_HEAD" != "$CAIRO_CORELIB_SHA" ]]; then
+            echo "cairo tag $CAIRO_CORELIB_TAG resolved to unexpected commit $CAIRO_HEAD (expected $CAIRO_CORELIB_SHA)" >&2
+            exit 1
+          fi
+          echo "UC_NATIVE_CORELIB_SRC=$CAIRO_ROOT/cairo/corelib/src" >> "$GITHUB_ENV"
+
+      - name: Build uc CLI
+        run: cargo build --release -p uc-cli
+
+      - name: Checkout real-world fixtures
+        run: |
+          set -euo pipefail
+          REAL_REPOS_ROOT="$RUNNER_TEMP/uc-real-repos"
+          mkdir -p "$REAL_REPOS_ROOT"
+
+          git init "$REAL_REPOS_ROOT/starknet-agentic"
+          git -C "$REAL_REPOS_ROOT/starknet-agentic" remote add origin \
+            https://github.com/keep-starknet-strange/starknet-agentic.git
+          git -C "$REAL_REPOS_ROOT/starknet-agentic" fetch --depth 1 origin "$AGENTIC_FIXTURE_SHA"
+          git -C "$REAL_REPOS_ROOT/starknet-agentic" checkout --detach FETCH_HEAD
+          AGENTIC_HEAD="$(git -C "$REAL_REPOS_ROOT/starknet-agentic" rev-parse HEAD)"
+          if [[ "$AGENTIC_HEAD" != "$AGENTIC_FIXTURE_SHA" ]]; then
+            echo "starknet-agentic SHA mismatch: got $AGENTIC_HEAD (expected $AGENTIC_FIXTURE_SHA)" >&2
+            exit 1
+          fi
+
+          git init "$REAL_REPOS_ROOT/monero-starknet-atomic-swap"
+          git -C "$REAL_REPOS_ROOT/monero-starknet-atomic-swap" remote add origin \
+            https://github.com/omarespejel/monero-starknet-atomic-swap.git
+          git -C "$REAL_REPOS_ROOT/monero-starknet-atomic-swap" fetch --depth 1 origin "$MONERO_FIXTURE_SHA"
+          git -C "$REAL_REPOS_ROOT/monero-starknet-atomic-swap" checkout --detach FETCH_HEAD
+          MONERO_HEAD="$(git -C "$REAL_REPOS_ROOT/monero-starknet-atomic-swap" rev-parse HEAD)"
+          if [[ "$MONERO_HEAD" != "$MONERO_FIXTURE_SHA" ]]; then
+            echo "monero-starknet-atomic-swap SHA mismatch: got $MONERO_HEAD (expected $MONERO_FIXTURE_SHA)" >&2
+            exit 1
+          fi
+          echo "UC_REAL_REPOS_ROOT=$REAL_REPOS_ROOT" >> "$GITHUB_ENV"
+
+      - name: Native strict smoke on starknet-agentic
+        env:
+          UC_NATIVE_BUILD_MODE: require
+          UC_NATIVE_DISALLOW_SCARB_FALLBACK: "1"
+          UC_NATIVE_CORELIB_SRC: ${{ env.UC_NATIVE_CORELIB_SRC }}
+        run: |
+          set -euo pipefail
+          mkdir -p benchmarks/results
+          UC_BIN="./target/release/uc"
+          AGENTIC_ROOT="$UC_REAL_REPOS_ROOT/starknet-agentic"
+
+          run_native_strict() {
+            local manifest_rel="$1"
+            local label="$2"
+            local manifest_path="$AGENTIC_ROOT/$manifest_rel"
+            local report_path="benchmarks/results/native-real-agentic-${label}.json"
+            local log_path="benchmarks/results/native-real-agentic-${label}.log"
+            "$UC_BIN" build \
+              --engine uc \
+              --daemon-mode off \
+              --manifest-path "$manifest_path" \
+              --report-path "$report_path" \
+              >"$log_path" 2>&1
+            if [[ ! -f "$report_path" ]]; then
+              echo "native strict gate failed: report missing for $manifest_rel" >&2
+              cat "$log_path" >&2
+              exit 1
+            fi
+            python3 - <<'PY' "$report_path" "$manifest_rel"
+            import json
+            import sys
+            from pathlib import Path
+
+            report_path = Path(sys.argv[1])
+            manifest_rel = sys.argv[2]
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            if report.get("exit_code") != 0:
+                raise SystemExit(
+                    f"native strict gate failed: non-zero report exit code for {manifest_rel}: {report.get('exit_code')}"
+                )
+            command = report.get("command") or []
+            if command and command[0] == "scarb":
+                raise SystemExit(
+                    f"native strict gate failed: fallback to scarb detected for {manifest_rel}"
+                )
+            PY
+          }
+
+          run_native_strict "contracts/huginn-registry/Scarb.toml" "huginn-registry"
+          run_native_strict "contracts/erc8004-cairo/Scarb.toml" "erc8004-cairo"
+          run_native_strict "contracts/agent-account/Scarb.toml" "agent-account"
+          run_native_strict "contracts/session-account/Scarb.toml" "session-account"
+
+      - name: UC smoke on monero-starknet-atomic-swap (controlled fallback allowed)
+        env:
+          UC_NATIVE_BUILD_MODE: auto
+          UC_NATIVE_DISALLOW_SCARB_FALLBACK: "0"
+          UC_NATIVE_CORELIB_SRC: ${{ env.UC_NATIVE_CORELIB_SRC }}
+        run: |
+          set -euo pipefail
+          mkdir -p benchmarks/results
+          UC_BIN="./target/release/uc"
+          MONERO_MANIFEST="$UC_REAL_REPOS_ROOT/monero-starknet-atomic-swap/cairo/Scarb.toml"
+          REPORT_PATH="benchmarks/results/native-real-monero-cairo.json"
+          LOG_PATH="benchmarks/results/native-real-monero-cairo.log"
+
+          "$UC_BIN" build \
+            --engine uc \
+            --daemon-mode off \
+            --manifest-path "$MONERO_MANIFEST" \
+            --report-path "$REPORT_PATH" \
+            >"$LOG_PATH" 2>&1
+
+          if [[ ! -f "$REPORT_PATH" ]]; then
+            echo "real-repo smoke failed: report missing for monero-starknet-atomic-swap" >&2
+            cat "$LOG_PATH" >&2
+            exit 1
+          fi
+
+          python3 - <<'PY' "$REPORT_PATH"
+          import json
+          import sys
+          from pathlib import Path
+
+          report_path = Path(sys.argv[1])
+          report = json.loads(report_path.read_text(encoding="utf-8"))
+          if report.get("exit_code") != 0:
+              raise SystemExit(
+                  f"real-repo smoke failed: non-zero report exit code for monero fixture: {report.get('exit_code')}"
+              )
+          command = report.get("command") or []
+          backend = command[0] if command else ""
+          if backend not in {"scarb", "uc-native"}:
+              raise SystemExit(
+                  f"real-repo smoke failed: unexpected backend command for monero fixture: {command!r}"
+              )
+          print(f"monero fixture backend={backend}")
+          PY
+
+      - name: Native auto fallback remains controlled for semver cairo-version requirements
+        env:
+          UC_NATIVE_BUILD_MODE: auto
+          UC_NATIVE_DISALLOW_SCARB_FALLBACK: "0"
+          UC_NATIVE_CORELIB_SRC: ${{ env.UC_NATIVE_CORELIB_SRC }}
+        run: |
+          set -euo pipefail
+          UC_BIN="./target/release/uc"
+          FIXTURE_ROOT="$RUNNER_TEMP/native-fallback-cairo-version-range"
+          rm -rf "$FIXTURE_ROOT"
+          cp -R benchmarks/fixtures/scarb_smoke "$FIXTURE_ROOT"
+          python3 - <<'PY' "$FIXTURE_ROOT/Scarb.toml"
+          from pathlib import Path
+          import sys
+
+          manifest_path = Path(sys.argv[1])
+          text = manifest_path.read_text(encoding="utf-8")
+          if "cairo-version" not in text:
+              text = text.replace(
+                  'edition = "2024_07"\n',
+                  'edition = "2024_07"\ncairo-version = ">=2.14.0"\n',
+                  1,
+              )
+          manifest_path.write_text(text, encoding="utf-8")
+          PY
+          REPORT_PATH="benchmarks/results/native-semver-cairo-version-auto.json"
+          LOG_PATH="benchmarks/results/native-semver-cairo-version-auto.log"
+          "$UC_BIN" build \
+            --engine uc \
+            --daemon-mode off \
+            --manifest-path "$FIXTURE_ROOT/Scarb.toml" \
+            --report-path "$REPORT_PATH" \
+            >"$LOG_PATH" 2>&1
+          python3 - <<'PY' "$REPORT_PATH"
+          import json
+          import sys
+          from pathlib import Path
+
+          report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if report.get("exit_code") != 0:
+              raise SystemExit(f"fallback gate failed: uc build exited with {report.get('exit_code')}")
+          command = report.get("command") or []
+          if not command or command[0] != "scarb":
+              raise SystemExit("fallback gate failed: expected scarb backend command in structured report")
+          PY
+
+      - name: Compare-build parity snapshot on supported agentic manifest
+        env:
+          UC_NATIVE_BUILD_MODE: require
+          UC_NATIVE_DISALLOW_SCARB_FALLBACK: "1"
+          UC_NATIVE_CORELIB_SRC: ${{ env.UC_NATIVE_CORELIB_SRC }}
+        run: |
+          set +e
+          ./target/release/uc compare-build \
+            --manifest-path "$UC_REAL_REPOS_ROOT/starknet-agentic/contracts/agent-account/Scarb.toml" \
+            --clean-before-each true \
+            --output-path benchmarks/results/compare-agentic-agent-account.json \
+            > benchmarks/results/compare-agentic-agent-account.log 2>&1
+          rc=$?
+          set -e
+
+          if [[ ! -f benchmarks/results/compare-agentic-agent-account.json ]]; then
+            echo "compare-build parity snapshot failed to produce report" >&2
+            cat benchmarks/results/compare-agentic-agent-account.log >&2
+            exit 1
+          fi
+
+          if [[ "$rc" -ne 0 ]]; then
+            # TODO(roadmap#14): make compare-build parity blocking after
+            # native artifact parity reaches stable pass criteria on real repos.
+            echo "compare-build reported mismatches; keeping non-blocking parity snapshot in this lane" >&2
+            tail -n 40 benchmarks/results/compare-agentic-agent-account.log >&2
+          fi
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          report_path = Path("benchmarks/results/compare-agentic-agent-account.json")
+          report = json.loads(report_path.read_text(encoding="utf-8"))
+          print(
+              "compare-build parity snapshot:",
+              f"passed={report.get('passed')}",
+              f"artifact_mismatch_count={report.get('artifact_mismatch_count')}",
+          )
+          PY
+
+      - name: Upload real-repo smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-real-repo-results
+          path: benchmarks/results/
+
   determinism-matrix:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Linux/macOS are release-blocking targets in the current native rollout.
+        # Windows determinism coverage is tracked separately and will be re-enabled
+        # before widening the support matrix.
+        os: [ubuntu-latest, macos-latest]
     env:
       # Lock context inputs so cross-platform checks compare equivalent conditions.
-      UC_SCARB_VERSION_LINE: scarb 2.14.0 (determinism-lane)
+      UC_SCARB_VERSION_LINE: scarb 2.16.0 (determinism-lane)
       UC_BUILD_ENV_PREFIXES: ""
       UC_SKIP_SCARB_TOOLCHAIN_CHECK: "1"
     steps:
@@ -253,16 +527,11 @@ jobs:
 
       - name: Install Scarb
         uses: software-mansion/setup-scarb@9d86a1616deecc95e8e8435daf902c5d025dc8b8 # v1
+        with:
+          scarb-version: ${{ env.SCARB_TOOLCHAIN_VERSION }}
 
       - name: Build uc CLI
         run: cargo build --release -p uc-cli
-
-      - name: Normalize checkout text mode on Windows
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          git config --global core.autocrlf false
-          git reset --hard HEAD
 
       - name: Capture fingerprint/session key
         shell: bash
@@ -270,9 +539,6 @@ jobs:
           mkdir -p benchmarks/results determinism
           UC_BIN="./target/release/uc"
           PYTHON_BIN="python3"
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            UC_BIN="./target/release/uc.exe"
-          fi
           if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
             PYTHON_BIN="python"
           fi
@@ -310,7 +576,7 @@ jobs:
           merge-multiple: true
           path: determinism
 
-      - name: Assert cross-platform determinism
+      - name: Assert Linux/macOS determinism
         shell: bash
         run: |
           set -euo pipefail
@@ -320,7 +586,7 @@ jobs:
           sk_unique_count="$(cat determinism/*.session-key.txt | tr -d '\r' | sort -u | wc -l | tr -d ' ')"
 
           if [[ "$fp_unique_count" != "1" ]]; then
-            echo "Fingerprint mismatch across OS lanes:" >&2
+            echo "Fingerprint mismatch across Linux/macOS lanes:" >&2
             for f in determinism/*.fingerprint.txt; do
               echo "$(basename "$f"): $(tr -d '\r' < "$f")" >&2
             done
@@ -328,11 +594,11 @@ jobs:
           fi
 
           if [[ "$sk_unique_count" != "1" ]]; then
-            echo "Session key mismatch across OS lanes:" >&2
+            echo "Session key mismatch across Linux/macOS lanes:" >&2
             for f in determinism/*.session-key.txt; do
               echo "$(basename "$f"): $(tr -d '\r' < "$f")" >&2
             done
             exit 1
           fi
 
-          echo "Cross-platform fingerprint and session key are deterministic."
+          echo "Linux/macOS fingerprint and session key are deterministic."

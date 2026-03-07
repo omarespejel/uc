@@ -335,8 +335,6 @@ dependencies = [
 [[package]]
 name = "cairo-lang-filesystem"
 version = "2.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0b4e9b0f473d1ae8b575c61f9ddf861cdf4dffa098e65613da3df2f4915bb44"
 dependencies = [
  "cairo-lang-debug",
  "cairo-lang-proc-macros",
@@ -347,7 +345,7 @@ dependencies = [
  "semver",
  "serde",
  "smol_str",
- "toml 0.9.12+spec-1.1.0",
+ "toml 0.8.23",
 ]
 
 [[package]]

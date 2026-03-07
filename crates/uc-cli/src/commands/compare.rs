@@ -4,10 +4,7 @@ pub(crate) fn run_compare_build(args: CompareBuildArgs) -> Result<()> {
     validate_scarb_toolchain()?;
     let common = args.common;
     let manifest_path = resolve_manifest_path(&common.manifest_path)?;
-    let workspace_root = manifest_path
-        .parent()
-        .context("manifest path has no parent")?
-        .to_path_buf();
+    let workspace_root = metadata_cache_workspace_root(&manifest_path)?;
     let profile = effective_profile(&common);
 
     if args.clean_before_each {
