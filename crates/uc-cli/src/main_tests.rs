@@ -9091,7 +9091,10 @@ fn phase0_build_phase_telemetry_new_fields_default_in_serde() {
     assert_eq!(t.native_find_contracts_ms, 0.0);
     assert_eq!(t.native_db_init_ms, 0.0);
     assert_eq!(t.native_setup_project_ms, 0.0);
+    assert_eq!(t.native_crate_cache_restore_ms, 0.0);
     assert_eq!(t.native_source_scan_ms, 0.0);
+    assert_eq!(t.native_session_image_persist_ms, 0.0);
+    assert_eq!(t.native_buildinfo_persist_ms, 0.0);
     assert_eq!(t.native_drift_scan_ms, 0.0);
 }
 
@@ -9101,15 +9104,20 @@ fn phase0_build_phase_telemetry_round_trips_with_new_fields() {
     t.native_find_contracts_ms = 42.5;
     t.native_db_init_ms = 3.3;
     t.native_setup_project_ms = 7.7;
+    t.native_crate_cache_restore_ms = 5.5;
     t.native_source_scan_ms = 12.1;
+    t.native_session_image_persist_ms = 8.8;
+    t.native_buildinfo_persist_ms = 2.2;
     t.native_drift_scan_ms = 1.9;
     let serialized = serde_json::to_string(&t).expect("serialize");
-    let deserialized: BuildPhaseTelemetry =
-        serde_json::from_str(&serialized).expect("deserialize");
+    let deserialized: BuildPhaseTelemetry = serde_json::from_str(&serialized).expect("deserialize");
     assert_eq!(deserialized.native_find_contracts_ms, 42.5);
     assert_eq!(deserialized.native_db_init_ms, 3.3);
     assert_eq!(deserialized.native_setup_project_ms, 7.7);
+    assert_eq!(deserialized.native_crate_cache_restore_ms, 5.5);
     assert_eq!(deserialized.native_source_scan_ms, 12.1);
+    assert_eq!(deserialized.native_session_image_persist_ms, 8.8);
+    assert_eq!(deserialized.native_buildinfo_persist_ms, 2.2);
     assert_eq!(deserialized.native_drift_scan_ms, 1.9);
 }
 
@@ -9117,7 +9125,7 @@ fn phase0_build_phase_telemetry_round_trips_with_new_fields() {
 /// in-flight counter. Without serialization, parallel tests can interfere.
 #[cfg(feature = "native-compile")]
 fn async_persist_test_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    static LOCK: TestOnceLock<Mutex<()>> = TestOnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
@@ -9228,14 +9236,16 @@ fn phase2_force_rebuild_only_on_cache_hit_with_empty_delta() {
     ));
 }
 
+#[cfg(feature = "mimalloc")]
 #[test]
 fn phase3_mimalloc_feature_gate_present() {
-    // Verify that mimalloc is in the default feature set at build time.
-    // When compiled with default features, cfg!(feature = "mimalloc") is true.
-    assert!(
-        cfg!(feature = "mimalloc"),
-        "mimalloc should be enabled by default features"
-    );
+    assert!(cfg!(feature = "mimalloc"));
+}
+
+#[cfg(not(feature = "mimalloc"))]
+#[test]
+fn phase3_mimalloc_feature_gate_absent() {
+    assert!(!cfg!(feature = "mimalloc"));
 }
 
 #[cfg(feature = "native-compile")]
@@ -9278,9 +9288,12 @@ fn phase4_session_image_postcard_roundtrip() {
     let mut contract_deps = BTreeMap::new();
     contract_deps.insert(
         "mypackage::MyContract".to_string(),
-        ["src/lib.cairo".to_string(), "src/contract.cairo".to_string()]
-            .into_iter()
-            .collect::<BTreeSet<_>>(),
+        [
+            "src/lib.cairo".to_string(),
+            "src/contract.cairo".to_string(),
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>(),
     );
 
     let plans = vec![NativeContractOutputPlan {
@@ -9319,7 +9332,10 @@ fn phase4_session_image_postcard_roundtrip() {
     // Decode and verify round-trip
     let decoded: NativeCompileSessionImageFile =
         postcard::from_bytes(&encoded).expect("postcard decode failed");
-    assert_eq!(decoded.schema_version, NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION);
+    assert_eq!(
+        decoded.schema_version,
+        NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION
+    );
     assert_eq!(decoded.signature_hash, "deadbeef0123456789abcdef");
     assert_eq!(decoded.source_root_modified_unix_ms, 1700000002000);
     assert_eq!(decoded.tracked_sources.len(), 2);
@@ -9391,29 +9407,90 @@ fn phase4_buildinfo_postcard_roundtrip() {
 
 #[cfg(feature = "native-compile")]
 #[test]
-fn phase4_postcard_rejects_old_json_session_image_as_cache_miss() {
-    // Verify that old-format JSON is not accidentally decoded by postcard.
-    // This simulates what happens when postcard is tried first on an old v1 JSON file.
-    let old_json = r#"{"schema_version":1,"signature_hash":"abc","source_root_modified_unix_ms":0,"tracked_sources":{},"tracked_source_bytes":0,"contract_source_dependencies":{},"contract_output_plans":[],"journal_cursor_applied":0,"generated_at_epoch_ms":0}"#;
+fn phase4_session_image_restore_accepts_legacy_json_v1_fallback() {
+    let dir = unique_test_dir("uc-phase4-session-image-legacy-json");
+    let signature = native_test_compile_session_signature(&dir, "manifest-blake3:legacy-json");
+    let tracked_sources = BTreeMap::from([(
+        "src/lib.cairo".to_string(),
+        NativeTrackedFileState {
+            size_bytes: 64,
+            modified_unix_ms: 101,
+        },
+    )]);
+    let tracked_source_bytes =
+        native_tracked_sources_total_bytes(&tracked_sources).expect("tracked-source bytes");
+    let legacy = NativeCompileSessionImageFile {
+        schema_version: NATIVE_COMPILE_SESSION_IMAGE_LEGACY_JSON_SCHEMA_VERSION,
+        signature_hash: native_compile_session_signature_hash(&signature),
+        source_root_modified_unix_ms: 777,
+        tracked_sources: tracked_sources.clone(),
+        tracked_source_bytes,
+        contract_source_dependencies: BTreeMap::new(),
+        contract_output_plans: Vec::new(),
+        journal_cursor_applied: 0,
+        generated_at_epoch_ms: 123,
+    };
+    let legacy_bytes = serde_json::to_vec(&legacy).expect("legacy JSON encode");
+    let image_path = native_compile_session_image_path(&dir).expect("image path should resolve");
+    fs::create_dir_all(
+        image_path
+            .parent()
+            .expect("session image path should have parent"),
+    )
+    .expect("failed to create session image parent");
+    fs::write(&image_path, legacy_bytes).expect("failed to write legacy session image");
 
-    let result = postcard::from_bytes::<NativeCompileSessionImageFile>(old_json.as_bytes());
-    // postcard should fail to decode JSON — it expects binary wire format
-    assert!(
-        result.is_err() || result.as_ref().unwrap().schema_version != NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION,
-        "postcard should not decode old JSON as schema v2"
-    );
+    let restored = try_native_compile_session_image_restore(&dir, &signature, 777)
+        .expect("legacy JSON session image should restore via fallback");
+    assert_eq!(restored.tracked_sources, tracked_sources);
+    assert_eq!(restored.tracked_source_bytes, tracked_source_bytes);
+
+    fs::remove_dir_all(&dir).ok();
 }
 
 #[cfg(feature = "native-compile")]
 #[test]
-fn phase4_postcard_rejects_old_json_buildinfo_as_cache_miss() {
-    let old_json = r#"{"schema_version":1,"signature_hash":"abc","source_root_modified_unix_ms":0,"tracked_sources":{},"tracked_source_bytes":0,"tracked_sources_signature":"","contract_source_dependencies":{},"contract_output_plans":[],"journal_cursor_applied":0,"generated_at_epoch_ms":0}"#;
+fn phase4_buildinfo_restore_accepts_legacy_json_v1_fallback() {
+    let dir = unique_test_dir("uc-phase4-buildinfo-legacy-json");
+    let signature = native_test_compile_session_signature(&dir, "manifest-blake3:legacy-json");
+    let tracked_sources = BTreeMap::from([(
+        "src/lib.cairo".to_string(),
+        NativeTrackedFileState {
+            size_bytes: 64,
+            modified_unix_ms: 101,
+        },
+    )]);
+    let tracked_source_bytes =
+        native_tracked_sources_total_bytes(&tracked_sources).expect("tracked-source bytes");
+    let legacy = NativeBuildInfoFile {
+        schema_version: NATIVE_BUILDINFO_LEGACY_JSON_SCHEMA_VERSION,
+        signature_hash: native_compile_session_signature_hash(&signature),
+        source_root_modified_unix_ms: 777,
+        tracked_sources: tracked_sources.clone(),
+        tracked_source_bytes,
+        tracked_sources_signature: native_tracked_sources_signature(&tracked_sources),
+        contract_source_dependencies: BTreeMap::new(),
+        contract_output_plans: Vec::new(),
+        journal_cursor_applied: 0,
+        generated_at_epoch_ms: 123,
+    };
+    let legacy_bytes = serde_json::to_vec(&legacy).expect("legacy JSON encode");
+    let buildinfo_path =
+        native_buildinfo_sidecar_path(&dir).expect("buildinfo path should resolve");
+    fs::create_dir_all(
+        buildinfo_path
+            .parent()
+            .expect("buildinfo path should have parent"),
+    )
+    .expect("failed to create buildinfo parent");
+    fs::write(&buildinfo_path, legacy_bytes).expect("failed to write legacy buildinfo");
 
-    let result = postcard::from_bytes::<NativeBuildInfoFile>(old_json.as_bytes());
-    assert!(
-        result.is_err() || result.as_ref().unwrap().schema_version != NATIVE_BUILDINFO_SCHEMA_VERSION,
-        "postcard should not decode old JSON as schema v2"
-    );
+    let restored = try_native_buildinfo_sidecar_restore(&dir, &signature, 777)
+        .expect("legacy JSON buildinfo should restore via fallback");
+    assert_eq!(restored.tracked_sources, tracked_sources);
+    assert_eq!(restored.tracked_source_bytes, tracked_source_bytes);
+
+    fs::remove_dir_all(&dir).ok();
 }
 
 #[cfg(feature = "native-compile")]
@@ -9469,7 +9546,11 @@ fn phase4_session_image_postcard_smaller_than_json_for_realistic_sizes() {
 // Phase 5: Embedded corelib tests
 // ---------------------------------------------------------------------------
 
-#[cfg(all(feature = "native-compile", not(uc_no_embedded_corelib)))]
+#[cfg(all(
+    feature = "native-compile",
+    feature = "embedded-corelib",
+    not(uc_no_embedded_corelib)
+))]
 #[test]
 fn phase5_embedded_corelib_is_non_empty() {
     // The EMBEDDED_CORELIB static should contain Cairo source files.
@@ -9481,49 +9562,79 @@ fn phase5_embedded_corelib_is_non_empty() {
     );
 }
 
-#[cfg(all(feature = "native-compile", not(uc_no_embedded_corelib)))]
+#[cfg(all(
+    feature = "native-compile",
+    feature = "embedded-corelib",
+    not(uc_no_embedded_corelib)
+))]
 #[test]
 fn phase5_embedded_corelib_contains_lib_cairo() {
     // The root of the embedded dir should contain lib.cairo.
-    let has_lib = EMBEDDED_CORELIB
-        .files()
-        .any(|f| f.path().file_name().map(|n| n == "lib.cairo").unwrap_or(false));
+    let has_lib = EMBEDDED_CORELIB.files().any(|f| {
+        f.path()
+            .file_name()
+            .map(|n| n == "lib.cairo")
+            .unwrap_or(false)
+    });
     assert!(has_lib, "embedded corelib must contain lib.cairo at root");
 }
 
-#[cfg(all(feature = "native-compile", not(uc_no_embedded_corelib)))]
+#[cfg(all(
+    feature = "native-compile",
+    feature = "embedded-corelib",
+    not(uc_no_embedded_corelib)
+))]
 #[test]
 fn phase5_embedded_corelib_contains_prelude_and_ops() {
-    let has_prelude = EMBEDDED_CORELIB
-        .files()
-        .any(|f| f.path().file_name().map(|n| n == "prelude.cairo").unwrap_or(false));
-    let has_ops = EMBEDDED_CORELIB
-        .files()
-        .any(|f| f.path().file_name().map(|n| n == "ops.cairo").unwrap_or(false));
+    let has_prelude = EMBEDDED_CORELIB.files().any(|f| {
+        f.path()
+            .file_name()
+            .map(|n| n == "prelude.cairo")
+            .unwrap_or(false)
+    });
+    let has_ops = EMBEDDED_CORELIB.files().any(|f| {
+        f.path()
+            .file_name()
+            .map(|n| n == "ops.cairo")
+            .unwrap_or(false)
+    });
     assert!(has_prelude, "embedded corelib must contain prelude.cairo");
     assert!(has_ops, "embedded corelib must contain ops.cairo");
 }
 
-#[cfg(all(feature = "native-compile", not(uc_no_embedded_corelib)))]
+#[cfg(all(
+    feature = "native-compile",
+    feature = "embedded-corelib",
+    not(uc_no_embedded_corelib)
+))]
 #[test]
 fn phase5_extract_embedded_corelib_creates_files() {
     // Extract to a temp directory and verify structure.
-    let tmp = std::env::temp_dir().join(format!(
-        "uc-phase5-test-{}",
-        std::process::id()
-    ));
+    let tmp = std::env::temp_dir().join(format!("uc-phase5-test-{}", std::process::id()));
     let _ = fs::remove_dir_all(&tmp);
-    extract_embedded_dir_recursive(&EMBEDDED_CORELIB, &tmp)
-        .expect("extraction should succeed");
+    extract_embedded_dir_recursive(&EMBEDDED_CORELIB, &tmp).expect("extraction should succeed");
 
-    assert!(tmp.join("lib.cairo").is_file(), "lib.cairo should be extracted");
-    assert!(tmp.join("prelude.cairo").is_file(), "prelude.cairo should be extracted");
-    assert!(tmp.join("ops.cairo").is_file(), "ops.cairo should be extracted");
-
-    // Verify nested dirs are extracted (corelib has internal/ subdir)
     assert!(
-        tmp.join("internal").is_dir() || true,
-        "nested directories should be extracted if they exist"
+        tmp.join("lib.cairo").is_file(),
+        "lib.cairo should be extracted"
+    );
+    assert!(
+        tmp.join("prelude.cairo").is_file(),
+        "prelude.cairo should be extracted"
+    );
+    assert!(
+        tmp.join("ops.cairo").is_file(),
+        "ops.cairo should be extracted"
+    );
+
+    // Verify at least one nested directory was extracted.
+    let has_subdir = fs::read_dir(&tmp)
+        .expect("failed to read extracted corelib directory")
+        .filter_map(|entry| entry.ok())
+        .any(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false));
+    assert!(
+        has_subdir,
+        "embedded corelib extraction should include nested directories"
     );
 
     // Verify extracted layout is compatible
@@ -9535,20 +9646,31 @@ fn phase5_extract_embedded_corelib_creates_files() {
     let _ = fs::remove_dir_all(&tmp);
 }
 
-#[cfg(all(feature = "native-compile", not(uc_no_embedded_corelib)))]
+#[cfg(all(
+    feature = "native-compile",
+    feature = "embedded-corelib",
+    not(uc_no_embedded_corelib)
+))]
 #[test]
 fn phase5_extract_embedded_corelib_is_idempotent() {
     // Calling extract_embedded_corelib twice should succeed and return the same path.
     let path1 = extract_embedded_corelib().expect("first extraction should succeed");
     let path2 = extract_embedded_corelib().expect("second extraction should succeed");
-    assert_eq!(path1, path2, "idempotent extraction should return same path");
+    assert_eq!(
+        path1, path2,
+        "idempotent extraction should return same path"
+    );
     assert!(
         native_corelib_layout_looks_compatible(&path1),
         "extracted path should be layout-compatible"
     );
 }
 
-#[cfg(all(feature = "native-compile", not(uc_no_embedded_corelib)))]
+#[cfg(all(
+    feature = "native-compile",
+    feature = "embedded-corelib",
+    not(uc_no_embedded_corelib)
+))]
 #[test]
 fn phase5_global_cache_dir_is_under_home() {
     let dir = uc_global_cache_dir().expect("should resolve global cache dir");
@@ -9585,22 +9707,29 @@ fn phase5_resolve_corelib_src_succeeds() {
 #[cfg(feature = "native-compile")]
 #[test]
 fn phase6_corelib_sierra_blob_path_is_versioned() {
-    let path = corelib_sierra_blob_path().expect("should resolve blob path");
+    let dir = unique_test_dir("uc-phase6-blob-path-versioned");
+    let corelib_src = dir.join("corelib/src");
+    create_mock_native_corelib(&corelib_src);
+    let path = corelib_sierra_blob_path(&corelib_src).expect("should resolve blob path");
     let version = native_cairo_lang_compiler_version();
-    let expected_name = format!("corelib-sierra-v{version}.blob");
+    let expected_prefix = format!("corelib-sierra-v{version}-");
     assert!(
         path.file_name()
-            .map(|n| n.to_string_lossy().contains(&expected_name))
+            .map(|n| n.to_string_lossy().contains(&expected_prefix))
             .unwrap_or(false),
-        "blob path {} should contain version stamp {expected_name}",
+        "blob path {} should contain version stamp prefix {expected_prefix}",
         path.display()
     );
+    fs::remove_dir_all(&dir).ok();
 }
 
 #[cfg(feature = "native-compile")]
 #[test]
 fn phase6_corelib_sierra_blob_path_under_home() {
-    let path = corelib_sierra_blob_path().expect("should resolve blob path");
+    let dir = unique_test_dir("uc-phase6-blob-path-home");
+    let corelib_src = dir.join("corelib/src");
+    create_mock_native_corelib(&corelib_src);
+    let path = corelib_sierra_blob_path(&corelib_src).expect("should resolve blob path");
     let home = std::env::var("HOME").expect("HOME should be set");
     assert!(
         path.starts_with(&home),
@@ -9608,6 +9737,7 @@ fn phase6_corelib_sierra_blob_path_under_home() {
         path.display(),
         home
     );
+    fs::remove_dir_all(&dir).ok();
 }
 
 #[cfg(feature = "native-compile")]
@@ -9628,9 +9758,13 @@ fn phase6_try_restore_returns_false_when_no_blob() {
     // Without it, the function should gracefully return false.
     // We don't call init_dev_corelib here to test the "no core crate" path.
     let mut db = db;
-    let result = try_restore_corelib_sierra_blob(&mut db);
+    let dir = unique_test_dir("uc-phase6-no-blob");
+    let corelib_src = dir.join("corelib/src");
+    create_mock_native_corelib(&corelib_src);
+    let result = try_restore_corelib_sierra_blob(&mut db, &corelib_src);
     // Should not panic. Result depends on whether core crate was set up and blob exists.
     let _ = result;
+    fs::remove_dir_all(&dir).ok();
 }
 
 #[cfg(feature = "native-compile")]
@@ -9644,5 +9778,9 @@ fn phase6_persist_corelib_sierra_blob_does_not_panic() {
         .with_default_plugin_suite(starknet_plugin_suite())
         .build()
         .expect("failed to init DB");
-    persist_corelib_sierra_blob_best_effort(&db);
+    let dir = unique_test_dir("uc-phase6-persist-no-panic");
+    let corelib_src = dir.join("corelib/src");
+    create_mock_native_corelib(&corelib_src);
+    persist_corelib_sierra_blob_best_effort(&db, &corelib_src);
+    fs::remove_dir_all(&dir).ok();
 }

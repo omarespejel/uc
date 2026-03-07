@@ -9,7 +9,7 @@ name = "uc"
 path = "src/main.rs"
 
 [features]
-default = ["native-compile", "mimalloc"]
+default = ["native-compile", "mimalloc", "embedded-corelib"]
 native-compile = [
   "dep:cairo-lang-compiler",
   "dep:cairo-lang-defs",
@@ -20,6 +20,10 @@ native-compile = [
   "dep:notify",
   "dep:scarb-stable-hash",
 ]
+# Embedded corelib path is compile-time optional so local/dev builds can opt out.
+embedded-corelib = ["dep:include_dir"]
+# `default-features = false` is inherited from workspace; this intentionally
+# prioritizes allocator throughput over mimalloc's optional hardened modes.
 mimalloc = ["dep:mimalloc"]
 dev-benchmark-command = []
 
@@ -33,7 +37,7 @@ cairo-lang-lowering = { workspace = true, optional = true }
 cairo-lang-starknet = { workspace = true, optional = true }
 cairo-lang-starknet-classes = { workspace = true, optional = true }
 clap.workspace = true
-include_dir.workspace = true
+include_dir = { workspace = true, optional = true }
 libc.workspace = true
 mimalloc = { workspace = true, optional = true }
 notify = { workspace = true, optional = true }
