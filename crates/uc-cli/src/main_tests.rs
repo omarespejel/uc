@@ -5196,6 +5196,153 @@ fn native_buildinfo_sidecar_round_trip_restores_tracked_sources_and_dependency_i
 }
 
 #[cfg(feature = "native-compile")]
+fn native_test_db_with_single_real_crate(
+    workspace_root: &Path,
+    crate_name: &str,
+) -> (RootDatabase, CrateInput) {
+    let src_dir = workspace_root.join("src");
+    fs::create_dir_all(&src_dir).expect("failed to create source root");
+    let mut db = RootDatabase::builder()
+        .build()
+        .expect("failed to create native test RootDatabase");
+    let crate_input = CrateInput::Real {
+        name: crate_name.to_string(),
+        discriminator: None,
+    };
+    let db_ref: &dyn salsa::Database = &db;
+    let mut crate_configs = files_group_input(db_ref)
+        .crate_configs(db_ref)
+        .clone()
+        .unwrap_or_default();
+    crate_configs.insert(
+        crate_input.clone(),
+        CrateConfigurationInput {
+            root: cairo_lang_filesystem::ids::DirectoryInput::Real(src_dir),
+            settings: Default::default(),
+            cache_file: None,
+        },
+    );
+    set_crate_configs_input(&mut db, crate_configs);
+    (db, crate_input)
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_crate_cache_restore_injects_cached_blob_for_matching_signature() {
+    let dir = unique_test_dir("uc-native-crate-cache-restore");
+    let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
+    let signature_hash = native_compile_session_signature_hash(&signature);
+    let (mut db, crate_input) = native_test_db_with_single_real_crate(&dir, "demo");
+    let descriptor = {
+        let crate_id = CrateInput::into_crate_ids(&db, [crate_input.clone()])
+            .into_iter()
+            .next()
+            .expect("crate id should be interned");
+        native_crate_cache_descriptor_for_crate(&db, crate_id)
+            .expect("real crate config should produce cache descriptor")
+    };
+    let entry_hash = native_crate_cache_entry_hash(&signature_hash, &descriptor.cache_key);
+    let (blob_path, entry_path) = native_crate_cache_entry_paths(&dir, &entry_hash)
+        .expect("native crate cache paths should resolve");
+    let cache_blob = b"native-cache-blob".to_vec();
+    if let Some(parent) = blob_path.parent() {
+        fs::create_dir_all(parent).expect("failed to create native cache directory");
+    }
+    atomic_write_bytes(&blob_path, &cache_blob, "test native crate cache blob")
+        .expect("failed to write native crate cache blob");
+    let entry = NativeCrateCacheEntryFile {
+        schema_version: NATIVE_CRATE_CACHE_ENTRY_SCHEMA_VERSION,
+        signature_hash: signature_hash.clone(),
+        crate_cache_key: descriptor.cache_key,
+        blob_hash: blake3::hash(&cache_blob).to_hex().to_string(),
+        blob_size: cache_blob.len() as u64,
+        generated_at_epoch_ms: epoch_ms_u64().unwrap_or_default(),
+    };
+    let entry_bytes = serde_json::to_vec(&entry).expect("failed to encode cache entry");
+    atomic_write_bytes(
+        &entry_path,
+        &entry_bytes,
+        "test native crate cache metadata",
+    )
+    .expect("failed to write native crate cache metadata");
+
+    let stats = native_restore_crate_cache_into_db(&dir, &signature_hash, &mut db);
+    assert_eq!(stats.restored, 1);
+    assert_eq!(stats.rejected, 0);
+    let restored_blob = db
+        .crate_config(
+            CrateInput::into_crate_ids(&db, [crate_input.clone()])
+                .into_iter()
+                .next()
+                .expect("crate id should be interned"),
+        )
+        .and_then(|config| config.cache_file)
+        .and_then(|blob_id| db.blob_content(blob_id))
+        .expect("cache restore should inject crate cache blob into crate config");
+    assert_eq!(restored_blob, cache_blob);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_crate_cache_restore_rejects_signature_mismatch() {
+    let dir = unique_test_dir("uc-native-crate-cache-signature-mismatch");
+    let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
+    let signature_hash = native_compile_session_signature_hash(&signature);
+    let (mut db, crate_input) = native_test_db_with_single_real_crate(&dir, "demo");
+    let descriptor = {
+        let crate_id = CrateInput::into_crate_ids(&db, [crate_input.clone()])
+            .into_iter()
+            .next()
+            .expect("crate id should be interned");
+        native_crate_cache_descriptor_for_crate(&db, crate_id)
+            .expect("real crate config should produce cache descriptor")
+    };
+    let entry_hash = native_crate_cache_entry_hash(&signature_hash, &descriptor.cache_key);
+    let (blob_path, entry_path) = native_crate_cache_entry_paths(&dir, &entry_hash)
+        .expect("native crate cache paths should resolve");
+    let cache_blob = b"native-cache-blob".to_vec();
+    if let Some(parent) = blob_path.parent() {
+        fs::create_dir_all(parent).expect("failed to create native cache directory");
+    }
+    atomic_write_bytes(&blob_path, &cache_blob, "test native crate cache blob")
+        .expect("failed to write native crate cache blob");
+    let entry = NativeCrateCacheEntryFile {
+        schema_version: NATIVE_CRATE_CACHE_ENTRY_SCHEMA_VERSION,
+        signature_hash,
+        crate_cache_key: descriptor.cache_key,
+        blob_hash: blake3::hash(&cache_blob).to_hex().to_string(),
+        blob_size: cache_blob.len() as u64,
+        generated_at_epoch_ms: epoch_ms_u64().unwrap_or_default(),
+    };
+    let entry_bytes = serde_json::to_vec(&entry).expect("failed to encode cache entry");
+    atomic_write_bytes(
+        &entry_path,
+        &entry_bytes,
+        "test native crate cache metadata",
+    )
+    .expect("failed to write native crate cache metadata");
+
+    let mismatch_stats = native_restore_crate_cache_into_db(&dir, "different-signature", &mut db);
+    assert_eq!(mismatch_stats.restored, 0);
+    assert!(
+        db.crate_config(
+            CrateInput::into_crate_ids(&db, [crate_input.clone()])
+                .into_iter()
+                .next()
+                .expect("crate id should be interned"),
+        )
+        .expect("crate config should exist")
+        .cache_file
+        .is_none(),
+        "signature mismatch must not inject cached blob"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
 #[test]
 fn native_source_journal_persistence_round_trip_and_consumption() {
     let dir = unique_test_dir("uc-native-source-journal-persistence");

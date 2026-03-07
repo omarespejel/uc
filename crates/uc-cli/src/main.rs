@@ -14,14 +14,17 @@ use cairo_lang_defs::ids::ModuleId;
 use cairo_lang_defs::ids::TopLevelLanguageElementId;
 #[cfg(feature = "native-compile")]
 use cairo_lang_filesystem::db::{
-    ensure_keyed_file_override_slots, init_dev_corelib, set_file_override_content_keyed, FilesGroup,
+    ensure_keyed_file_override_slots, files_group_input, init_dev_corelib, set_crate_configs_input,
+    set_file_override_content_keyed, CrateConfigurationInput, FilesGroup,
 };
 #[cfg(feature = "native-compile")]
 use cairo_lang_filesystem::detect::detect_corelib;
 #[cfg(feature = "native-compile")]
-use cairo_lang_filesystem::ids::CrateInput;
+use cairo_lang_filesystem::ids::{BlobLongId, CrateInput, CrateLongId, Directory};
 #[cfg(feature = "native-compile")]
 use cairo_lang_filesystem::ids::{FileId, FileLongId};
+#[cfg(feature = "native-compile")]
+use cairo_lang_lowering::cache::generate_crate_cache;
 #[cfg(feature = "native-compile")]
 use cairo_lang_lowering::optimizations::config::Optimizations;
 #[cfg(feature = "native-compile")]
@@ -173,6 +176,16 @@ const MAX_NATIVE_COMPILE_SESSION_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 const NATIVE_BUILDINFO_SCHEMA_VERSION: u32 = 1;
 #[cfg(feature = "native-compile")]
 const MAX_NATIVE_BUILDINFO_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(feature = "native-compile")]
+const NATIVE_CRATE_CACHE_ENTRY_SCHEMA_VERSION: u32 = 1;
+#[cfg(feature = "native-compile")]
+const MAX_NATIVE_CRATE_CACHE_ENTRY_BYTES: u64 = 64 * 1024;
+#[cfg(feature = "native-compile")]
+const MAX_NATIVE_CRATE_CACHE_BLOB_BYTES: u64 = 128 * 1024 * 1024;
+#[cfg(feature = "native-compile")]
+const DEFAULT_NATIVE_CRATE_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+#[cfg(feature = "native-compile")]
+const DEFAULT_NATIVE_CRATE_CACHE_ENABLED: bool = true;
 #[cfg(feature = "native-compile")]
 const NATIVE_SOURCE_JOURNAL_SCHEMA_VERSION: u32 = 1;
 #[cfg(feature = "native-compile")]
@@ -978,6 +991,42 @@ struct NativeBuildInfoSnapshot {
     journal_cursor_applied: u64,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+#[cfg(feature = "native-compile")]
+struct NativeCrateCacheDescriptor {
+    cache_key: String,
+    label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg(feature = "native-compile")]
+struct NativeCrateCacheEntryFile {
+    schema_version: u32,
+    signature_hash: String,
+    crate_cache_key: String,
+    blob_hash: String,
+    blob_size: u64,
+    generated_at_epoch_ms: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+#[cfg(feature = "native-compile")]
+struct NativeCrateCacheRestoreStats {
+    restored: usize,
+    missing: usize,
+    rejected: usize,
+    skipped: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+#[cfg(feature = "native-compile")]
+struct NativeCrateCachePersistStats {
+    saved: usize,
+    skipped: usize,
+    failed: usize,
+    bytes_written: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg(feature = "native-compile")]
 struct NativeSourceJournalFile {
@@ -1604,6 +1653,23 @@ fn parse_env_bool(name: &str, default: bool) -> bool {
         }
         Err(_) => default,
     }
+}
+
+#[cfg(feature = "native-compile")]
+fn native_crate_cache_enabled() -> bool {
+    parse_env_bool(
+        "UC_NATIVE_CRATE_CACHE_ENABLED",
+        DEFAULT_NATIVE_CRATE_CACHE_ENABLED,
+    )
+}
+
+#[cfg(feature = "native-compile")]
+fn native_crate_cache_max_bytes() -> u64 {
+    parse_env_u64(
+        "UC_NATIVE_CRATE_CACHE_MAX_BYTES",
+        DEFAULT_NATIVE_CRATE_CACHE_MAX_BYTES,
+    )
+    .max(MAX_NATIVE_CRATE_CACHE_BLOB_BYTES)
 }
 
 #[cfg(feature = "native-compile")]
@@ -6666,11 +6732,399 @@ fn try_native_buildinfo_sidecar_restore(
 }
 
 #[cfg(feature = "native-compile")]
+fn native_crate_cache_root_path(workspace_root: &Path) -> Result<PathBuf> {
+    let path = workspace_root.join(".uc/cache/native-session/crate-cache-v1");
+    ensure_path_within_root(workspace_root, &path, "native crate cache root")?;
+    Ok(path)
+}
+
+#[cfg(feature = "native-compile")]
+fn native_crate_cache_entry_hash(signature_hash: &str, crate_cache_key: &str) -> String {
+    let mut hasher = Hasher::new();
+    hasher.update(b"uc-native-crate-cache-entry-v1");
+    hasher.update(signature_hash.as_bytes());
+    hasher.update(b"\x1F");
+    hasher.update(crate_cache_key.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+#[cfg(feature = "native-compile")]
+fn native_crate_cache_entry_paths(
+    workspace_root: &Path,
+    entry_hash: &str,
+) -> Result<(PathBuf, PathBuf)> {
+    let root = native_crate_cache_root_path(workspace_root)?;
+    let blob_path = root.join(format!("{entry_hash}.bin"));
+    let entry_path = root.join(format!("{entry_hash}.json"));
+    ensure_path_within_root(workspace_root, &blob_path, "native crate cache blob path")?;
+    ensure_path_within_root(
+        workspace_root,
+        &entry_path,
+        "native crate cache metadata path",
+    )?;
+    Ok((blob_path, entry_path))
+}
+
+#[cfg(feature = "native-compile")]
+fn native_crate_cache_descriptor_for_crate(
+    db: &dyn FilesGroup,
+    crate_id: cairo_lang_filesystem::ids::CrateId<'_>,
+) -> Option<NativeCrateCacheDescriptor> {
+    let crate_config = db.crate_config(crate_id)?;
+    let (root, root_modified_unix_ms) = match &crate_config.root {
+        Directory::Real(path) => {
+            let root = normalize_fingerprint_path(path);
+            let modified = fs::metadata(path)
+                .ok()
+                .and_then(|metadata| metadata_modified_unix_ms(&metadata).ok())
+                .unwrap_or_default();
+            (root, modified)
+        }
+        Directory::Virtual { .. } => return None,
+    };
+    let (name, discriminator) = match crate_id.long(db) {
+        CrateLongId::Real {
+            name,
+            discriminator,
+        } => (
+            name.to_string(db),
+            discriminator.clone().unwrap_or_default(),
+        ),
+        CrateLongId::Virtual { .. } => return None,
+    };
+    let cache_key = format!("real:{name}:{discriminator}:{root}:{root_modified_unix_ms}");
+    let label = format!(
+        "real:{name}{}@{root}",
+        if discriminator.is_empty() {
+            String::new()
+        } else {
+            format!("#{discriminator}")
+        }
+    );
+    Some(NativeCrateCacheDescriptor { cache_key, label })
+}
+
+#[cfg(feature = "native-compile")]
+fn native_restore_crate_cache_into_db(
+    workspace_root: &Path,
+    signature_hash: &str,
+    db: &mut RootDatabase,
+) -> NativeCrateCacheRestoreStats {
+    if !native_crate_cache_enabled() {
+        return NativeCrateCacheRestoreStats::default();
+    }
+    let crate_ids = db.crate_configs().keys().copied().collect::<Vec<_>>();
+    if crate_ids.is_empty() {
+        return NativeCrateCacheRestoreStats::default();
+    }
+    let db_ref: &dyn salsa::Database = db;
+    let mut crate_configs = files_group_input(db_ref)
+        .crate_configs(db_ref)
+        .clone()
+        .unwrap_or_default();
+    let mut stats = NativeCrateCacheRestoreStats::default();
+    let mut updated = false;
+    for crate_id in crate_ids {
+        let Some(descriptor) = native_crate_cache_descriptor_for_crate(db, crate_id) else {
+            stats.skipped = stats.skipped.saturating_add(1);
+            continue;
+        };
+        let entry_hash = native_crate_cache_entry_hash(signature_hash, &descriptor.cache_key);
+        let (blob_path, entry_path) =
+            match native_crate_cache_entry_paths(workspace_root, &entry_hash) {
+                Ok(paths) => paths,
+                Err(err) => {
+                    tracing::warn!(
+                        workspace_root = %workspace_root.display(),
+                        error = %format!("{err:#}"),
+                        crate_label = %descriptor.label,
+                        "native crate cache paths invalid; skipping restore"
+                    );
+                    stats.rejected = stats.rejected.saturating_add(1);
+                    continue;
+                }
+            };
+        if !blob_path.is_file() || !entry_path.is_file() {
+            stats.missing = stats.missing.saturating_add(1);
+            continue;
+        }
+        let entry_bytes = match read_bytes_with_limit(
+            &entry_path,
+            MAX_NATIVE_CRATE_CACHE_ENTRY_BYTES,
+            "native crate cache entry",
+        ) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!(
+                    path = %entry_path.display(),
+                    error = %format!("{err:#}"),
+                    crate_label = %descriptor.label,
+                    "failed to read native crate cache metadata; skipping restore"
+                );
+                stats.rejected = stats.rejected.saturating_add(1);
+                continue;
+            }
+        };
+        let entry = match serde_json::from_slice::<NativeCrateCacheEntryFile>(&entry_bytes) {
+            Ok(entry) if entry.schema_version == NATIVE_CRATE_CACHE_ENTRY_SCHEMA_VERSION => entry,
+            Ok(_) => {
+                stats.rejected = stats.rejected.saturating_add(1);
+                continue;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %entry_path.display(),
+                    error = %err,
+                    crate_label = %descriptor.label,
+                    "failed to decode native crate cache metadata; skipping restore"
+                );
+                stats.rejected = stats.rejected.saturating_add(1);
+                continue;
+            }
+        };
+        if entry.signature_hash != signature_hash || entry.crate_cache_key != descriptor.cache_key {
+            stats.rejected = stats.rejected.saturating_add(1);
+            continue;
+        }
+        if entry.blob_size > MAX_NATIVE_CRATE_CACHE_BLOB_BYTES {
+            stats.rejected = stats.rejected.saturating_add(1);
+            continue;
+        }
+        let blob_bytes = match read_bytes_with_limit(
+            &blob_path,
+            MAX_NATIVE_CRATE_CACHE_BLOB_BYTES,
+            "native crate cache blob",
+        ) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!(
+                    path = %blob_path.display(),
+                    error = %format!("{err:#}"),
+                    crate_label = %descriptor.label,
+                    "failed to read native crate cache blob; skipping restore"
+                );
+                stats.rejected = stats.rejected.saturating_add(1);
+                continue;
+            }
+        };
+        if blob_bytes.len() as u64 != entry.blob_size
+            || blake3::hash(&blob_bytes).to_hex().to_string() != entry.blob_hash
+        {
+            stats.rejected = stats.rejected.saturating_add(1);
+            continue;
+        }
+        let crate_input = crate_id.long(db).clone().into_crate_input(db);
+        let Some(existing) = crate_configs.get(&crate_input).cloned() else {
+            stats.skipped = stats.skipped.saturating_add(1);
+            continue;
+        };
+        crate_configs.insert(
+            crate_input,
+            CrateConfigurationInput {
+                root: existing.root,
+                settings: existing.settings,
+                cache_file: Some(BlobLongId::Virtual(blob_bytes)),
+            },
+        );
+        stats.restored = stats.restored.saturating_add(1);
+        updated = true;
+    }
+    if updated {
+        set_crate_configs_input(db, crate_configs);
+    }
+    stats
+}
+
+#[cfg(feature = "native-compile")]
+fn native_prune_crate_cache_files(workspace_root: &Path, max_bytes: u64) -> Result<()> {
+    let root = native_crate_cache_root_path(workspace_root)?;
+    if !root.is_dir() {
+        return Ok(());
+    }
+    let mut files = Vec::new();
+    let mut total_bytes = 0_u64;
+    for entry in WalkDir::new(&root)
+        .follow_links(false)
+        .into_iter()
+        .flatten()
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let metadata =
+            fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+        let modified = metadata_modified_unix_ms(&metadata).unwrap_or_default();
+        let size = metadata.len();
+        total_bytes = total_bytes.saturating_add(size);
+        files.push((modified, size, path.to_path_buf()));
+    }
+    if total_bytes <= max_bytes {
+        return Ok(());
+    }
+    files.sort_by_key(|(modified, _, _)| *modified);
+    for (_modified, size, path) in files {
+        if total_bytes <= max_bytes {
+            break;
+        }
+        ensure_path_within_root(workspace_root, &path, "native crate cache prune path")?;
+        if fs::remove_file(&path).is_ok() {
+            total_bytes = total_bytes.saturating_sub(size);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native-compile")]
+fn native_persist_crate_cache_entries(
+    workspace_root: &Path,
+    signature_hash: &str,
+    db: &RootDatabase,
+    crate_ids: Vec<cairo_lang_filesystem::ids::CrateId<'_>>,
+) -> Result<NativeCrateCachePersistStats> {
+    let mut stats = NativeCrateCachePersistStats::default();
+    if !native_crate_cache_enabled() || crate_ids.is_empty() {
+        return Ok(stats);
+    }
+    let root = native_crate_cache_root_path(workspace_root)?;
+    fs::create_dir_all(&root).with_context(|| format!("failed to create {}", root.display()))?;
+    let mut seen = HashSet::new();
+    for crate_id in crate_ids {
+        let Some(descriptor) = native_crate_cache_descriptor_for_crate(db, crate_id) else {
+            stats.skipped = stats.skipped.saturating_add(1);
+            continue;
+        };
+        if !seen.insert(descriptor.cache_key.clone()) {
+            continue;
+        }
+        let blob = match generate_crate_cache(db, crate_id) {
+            Ok(blob) => blob,
+            Err(err) => {
+                tracing::debug!(
+                    crate_label = %descriptor.label,
+                    error = %err,
+                    "native crate cache generation failed for crate"
+                );
+                stats.failed = stats.failed.saturating_add(1);
+                continue;
+            }
+        };
+        if blob.len() as u64 > MAX_NATIVE_CRATE_CACHE_BLOB_BYTES {
+            tracing::warn!(
+                crate_label = %descriptor.label,
+                bytes = blob.len(),
+                max_bytes = MAX_NATIVE_CRATE_CACHE_BLOB_BYTES,
+                "skipping native crate cache blob: entry exceeds size limit"
+            );
+            stats.skipped = stats.skipped.saturating_add(1);
+            continue;
+        }
+        let entry_hash = native_crate_cache_entry_hash(signature_hash, &descriptor.cache_key);
+        let (blob_path, entry_path) = native_crate_cache_entry_paths(workspace_root, &entry_hash)?;
+        let blob_hash = blake3::hash(&blob).to_hex().to_string();
+        let entry = NativeCrateCacheEntryFile {
+            schema_version: NATIVE_CRATE_CACHE_ENTRY_SCHEMA_VERSION,
+            signature_hash: signature_hash.to_string(),
+            crate_cache_key: descriptor.cache_key.clone(),
+            blob_hash,
+            blob_size: blob.len() as u64,
+            generated_at_epoch_ms: epoch_ms_u64().unwrap_or_default(),
+        };
+        let entry_bytes =
+            serde_json::to_vec(&entry).context("failed to encode native crate cache metadata")?;
+        if entry_bytes.len() as u64 > MAX_NATIVE_CRATE_CACHE_ENTRY_BYTES {
+            tracing::warn!(
+                crate_label = %descriptor.label,
+                bytes = entry_bytes.len(),
+                max_bytes = MAX_NATIVE_CRATE_CACHE_ENTRY_BYTES,
+                "skipping native crate cache metadata write: entry exceeds size limit"
+            );
+            stats.skipped = stats.skipped.saturating_add(1);
+            continue;
+        }
+        atomic_write_bytes(&blob_path, &blob, "native crate cache blob")?;
+        atomic_write_bytes(&entry_path, &entry_bytes, "native crate cache metadata")?;
+        stats.saved = stats.saved.saturating_add(1);
+        stats.bytes_written = stats.bytes_written.saturating_add(blob.len() as u64);
+    }
+    native_prune_crate_cache_files(workspace_root, native_crate_cache_max_bytes())?;
+    Ok(stats)
+}
+
+#[cfg(feature = "native-compile")]
+fn native_persist_crate_cache_after_build_best_effort(
+    workspace_root: &Path,
+    signature: &NativeCompileSessionSignature,
+    changed_files_count: u64,
+    removed_files_count: u64,
+    compiled_contracts: u64,
+) {
+    if !native_crate_cache_enabled() {
+        return;
+    }
+    if compiled_contracts == 0 {
+        return;
+    }
+    if changed_files_count != 0 || removed_files_count != 0 {
+        return;
+    }
+    let signature_hash = native_compile_session_signature_hash(signature);
+    let session_handle = match native_compile_session_handle(workspace_root, signature) {
+        Ok(handle) => handle,
+        Err(err) => {
+            tracing::warn!(
+                workspace_root = %workspace_root.display(),
+                error = %format!("{err:#}"),
+                "failed to access native compile session for crate-cache persist"
+            );
+            return;
+        }
+    };
+    let (db_snapshot, mut crate_inputs) = {
+        let session = session_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (session.db.snapshot(), session.main_crate_inputs.clone())
+    };
+    let core_input = CrateLongId::core(&db_snapshot).into_crate_input(&db_snapshot);
+    if !crate_inputs.iter().any(|input| input == &core_input) {
+        crate_inputs.push(core_input);
+    }
+    let crate_ids = CrateInput::into_crate_ids(&db_snapshot, crate_inputs.clone());
+    match native_persist_crate_cache_entries(
+        workspace_root,
+        &signature_hash,
+        &db_snapshot,
+        crate_ids,
+    ) {
+        Ok(stats) => {
+            tracing::debug!(
+                workspace_root = %workspace_root.display(),
+                signature_hash = %signature_hash,
+                saved = stats.saved,
+                skipped = stats.skipped,
+                failed = stats.failed,
+                bytes_written = stats.bytes_written,
+                "native crate cache persisted"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                workspace_root = %workspace_root.display(),
+                error = %format!("{err:#}"),
+                "failed to persist native crate cache"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "native-compile")]
 fn build_native_compile_session_state(
     workspace_root: &Path,
     signature: NativeCompileSessionSignature,
 ) -> Result<NativeCompileSessionState> {
     let source_roots = native_compile_source_roots(&signature.context);
+    let signature_hash = native_compile_session_signature_hash(&signature);
     let db_start = Instant::now();
     let mut db = RootDatabase::builder()
         .with_optimizations(Optimizations::enabled_with_default_movable_functions(
@@ -6690,6 +7144,10 @@ fn build_native_compile_session_state(
             )
         })?;
     let setup_project_ms = setup_start.elapsed().as_secs_f64() * 1000.0;
+    let crate_cache_restore_start = Instant::now();
+    let crate_cache_restore_stats =
+        native_restore_crate_cache_into_db(workspace_root, &signature_hash, &mut db);
+    let crate_cache_restore_ms = crate_cache_restore_start.elapsed().as_secs_f64() * 1000.0;
     let source_root_modified_unix_ms =
         native_source_roots_modified_unix_ms(workspace_root, &source_roots)?;
     let scan_start = Instant::now();
@@ -6753,6 +7211,11 @@ fn build_native_compile_session_state(
         workspace_root = %workspace_root.display(),
         db_init_ms,
         setup_project_ms,
+        crate_cache_restore_ms,
+        crate_cache_restored = crate_cache_restore_stats.restored,
+        crate_cache_missing = crate_cache_restore_stats.missing,
+        crate_cache_rejected = crate_cache_restore_stats.rejected,
+        crate_cache_skipped = crate_cache_restore_stats.skipped,
         source_scan_ms,
         session_image_hit,
         buildinfo_hit,
@@ -8332,6 +8795,13 @@ fn run_native_build_inner(
         &signature,
         &dependency_updates,
         contract_output_plans.as_deref(),
+    );
+    native_persist_crate_cache_after_build_best_effort(
+        workspace_root,
+        &signature,
+        changed_files_count,
+        removed_files_count,
+        compiled_contracts,
     );
     let compile_ms = compile_start.elapsed().as_secs_f64() * 1000.0;
     let session_scope_ms = session_scope_start.elapsed().as_secs_f64() * 1000.0;
