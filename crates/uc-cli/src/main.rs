@@ -198,10 +198,13 @@ const DEFAULT_NATIVE_COMPILE_SESSION_MEMORY_MULTIPLIER: u64 = 64;
 #[cfg(feature = "native-compile")]
 const DEFAULT_NATIVE_COMPILE_SESSION_MEMORY_BASE_OVERHEAD_BYTES: u64 = 32 * 1024 * 1024;
 #[cfg(feature = "native-compile")]
-// Phase 4: bumped from 1 → 2 for postcard binary serialization (with JSON-v1 fallback).
-const NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION: u32 = 2;
+// Phase 7: bumped from 2 -> 3 to add tracked_sources_content_hash for
+// content-hash restore validation (with postcard-v2/json-v1 fallback).
+const NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION: u32 = 3;
 #[cfg(feature = "native-compile")]
 const NATIVE_COMPILE_SESSION_IMAGE_LEGACY_JSON_SCHEMA_VERSION: u32 = 1;
+#[cfg(feature = "native-compile")]
+const NATIVE_COMPILE_SESSION_IMAGE_LEGACY_POSTCARD_SCHEMA_VERSION: u32 = 2;
 #[cfg(feature = "native-compile")]
 const MAX_NATIVE_COMPILE_SESSION_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 #[cfg(feature = "native-compile")]
@@ -1025,6 +1028,23 @@ struct NativeCompileSessionImageFile {
     source_root_modified_unix_ms: u64,
     tracked_sources: BTreeMap<String, NativeTrackedFileState>,
     tracked_source_bytes: u64,
+    #[serde(default)]
+    tracked_sources_content_hash: String,
+    contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
+    contract_output_plans: Vec<NativeContractOutputPlan>,
+    #[serde(default)]
+    journal_cursor_applied: u64,
+    generated_at_epoch_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg(feature = "native-compile")]
+struct NativeCompileSessionImageFileLegacyPostcardV2 {
+    schema_version: u32,
+    signature_hash: String,
+    source_root_modified_unix_ms: u64,
+    tracked_sources: BTreeMap<String, NativeTrackedFileState>,
+    tracked_source_bytes: u64,
     contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
     contract_output_plans: Vec<NativeContractOutputPlan>,
     #[serde(default)]
@@ -1039,6 +1059,7 @@ struct NativeCompileSessionImageSnapshot {
     source_root_modified_unix_ms: u64,
     tracked_sources: BTreeMap<String, NativeTrackedFileState>,
     tracked_source_bytes: u64,
+    tracked_sources_content_hash: String,
     contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
     contract_output_plans: Vec<NativeContractOutputPlan>,
     journal_cursor_applied: u64,
@@ -1087,6 +1108,24 @@ struct NativeBuildInfoSnapshot {
     contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
     contract_output_plans: Vec<NativeContractOutputPlan>,
     journal_cursor_applied: u64,
+}
+
+#[cfg(feature = "native-compile")]
+impl From<NativeCompileSessionImageFileLegacyPostcardV2> for NativeCompileSessionImageFile {
+    fn from(value: NativeCompileSessionImageFileLegacyPostcardV2) -> Self {
+        Self {
+            schema_version: value.schema_version,
+            signature_hash: value.signature_hash,
+            source_root_modified_unix_ms: value.source_root_modified_unix_ms,
+            tracked_sources: value.tracked_sources,
+            tracked_source_bytes: value.tracked_source_bytes,
+            tracked_sources_content_hash: String::new(),
+            contract_source_dependencies: value.contract_source_dependencies,
+            contract_output_plans: value.contract_output_plans,
+            journal_cursor_applied: value.journal_cursor_applied,
+            generated_at_epoch_ms: value.generated_at_epoch_ms,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -7082,6 +7121,7 @@ fn native_compile_session_image_snapshot_from_state(
         source_root_modified_unix_ms: session.source_root_modified_unix_ms,
         tracked_sources: session.tracked_sources.clone(),
         tracked_source_bytes: session.tracked_source_bytes,
+        tracked_sources_content_hash: String::new(),
         contract_source_dependencies: session.contract_source_dependencies.clone(),
         contract_output_plans: session.contract_output_plans.clone(),
         journal_cursor_applied: session.journal_cursor_applied,
@@ -7098,12 +7138,18 @@ fn persist_native_compile_session_image_snapshot(
         .parent()
         .context("native compile session image path has no parent directory")?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let tracked_sources_content_hash = if snapshot.tracked_sources_content_hash.is_empty() {
+        native_tracked_sources_content_hash(workspace_root, &snapshot.tracked_sources)?
+    } else {
+        snapshot.tracked_sources_content_hash.clone()
+    };
     let image = NativeCompileSessionImageFile {
         schema_version: NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION,
         signature_hash: snapshot.signature_hash.clone(),
         source_root_modified_unix_ms: snapshot.source_root_modified_unix_ms,
         tracked_sources: snapshot.tracked_sources.clone(),
         tracked_source_bytes: snapshot.tracked_source_bytes,
+        tracked_sources_content_hash,
         contract_source_dependencies: snapshot.contract_source_dependencies.clone(),
         contract_output_plans: snapshot.contract_output_plans.clone(),
         journal_cursor_applied: snapshot.journal_cursor_applied,
@@ -7154,9 +7200,16 @@ fn decode_native_compile_session_image_file(
     )?;
     if let Ok(image) = postcard::from_bytes::<NativeCompileSessionImageFile>(&bytes) {
         if image.schema_version == NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION
+            || image.schema_version == NATIVE_COMPILE_SESSION_IMAGE_LEGACY_POSTCARD_SCHEMA_VERSION
             || image.schema_version == NATIVE_COMPILE_SESSION_IMAGE_LEGACY_JSON_SCHEMA_VERSION
         {
             return Ok((image, "postcard"));
+        }
+    }
+    if let Ok(image) = postcard::from_bytes::<NativeCompileSessionImageFileLegacyPostcardV2>(&bytes)
+    {
+        if image.schema_version == NATIVE_COMPILE_SESSION_IMAGE_LEGACY_POSTCARD_SCHEMA_VERSION {
+            return Ok((image.into(), "postcard"));
         }
     }
     let image =
@@ -7167,6 +7220,7 @@ fn decode_native_compile_session_image_file(
             )
         })?;
     if image.schema_version != NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION
+        && image.schema_version != NATIVE_COMPILE_SESSION_IMAGE_LEGACY_POSTCARD_SCHEMA_VERSION
         && image.schema_version != NATIVE_COMPILE_SESSION_IMAGE_LEGACY_JSON_SCHEMA_VERSION
     {
         bail!(
@@ -7182,6 +7236,7 @@ fn decode_native_compile_session_image_file(
 fn try_native_compile_session_image_restore(
     workspace_root: &Path,
     signature: &NativeCompileSessionSignature,
+    current_tracked_sources: &BTreeMap<String, NativeTrackedFileState>,
     source_root_modified_unix_ms: u64,
 ) -> Option<NativeCompileSessionImageSnapshot> {
     let image_path = match native_compile_session_image_path(workspace_root) {
@@ -7238,9 +7293,6 @@ fn try_native_compile_session_image_restore(
     if decoded.signature_hash != signature_hash {
         return None;
     }
-    if decoded.source_root_modified_unix_ms != source_root_modified_unix_ms {
-        return None;
-    }
     let tracked_source_bytes = match native_tracked_sources_total_bytes(&decoded.tracked_sources) {
         Ok(bytes) => bytes,
         Err(err) => {
@@ -7260,11 +7312,46 @@ fn try_native_compile_session_image_restore(
             "native session image tracked-source byte budget drift; using computed value"
         );
     }
+    if decoded.tracked_sources_content_hash.is_empty() {
+        // Legacy fallback (v1/v2 images): retain root-mtime gate semantics.
+        if decoded.source_root_modified_unix_ms != source_root_modified_unix_ms {
+            return None;
+        }
+    } else {
+        if !native_tracked_sources_layout_matches(&decoded.tracked_sources, current_tracked_sources)
+        {
+            tracing::debug!(
+                path = %image_path.display(),
+                image_sources = decoded.tracked_sources.len(),
+                current_sources = current_tracked_sources.len(),
+                "native session image tracked-source layout drift detected; ignoring"
+            );
+            return None;
+        }
+        let current_content_hash = match native_tracked_sources_content_hash(
+            workspace_root,
+            current_tracked_sources,
+        ) {
+            Ok(hash) => hash,
+            Err(err) => {
+                tracing::warn!(
+                    path = %image_path.display(),
+                    error = %format!("{err:#}"),
+                    "failed to compute current tracked-source content hash; ignoring session image"
+                );
+                return None;
+            }
+        };
+        if current_content_hash != decoded.tracked_sources_content_hash {
+            return None;
+        }
+    }
     Some(NativeCompileSessionImageSnapshot {
         signature_hash,
         source_root_modified_unix_ms: decoded.source_root_modified_unix_ms,
         tracked_sources: decoded.tracked_sources,
         tracked_source_bytes,
+        tracked_sources_content_hash: decoded.tracked_sources_content_hash,
         contract_source_dependencies: decoded.contract_source_dependencies,
         contract_output_plans: decoded.contract_output_plans,
         journal_cursor_applied: decoded.journal_cursor_applied,
@@ -7286,6 +7373,7 @@ fn native_buildinfo_sidecar_path(workspace_root: &Path) -> Result<PathBuf> {
 }
 
 #[cfg(feature = "native-compile")]
+#[cfg_attr(not(test), allow(dead_code))]
 fn native_has_persisted_session_state_hints(workspace_root: &Path) -> bool {
     native_compile_session_image_path(workspace_root)
         .ok()
@@ -7307,6 +7395,86 @@ fn native_tracked_sources_signature(
         hasher.update(&state.modified_unix_ms.to_le_bytes());
     }
     hasher.finalize().to_hex().to_string()
+}
+
+#[cfg(feature = "native-compile")]
+fn native_tracked_sources_layout_matches(
+    previous: &BTreeMap<String, NativeTrackedFileState>,
+    current: &BTreeMap<String, NativeTrackedFileState>,
+) -> bool {
+    if previous.len() != current.len() {
+        return false;
+    }
+    previous.iter().all(|(relative, previous_state)| {
+        current
+            .get(relative)
+            .is_some_and(|current_state| current_state.size_bytes == previous_state.size_bytes)
+    })
+}
+
+#[cfg(feature = "native-compile")]
+fn native_sanitize_tracked_source_relative_path(relative: &str) -> Result<PathBuf> {
+    let rel_path = Path::new(relative);
+    if rel_path.is_absolute() {
+        bail!("tracked source path must be relative: {}", relative);
+    }
+    let mut sanitized = PathBuf::new();
+    for component in rel_path.components() {
+        match component {
+            Component::Normal(value) => sanitized.push(value),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!(
+                    "tracked source path contains invalid component: {}",
+                    relative
+                )
+            }
+        }
+    }
+    if sanitized.as_os_str().is_empty() {
+        bail!("tracked source path must not be empty");
+    }
+    Ok(sanitized)
+}
+
+#[cfg(feature = "native-compile")]
+fn native_tracked_sources_content_hash(
+    workspace_root: &Path,
+    tracked_sources: &BTreeMap<String, NativeTrackedFileState>,
+) -> Result<String> {
+    let mut hasher = Hasher::new();
+    hasher.update(b"uc-native-tracked-sources-content-hash-v1");
+    for (relative, state) in tracked_sources {
+        let sanitized = native_sanitize_tracked_source_relative_path(relative)?;
+        let absolute_path = workspace_root.join(&sanitized);
+        ensure_path_within_root(
+            workspace_root,
+            &absolute_path,
+            "native tracked source content-hash path",
+        )?;
+        let metadata = fs::metadata(&absolute_path)
+            .with_context(|| format!("failed to stat {}", absolute_path.display()))?;
+        if !metadata.is_file() {
+            bail!(
+                "tracked source path is not a file: {}",
+                absolute_path.display()
+            );
+        }
+        if metadata.len() != state.size_bytes {
+            bail!(
+                "tracked source size mismatch at {} (snapshot={} bytes, current={} bytes)",
+                absolute_path.display(),
+                state.size_bytes,
+                metadata.len()
+            );
+        }
+        let content_hash = hash_fingerprint_source_file(&absolute_path)?;
+        hasher.update(relative.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(content_hash.as_bytes());
+        hasher.update(&[0]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 #[cfg(feature = "native-compile")]
@@ -8409,19 +8577,12 @@ fn build_native_compile_session_state(
         native_restore_crate_cache_into_db(workspace_root, &signature_hash, &mut db);
     let crate_cache_restore_ms = crate_cache_restore_start.elapsed().as_secs_f64() * 1000.0;
     let scan_start = Instant::now();
-    let mut precollected_tracked_sources: Option<(BTreeMap<String, NativeTrackedFileState>, u64)> =
-        None;
-    let source_root_modified_unix_ms = if native_has_persisted_session_state_hints(workspace_root) {
-        native_source_roots_modified_unix_ms(workspace_root, &source_roots)?
-    } else {
-        let (tracked_sources, tracked_source_bytes, latest_source_root_modified_unix_ms) =
-            native_collect_tracked_sources_with_source_root_mtime(workspace_root, &source_roots)?;
-        precollected_tracked_sources = Some((tracked_sources, tracked_source_bytes));
-        latest_source_root_modified_unix_ms
-    };
+    let (scanned_tracked_sources, scanned_tracked_source_bytes, source_root_modified_unix_ms) =
+        native_collect_tracked_sources_with_source_root_mtime(workspace_root, &source_roots)?;
     let restored_image = try_native_compile_session_image_restore(
         workspace_root,
         &signature,
+        &scanned_tracked_sources,
         source_root_modified_unix_ms,
     );
     let restored_buildinfo = if restored_image.is_none() {
@@ -8489,17 +8650,9 @@ fn build_native_compile_session_state(
             false,
         )
     } else {
-        let (tracked_sources, tracked_source_bytes) =
-            if let Some((tracked_sources, tracked_source_bytes)) =
-                precollected_tracked_sources.take()
-            {
-                (tracked_sources, tracked_source_bytes)
-            } else {
-                native_collect_tracked_sources(workspace_root, &source_roots)?
-            };
         (
-            tracked_sources,
-            tracked_source_bytes,
+            scanned_tracked_sources,
+            scanned_tracked_source_bytes,
             BTreeMap::new(),
             Vec::new(),
             false,

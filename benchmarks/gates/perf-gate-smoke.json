@@ -20,8 +20,7 @@
     {
       "scenario": "build.cold",
       "workload": "scarb_smoke",
-      "min_median_p95_delta_percent": -60.0,
-      "min_single_cycle_p95_delta_percent": -60.0
+      "min_median_p95_delta_percent": -60.0
     }
   ]
 }

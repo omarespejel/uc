@@ -194,8 +194,11 @@ if [[ "$MATRIX" == "research" && -z "$WORKSPACE_ROOT" ]]; then
   echo "--workspace-root is required for research matrix" >&2
   exit 1
 fi
-if [[ -z "$GATE_CONFIG" && "$MATRIX" == "research" ]]; then
-  GATE_CONFIG="$ROOT_DIR/benchmarks/gates/perf-gate-${MATRIX}.json"
+if [[ -z "$GATE_CONFIG" ]]; then
+  default_gate_config="$ROOT_DIR/benchmarks/gates/perf-gate-${MATRIX}.json"
+  if [[ -f "$default_gate_config" ]]; then
+    GATE_CONFIG="$default_gate_config"
+  fi
 fi
 if [[ "$RUNS" -ne 12 || "$COLD_RUNS" -ne 12 ]]; then
   echo "Stability lane requires --runs 12 and --cold-runs 12 (got runs=$RUNS cold-runs=$COLD_RUNS)." >&2

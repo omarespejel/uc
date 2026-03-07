@@ -5855,24 +5855,19 @@ fn native_test_compile_session_signature(
 fn native_compile_session_image_round_trip_restores_tracked_sources_and_dependency_index() {
     let dir = unique_test_dir("uc-native-session-image-roundtrip");
     let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
-    let tracked_sources = BTreeMap::from([
-        (
-            "src/lib.cairo".to_string(),
-            NativeTrackedFileState {
-                size_bytes: 42,
-                modified_unix_ms: 101,
-            },
-        ),
-        (
-            "src/math.cairo".to_string(),
-            NativeTrackedFileState {
-                size_bytes: 12,
-                modified_unix_ms: 102,
-            },
-        ),
-    ]);
-    let tracked_source_bytes = native_tracked_sources_total_bytes(&tracked_sources)
-        .expect("tracked source bytes should be computed");
+    let src_dir = dir.join("src");
+    fs::create_dir_all(&src_dir).expect("failed to create src dir");
+    fs::write(src_dir.join("lib.cairo"), "fn lib() -> felt252 { 1 }\n")
+        .expect("failed to write lib.cairo");
+    fs::write(
+        src_dir.join("math.cairo"),
+        "fn add(a: felt252, b: felt252) -> felt252 { a + b }\n",
+    )
+    .expect("failed to write math.cairo");
+    let source_roots = vec![src_dir.clone()];
+    let (tracked_sources, tracked_source_bytes, source_root_modified_unix_ms) =
+        native_collect_tracked_sources_with_source_root_mtime(&dir, &source_roots)
+            .expect("tracked source scan should succeed");
     let dependencies = BTreeMap::from([(
         "demo::token".to_string(),
         BTreeSet::from(["src/lib.cairo".to_string(), "src/math.cairo".to_string()]),
@@ -5887,9 +5882,11 @@ fn native_compile_session_image_round_trip_restores_tracked_sources_and_dependen
     }];
     let snapshot = NativeCompileSessionImageSnapshot {
         signature_hash: native_compile_session_signature_hash(&signature),
-        source_root_modified_unix_ms: 777,
+        source_root_modified_unix_ms,
         tracked_sources: tracked_sources.clone(),
         tracked_source_bytes,
+        tracked_sources_content_hash: native_tracked_sources_content_hash(&dir, &tracked_sources)
+            .expect("tracked-source content hash should compute"),
         contract_source_dependencies: dependencies.clone(),
         contract_output_plans: plans.clone(),
         journal_cursor_applied: 33,
@@ -5897,8 +5894,13 @@ fn native_compile_session_image_round_trip_restores_tracked_sources_and_dependen
     persist_native_compile_session_image_snapshot(&dir, &snapshot)
         .expect("native session image should persist");
 
-    let restored = try_native_compile_session_image_restore(&dir, &signature, 777)
-        .expect("matching signature/root mtime should restore session image");
+    let restored = try_native_compile_session_image_restore(
+        &dir,
+        &signature,
+        &tracked_sources,
+        source_root_modified_unix_ms,
+    )
+    .expect("matching signature/content hash should restore session image");
     assert_eq!(restored.tracked_sources, tracked_sources);
     assert_eq!(restored.tracked_source_bytes, tracked_source_bytes);
     assert_eq!(restored.contract_source_dependencies, dependencies);
@@ -5910,23 +5912,24 @@ fn native_compile_session_image_round_trip_restores_tracked_sources_and_dependen
 
 #[cfg(feature = "native-compile")]
 #[test]
-fn native_compile_session_image_restore_rejects_signature_and_root_mtime_mismatches() {
+fn native_compile_session_image_restore_uses_content_hash_and_rejects_content_drift() {
     let dir = unique_test_dir("uc-native-session-image-invalidations");
     let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
-    let tracked_sources = BTreeMap::from([(
-        "src/lib.cairo".to_string(),
-        NativeTrackedFileState {
-            size_bytes: 5,
-            modified_unix_ms: 11,
-        },
-    )]);
-    let tracked_source_bytes = native_tracked_sources_total_bytes(&tracked_sources)
-        .expect("tracked source bytes should be computed");
+    let src_dir = dir.join("src");
+    fs::create_dir_all(&src_dir).expect("failed to create src dir");
+    let lib_path = src_dir.join("lib.cairo");
+    fs::write(&lib_path, "fn lib() -> felt252 { 1 }\n").expect("failed to write lib.cairo");
+    let source_roots = vec![src_dir.clone()];
+    let (tracked_sources, tracked_source_bytes, source_root_modified_unix_ms) =
+        native_collect_tracked_sources_with_source_root_mtime(&dir, &source_roots)
+            .expect("tracked source scan should succeed");
     let snapshot = NativeCompileSessionImageSnapshot {
         signature_hash: native_compile_session_signature_hash(&signature),
-        source_root_modified_unix_ms: 999,
-        tracked_sources,
+        source_root_modified_unix_ms,
+        tracked_sources: tracked_sources.clone(),
         tracked_source_bytes,
+        tracked_sources_content_hash: native_tracked_sources_content_hash(&dir, &tracked_sources)
+            .expect("tracked-source content hash should compute"),
         contract_source_dependencies: BTreeMap::new(),
         contract_output_plans: Vec::new(),
         journal_cursor_applied: 0,
@@ -5936,12 +5939,47 @@ fn native_compile_session_image_restore_rejects_signature_and_root_mtime_mismatc
 
     let different_signature = native_test_compile_session_signature(&dir, "manifest-blake3:other");
     assert!(
-        try_native_compile_session_image_restore(&dir, &different_signature, 999).is_none(),
+        try_native_compile_session_image_restore(
+            &dir,
+            &different_signature,
+            &tracked_sources,
+            source_root_modified_unix_ms,
+        )
+        .is_none(),
         "signature mismatch must invalidate persisted session image"
     );
+
+    // mtime-only drift should no longer invalidate when content hash matches.
+    let mut mtime_only_drift = tracked_sources.clone();
+    for state in mtime_only_drift.values_mut() {
+        state.modified_unix_ms = state.modified_unix_ms.saturating_add(5_000);
+    }
     assert!(
-        try_native_compile_session_image_restore(&dir, &signature, 1_000).is_none(),
-        "source-root mtime mismatch must invalidate persisted session image"
+        try_native_compile_session_image_restore(
+            &dir,
+            &signature,
+            &mtime_only_drift,
+            source_root_modified_unix_ms.saturating_add(5_000),
+        )
+        .is_some(),
+        "mtime-only drift should not invalidate session image when content hash matches"
+    );
+
+    // Real content drift with same file size must invalidate.
+    fs::write(&lib_path, "fn lib() -> felt252 { 2 }\n")
+        .expect("failed to rewrite lib.cairo with same-size contents");
+    let (current_sources, _current_bytes, current_source_root_modified_unix_ms) =
+        native_collect_tracked_sources_with_source_root_mtime(&dir, &source_roots)
+            .expect("tracked source scan should succeed after content edit");
+    assert!(
+        try_native_compile_session_image_restore(
+            &dir,
+            &signature,
+            &current_sources,
+            current_source_root_modified_unix_ms,
+        )
+        .is_none(),
+        "content drift must invalidate persisted session image"
     );
 
     fs::remove_dir_all(&dir).ok();
@@ -9271,8 +9309,8 @@ fn phase3_mimalloc_feature_gate_absent() {
 #[test]
 fn phase4_session_image_schema_version_bumped() {
     assert_eq!(
-        NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION, 2,
-        "session image schema should be v2 for postcard encoding"
+        NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION, 3,
+        "session image schema should be v3 for content-hash validation support"
     );
 }
 
@@ -9330,6 +9368,7 @@ fn phase4_session_image_postcard_roundtrip() {
         source_root_modified_unix_ms: 1700000002000,
         tracked_sources: tracked_sources.clone(),
         tracked_source_bytes: 3072,
+        tracked_sources_content_hash: "tracked-content-hash".to_string(),
         contract_source_dependencies: contract_deps.clone(),
         contract_output_plans: plans.clone(),
         journal_cursor_applied: 42,
@@ -9359,6 +9398,7 @@ fn phase4_session_image_postcard_roundtrip() {
     assert_eq!(decoded.source_root_modified_unix_ms, 1700000002000);
     assert_eq!(decoded.tracked_sources.len(), 2);
     assert_eq!(decoded.tracked_source_bytes, 3072);
+    assert_eq!(decoded.tracked_sources_content_hash, "tracked-content-hash");
     assert_eq!(decoded.contract_source_dependencies.len(), 1);
     assert_eq!(decoded.contract_output_plans.len(), 1);
     assert_eq!(decoded.journal_cursor_applied, 42);
@@ -9435,6 +9475,7 @@ fn phase4_decode_session_image_file_accepts_postcard_and_json() {
         source_root_modified_unix_ms: 111,
         tracked_sources: BTreeMap::new(),
         tracked_source_bytes: 0,
+        tracked_sources_content_hash: "abc".to_string(),
         contract_source_dependencies: BTreeMap::new(),
         contract_output_plans: Vec::new(),
         journal_cursor_applied: 0,
@@ -9451,6 +9492,39 @@ fn phase4_decode_session_image_file_accepts_postcard_and_json() {
     fs::write(&path, json_bytes).expect("write json image");
     let (_, encoding) = decode_native_compile_session_image_file(&path).expect("decode json image");
     assert_eq!(encoding, "json");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn phase7_decode_session_image_file_accepts_legacy_postcard_v2() {
+    let dir = unique_test_dir("uc-phase7-decode-session-image-legacy-postcard");
+    let path = dir.join("session-image-v2.bin");
+    let legacy_v2 = NativeCompileSessionImageFileLegacyPostcardV2 {
+        schema_version: NATIVE_COMPILE_SESSION_IMAGE_LEGACY_POSTCARD_SCHEMA_VERSION,
+        signature_hash: "legacy-v2".to_string(),
+        source_root_modified_unix_ms: 111,
+        tracked_sources: BTreeMap::new(),
+        tracked_source_bytes: 0,
+        contract_source_dependencies: BTreeMap::new(),
+        contract_output_plans: Vec::new(),
+        journal_cursor_applied: 0,
+        generated_at_epoch_ms: 222,
+    };
+    let bytes = postcard::to_allocvec(&legacy_v2).expect("legacy postcard encode");
+    fs::write(&path, bytes).expect("write legacy postcard image");
+    let (decoded, encoding) =
+        decode_native_compile_session_image_file(&path).expect("decode legacy postcard image");
+    assert_eq!(encoding, "postcard");
+    assert_eq!(
+        decoded.schema_version,
+        NATIVE_COMPILE_SESSION_IMAGE_LEGACY_POSTCARD_SCHEMA_VERSION
+    );
+    assert!(
+        decoded.tracked_sources_content_hash.is_empty(),
+        "legacy postcard v2 should decode with empty content hash"
+    );
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -9506,6 +9580,7 @@ fn phase4_session_image_restore_accepts_legacy_json_v1_fallback() {
         source_root_modified_unix_ms: 777,
         tracked_sources: tracked_sources.clone(),
         tracked_source_bytes,
+        tracked_sources_content_hash: String::new(),
         contract_source_dependencies: BTreeMap::new(),
         contract_output_plans: Vec::new(),
         journal_cursor_applied: 0,
@@ -9521,8 +9596,9 @@ fn phase4_session_image_restore_accepts_legacy_json_v1_fallback() {
     .expect("failed to create session image parent");
     fs::write(&image_path, legacy_bytes).expect("failed to write legacy session image");
 
-    let restored = try_native_compile_session_image_restore(&dir, &signature, 777)
-        .expect("legacy JSON session image should restore via fallback");
+    let restored =
+        try_native_compile_session_image_restore(&dir, &signature, &tracked_sources, 777)
+            .expect("legacy JSON session image should restore via fallback");
     assert_eq!(restored.tracked_sources, tracked_sources);
     assert_eq!(restored.tracked_source_bytes, tracked_source_bytes);
 
@@ -9603,6 +9679,7 @@ fn phase4_session_image_postcard_smaller_than_json_for_realistic_sizes() {
         source_root_modified_unix_ms: 1700000000000,
         tracked_sources,
         tracked_source_bytes: 409600,
+        tracked_sources_content_hash: "phase4-realistic-hash".to_string(),
         contract_source_dependencies: deps,
         contract_output_plans: Vec::new(),
         journal_cursor_applied: 0,
