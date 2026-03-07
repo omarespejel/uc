@@ -605,7 +605,16 @@ pattern = re.compile(
     r"native_session_prepare=(?P<native_session_prepare>[0-9.]+)\s+"
     r"native_frontend_compile=(?P<native_frontend_compile>[0-9.]+)\s+"
     r"native_casm=(?P<native_casm>[0-9.]+)\s+"
-    r"native_artifact_write=(?P<native_artifact_write>[0-9.]+))?"
+    r"native_artifact_write=(?P<native_artifact_write>[0-9.]+)"
+    r"(?:\s+native_find_contracts=(?P<native_find_contracts>[0-9.]+))?"
+    r"(?:\s+native_db_init=(?P<native_db_init>[0-9.]+))?"
+    r"(?:\s+native_setup_project=(?P<native_setup_project>[0-9.]+))?"
+    r"(?:\s+native_crate_cache_restore=(?P<native_crate_cache_restore>[0-9.]+))?"
+    r"(?:\s+native_source_scan=(?P<native_source_scan>[0-9.]+))?"
+    r"(?:\s+native_session_image_persist=(?P<native_session_image_persist>[0-9.]+))?"
+    r"(?:\s+native_buildinfo_persist=(?P<native_buildinfo_persist>[0-9.]+))?"
+    r"(?:\s+native_drift_scan=(?P<native_drift_scan>[0-9.]+))?"
+    r")?"
 )
 match = pattern.search(line)
 if not match:
@@ -636,6 +645,14 @@ payload = {
     "native_frontend_compile_ms": as_float(match.group("native_frontend_compile")),
     "native_casm_ms": as_float(match.group("native_casm")),
     "native_artifact_write_ms": as_float(match.group("native_artifact_write")),
+    "native_find_contracts_ms": as_float(match.group("native_find_contracts")),
+    "native_db_init_ms": as_float(match.group("native_db_init")),
+    "native_setup_project_ms": as_float(match.group("native_setup_project")),
+    "native_crate_cache_restore_ms": as_float(match.group("native_crate_cache_restore")),
+    "native_source_scan_ms": as_float(match.group("native_source_scan")),
+    "native_session_image_persist_ms": as_float(match.group("native_session_image_persist")),
+    "native_buildinfo_persist_ms": as_float(match.group("native_buildinfo_persist")),
+    "native_drift_scan_ms": as_float(match.group("native_drift_scan")),
 }
 with open(phase_file, "a", encoding="utf-8") as f:
     f.write(json.dumps(payload))
