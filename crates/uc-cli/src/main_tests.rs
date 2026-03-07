@@ -9426,6 +9426,68 @@ fn phase4_buildinfo_postcard_roundtrip() {
 
 #[cfg(feature = "native-compile")]
 #[test]
+fn phase4_decode_session_image_file_accepts_postcard_and_json() {
+    let dir = unique_test_dir("uc-phase4-decode-session-image");
+    let path = dir.join("session-image.bin");
+    let image = NativeCompileSessionImageFile {
+        schema_version: NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION,
+        signature_hash: "decode-session-image".to_string(),
+        source_root_modified_unix_ms: 111,
+        tracked_sources: BTreeMap::new(),
+        tracked_source_bytes: 0,
+        contract_source_dependencies: BTreeMap::new(),
+        contract_output_plans: Vec::new(),
+        journal_cursor_applied: 0,
+        generated_at_epoch_ms: 222,
+    };
+
+    let postcard_bytes = postcard::to_allocvec(&image).expect("postcard encode");
+    fs::write(&path, postcard_bytes).expect("write postcard image");
+    let (_, encoding) =
+        decode_native_compile_session_image_file(&path).expect("decode postcard image");
+    assert_eq!(encoding, "postcard");
+
+    let json_bytes = serde_json::to_vec(&image).expect("json encode");
+    fs::write(&path, json_bytes).expect("write json image");
+    let (_, encoding) = decode_native_compile_session_image_file(&path).expect("decode json image");
+    assert_eq!(encoding, "json");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn phase4_decode_buildinfo_file_accepts_postcard_and_json() {
+    let dir = unique_test_dir("uc-phase4-decode-buildinfo");
+    let path = dir.join("buildinfo.bin");
+    let buildinfo = NativeBuildInfoFile {
+        schema_version: NATIVE_BUILDINFO_SCHEMA_VERSION,
+        signature_hash: "decode-buildinfo".to_string(),
+        source_root_modified_unix_ms: 111,
+        tracked_sources: BTreeMap::new(),
+        tracked_source_bytes: 0,
+        tracked_sources_signature: native_tracked_sources_signature(&BTreeMap::new()),
+        contract_source_dependencies: BTreeMap::new(),
+        contract_output_plans: Vec::new(),
+        journal_cursor_applied: 0,
+        generated_at_epoch_ms: 222,
+    };
+
+    let postcard_bytes = postcard::to_allocvec(&buildinfo).expect("postcard encode");
+    fs::write(&path, postcard_bytes).expect("write postcard buildinfo");
+    let (_, encoding) = decode_native_buildinfo_file(&path).expect("decode postcard buildinfo");
+    assert_eq!(encoding, "postcard");
+
+    let json_bytes = serde_json::to_vec(&buildinfo).expect("json encode");
+    fs::write(&path, json_bytes).expect("write json buildinfo");
+    let (_, encoding) = decode_native_buildinfo_file(&path).expect("decode json buildinfo");
+    assert_eq!(encoding, "json");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
 fn phase4_session_image_restore_accepts_legacy_json_v1_fallback() {
     let dir = unique_test_dir("uc-phase4-session-image-legacy-json");
     let signature = native_test_compile_session_signature(&dir, "manifest-blake3:legacy-json");

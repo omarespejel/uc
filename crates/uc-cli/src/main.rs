@@ -305,10 +305,17 @@ struct CacheArgs {
 #[derive(Subcommand, Debug)]
 enum CacheCommand {
     Clean(CacheCleanArgs),
+    Inspect(CacheInspectArgs),
 }
 
 #[derive(Args, Debug, Clone)]
 struct CacheCleanArgs {
+    #[arg(long)]
+    manifest_path: Option<PathBuf>,
+}
+
+#[derive(Args, Debug, Clone)]
+struct CacheInspectArgs {
     #[arg(long)]
     manifest_path: Option<PathBuf>,
 }
@@ -2580,6 +2587,7 @@ fn run_daemon(args: DaemonArgs) -> Result<()> {
 fn run_cache(args: CacheArgs) -> Result<()> {
     match args.command {
         CacheCommand::Clean(clean) => run_cache_clean(clean),
+        CacheCommand::Inspect(inspect) => run_cache_inspect(inspect),
     }
 }
 
@@ -2598,6 +2606,61 @@ fn run_cache_clean(args: CacheCleanArgs) -> Result<()> {
         .with_context(|| format!("failed to remove cache directory {}", cache_root.display()))?;
     println!("uc cache cleaned: {}", cache_root.display());
     Ok(())
+}
+
+fn run_cache_inspect(args: CacheInspectArgs) -> Result<()> {
+    let manifest_path = resolve_manifest_path(&args.manifest_path)?;
+    let workspace_root = manifest_path
+        .parent()
+        .context("manifest path has no parent")?
+        .to_path_buf();
+    #[cfg(not(feature = "native-compile"))]
+    {
+        let _ = workspace_root;
+        bail!("`uc cache inspect` requires the `native-compile` feature");
+    }
+    #[cfg(feature = "native-compile")]
+    {
+        let image_path = native_compile_session_image_path(&workspace_root)?;
+        let buildinfo_path = native_buildinfo_sidecar_path(&workspace_root)?;
+        let mut found_any = false;
+
+        if image_path.is_file() {
+            found_any = true;
+            let (image, encoding) = decode_native_compile_session_image_file(&image_path)?;
+            println!(
+                "session_image: path={} encoding={} schema_version={}",
+                image_path.display(),
+                encoding,
+                image.schema_version
+            );
+            println!("{}", serde_json::to_string_pretty(&image)?);
+        } else {
+            println!("session_image: missing ({})", image_path.display());
+        }
+
+        if buildinfo_path.is_file() {
+            found_any = true;
+            let (buildinfo, encoding) = decode_native_buildinfo_file(&buildinfo_path)?;
+            println!(
+                "buildinfo: path={} encoding={} schema_version={}",
+                buildinfo_path.display(),
+                encoding,
+                buildinfo.schema_version
+            );
+            println!("{}", serde_json::to_string_pretty(&buildinfo)?);
+        } else {
+            println!("buildinfo: missing ({})", buildinfo_path.display());
+        }
+
+        if !found_any {
+            println!(
+                "uc cache inspect: no native session/buildinfo files found under {}",
+                workspace_root.join(".uc/cache").display()
+            );
+        }
+        Ok(())
+    }
 }
 
 fn run_daemon_start(args: DaemonSocketArgs) -> Result<()> {
@@ -7081,6 +7144,41 @@ fn persist_native_compile_session_image_snapshot_best_effort(
 }
 
 #[cfg(feature = "native-compile")]
+fn decode_native_compile_session_image_file(
+    image_path: &Path,
+) -> Result<(NativeCompileSessionImageFile, &'static str)> {
+    let bytes = read_bytes_with_limit(
+        image_path,
+        MAX_NATIVE_COMPILE_SESSION_IMAGE_BYTES,
+        "native session image",
+    )?;
+    if let Ok(image) = postcard::from_bytes::<NativeCompileSessionImageFile>(&bytes) {
+        if image.schema_version == NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION
+            || image.schema_version == NATIVE_COMPILE_SESSION_IMAGE_LEGACY_JSON_SCHEMA_VERSION
+        {
+            return Ok((image, "postcard"));
+        }
+    }
+    let image =
+        serde_json::from_slice::<NativeCompileSessionImageFile>(&bytes).with_context(|| {
+            format!(
+                "native session image {} is neither valid postcard nor valid JSON",
+                image_path.display()
+            )
+        })?;
+    if image.schema_version != NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION
+        && image.schema_version != NATIVE_COMPILE_SESSION_IMAGE_LEGACY_JSON_SCHEMA_VERSION
+    {
+        bail!(
+            "native session image {} has unsupported schema_version {}",
+            image_path.display(),
+            image.schema_version
+        );
+    }
+    Ok((image, "json"))
+}
+
+#[cfg(feature = "native-compile")]
 fn try_native_compile_session_image_restore(
     workspace_root: &Path,
     signature: &NativeCompileSessionSignature,
@@ -7119,55 +7217,23 @@ fn try_native_compile_session_image_restore(
         let _ = fs::remove_file(&image_path);
         return None;
     }
-    let bytes = match read_bytes_with_limit(
-        &image_path,
-        MAX_NATIVE_COMPILE_SESSION_IMAGE_BYTES,
-        "native session image",
-    ) {
-        Ok(bytes) => bytes,
+    let (decoded, encoding) = match decode_native_compile_session_image_file(&image_path) {
+        Ok(value) => value,
         Err(err) => {
             tracing::warn!(
                 path = %image_path.display(),
                 error = %format!("{err:#}"),
-                "failed to read native session image; ignoring"
+                "failed to decode native session image; ignoring"
             );
             return None;
         }
     };
-    // Phase 4: decode with postcard first (v2+), then fall back to JSON (legacy v1/v2).
-    let decoded: NativeCompileSessionImageFile =
-        match postcard::from_bytes::<NativeCompileSessionImageFile>(&bytes) {
-            Ok(image) if image.schema_version == NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION => {
-                tracing::trace!(
-                    path = %image_path.display(),
-                    schema_version = image.schema_version,
-                    "cold-path phase-4: decoded session image with postcard"
-                );
-                image
-            }
-            Ok(_) | Err(_) => {
-                // Postcard decode failed or schema mismatch; try JSON fallback.
-                match serde_json::from_slice::<NativeCompileSessionImageFile>(&bytes) {
-                    Ok(image)
-                        if image.schema_version == NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION
-                            || image.schema_version
-                                == NATIVE_COMPILE_SESSION_IMAGE_LEGACY_JSON_SCHEMA_VERSION =>
-                    {
-                        image
-                    }
-                    Ok(_) => return None,
-                    Err(err) => {
-                        tracing::debug!(
-                            path = %image_path.display(),
-                            error = %err,
-                            "cold-path phase-4: session image is neither valid postcard \
-                             nor valid JSON for current schema version; treating as cache miss"
-                        );
-                        return None;
-                    }
-                }
-            }
-        };
+    tracing::trace!(
+        path = %image_path.display(),
+        schema_version = decoded.schema_version,
+        encoding,
+        "cold-path phase-4: decoded session image"
+    );
     let signature_hash = native_compile_session_signature_hash(signature);
     if decoded.signature_hash != signature_hash {
         return None;
@@ -7512,6 +7578,40 @@ fn persist_native_buildinfo_sidecar_best_effort(
 }
 
 #[cfg(feature = "native-compile")]
+fn decode_native_buildinfo_file(
+    buildinfo_path: &Path,
+) -> Result<(NativeBuildInfoFile, &'static str)> {
+    let bytes = read_bytes_with_limit(
+        buildinfo_path,
+        MAX_NATIVE_BUILDINFO_BYTES,
+        "native buildinfo sidecar",
+    )?;
+    if let Ok(file) = postcard::from_bytes::<NativeBuildInfoFile>(&bytes) {
+        if file.schema_version == NATIVE_BUILDINFO_SCHEMA_VERSION
+            || file.schema_version == NATIVE_BUILDINFO_LEGACY_JSON_SCHEMA_VERSION
+        {
+            return Ok((file, "postcard"));
+        }
+    }
+    let file = serde_json::from_slice::<NativeBuildInfoFile>(&bytes).with_context(|| {
+        format!(
+            "native buildinfo sidecar {} is neither valid postcard nor valid JSON",
+            buildinfo_path.display()
+        )
+    })?;
+    if file.schema_version != NATIVE_BUILDINFO_SCHEMA_VERSION
+        && file.schema_version != NATIVE_BUILDINFO_LEGACY_JSON_SCHEMA_VERSION
+    {
+        bail!(
+            "native buildinfo sidecar {} has unsupported schema_version {}",
+            buildinfo_path.display(),
+            file.schema_version
+        );
+    }
+    Ok((file, "json"))
+}
+
+#[cfg(feature = "native-compile")]
 fn load_native_buildinfo_sidecar_snapshot(
     workspace_root: &Path,
     signature: &NativeCompileSessionSignature,
@@ -7549,50 +7649,23 @@ fn load_native_buildinfo_sidecar_snapshot(
         let _ = fs::remove_file(&sidecar_path);
         return None;
     }
-    let bytes = match read_bytes_with_limit(
-        &sidecar_path,
-        MAX_NATIVE_BUILDINFO_BYTES,
-        "native buildinfo sidecar",
-    ) {
-        Ok(bytes) => bytes,
+    let (decoded, encoding) = match decode_native_buildinfo_file(&sidecar_path) {
+        Ok(value) => value,
         Err(err) => {
             tracing::warn!(
                 path = %sidecar_path.display(),
                 error = %format!("{err:#}"),
-                "failed to read native buildinfo sidecar; ignoring"
+                "failed to decode native buildinfo sidecar; ignoring"
             );
             return None;
         }
     };
-    // Phase 4: decode with postcard first (v2+), then fall back to JSON (legacy v1/v2).
-    let decoded = match postcard::from_bytes::<NativeBuildInfoFile>(&bytes) {
-        Ok(file) if file.schema_version == NATIVE_BUILDINFO_SCHEMA_VERSION => {
-            tracing::trace!(
-                path = %sidecar_path.display(),
-                schema_version = file.schema_version,
-                "cold-path phase-4: decoded buildinfo with postcard"
-            );
-            file
-        }
-        Ok(_) | Err(_) => match serde_json::from_slice::<NativeBuildInfoFile>(&bytes) {
-            Ok(file)
-                if file.schema_version == NATIVE_BUILDINFO_SCHEMA_VERSION
-                    || file.schema_version == NATIVE_BUILDINFO_LEGACY_JSON_SCHEMA_VERSION =>
-            {
-                file
-            }
-            Ok(_) => return None,
-            Err(err) => {
-                tracing::debug!(
-                    path = %sidecar_path.display(),
-                    error = %err,
-                    "cold-path phase-4: buildinfo is neither valid postcard \
-                     nor valid JSON for current schema version; treating as cache miss"
-                );
-                return None;
-            }
-        },
-    };
+    tracing::trace!(
+        path = %sidecar_path.display(),
+        schema_version = decoded.schema_version,
+        encoding,
+        "cold-path phase-4: decoded buildinfo"
+    );
     let signature_hash = native_compile_session_signature_hash(signature);
     if decoded.signature_hash != signature_hash {
         return None;
