@@ -53,3 +53,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 uc-core = { path = "../uc-core" }
 walkdir.workspace = true
+
+[build-dependencies]
+toml.workspace = true

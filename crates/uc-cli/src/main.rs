@@ -77,7 +77,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -994,6 +994,12 @@ struct NativeCompileSessionSnapshot {
     journal_fallback_full_scan: bool,
     contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
     contract_output_plans: Vec<NativeContractOutputPlan>,
+    build_db_init_ms: f64,
+    build_setup_project_ms: f64,
+    build_crate_cache_restore_ms: f64,
+    build_source_scan_ms: f64,
+    build_session_image_persist_ms: f64,
+    build_buildinfo_persist_ms: f64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -6448,24 +6454,43 @@ fn native_collect_contract_dependency_updates(
 }
 
 #[cfg(feature = "native-compile")]
+fn native_compile_session_handle_if_cached(
+    workspace_root: &Path,
+) -> Option<Arc<Mutex<NativeCompileSessionState>>> {
+    let cache_key = native_compile_session_cache_key(workspace_root);
+    let now_ms = epoch_ms_u64().unwrap_or_default();
+    let mut cache = native_compile_session_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    evict_expired_native_compile_session_cache_entries(
+        &mut cache,
+        now_ms,
+        native_compile_session_cache_ttl_ms(),
+    );
+    let entry = cache.get_mut(&cache_key)?;
+    entry.last_access_epoch_ms = now_ms;
+    Some(entry.session.clone())
+}
+
+#[cfg(feature = "native-compile")]
 fn native_update_compile_session_post_build_state(
     workspace_root: &Path,
     signature: &NativeCompileSessionSignature,
     dependency_updates: &[(String, BTreeSet<String>)],
     contract_output_plans: Option<&[NativeContractOutputPlan]>,
-) {
+) -> NativeSessionRuntimeTelemetry {
+    let mut runtime_telemetry = NativeSessionRuntimeTelemetry::default();
     if dependency_updates.is_empty() && contract_output_plans.is_none() {
-        return;
+        return runtime_telemetry;
     }
-    let session_handle = match native_compile_session_handle(workspace_root, signature) {
-        Ok((handle, _session_cache_hit)) => handle,
-        Err(err) => {
+    let session_handle = match native_compile_session_handle_if_cached(workspace_root) {
+        Some(handle) => handle,
+        None => {
             tracing::warn!(
                 workspace_root = %workspace_root.display(),
-                error = %format!("{err:#}"),
-                "failed to update native session post-build state"
+                "native session was evicted before post-build state update; skipping"
             );
-            return;
+            return runtime_telemetry;
         }
     };
     let (estimated_bytes, image_snapshot, buildinfo_snapshot) = {
@@ -6473,7 +6498,7 @@ fn native_update_compile_session_post_build_state(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if session.signature != *signature {
-            return;
+            return runtime_telemetry;
         }
         let mut state_changed = false;
         for (module_path, dependencies) in dependency_updates {
@@ -6514,6 +6539,9 @@ fn native_update_compile_session_post_build_state(
     update_native_compile_session_cached_estimated_bytes(workspace_root, estimated_bytes);
     // Phase 1: async persistence for post-build state update persist calls
     if image_snapshot.is_some() || buildinfo_snapshot.is_some() {
+        let persist_image = image_snapshot.is_some();
+        let persist_buildinfo = buildinfo_snapshot.is_some();
+        let schedule_start = Instant::now();
         let ws_root = workspace_root.to_path_buf();
         cold_path_async_persist_spawn(move || {
             if let Some(image) = image_snapshot {
@@ -6523,7 +6551,15 @@ fn native_update_compile_session_post_build_state(
                 persist_native_buildinfo_sidecar_best_effort(&ws_root, &buildinfo);
             }
         });
+        let persist_schedule_ms = schedule_start.elapsed().as_secs_f64() * 1000.0;
+        if persist_image {
+            runtime_telemetry.session_image_persist_ms += persist_schedule_ms;
+        }
+        if persist_buildinfo {
+            runtime_telemetry.buildinfo_persist_ms += persist_schedule_ms;
+        }
     }
+    runtime_telemetry
 }
 
 #[cfg(feature = "native-compile")]
@@ -8166,11 +8202,11 @@ fn run_cold_path_async_persist_worker(receiver: Receiver<ColdPathPersistTask>) {
 }
 
 #[cfg(feature = "native-compile")]
-fn cold_path_async_persist_sender() -> Option<&'static Sender<ColdPathPersistTask>> {
-    static SENDER: OnceLock<Option<Sender<ColdPathPersistTask>>> = OnceLock::new();
+fn cold_path_async_persist_sender() -> Option<&'static SyncSender<ColdPathPersistTask>> {
+    static SENDER: OnceLock<Option<SyncSender<ColdPathPersistTask>>> = OnceLock::new();
     SENDER
         .get_or_init(|| {
-            let (sender, receiver) = mpsc::channel::<ColdPathPersistTask>();
+            let (sender, receiver) = mpsc::sync_channel::<ColdPathPersistTask>(ASYNC_PERSIST_QUEUE_LIMIT);
             match thread::Builder::new()
                 .name("uc-cold-persist".to_string())
                 .spawn(move || run_cold_path_async_persist_worker(receiver))
@@ -8196,13 +8232,20 @@ fn cold_path_async_persist_spawn<F: FnOnce() + Send + 'static>(f: F) {
     let mut pending: Option<ColdPathPersistTask> = Some(Box::new(f));
     if let Some(sender) = cold_path_async_persist_sender() {
         if let Some(task) = pending.take() {
-            match sender.send(task) {
+            match sender.try_send(task) {
                 Ok(()) => return,
-                Err(err) => {
+                Err(TrySendError::Full(task)) => {
+                    tracing::warn!(
+                        limit = ASYNC_PERSIST_QUEUE_LIMIT,
+                        "cold-path: async persist queue is full; running task inline"
+                    );
+                    pending = Some(task);
+                }
+                Err(TrySendError::Disconnected(task)) => {
                     tracing::warn!(
                         "cold-path: async persist worker disconnected; running task inline"
                     );
-                    pending = Some(err.0);
+                    pending = Some(task);
                 }
             }
         }
@@ -9186,6 +9229,15 @@ fn native_should_force_full_rebuild_on_empty_delta(
 }
 
 #[cfg(feature = "native-compile")]
+fn native_should_skip_drift_scan_for_fresh_session(
+    session_cache_hit: bool,
+    fresh_source_scan: bool,
+    needs_full_rebuild: bool,
+) -> bool {
+    !needs_full_rebuild && !session_cache_hit && fresh_source_scan
+}
+
+#[cfg(feature = "native-compile")]
 fn native_should_try_cached_noop_reuse(
     changed_files: &[String],
     removed_files: &[String],
@@ -9279,17 +9331,22 @@ fn with_native_compile_session<T>(
     daemon_context: bool,
     rebuild_on_empty_delta: bool,
     f: impl FnOnce(&NativeCompileSessionSnapshot) -> Result<T>,
-) -> Result<(T, NativeSessionRuntimeTelemetry)> {
+) -> Result<(
+    T,
+    NativeSessionRuntimeTelemetry,
+    NativeCompileSessionSnapshot,
+)> {
     let source_roots = native_compile_source_roots(&signature.context);
     let (session_handle, session_cache_hit) =
         native_compile_session_handle(workspace_root, signature)?;
-    let (needs_full_rebuild, session_applied_cursor) = {
+    let (needs_full_rebuild, session_applied_cursor, fresh_source_scan) = {
         let session = session_handle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         (
             session.signature != *signature,
             session.journal_cursor_applied,
+            session.fresh_source_scan,
         )
     };
     let snapshot_previous_sources = || {
@@ -9309,10 +9366,11 @@ fn with_native_compile_session<T>(
         mut journal_fallback_full_scan,
     ) = if needs_full_rebuild {
         (Vec::new(), Vec::new(), None, 0_u64, false)
-    } else if !session_cache_hit && {
-        let session = session_handle.lock().unwrap_or_else(|p| p.into_inner());
-        session.fresh_source_scan
-    } {
+    } else if native_should_skip_drift_scan_for_fresh_session(
+        session_cache_hit,
+        fresh_source_scan,
+        needs_full_rebuild,
+    ) {
         // Phase 2: skip redundant source scan on cold path.  The session was just
         // freshly built by build_native_compile_session_state with a live filesystem
         // scan, so tracked_sources already reflect the current state.  Re-scanning
@@ -9587,6 +9645,12 @@ fn with_native_compile_session<T>(
                 journal_fallback_full_scan,
                 contract_source_dependencies: session.contract_source_dependencies.clone(),
                 contract_output_plans: session.contract_output_plans.clone(),
+                build_db_init_ms: session.build_db_init_ms,
+                build_setup_project_ms: session.build_setup_project_ms,
+                build_crate_cache_restore_ms: session.build_crate_cache_restore_ms,
+                build_source_scan_ms: session.build_source_scan_ms,
+                build_session_image_persist_ms: session.build_session_image_persist_ms,
+                build_buildinfo_persist_ms: session.build_buildinfo_persist_ms,
             },
             state_mutated.then(|| native_compile_session_image_snapshot_from_state(&session)),
             state_mutated.then(|| {
@@ -9665,7 +9729,7 @@ fn with_native_compile_session<T>(
             }
         }
     }
-    result.map(|value| (value, runtime_telemetry))
+    result.map(|value| (value, runtime_telemetry, snapshot))
 }
 
 #[cfg(feature = "native-compile")]
@@ -9858,7 +9922,8 @@ fn run_native_build_inner(
             contract_output_plans,
             find_contracts_ms,
         ),
-        session_runtime_telemetry,
+        mut session_runtime_telemetry,
+        session_snapshot,
     ) = with_native_compile_session(
         workspace_root,
         &signature,
@@ -10215,12 +10280,16 @@ fn run_native_build_inner(
             ))
         },
     )?;
-    native_update_compile_session_post_build_state(
+    let post_build_runtime_telemetry = native_update_compile_session_post_build_state(
         workspace_root,
         &signature,
         &dependency_updates,
         contract_output_plans.as_deref(),
     );
+    session_runtime_telemetry.session_image_persist_ms +=
+        post_build_runtime_telemetry.session_image_persist_ms;
+    session_runtime_telemetry.buildinfo_persist_ms +=
+        post_build_runtime_telemetry.buildinfo_persist_ms;
     native_persist_crate_cache_after_build_best_effort(
         workspace_root,
         &signature,
@@ -10233,64 +10302,23 @@ fn run_native_build_inner(
     // Unlike per-workspace crate cache, this runs on every build since the corelib
     // blob is the same for all projects with the same compiler version.
     {
-        let sig_for_phase6 = signature.clone();
-        let ws_for_phase6 = workspace_root.to_path_buf();
+        let db_for_phase6 = session_snapshot.db.snapshot();
         let corelib_for_phase6 = signature.context.corelib_src.clone();
         cold_path_async_persist_spawn(move || {
-            let session_handle = match native_compile_session_handle(
-                &ws_for_phase6,
-                &sig_for_phase6,
-            ) {
-                Ok((handle, _)) => handle,
-                Err(e) => {
-                    tracing::debug!(error = %e, "phase-6: failed to access session for corelib blob persist");
-                    return;
-                }
-            };
-            let db_snapshot = {
-                let session = match session_handle.lock() {
-                    Ok(guard) => guard,
-                    Err(_poisoned) => {
-                        tracing::warn!(
-                            "phase-6: session mutex is poisoned; skipping corelib blob persist \
-                             to avoid persisting potentially corrupt state"
-                        );
-                        return;
-                    }
-                };
-                session.db.snapshot()
-            };
-            persist_corelib_sierra_blob_best_effort(&db_snapshot, &corelib_for_phase6);
+            persist_corelib_sierra_blob_best_effort(&db_for_phase6, &corelib_for_phase6);
         });
     }
     let compile_ms = compile_start.elapsed().as_secs_f64() * 1000.0;
     let session_scope_ms = session_scope_start.elapsed().as_secs_f64() * 1000.0;
     let session_prepare_ms =
         (session_scope_ms - frontend_compile_ms - casm_ms - artifact_write_ms).max(0.0);
-    // Phase 0: extract sub-timings from session state for telemetry.
-    let (
-        build_db_init_ms,
-        build_setup_project_ms,
-        build_crate_cache_restore_ms,
-        build_source_scan_ms,
-        build_session_image_persist_ms,
-        build_buildinfo_persist_ms,
-    ) = {
-        match native_compile_session_handle(workspace_root, &signature) {
-            Ok((handle, _)) => {
-                let session = handle.lock().unwrap_or_else(|p| p.into_inner());
-                (
-                    session.build_db_init_ms,
-                    session.build_setup_project_ms,
-                    session.build_crate_cache_restore_ms,
-                    session.build_source_scan_ms,
-                    session.build_session_image_persist_ms,
-                    session.build_buildinfo_persist_ms,
-                )
-            }
-            Err(_) => (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
-        }
-    };
+    // Phase 0: read sub-timings from the live session snapshot used for this build.
+    let build_db_init_ms = session_snapshot.build_db_init_ms;
+    let build_setup_project_ms = session_snapshot.build_setup_project_ms;
+    let build_crate_cache_restore_ms = session_snapshot.build_crate_cache_restore_ms;
+    let build_source_scan_ms = session_snapshot.build_source_scan_ms;
+    let build_session_image_persist_ms = session_snapshot.build_session_image_persist_ms;
+    let build_buildinfo_persist_ms = session_snapshot.build_buildinfo_persist_ms;
     let native_phase_telemetry = NativeBuildPhaseTelemetry {
         context_ms,
         target_dir_ms,

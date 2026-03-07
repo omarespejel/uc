@@ -9201,18 +9201,37 @@ fn phase1_async_persist_drain_handles_multiple_tasks() {
 #[cfg(feature = "native-compile")]
 #[test]
 fn phase2_skip_double_scan_logic() {
-    // Phase 2: verify that native_should_force_full_rebuild_on_empty_delta
-    // returns false when session_cache_hit is false (freshly-built session).
-    // This is the key invariant that makes the drift-scan skip safe.
-    let result = native_should_force_full_rebuild_on_empty_delta(
-        true,  // rebuild_on_empty_delta
-        false, // session_cache_hit = false → freshly built
-        false, // needs_full_rebuild
-        false, // changed_source_set_detected
+    assert!(
+        native_should_skip_drift_scan_for_fresh_session(
+            false, // session_cache_hit
+            true,  // fresh_source_scan
+            false, // needs_full_rebuild
+        ),
+        "freshly-built sessions with a fresh source scan should skip redundant drift scan"
     );
     assert!(
-        !result,
-        "force_full_rebuild should be false for freshly-built sessions (session_cache_hit=false)"
+        !native_should_skip_drift_scan_for_fresh_session(
+            false, // session_cache_hit
+            false, // fresh_source_scan
+            false, // needs_full_rebuild
+        ),
+        "restored sessions must not skip drift scan without a fresh source scan"
+    );
+    assert!(
+        !native_should_skip_drift_scan_for_fresh_session(
+            true,  // session_cache_hit
+            true,  // fresh_source_scan
+            false, // needs_full_rebuild
+        ),
+        "cache-hit sessions should continue through normal drift handling"
+    );
+    assert!(
+        !native_should_skip_drift_scan_for_fresh_session(
+            false, // session_cache_hit
+            true,  // fresh_source_scan
+            true,  // needs_full_rebuild
+        ),
+        "signature rebuild path should never skip drift handling"
     );
 }
 
@@ -9686,18 +9705,28 @@ fn phase5_global_cache_dir_is_under_home() {
 #[cfg(feature = "native-compile")]
 #[test]
 fn phase5_resolve_corelib_src_succeeds() {
-    // resolve_native_corelib_src should succeed (either via embedded or filesystem).
-    // Use a dummy workspace root — the embedded path is tried first.
-    let workspace_root = std::env::temp_dir();
-    let result = resolve_native_corelib_src(&workspace_root);
-    // On machines with embedded corelib, this should succeed.
-    // On machines without, it may fail — but the function should not panic.
-    if let Ok(path) = &result {
-        assert!(
-            native_corelib_layout_looks_compatible(path),
-            "resolved corelib should be layout-compatible"
-        );
-    }
+    let env_guard = integration_env_lock()
+        .lock()
+        .expect("failed to acquire integration env lock");
+    let workspace_root = unique_test_dir("uc-phase5-resolve-corelib");
+    let corelib_src = workspace_root.join("mock-corelib/src");
+    create_mock_native_corelib(&corelib_src);
+    write_mock_native_corelib_manifest(&corelib_src, &native_cairo_lang_compiler_version());
+    let _env = ScopedEnvVar::set_with_lock(&env_guard, "UC_NATIVE_CORELIB_SRC", &corelib_src);
+    let resolved = resolve_native_corelib_src(&workspace_root)
+        .expect("resolve_native_corelib_src should honor explicit valid override");
+    let expected = corelib_src
+        .canonicalize()
+        .expect("mock corelib path should canonicalize");
+    assert_eq!(
+        resolved, expected,
+        "native corelib resolution should return the explicit override path"
+    );
+    assert!(
+        native_corelib_layout_looks_compatible(&resolved),
+        "resolved corelib should be layout-compatible"
+    );
+    fs::remove_dir_all(&workspace_root).ok();
 }
 
 // ---------------------------------------------------------------------------

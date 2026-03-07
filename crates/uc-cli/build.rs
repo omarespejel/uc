@@ -50,53 +50,27 @@ fn workspace_lockfile_path() -> Option<PathBuf> {
 fn compiler_version_from_lockfile() -> Option<String> {
     let lockfile_path = workspace_lockfile_path()?;
     let lockfile = std::fs::read_to_string(lockfile_path).ok()?;
-    // Simple parse: look for [[package]] blocks with name = "cairo-lang-compiler"
-    let mut in_target = false;
-    for line in lockfile.lines() {
-        let trimmed = line.trim();
-        if trimmed == "[[package]]" {
-            in_target = false;
-            continue;
-        }
-        if trimmed == r#"name = "cairo-lang-compiler""# {
-            in_target = true;
-            continue;
-        }
-        if in_target && trimmed.starts_with("version = \"") {
-            let version = trimmed
-                .strip_prefix("version = \"")
-                .and_then(|s| s.strip_suffix('"'));
-            return version.map(String::from);
-        }
-    }
-    None
+    let parsed: toml::Value = toml::from_str(&lockfile).ok()?;
+    let packages = parsed.get("package")?.as_array()?;
+    packages.iter().find_map(|entry| {
+        let table = entry.as_table()?;
+        (table.get("name")?.as_str()? == "cairo-lang-compiler")
+            .then(|| table.get("version")?.as_str().map(ToOwned::to_owned))
+            .flatten()
+    })
 }
 
 /// Read the corelib version from its Scarb.toml.
 fn corelib_manifest_version(corelib_src: &Path) -> Option<String> {
     let manifest_path = corelib_src.parent()?.join("Scarb.toml");
     let text = std::fs::read_to_string(manifest_path).ok()?;
-    // Simple parse: look for version = "..." in [package] section
-    let mut in_package = false;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed == "[package]" {
-            in_package = true;
-            continue;
-        }
-        if trimmed.starts_with('[') {
-            in_package = false;
-            continue;
-        }
-        if in_package && trimmed.starts_with("version") {
-            if let Some(rest) = trimmed.strip_prefix("version") {
-                let rest = rest.trim().strip_prefix('=')?.trim();
-                let rest = rest.strip_prefix('"')?.strip_suffix('"')?;
-                return Some(rest.to_string());
-            }
-        }
-    }
-    None
+    let parsed: toml::Value = toml::from_str(&text).ok()?;
+    parsed
+        .get("package")
+        .and_then(toml::Value::as_table)
+        .and_then(|package| package.get("version"))
+        .and_then(toml::Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 fn version_matches(corelib_src: &Path) -> bool {
@@ -250,13 +224,20 @@ fn find_corelib_src(candidates: &[PathBuf]) -> Option<PathBuf> {
             println!("cargo:rerun-if-changed={}", runtime_override.display());
             if let Some(candidate) = try_candidate(runtime_override) {
                 return Some(candidate);
+            } else {
+                println!(
+                    "cargo:warning=Phase 5: UC_NATIVE_CORELIB_SRC='{}' is not a valid \
+                     compatible corelib/src (missing files or version mismatch); \
+                     falling back to discovery",
+                    path
+                );
             }
         }
     }
 
     // 3. Search relative to workspace root (mirrors runtime candidate search)
     for candidate in candidates {
-        if let Some(p) = try_candidate(&candidate) {
+        if let Some(p) = try_candidate(candidate) {
             return Some(p);
         }
     }
