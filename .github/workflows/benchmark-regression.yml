@@ -295,6 +295,11 @@ jobs:
             https://github.com/keep-starknet-strange/starknet-agentic.git
           git -C "$REAL_REPOS_ROOT/starknet-agentic" fetch --depth 1 origin "$AGENTIC_FIXTURE_SHA"
           git -C "$REAL_REPOS_ROOT/starknet-agentic" checkout --detach FETCH_HEAD
+          AGENTIC_HEAD="$(git -C "$REAL_REPOS_ROOT/starknet-agentic" rev-parse HEAD)"
+          if [[ "$AGENTIC_HEAD" != "$AGENTIC_FIXTURE_SHA" ]]; then
+            echo "starknet-agentic SHA mismatch: got $AGENTIC_HEAD (expected $AGENTIC_FIXTURE_SHA)" >&2
+            exit 1
+          fi
           echo "UC_REAL_REPOS_ROOT=$REAL_REPOS_ROOT" >> "$GITHUB_ENV"
 
       - name: Native strict smoke on starknet-agentic
@@ -320,11 +325,29 @@ jobs:
               --manifest-path "$manifest_path" \
               --report-path "$report_path" \
               >"$log_path" 2>&1
-            if grep -E "falling back to scarb backend|fell back to scarb backend" "$log_path" >/dev/null; then
-              echo "native strict gate failed: fallback detected for $manifest_rel" >&2
+            if [[ ! -f "$report_path" ]]; then
+              echo "native strict gate failed: report missing for $manifest_rel" >&2
               cat "$log_path" >&2
               exit 1
             fi
+            python3 - <<'PY' "$report_path" "$manifest_rel"
+            import json
+            import sys
+            from pathlib import Path
+
+            report_path = Path(sys.argv[1])
+            manifest_rel = sys.argv[2]
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            if report.get("exit_code") != 0:
+                raise SystemExit(
+                    f"native strict gate failed: non-zero report exit code for {manifest_rel}: {report.get('exit_code')}"
+                )
+            command = report.get("command") or []
+            if command and command[0] == "scarb":
+                raise SystemExit(
+                    f"native strict gate failed: fallback to scarb detected for {manifest_rel}"
+                )
+            PY
           }
 
           run_native_strict "contracts/huginn-registry/Scarb.toml" "huginn-registry"

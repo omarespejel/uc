@@ -6464,6 +6464,39 @@ fn native_commit_source_journal_delta_keeps_newer_events_when_apply_cursor_is_st
 
 #[cfg(feature = "native-compile")]
 #[test]
+fn native_source_roots_modified_unix_ms_tracks_nested_file_edits() {
+    let workspace = unique_test_dir("uc-native-source-root-mtime-file-edit");
+    let src_dir = workspace.join("src").join("nested");
+    fs::create_dir_all(&src_dir).expect("failed to create nested source root");
+    let source_file = src_dir.join("lib.cairo");
+    fs::write(&source_file, "fn value() -> felt252 { 0 }\n").expect("failed to write source file");
+
+    let baseline = native_source_roots_modified_unix_ms(&workspace, &[workspace.join("src")])
+        .expect("failed to compute baseline source-root mtime");
+    let mut updated = baseline;
+    for revision in 1..=8_u64 {
+        thread::sleep(Duration::from_millis(20));
+        fs::write(
+            &source_file,
+            format!("fn value() -> felt252 {{ {revision} }}\n"),
+        )
+        .expect("failed to rewrite source file");
+        updated = native_source_roots_modified_unix_ms(&workspace, &[workspace.join("src")])
+            .expect("failed to recompute source-root mtime");
+        if updated > baseline {
+            break;
+        }
+    }
+    assert!(
+        updated > baseline,
+        "nested source-file edit should advance source-root freshness marker (baseline={baseline}, updated={updated})"
+    );
+
+    fs::remove_dir_all(&workspace).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
 fn native_session_refresh_action_prefers_incremental_for_changed_sets() {
     assert_eq!(
         native_session_refresh_action(false, false, 0, 0),
@@ -7828,14 +7861,23 @@ fn native_should_capture_statement_locations_with_flags_disables_when_base_disab
 
 #[cfg(feature = "native-compile")]
 #[test]
-fn native_should_capture_statement_locations_with_flags_defaults_off_on_cold() {
+fn native_capture_statement_locations_on_cold_default_is_enabled() {
+    assert!(
+        DEFAULT_NATIVE_CAPTURE_STATEMENT_LOCATIONS_ON_COLD,
+        "cold statement-location capture should default on for restart-safe dependency indexing"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_should_capture_statement_locations_with_flags_respects_cold_flag() {
     let changed = vec!["src/lib.cairo".to_string()];
     let removed = Vec::new();
     assert!(
         !native_should_capture_statement_locations_with_flags(
             true, false, &changed, &removed, true
         ),
-        "cold compile should follow capture-on-cold flag"
+        "cold compile should follow explicit capture-on-cold flag"
     );
 }
 

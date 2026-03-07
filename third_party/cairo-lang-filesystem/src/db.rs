@@ -404,11 +404,22 @@ fn keyed_file_override_slot(db: &mut dyn Database, file: FileInput) -> (FileOver
 /// Sets keyed override content for a single file.
 ///
 /// Returns `true` when database state changed (slot insertion and/or content change).
+/// Passing `None` for an unregistered file is treated as a no-op and returns `false`.
 pub fn set_file_override_content_keyed(
     db: &mut dyn Database,
     file: FileInput,
     content: Option<Arc<str>>,
 ) -> bool {
+    if content.is_none() {
+        let db_ref: &dyn Database = db;
+        let slot_exists = files_group_input(db_ref)
+            .keyed_file_overrides(db_ref)
+            .as_ref()
+            .is_some_and(|overrides| overrides.contains_key(&file));
+        if !slot_exists {
+            return false;
+        }
+    }
     let (slot, inserted) = keyed_file_override_slot(db, file);
     let current_present = slot.present(db);
     let current_content = slot.content(db).clone();

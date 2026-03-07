@@ -66,7 +66,7 @@ use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -130,6 +130,7 @@ const DAEMON_UNHEALTHY_RECOVERY_SECONDS: u64 = 5;
 const DEFAULT_DAEMON_CLIENT_READ_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_DAEMON_BUILD_READ_TIMEOUT_SECS: u64 = 0;
 const DEFAULT_DAEMON_CLIENT_WRITE_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_DAEMON_MAX_CONNECTION_HANDLERS: usize = 256;
 const ASYNC_PERSIST_ERROR_QUEUE_LIMIT: usize = 32;
 const ASYNC_PERSIST_QUEUE_LIMIT: usize = 128;
 const DEFAULT_ASYNC_PERSIST_ERROR_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -165,7 +166,7 @@ const DEFAULT_NATIVE_IMPACTED_SUBSET_ENABLED: bool = true;
 #[cfg(feature = "native-compile")]
 const DEFAULT_NATIVE_CAPTURE_STATEMENT_LOCATIONS: bool = true;
 #[cfg(feature = "native-compile")]
-const DEFAULT_NATIVE_CAPTURE_STATEMENT_LOCATIONS_ON_COLD: bool = false;
+const DEFAULT_NATIVE_CAPTURE_STATEMENT_LOCATIONS_ON_COLD: bool = true;
 #[cfg(feature = "native-compile")]
 const DEFAULT_NATIVE_DEPENDENCY_METADATA_ENABLED: bool = false;
 #[cfg(feature = "native-compile")]
@@ -2391,6 +2392,17 @@ fn daemon_client_write_timeout() -> Option<Duration> {
     ))
 }
 
+fn daemon_max_connection_handlers() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_env_usize(
+            "UC_DAEMON_MAX_CONNECTION_HANDLERS",
+            DEFAULT_DAEMON_MAX_CONNECTION_HANDLERS,
+        )
+        .max(1)
+    })
+}
+
 fn daemon_response_size_limit_bytes() -> usize {
     let compute = || {
         let configured = parse_env_usize(
@@ -2765,6 +2777,8 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
         let health = Arc::new(Mutex::new(DaemonHealth::default()));
         let rate_limiter = Arc::new(Mutex::new(DaemonRateLimiter::new()));
         let should_shutdown = Arc::new(AtomicBool::new(false));
+        let active_handlers = Arc::new(AtomicUsize::new(0));
+        let max_connection_handlers = daemon_max_connection_handlers();
         prewarm_daemon_compiler_version_cache();
 
         loop {
@@ -2772,12 +2786,31 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
                 break;
             }
             match listener.accept() {
-                Ok((stream, _)) => {
+                Ok((mut stream, _)) => {
+                    let in_flight = active_handlers.fetch_add(1, Ordering::AcqRel) + 1;
+                    if in_flight > max_connection_handlers {
+                        active_handlers.fetch_sub(1, Ordering::AcqRel);
+                        if let Err(err) = write_daemon_over_capacity_response(&mut stream) {
+                            tracing::warn!(
+                                error = %format!("{err:#}"),
+                                "failed to reply to over-capacity daemon connection"
+                            );
+                        }
+                        continue;
+                    }
                     let status = Arc::clone(&status);
                     let health = Arc::clone(&health);
                     let should_shutdown = Arc::clone(&should_shutdown);
                     let rate_limiter = Arc::clone(&rate_limiter);
+                    let active_handlers = Arc::clone(&active_handlers);
                     thread::spawn(move || {
+                        struct ActiveDaemonConnectionGuard(Arc<AtomicUsize>);
+                        impl Drop for ActiveDaemonConnectionGuard {
+                            fn drop(&mut self) {
+                                self.0.fetch_sub(1, Ordering::AcqRel);
+                            }
+                        }
+                        let _active_guard = ActiveDaemonConnectionGuard(active_handlers);
                         if let Err(err) = handle_daemon_connection(
                             stream,
                             status.as_ref(),
@@ -2808,6 +2841,25 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
         remove_socket_if_exists(&socket_path)?;
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn write_daemon_over_capacity_response(stream: &mut UnixStream) -> Result<()> {
+    let response = DaemonResponse::Error {
+        message: format!(
+            "daemon is busy (max {} concurrent handlers); retry shortly",
+            daemon_max_connection_handlers()
+        ),
+    };
+    let payload = serde_json::to_vec(&response).context("failed to encode daemon response")?;
+    stream
+        .write_all(&payload)
+        .context("failed to write daemon response")?;
+    stream
+        .write_all(b"\n")
+        .context("failed to write daemon response newline")?;
+    stream.flush().context("failed to flush daemon response")?;
+    Ok(())
 }
 
 fn prewarm_daemon_compiler_version_cache() {
@@ -5383,7 +5435,6 @@ fn native_source_roots_modified_unix_ms(
     workspace_root: &Path,
     source_roots: &[PathBuf],
 ) -> Result<u64> {
-    let _ = workspace_root;
     let mut latest = 0_u64;
     for source_root in source_roots {
         let metadata = match fs::metadata(source_root) {
@@ -5397,8 +5448,38 @@ fn native_source_roots_modified_unix_ms(
         if !metadata.is_dir() {
             continue;
         }
-        let modified_unix_ms = metadata_modified_unix_ms(&metadata)?;
-        latest = latest.max(modified_unix_ms);
+        let root_modified_unix_ms = metadata_modified_unix_ms(&metadata)?;
+        let root_change_unix_ms =
+            metadata_change_unix_ms(&metadata).unwrap_or(root_modified_unix_ms);
+        latest = latest.max(root_modified_unix_ms.max(root_change_unix_ms));
+        let walker = WalkDir::new(source_root)
+            .follow_links(false)
+            .max_depth(MAX_FINGERPRINT_DEPTH)
+            .into_iter()
+            .filter_entry(|entry| !is_ignored_entry(workspace_root, entry.path()));
+        for entry in walker.filter_map(|entry| entry.ok()) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let is_cairo = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("cairo"));
+            if !is_cairo {
+                continue;
+            }
+            let metadata = match fs::metadata(path) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(err).with_context(|| format!("failed to stat {}", path.display()));
+                }
+            };
+            let modified_unix_ms = metadata_modified_unix_ms(&metadata)?;
+            let change_unix_ms = metadata_change_unix_ms(&metadata).unwrap_or(modified_unix_ms);
+            latest = latest.max(modified_unix_ms.max(change_unix_ms));
+        }
     }
     Ok(latest)
 }
@@ -8805,8 +8886,8 @@ fn run_native_build_inner(
             removed_files = session.removed_files.len(),
             "native session snapshot delta"
         );
-        // Cold native session bootstraps do not need statement-location capture; keep it for
-        // incremental changed-file builds where impacted-unit selection depends on it.
+        // Keep statement-location capture enabled by default on cold boots so dependency indexing
+        // is ready after daemon restarts; incremental builds still honor explicit opt-out flags.
         let capture_statement_locations = native_should_capture_statement_locations(
             &session.changed_files,
             &session.removed_files,
