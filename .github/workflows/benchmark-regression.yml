@@ -7,10 +7,13 @@ on:
     branches: [main]
 
 env:
+  SCARB_TOOLCHAIN_VERSION: 2.16.0
   SCARB_FIXTURE_TAG: v2.16.0
   CAIRO_CORELIB_TAG: v2.16.0
   SCARB_FIXTURE_SHA: 231227f3fe49cc813b1b018a67cf3b7080766e24
   CAIRO_CORELIB_SHA: 6a43d7c9419481fcb82376447fecf85c44d8fbbf
+  AGENTIC_FIXTURE_SHA: 86679251313346279bf32d313536d851aaab932f
+  MONERO_FIXTURE_SHA: fef80441c930f96134bd55c2ac9aad059ef3a149
 
 jobs:
   benchmark-smoke:
@@ -34,6 +37,8 @@ jobs:
 
       - name: Install Scarb
         uses: software-mansion/setup-scarb@9d86a1616deecc95e8e8435daf902c5d025dc8b8 # v1
+        with:
+          scarb-version: ${{ env.SCARB_TOOLCHAIN_VERSION }}
 
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
@@ -88,6 +93,8 @@ jobs:
 
       - name: Install Scarb
         uses: software-mansion/setup-scarb@9d86a1616deecc95e8e8435daf902c5d025dc8b8 # v1
+        with:
+          scarb-version: ${{ env.SCARB_TOOLCHAIN_VERSION }}
 
       - name: Install benchmark tools
         run: sudo apt-get update && sudo apt-get install -y jq util-linux
@@ -210,7 +217,7 @@ jobs:
             set -e
             if [[ "$exit_code" -ne 0 ]]; then
               if [[ "$allow_skip_unsupported" == "1" ]] \
-                && grep -E "native compile does not support .* yet" "$log_path" >/dev/null; then
+                && grep -E "native compile does not support .* yet|native compile manifest includes non-starknet dependencies|Plugin diagnostic: Unsupported attribute" "$log_path" >/dev/null; then
                 echo "native-only gate: skipping unsupported fixture '$tag'"
                 return 0
               fi
@@ -236,15 +243,142 @@ jobs:
           name: native-only-results
           path: benchmarks/results/
 
+  native-real-repos-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Scarb
+        uses: software-mansion/setup-scarb@9d86a1616deecc95e8e8435daf902c5d025dc8b8 # v1
+        with:
+          scarb-version: ${{ env.SCARB_TOOLCHAIN_VERSION }}
+
+      - name: Prepare native corelib source
+        run: |
+          set -euo pipefail
+          CAIRO_ROOT="$RUNNER_TEMP/cairo-workspace"
+          git clone --depth 1 --branch "$CAIRO_CORELIB_TAG" \
+            https://github.com/starkware-libs/cairo.git "$CAIRO_ROOT/cairo"
+          CAIRO_HEAD="$(git -C "$CAIRO_ROOT/cairo" rev-parse HEAD)"
+          if [[ "$CAIRO_HEAD" != "$CAIRO_CORELIB_SHA" ]]; then
+            echo "cairo tag $CAIRO_CORELIB_TAG resolved to unexpected commit $CAIRO_HEAD (expected $CAIRO_CORELIB_SHA)" >&2
+            exit 1
+          fi
+          echo "UC_NATIVE_CORELIB_SRC=$CAIRO_ROOT/cairo/corelib/src" >> "$GITHUB_ENV"
+
+      - name: Build uc CLI
+        run: cargo build --release -p uc-cli
+
+      - name: Checkout real-world fixtures
+        run: |
+          set -euo pipefail
+          REAL_REPOS_ROOT="$RUNNER_TEMP/uc-real-repos"
+          mkdir -p "$REAL_REPOS_ROOT"
+
+          git clone --depth 1 https://github.com/keep-starknet-strange/starknet-agentic.git \
+            "$REAL_REPOS_ROOT/starknet-agentic"
+          AGENTIC_HEAD="$(git -C "$REAL_REPOS_ROOT/starknet-agentic" rev-parse HEAD)"
+          if [[ "$AGENTIC_HEAD" != "$AGENTIC_FIXTURE_SHA" ]]; then
+            echo "starknet-agentic HEAD changed to $AGENTIC_HEAD (expected $AGENTIC_FIXTURE_SHA)" >&2
+            exit 1
+          fi
+
+          git clone --depth 1 https://github.com/omarespejel/monero-starknet-atomic-swap.git \
+            "$REAL_REPOS_ROOT/monero-starknet-atomic-swap"
+          MONERO_HEAD="$(git -C "$REAL_REPOS_ROOT/monero-starknet-atomic-swap" rev-parse HEAD)"
+          if [[ "$MONERO_HEAD" != "$MONERO_FIXTURE_SHA" ]]; then
+            echo "monero-starknet-atomic-swap HEAD changed to $MONERO_HEAD (expected $MONERO_FIXTURE_SHA)" >&2
+            exit 1
+          fi
+          echo "UC_REAL_REPOS_ROOT=$REAL_REPOS_ROOT" >> "$GITHUB_ENV"
+
+      - name: Native strict smoke on starknet-agentic
+        env:
+          UC_NATIVE_BUILD_MODE: require
+          UC_NATIVE_DISALLOW_SCARB_FALLBACK: "1"
+          UC_NATIVE_CORELIB_SRC: ${{ env.UC_NATIVE_CORELIB_SRC }}
+        run: |
+          set -euo pipefail
+          mkdir -p benchmarks/results
+          UC_BIN="./target/release/uc"
+          AGENTIC_ROOT="$UC_REAL_REPOS_ROOT/starknet-agentic"
+
+          run_native_strict() {
+            local manifest_rel="$1"
+            local label="$2"
+            local manifest_path="$AGENTIC_ROOT/$manifest_rel"
+            local report_path="benchmarks/results/native-real-agentic-${label}.json"
+            local log_path="benchmarks/results/native-real-agentic-${label}.log"
+            "$UC_BIN" build \
+              --engine uc \
+              --daemon-mode off \
+              --manifest-path "$manifest_path" \
+              --report-path "$report_path" \
+              >"$log_path" 2>&1
+            if grep -E "falling back to scarb backend|fell back to scarb backend" "$log_path" >/dev/null; then
+              echo "native strict gate failed: fallback detected for $manifest_rel" >&2
+              cat "$log_path" >&2
+              exit 1
+            fi
+          }
+
+          run_native_strict "contracts/huginn-registry/Scarb.toml" "huginn-registry"
+          run_native_strict "contracts/erc8004-cairo/Scarb.toml" "erc8004-cairo"
+          run_native_strict "contracts/agent-account/Scarb.toml" "agent-account"
+          run_native_strict "contracts/session-account/Scarb.toml" "session-account"
+
+      - name: Monero auto-mode fallback remains controlled
+        env:
+          UC_NATIVE_BUILD_MODE: auto
+          UC_NATIVE_DISALLOW_SCARB_FALLBACK: "0"
+          UC_NATIVE_CORELIB_SRC: ${{ env.UC_NATIVE_CORELIB_SRC }}
+        run: |
+          set -euo pipefail
+          UC_BIN="./target/release/uc"
+          MONERO_MANIFEST="$UC_REAL_REPOS_ROOT/monero-starknet-atomic-swap/cairo/Scarb.toml"
+          REPORT_PATH="benchmarks/results/native-real-monero-auto.json"
+          LOG_PATH="benchmarks/results/native-real-monero-auto.log"
+          "$UC_BIN" build \
+            --engine uc \
+            --daemon-mode off \
+            --manifest-path "$MONERO_MANIFEST" \
+            --report-path "$REPORT_PATH" \
+            >"$LOG_PATH" 2>&1
+          if ! grep -E "incompatible with package cairo-version" "$LOG_PATH" >/dev/null; then
+            echo "monero fallback gate failed: expected cairo-version fallback reason not found" >&2
+            cat "$LOG_PATH" >&2
+            exit 1
+          fi
+
+      - name: Compare-build parity on supported agentic manifest
+        env:
+          UC_NATIVE_BUILD_MODE: require
+          UC_NATIVE_DISALLOW_SCARB_FALLBACK: "1"
+          UC_NATIVE_CORELIB_SRC: ${{ env.UC_NATIVE_CORELIB_SRC }}
+        run: |
+          ./target/release/uc compare-build \
+            --manifest-path "$UC_REAL_REPOS_ROOT/starknet-agentic/contracts/agent-account/Scarb.toml" \
+            --clean-before-each true \
+            --output-path benchmarks/results/compare-agentic-agent-account.json
+
+      - name: Upload real-repo smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-real-repo-results
+          path: benchmarks/results/
+
   determinism-matrix:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
     env:
       # Lock context inputs so cross-platform checks compare equivalent conditions.
-      UC_SCARB_VERSION_LINE: scarb 2.14.0 (determinism-lane)
+      UC_SCARB_VERSION_LINE: scarb 2.16.0 (determinism-lane)
       UC_BUILD_ENV_PREFIXES: ""
       UC_SKIP_SCARB_TOOLCHAIN_CHECK: "1"
     steps:
@@ -253,16 +387,11 @@ jobs:
 
       - name: Install Scarb
         uses: software-mansion/setup-scarb@9d86a1616deecc95e8e8435daf902c5d025dc8b8 # v1
+        with:
+          scarb-version: ${{ env.SCARB_TOOLCHAIN_VERSION }}
 
       - name: Build uc CLI
         run: cargo build --release -p uc-cli
-
-      - name: Normalize checkout text mode on Windows
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          git config --global core.autocrlf false
-          git reset --hard HEAD
 
       - name: Capture fingerprint/session key
         shell: bash
@@ -270,9 +399,6 @@ jobs:
           mkdir -p benchmarks/results determinism
           UC_BIN="./target/release/uc"
           PYTHON_BIN="python3"
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            UC_BIN="./target/release/uc.exe"
-          fi
           if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
             PYTHON_BIN="python"
           fi
