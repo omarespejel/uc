@@ -230,19 +230,19 @@ jobs:
               exit 1
             fi
             python3 - <<'PY' "$report_path" "$tag"
-import json
-import sys
-from pathlib import Path
+            import json
+            import sys
+            from pathlib import Path
 
-report_path = Path(sys.argv[1])
-tag = sys.argv[2]
-report = json.loads(report_path.read_text(encoding="utf-8"))
-if report.get("exit_code") != 0:
-    raise SystemExit(f"native-only gate failed: non-zero report exit code for {tag}: {report.get('exit_code')}")
-command = report.get("command") or []
-if command and command[0] == "scarb":
-    raise SystemExit(f"native-only gate failed: fallback to scarb detected for {tag}")
-PY
+            report_path = Path(sys.argv[1])
+            tag = sys.argv[2]
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            if report.get("exit_code") != 0:
+                raise SystemExit(f"native-only gate failed: non-zero report exit code for {tag}: {report.get('exit_code')}")
+            command = report.get("command") or []
+            if command and command[0] == "scarb":
+                raise SystemExit(f"native-only gate failed: fallback to scarb detected for {tag}")
+            PY
           }
 
           run_native_only "benchmarks/fixtures/scarb_smoke/Scarb.toml" "smoke"
@@ -344,19 +344,19 @@ PY
           rm -rf "$FIXTURE_ROOT"
           cp -R benchmarks/fixtures/scarb_smoke "$FIXTURE_ROOT"
           python3 - <<'PY' "$FIXTURE_ROOT/Scarb.toml"
-from pathlib import Path
-import sys
+          from pathlib import Path
+          import sys
 
-manifest_path = Path(sys.argv[1])
-text = manifest_path.read_text(encoding="utf-8")
-if "cairo-version" not in text:
-    text = text.replace(
-        'edition = "2024_07"\n',
-        'edition = "2024_07"\ncairo-version = ">=2.14.0"\n',
-        1,
-    )
-manifest_path.write_text(text, encoding="utf-8")
-PY
+          manifest_path = Path(sys.argv[1])
+          text = manifest_path.read_text(encoding="utf-8")
+          if "cairo-version" not in text:
+              text = text.replace(
+                  'edition = "2024_07"\n',
+                  'edition = "2024_07"\ncairo-version = ">=2.14.0"\n',
+                  1,
+              )
+          manifest_path.write_text(text, encoding="utf-8")
+          PY
           REPORT_PATH="benchmarks/results/native-semver-cairo-version-auto.json"
           LOG_PATH="benchmarks/results/native-semver-cairo-version-auto.log"
           "$UC_BIN" build \
@@ -366,17 +366,17 @@ PY
             --report-path "$REPORT_PATH" \
             >"$LOG_PATH" 2>&1
           python3 - <<'PY' "$REPORT_PATH"
-import json
-import sys
-from pathlib import Path
+          import json
+          import sys
+          from pathlib import Path
 
-report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-if report.get("exit_code") != 0:
-    raise SystemExit(f"fallback gate failed: uc build exited with {report.get('exit_code')}")
-command = report.get("command") or []
-if not command or command[0] != "scarb":
-    raise SystemExit("fallback gate failed: expected scarb backend command in structured report")
-PY
+          report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if report.get("exit_code") != 0:
+              raise SystemExit(f"fallback gate failed: uc build exited with {report.get('exit_code')}")
+          command = report.get("command") or []
+          if not command or command[0] != "scarb":
+              raise SystemExit("fallback gate failed: expected scarb backend command in structured report")
+          PY
 
       - name: Compare-build parity snapshot on supported agentic manifest
         env:
@@ -407,7 +407,7 @@ PY
               f"passed={report.get('passed')}",
               f"artifact_mismatch_count={report.get('artifact_mismatch_count')}",
           )
-PY
+          PY
 
       - name: Upload real-repo smoke artifacts
         if: always()
