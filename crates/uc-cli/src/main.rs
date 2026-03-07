@@ -958,6 +958,15 @@ struct NativeCompileSessionState {
     source_root_modified_unix_ms: u64,
     contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
     contract_output_plans: Vec<NativeContractOutputPlan>,
+    // Phase 0 sub-timings from build_native_compile_session_state
+    build_db_init_ms: f64,
+    build_setup_project_ms: f64,
+    build_crate_cache_restore_ms: f64,
+    build_source_scan_ms: f64,
+    // Phase 2: true when tracked_sources were freshly scanned from disk
+    // (not restored from image/buildinfo/replay). Only skip the drift scan
+    // when this is true, since restored tracked_sources may be stale.
+    fresh_source_scan: bool,
 }
 
 #[cfg(feature = "native-compile")]
@@ -6934,7 +6943,9 @@ fn try_native_compile_session_image_restore(
                 image
             }
             Ok(_) | Err(_) => {
-                // Fall back to JSON for schema v1 (pre-phase-4) caches
+                // Postcard decode failed or schema mismatch; try JSON as a
+                // defensive fallback. Note: v1 caches are intentionally
+                // rejected by the schema v2 bump (cache miss on upgrade).
                 match serde_json::from_slice::<NativeCompileSessionImageFile>(&bytes) {
                     Ok(image)
                         if image.schema_version
@@ -7976,10 +7987,24 @@ fn cold_path_async_persist_in_flight() -> &'static AtomicUsize {
 #[cfg(feature = "native-compile")]
 fn cold_path_async_persist_spawn<F: FnOnce() + Send + 'static>(f: F) {
     cold_path_async_persist_in_flight().fetch_add(1, Ordering::SeqCst);
+    // The RAII guard ensures the counter is decremented even if the closure panics.
+    // catch_unwind prevents the panic from propagating and aborting the process.
     thread::spawn(move || {
-        f();
-        cold_path_async_persist_in_flight().fetch_sub(1, Ordering::SeqCst);
+        let _guard = ColdPathPersistGuard;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
     });
+}
+
+/// RAII guard that decrements the in-flight counter on drop, ensuring
+/// the counter is always decremented even if the closure panics.
+#[cfg(feature = "native-compile")]
+struct ColdPathPersistGuard;
+
+#[cfg(feature = "native-compile")]
+impl Drop for ColdPathPersistGuard {
+    fn drop(&mut self) {
+        cold_path_async_persist_in_flight().fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Block until all in-flight async persist threads have completed.
@@ -8088,6 +8113,7 @@ fn build_native_compile_session_state(
         buildinfo_hit,
         buildinfo_replay_hit,
         journal_cursor_applied,
+        fresh_source_scan,
     ) = if let Some(image) = restored_image {
         (
             image.tracked_sources,
@@ -8098,6 +8124,7 @@ fn build_native_compile_session_state(
             false,
             false,
             image.journal_cursor_applied,
+            false,
         )
     } else if let Some(buildinfo) = restored_buildinfo {
         (
@@ -8109,6 +8136,7 @@ fn build_native_compile_session_state(
             true,
             false,
             buildinfo.journal_cursor_applied,
+            false,
         )
     } else if let Some(buildinfo) = replayed_buildinfo {
         (
@@ -8120,6 +8148,7 @@ fn build_native_compile_session_state(
             false,
             true,
             buildinfo.journal_cursor_applied,
+            false,
         )
     } else {
         let (tracked_sources, tracked_source_bytes) =
@@ -8139,6 +8168,7 @@ fn build_native_compile_session_state(
             false,
             false,
             native_current_source_journal_cursor(workspace_root),
+            true, // fresh_source_scan: tracked_sources are from a live filesystem scan
         )
     };
     let source_scan_ms = scan_start.elapsed().as_secs_f64() * 1000.0;
@@ -8196,6 +8226,11 @@ fn build_native_compile_session_state(
         source_root_modified_unix_ms,
         contract_source_dependencies,
         contract_output_plans,
+        build_db_init_ms: db_init_ms,
+        build_setup_project_ms: setup_project_ms,
+        build_crate_cache_restore_ms: crate_cache_restore_ms,
+        build_source_scan_ms: source_scan_ms,
+        fresh_source_scan,
     };
     // Phase 1: move persistence off the critical path by spawning a background thread.
     // Persistence is already best-effort (failures are logged and ignored), so it is safe
@@ -9041,13 +9076,17 @@ fn with_native_compile_session<T>(
         mut journal_fallback_full_scan,
     ) = if needs_full_rebuild {
         (Vec::new(), Vec::new(), None, 0_u64, false)
-    } else if !session_cache_hit {
+    } else if !session_cache_hit && {
+        let session = session_handle.lock().unwrap_or_else(|p| p.into_inner());
+        session.fresh_source_scan
+    } {
         // Phase 2: skip redundant source scan on cold path.  The session was just
-        // freshly built by build_native_compile_session_state which already collected
-        // tracked_sources reflecting the current filesystem state.  Re-scanning here
-        // would be a ~30-80 ms double scan with zero new information.
+        // freshly built by build_native_compile_session_state with a live filesystem
+        // scan, so tracked_sources already reflect the current state.  Re-scanning
+        // here would be a ~30-80 ms double scan with zero new information.
+        // Only safe when fresh_source_scan is true (not restored from cache/replay).
         tracing::debug!(
-            "cold-path phase-2: skipping drift scan for freshly-built session (session_cache_hit=false)"
+            "cold-path phase-2: skipping drift scan for freshly-built session with fresh source scan"
         );
         (Vec::new(), Vec::new(), None, 0_u64, false)
     } else if daemon_context {
@@ -9955,6 +9994,21 @@ fn run_native_build_inner(
     let session_scope_ms = session_scope_start.elapsed().as_secs_f64() * 1000.0;
     let session_prepare_ms =
         (session_scope_ms - frontend_compile_ms - casm_ms - artifact_write_ms).max(0.0);
+    // Phase 0: extract sub-timings from session state for telemetry.
+    let (build_db_init_ms, build_setup_project_ms, build_crate_cache_restore_ms, build_source_scan_ms) = {
+        match native_compile_session_handle(workspace_root, &signature) {
+            Ok((handle, _)) => {
+                let session = handle.lock().unwrap_or_else(|p| p.into_inner());
+                (
+                    session.build_db_init_ms,
+                    session.build_setup_project_ms,
+                    session.build_crate_cache_restore_ms,
+                    session.build_source_scan_ms,
+                )
+            }
+            Err(_) => (0.0, 0.0, 0.0, 0.0),
+        }
+    };
     let native_phase_telemetry = NativeBuildPhaseTelemetry {
         context_ms,
         target_dir_ms,
@@ -9968,11 +10022,10 @@ fn run_native_build_inner(
         compiled_contracts,
         impacted_subset_used,
         journal_fallback_full_scan,
-        // Phase 0: propagate sub-timings for cold-path diagnostics
-        db_init_ms: 0.0,           // populated from session state below
-        setup_project_ms: 0.0,     // populated from session state below
-        crate_cache_restore_ms: 0.0,
-        source_scan_ms: 0.0,
+        db_init_ms: build_db_init_ms,
+        setup_project_ms: build_setup_project_ms,
+        crate_cache_restore_ms: build_crate_cache_restore_ms,
+        source_scan_ms: build_source_scan_ms,
         find_contracts_ms,
         session_image_persist_ms: 0.0,
         buildinfo_persist_ms: 0.0,

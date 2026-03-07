@@ -9113,11 +9113,20 @@ fn phase0_build_phase_telemetry_round_trips_with_new_fields() {
     assert_eq!(deserialized.native_drift_scan_ms, 1.9);
 }
 
+/// Mutex to serialize Phase 1 async-persist tests, which share a process-global
+/// in-flight counter. Without serialization, parallel tests can interfere.
+#[cfg(feature = "native-compile")]
+fn async_persist_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 #[cfg(feature = "native-compile")]
 #[test]
 fn phase1_async_persist_counter_returns_to_zero_after_drain() {
-    // The global counter may be non-zero if other tests have in-flight tasks.
-    // Drain first, then verify it reaches zero.
+    let _guard = async_persist_test_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     cold_path_async_persist_drain();
     assert_eq!(
         cold_path_async_persist_in_flight().load(Ordering::SeqCst),
@@ -9129,6 +9138,9 @@ fn phase1_async_persist_counter_returns_to_zero_after_drain() {
 #[cfg(feature = "native-compile")]
 #[test]
 fn phase1_async_persist_spawn_completes_and_decrements_counter() {
+    let _guard = async_persist_test_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     use std::sync::atomic::AtomicBool;
 
     let flag = Arc::new(AtomicBool::new(false));
@@ -9138,7 +9150,6 @@ fn phase1_async_persist_spawn_completes_and_decrements_counter() {
         flag_clone.store(true, Ordering::SeqCst);
     });
 
-    // Wait for the background thread to finish (drain handles this)
     cold_path_async_persist_drain();
 
     assert!(
@@ -9155,6 +9166,9 @@ fn phase1_async_persist_spawn_completes_and_decrements_counter() {
 #[cfg(feature = "native-compile")]
 #[test]
 fn phase1_async_persist_drain_handles_multiple_tasks() {
+    let _guard = async_persist_test_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     use std::sync::atomic::AtomicU32;
 
     let counter = Arc::new(AtomicU32::new(0));
@@ -9217,18 +9231,11 @@ fn phase2_force_rebuild_only_on_cache_hit_with_empty_delta() {
 #[test]
 fn phase3_mimalloc_feature_gate_present() {
     // Verify that mimalloc is in the default feature set at build time.
-    // When compiled without --no-default-features, this test runs under mimalloc.
-    #[cfg(feature = "mimalloc")]
-    {
-        // Just verify the global allocator is set (the binary boots fine)
-        let _ = Box::new(42_u64);
-    }
-    #[cfg(not(feature = "mimalloc"))]
-    {
-        // If mimalloc is not compiled in, this test still passes —
-        // it just verifies the fallback path (system allocator) also works.
-        let _ = Box::new(42_u64);
-    }
+    // When compiled with default features, cfg!(feature = "mimalloc") is true.
+    assert!(
+        cfg!(feature = "mimalloc"),
+        "mimalloc should be enabled by default features"
+    );
 }
 
 #[cfg(feature = "native-compile")]
