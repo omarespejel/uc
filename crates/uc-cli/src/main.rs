@@ -24,7 +24,7 @@ use cairo_lang_filesystem::db::{
 #[cfg(feature = "native-compile")]
 use cairo_lang_filesystem::detect::detect_corelib;
 #[cfg(feature = "native-compile")]
-use cairo_lang_filesystem::ids::{BlobLongId, CrateInput, CrateLongId, Directory};
+use cairo_lang_filesystem::ids::{BlobLongId, CrateId, CrateInput, CrateLongId, Directory};
 #[cfg(feature = "native-compile")]
 use cairo_lang_filesystem::ids::{FileId, FileLongId};
 #[cfg(feature = "native-compile")]
@@ -44,6 +44,8 @@ use cairo_lang_starknet_classes::casm_contract_class::CasmContractClass;
 #[cfg(feature = "native-compile")]
 use cairo_lang_starknet_classes::contract_class::ContractClass;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+#[cfg(all(feature = "native-compile", not(uc_no_embedded_corelib)))]
+use include_dir::{include_dir, Dir};
 #[cfg(feature = "native-compile")]
 use notify::event::{ModifyKind as NotifyModifyKind, RenameMode as NotifyRenameMode};
 #[cfg(feature = "native-compile")]
@@ -95,6 +97,14 @@ use commands::{run_build, run_compare_build, run_metadata, run_migrate};
 #[allow(unused_imports)]
 use daemon::*;
 use fingerprint::*;
+
+/// Embedded corelib source tree (Phase 5: cold-path supremacy).
+/// At compile time, build.rs discovers the Cairo corelib and sets
+/// `UC_CORELIB_SRC_DIR`; we embed the entire `corelib/src/` directory
+/// so the binary is self-contained and the runtime corelib search is
+/// eliminated on first run.
+#[cfg(all(feature = "native-compile", not(uc_no_embedded_corelib)))]
+static EMBEDDED_CORELIB: Dir<'_> = include_dir!("$UC_CORELIB_SRC_DIR");
 
 const BUILD_CACHE_SCHEMA_VERSION: u32 = 1;
 const MIN_HASH_LEN: usize = 2;
@@ -4191,8 +4201,282 @@ fn toml_escape_basic_string(raw: &str) -> String {
     escaped
 }
 
+/// Returns the platform-appropriate global cache directory for uc.
+/// macOS: ~/Library/Caches/uc
+/// Linux: ~/.cache/uc
+#[cfg(all(feature = "native-compile", not(uc_no_embedded_corelib)))]
+fn uc_global_cache_dir() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME environment variable not set")?;
+    #[cfg(target_os = "macos")]
+    let base = home.join("Library/Caches/uc");
+    #[cfg(not(target_os = "macos"))]
+    let base = home.join(".cache/uc");
+    Ok(base)
+}
+
+/// Extract the compile-time-embedded corelib to a versioned cache directory.
+/// Returns the path to the extracted `corelib/src/` directory.
+///
+/// The extraction is idempotent: a `.uc-extracted-ok` marker file is written
+/// after successful extraction, and subsequent calls return immediately.
+#[cfg(all(feature = "native-compile", not(uc_no_embedded_corelib)))]
+fn extract_embedded_corelib() -> Result<PathBuf> {
+    let version = native_cairo_lang_compiler_version();
+    let cache_dir = uc_global_cache_dir()?;
+    let target_dir = cache_dir.join(format!("corelib-v{}/src", version));
+    let marker = target_dir.join(".uc-extracted-ok");
+
+    if marker.is_file() && native_corelib_layout_looks_compatible(&target_dir) {
+        tracing::debug!(
+            corelib_src = %target_dir.display(),
+            "phase-5: using previously extracted embedded corelib"
+        );
+        return Ok(target_dir);
+    }
+
+    // Marker missing or layout broken; (re-)extract.
+    if target_dir.exists() {
+        tracing::debug!(
+            target = %target_dir.display(),
+            "phase-5: removing stale embedded corelib extraction"
+        );
+        let _ = fs::remove_dir_all(&target_dir);
+    }
+
+    let file_count = count_embedded_files(&EMBEDDED_CORELIB);
+    tracing::debug!(
+        target = %target_dir.display(),
+        file_count,
+        "phase-5: extracting embedded corelib to cache"
+    );
+
+    let start = Instant::now();
+    extract_embedded_dir_recursive(&EMBEDDED_CORELIB, &target_dir)?;
+
+    // Write marker after all files are on disk.
+    fs::write(
+        &marker,
+        format!(
+            "extracted by uc v{} at {}\n",
+            env!("CARGO_PKG_VERSION"),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        ),
+    )
+    .context("failed to write embedded corelib extraction marker")?;
+
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    tracing::debug!(
+        elapsed_ms,
+        target = %target_dir.display(),
+        file_count,
+        "phase-5: embedded corelib extraction complete"
+    );
+
+    Ok(target_dir)
+}
+
+#[cfg(all(feature = "native-compile", not(uc_no_embedded_corelib)))]
+fn extract_embedded_dir_recursive(dir: &Dir<'_>, target: &Path) -> Result<()> {
+    fs::create_dir_all(target)
+        .with_context(|| format!("failed to create dir {}", target.display()))?;
+    for file in dir.files() {
+        let file_name = file
+            .path()
+            .file_name()
+            .context("embedded file has no name")?;
+        fs::write(target.join(file_name), file.contents()).with_context(|| {
+            format!(
+                "failed to write embedded file {}",
+                target.join(file_name).display()
+            )
+        })?;
+    }
+    for subdir in dir.dirs() {
+        let subdir_name = subdir
+            .path()
+            .file_name()
+            .context("embedded dir has no name")?;
+        extract_embedded_dir_recursive(subdir, &target.join(subdir_name))?;
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "native-compile", not(uc_no_embedded_corelib)))]
+fn count_embedded_files(dir: &Dir<'_>) -> usize {
+    let mut count = dir.files().count();
+    for subdir in dir.dirs() {
+        count += count_embedded_files(subdir);
+    }
+    count
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: Pre-compiled corelib Sierra blob
+// ---------------------------------------------------------------------------
+//
+// The corelib is identical for a given cairo-lang compiler version. We can
+// generate its lowering cache blob once (after the first build) and reuse it
+// across ALL projects, eliminating ~300-500ms of Salsa evaluation on every
+// cold start.
+
+/// Path to the pre-compiled corelib Sierra blob in the global cache.
+#[cfg(feature = "native-compile")]
+fn corelib_sierra_blob_path() -> Result<PathBuf> {
+    let version = native_cairo_lang_compiler_version();
+    let cache_dir = {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .context("HOME environment variable not set")?;
+        #[cfg(target_os = "macos")]
+        let base = home.join("Library/Caches/uc");
+        #[cfg(not(target_os = "macos"))]
+        let base = home.join(".cache/uc");
+        base
+    };
+    Ok(cache_dir.join(format!("corelib-sierra-v{version}.blob")))
+}
+
+/// Try to load a pre-compiled corelib Sierra blob and inject it into the
+/// corelib crate's `cache_file` in the DB.
+///
+/// Returns `true` if the blob was successfully loaded and injected.
+#[cfg(feature = "native-compile")]
+fn try_restore_corelib_sierra_blob(db: &mut RootDatabase) -> bool {
+    let blob_path = match corelib_sierra_blob_path() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(error = %e, "phase-6: cannot determine corelib sierra blob path");
+            return false;
+        }
+    };
+    if !blob_path.is_file() {
+        tracing::debug!(
+            path = %blob_path.display(),
+            "phase-6: no pre-compiled corelib sierra blob found"
+        );
+        return false;
+    }
+    let blob_bytes = match fs::read(&blob_path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::debug!(
+                path = %blob_path.display(),
+                error = %e,
+                "phase-6: failed to read corelib sierra blob"
+            );
+            return false;
+        }
+    };
+    if blob_bytes.is_empty() {
+        tracing::debug!("phase-6: corelib sierra blob is empty; skipping");
+        return false;
+    }
+
+    // Inject the blob into the core crate's cache_file.
+    let core_input = CrateLongId::core(db).into_crate_input(db);
+    let db_ref: &dyn salsa::Database = db;
+    let mut crate_configs = files_group_input(db_ref)
+        .crate_configs(db_ref)
+        .clone()
+        .unwrap_or_default();
+
+    if let Some(existing) = crate_configs.get(&core_input.clone()).cloned() {
+        crate_configs.insert(
+            core_input.clone(),
+            CrateConfigurationInput {
+                root: existing.root,
+                settings: existing.settings,
+                cache_file: Some(BlobLongId::Virtual(blob_bytes.clone())),
+            },
+        );
+        set_crate_configs_input(db, crate_configs);
+        tracing::debug!(
+            path = %blob_path.display(),
+            blob_bytes = blob_bytes.len(),
+            "phase-6: injected pre-compiled corelib sierra blob"
+        );
+        true
+    } else {
+        tracing::debug!("phase-6: core crate not found in DB config; skipping blob injection");
+        false
+    }
+}
+
+/// Generate and persist the corelib's lowering cache blob to the global cache.
+/// Called after a successful build.
+#[cfg(feature = "native-compile")]
+fn persist_corelib_sierra_blob_best_effort(db: &RootDatabase) {
+    let blob_path = match corelib_sierra_blob_path() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(error = %e, "phase-6: cannot determine corelib sierra blob path for persist");
+            return;
+        }
+    };
+
+    // Skip if already persisted.
+    if blob_path.is_file() {
+        tracing::debug!(
+            path = %blob_path.display(),
+            "phase-6: corelib sierra blob already exists; skipping persist"
+        );
+        return;
+    }
+
+    let core_crate_id = CrateId::core(db);
+    let blob = match generate_crate_cache(db, core_crate_id) {
+        Ok(blob) => blob,
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "phase-6: failed to generate corelib lowering cache"
+            );
+            return;
+        }
+    };
+
+    if blob.is_empty() {
+        tracing::debug!("phase-6: generated corelib blob is empty; skipping persist");
+        return;
+    }
+
+    if let Some(parent) = blob_path.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            tracing::debug!(
+                error = %e,
+                path = %parent.display(),
+                "phase-6: failed to create corelib sierra blob cache directory"
+            );
+            return;
+        }
+    }
+
+    match atomic_write_bytes(&blob_path, &blob, "corelib sierra blob") {
+        Ok(()) => {
+            tracing::debug!(
+                path = %blob_path.display(),
+                blob_bytes = blob.len(),
+                "phase-6: persisted pre-compiled corelib sierra blob"
+            );
+        }
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                path = %blob_path.display(),
+                "phase-6: failed to persist corelib sierra blob"
+            );
+        }
+    }
+}
+
 #[cfg(feature = "native-compile")]
 fn resolve_native_corelib_src(workspace_root: &Path) -> Result<PathBuf> {
+    // Explicit env override always wins (also used by tests to control resolution).
     if let Some(path) = std::env::var_os("UC_NATIVE_CORELIB_SRC") {
         let candidate = PathBuf::from(path);
         let canonical = candidate.canonicalize().with_context(|| {
@@ -4221,6 +4505,27 @@ fn resolve_native_corelib_src(workspace_root: &Path) -> Result<PathBuf> {
             canonical.display(),
             native_cairo_lang_compiler_version()
         )));
+    }
+
+    // Phase 5: try embedded corelib before filesystem search.
+    #[cfg(not(uc_no_embedded_corelib))]
+    if std::env::var_os("UC_DISABLE_EMBEDDED_CORELIB").is_none() {
+        match extract_embedded_corelib() {
+            Ok(path) => {
+                tracing::debug!(
+                    source = "embedded",
+                    corelib_src = %path.display(),
+                    "phase-5: selected embedded native corelib source path"
+                );
+                return Ok(path);
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "phase-5: embedded corelib extraction failed; falling back to filesystem search"
+                );
+            }
+        }
     }
 
     let candidates = native_corelib_candidate_paths(workspace_root);
@@ -7721,6 +8026,12 @@ fn build_native_compile_session_state(
         .context("failed to initialize native cairo compiler database")?;
     let db_init_ms = db_start.elapsed().as_secs_f64() * 1000.0;
     init_dev_corelib(&mut db, signature.context.corelib_src.clone());
+    // Phase 6: inject pre-compiled corelib Sierra blob if available.
+    let corelib_blob_restored = try_restore_corelib_sierra_blob(&mut db);
+    tracing::debug!(
+        corelib_blob_restored,
+        "phase-6: corelib sierra blob restore attempted"
+    );
     let setup_start = Instant::now();
     let main_crate_inputs = setup_project(&mut db, &signature.context.cairo_project_dir)
         .with_context(|| {
@@ -9619,6 +9930,27 @@ fn run_native_build_inner(
         removed_files_count,
         compiled_contracts,
     );
+    // Phase 6: persist corelib sierra blob to global cache (best-effort, async).
+    // Unlike per-workspace crate cache, this runs on every build since the corelib
+    // blob is the same for all projects with the same compiler version.
+    {
+        let sig_for_phase6 = signature.clone();
+        let ws_for_phase6 = workspace_root.to_path_buf();
+        cold_path_async_persist_spawn(move || {
+            let session_handle = match native_compile_session_handle(&ws_for_phase6, &sig_for_phase6) {
+                Ok((handle, _)) => handle,
+                Err(e) => {
+                    tracing::debug!(error = %e, "phase-6: failed to access session for corelib blob persist");
+                    return;
+                }
+            };
+            let db_snapshot = {
+                let session = session_handle.lock().unwrap_or_else(|p| p.into_inner());
+                session.db.snapshot()
+            };
+            persist_corelib_sierra_blob_best_effort(&db_snapshot);
+        });
+    }
     let compile_ms = compile_start.elapsed().as_secs_f64() * 1000.0;
     let session_scope_ms = session_scope_start.elapsed().as_secs_f64() * 1000.0;
     let session_prepare_ms =

@@ -33,6 +33,7 @@ cairo-lang-lowering = { workspace = true, optional = true }
 cairo-lang-starknet = { workspace = true, optional = true }
 cairo-lang-starknet-classes = { workspace = true, optional = true }
 clap.workspace = true
+include_dir.workspace = true
 libc.workspace = true
 mimalloc = { workspace = true, optional = true }
 notify = { workspace = true, optional = true }

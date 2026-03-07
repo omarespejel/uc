@@ -21,6 +21,7 @@ cairo-lang-lowering = "2.16.0"
 cairo-lang-starknet = "2.16.0"
 cairo-lang-starknet-classes = "2.16.0"
 clap = { version = "4", features = ["derive"] }
+include_dir = "0.7"
 libc = "0.2"
 mimalloc = { version = "0.1", default-features = false }
 notify = "6"
