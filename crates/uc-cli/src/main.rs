@@ -4441,7 +4441,8 @@ fn corelib_source_tree_fingerprint(corelib_src: &Path) -> Result<String> {
     let canonical_corelib_src = corelib_src
         .canonicalize()
         .with_context(|| format!("failed to canonicalize {}", corelib_src.display()))?;
-    let mut files = Vec::<(String, u64, u64, u64)>::new();
+    let mut files = Vec::<(String, u64, String)>::new();
+    let mut total_bytes: u64 = 0;
     for entry in WalkDir::new(&canonical_corelib_src)
         .follow_links(false)
         .into_iter()
@@ -4459,8 +4460,29 @@ fn corelib_source_tree_fingerprint(corelib_src: &Path) -> Result<String> {
         }
         let metadata = fs::metadata(entry.path())
             .with_context(|| format!("failed to stat {}", entry.path().display()))?;
-        let modified_unix_ms = metadata_modified_unix_ms(&metadata)?;
-        let change_unix_ms = metadata_change_unix_ms(&metadata).unwrap_or(modified_unix_ms);
+        if metadata.len() > max_fingerprint_file_bytes() {
+            bail!(
+                "corelib fingerprint input {} exceeds per-file limit ({} > {})",
+                entry.path().display(),
+                metadata.len(),
+                max_fingerprint_file_bytes()
+            );
+        }
+        total_bytes = total_bytes.saturating_add(metadata.len());
+        if total_bytes > max_fingerprint_total_bytes() {
+            bail!(
+                "corelib fingerprint inputs exceed total size limit ({} > {}) under {}",
+                total_bytes,
+                max_fingerprint_total_bytes(),
+                canonical_corelib_src.display()
+            );
+        }
+        let contents = read_bytes_with_limit(
+            entry.path(),
+            max_fingerprint_file_bytes(),
+            "corelib fingerprint input",
+        )?;
+        let content_hash = blake3::hash(&contents).to_hex().to_string();
         let relative = entry
             .path()
             .strip_prefix(&canonical_corelib_src)
@@ -4468,20 +4490,17 @@ fn corelib_source_tree_fingerprint(corelib_src: &Path) -> Result<String> {
         files.push((
             normalize_fingerprint_path(relative),
             metadata.len(),
-            modified_unix_ms,
-            change_unix_ms,
+            content_hash,
         ));
     }
     files.sort_by(|left, right| left.0.cmp(&right.0));
     let mut hasher = Hasher::new();
-    hasher.update(b"uc-corelib-sierra-blob-fingerprint-v1");
-    hasher.update(normalize_fingerprint_path(&canonical_corelib_src).as_bytes());
+    hasher.update(b"uc-corelib-sierra-blob-fingerprint-v2");
     hasher.update(&(files.len() as u64).to_le_bytes());
-    for (path, size_bytes, modified_unix_ms, change_unix_ms) in files {
+    for (path, size_bytes, content_hash) in files {
         hasher.update(path.as_bytes());
         hasher.update(&size_bytes.to_le_bytes());
-        hasher.update(&modified_unix_ms.to_le_bytes());
-        hasher.update(&change_unix_ms.to_le_bytes());
+        hasher.update(content_hash.as_bytes());
     }
     Ok(hasher.finalize().to_hex().to_string())
 }

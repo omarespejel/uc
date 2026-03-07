@@ -197,23 +197,30 @@ fn corelib_candidate_paths() -> Vec<PathBuf> {
 
 fn emit_corelib_candidate_rerun_hints(candidates: &[PathBuf]) {
     for candidate in candidates {
+        // Avoid non-existent paths: Cargo treats missing rerun-if-changed paths
+        // as "always dirty", which forces build.rs to rerun every invocation.
+        if !candidate.exists() {
+            continue;
+        }
         println!("cargo:rerun-if-changed={}", candidate.display());
         if let Some(parent) = candidate.parent() {
             let manifest = parent.join("Scarb.toml");
-            println!("cargo:rerun-if-changed={}", manifest.display());
+            if manifest.exists() {
+                println!("cargo:rerun-if-changed={}", manifest.display());
+            }
         }
-        println!(
-            "cargo:rerun-if-changed={}",
-            candidate.join("lib.cairo").display()
-        );
-        println!(
-            "cargo:rerun-if-changed={}",
-            candidate.join("prelude.cairo").display()
-        );
-        println!(
-            "cargo:rerun-if-changed={}",
-            candidate.join("ops.cairo").display()
-        );
+        let lib = candidate.join("lib.cairo");
+        if lib.exists() {
+            println!("cargo:rerun-if-changed={}", lib.display());
+        }
+        let prelude = candidate.join("prelude.cairo");
+        if prelude.exists() {
+            println!("cargo:rerun-if-changed={}", prelude.display());
+        }
+        let ops = candidate.join("ops.cairo");
+        if ops.exists() {
+            println!("cargo:rerun-if-changed={}", ops.display());
+        }
     }
 }
 

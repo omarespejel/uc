@@ -18,6 +18,7 @@ native-compile = [
   "dep:cairo-lang-starknet",
   "dep:cairo-lang-starknet-classes",
   "dep:notify",
+  "dep:postcard",
   "dep:scarb-stable-hash",
 ]
 # Embedded corelib path is compile-time optional so local/dev builds can opt out.
@@ -41,7 +42,7 @@ include_dir = { workspace = true, optional = true }
 libc.workspace = true
 mimalloc = { workspace = true, optional = true }
 notify = { workspace = true, optional = true }
-postcard.workspace = true
+postcard = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 scarb-stable-hash = { workspace = true, optional = true }

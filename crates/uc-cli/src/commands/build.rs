@@ -1210,7 +1210,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
     if should_log_phase_telemetry() {
         if let Some(telemetry) = phase_telemetry.as_ref() {
             eprintln!(
-                "uc: phase timings (ms) fingerprint={:.3} cache_lookup={:.3} cache_restore={:.3} compile={:.3} cache_persist={:.3} async={} scheduled={} daemon_used={} cache_hit={} native_context={:.3} native_target_dir={:.3} native_session_prepare={:.3} native_frontend_compile={:.3} native_casm={:.3} native_artifact_write={:.3} native_find_contracts={:.3} native_db_init={:.3} native_setup_project={:.3} native_source_scan={:.3} native_drift_scan={:.3}",
+                "uc: phase timings (ms) fingerprint={:.3} cache_lookup={:.3} cache_restore={:.3} compile={:.3} cache_persist={:.3} async={} scheduled={} daemon_used={} cache_hit={} native_context={:.3} native_target_dir={:.3} native_session_prepare={:.3} native_frontend_compile={:.3} native_casm={:.3} native_artifact_write={:.3} native_find_contracts={:.3} native_db_init={:.3} native_setup_project={:.3} native_crate_cache_restore={:.3} native_source_scan={:.3} native_session_image_persist={:.3} native_buildinfo_persist={:.3} native_drift_scan={:.3}",
                 telemetry.fingerprint_ms,
                 telemetry.cache_lookup_ms,
                 telemetry.cache_restore_ms,
@@ -1229,7 +1229,10 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                 telemetry.native_find_contracts_ms,
                 telemetry.native_db_init_ms,
                 telemetry.native_setup_project_ms,
+                telemetry.native_crate_cache_restore_ms,
                 telemetry.native_source_scan_ms,
+                telemetry.native_session_image_persist_ms,
+                telemetry.native_buildinfo_persist_ms,
                 telemetry.native_drift_scan_ms,
             );
         }

@@ -9742,6 +9742,27 @@ fn phase6_corelib_sierra_blob_path_under_home() {
 
 #[cfg(feature = "native-compile")]
 #[test]
+fn phase6_corelib_fingerprint_stable_when_only_mtime_changes() {
+    let dir = unique_test_dir("uc-phase6-fingerprint-mtime-stability");
+    let corelib_src = dir.join("corelib/src");
+    create_mock_native_corelib(&corelib_src);
+    let fingerprint_before =
+        corelib_source_tree_fingerprint(&corelib_src).expect("should fingerprint corelib");
+    let lib_path = corelib_src.join("lib.cairo");
+    let same_contents = fs::read(&lib_path).expect("should read lib.cairo");
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    fs::write(&lib_path, same_contents).expect("should rewrite lib.cairo with identical content");
+    let fingerprint_after =
+        corelib_source_tree_fingerprint(&corelib_src).expect("should fingerprint corelib again");
+    assert_eq!(
+        fingerprint_before, fingerprint_after,
+        "phase-6 fingerprint should be content-stable across mtime-only changes"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
 fn phase6_try_restore_returns_false_when_no_blob() {
     // When no pre-compiled blob exists, try_restore should return false without panicking.
     // We test this with a fresh DB that has no corelib blob in the global cache.
