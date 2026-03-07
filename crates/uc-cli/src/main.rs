@@ -5638,6 +5638,57 @@ fn native_contract_name(module_path: &str) -> &str {
 }
 
 #[cfg(feature = "native-compile")]
+fn native_select_primary_contract_crate_ids<'db>(
+    db: &'db RootDatabase,
+    all_crate_ids: &[cairo_lang_filesystem::ids::CrateId<'db>],
+    context: &NativeCompileContext,
+) -> Vec<cairo_lang_filesystem::ids::CrateId<'db>> {
+    let expected_root = normalize_fingerprint_path(&context.main_source_root);
+    let mut root_and_name_matches = Vec::new();
+    let mut name_only_matches = Vec::new();
+
+    for crate_id in all_crate_ids.iter().copied() {
+        let CrateLongId::Real { name, .. } = crate_id.long(db) else {
+            continue;
+        };
+        if name.to_string(db) != context.crate_name {
+            continue;
+        }
+        name_only_matches.push(crate_id);
+        let Some(config) = db.crate_config(crate_id) else {
+            continue;
+        };
+        let Directory::Real(root) = &config.root else {
+            continue;
+        };
+        if normalize_fingerprint_path(root) == expected_root {
+            root_and_name_matches.push(crate_id);
+        }
+    }
+
+    if !root_and_name_matches.is_empty() {
+        return root_and_name_matches;
+    }
+    if !name_only_matches.is_empty() {
+        tracing::debug!(
+            expected_crate = %context.crate_name,
+            expected_root = %context.main_source_root.display(),
+            selected = name_only_matches.len(),
+            "native contract crate scope fell back to crate-name match without root-path match"
+        );
+        return name_only_matches;
+    }
+
+    tracing::warn!(
+        expected_crate = %context.crate_name,
+        expected_root = %context.main_source_root.display(),
+        available_crates = all_crate_ids.len(),
+        "native contract crate scope could not find expected root crate; falling back to all crates"
+    );
+    all_crate_ids.to_vec()
+}
+
+#[cfg(feature = "native-compile")]
 fn native_contract_file_stems(module_paths: &[String]) -> Vec<String> {
     let mut seen_names = HashSet::new();
     let duplicate_names: HashSet<String> = module_paths
@@ -8840,8 +8891,10 @@ fn run_native_build_inner(
                 ));
             }
         }
-        let crate_ids =
+        let all_crate_ids =
             CrateInput::into_crate_ids(&session.db, session.main_crate_inputs.iter().cloned());
+        let crate_ids =
+            native_select_primary_contract_crate_ids(&session.db, &all_crate_ids, &context);
         let contracts = find_contracts(&session.db, &crate_ids);
 
         if contracts.is_empty() {

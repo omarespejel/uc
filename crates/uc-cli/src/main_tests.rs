@@ -5700,6 +5700,163 @@ fn native_contract_file_stems_disambiguate_non_injective_module_path_collisions(
 }
 
 #[cfg(feature = "native-compile")]
+fn native_test_context_for_contract_scope(
+    crate_name: &str,
+    main_source_root: PathBuf,
+) -> NativeCompileContext {
+    NativeCompileContext {
+        package_name: crate_name.to_string(),
+        crate_name: crate_name.to_string(),
+        main_source_root,
+        workspace_mode_supported: true,
+        cairo_project_dir: PathBuf::from("/tmp/uc-native-project"),
+        corelib_src: PathBuf::from("/tmp/uc-corelib/src"),
+        starknet_target: NativeStarknetTargetProps {
+            sierra: true,
+            casm: true,
+        },
+        manifest_content_hash: "manifest-blake3:test".to_string(),
+        external_non_starknet_dependencies: Vec::new(),
+        path_dependency_roots: Vec::new(),
+        crate_dependency_configs: Vec::new(),
+    }
+}
+
+#[cfg(feature = "native-compile")]
+fn native_test_db_with_real_crates(crates: &[(CrateInput, PathBuf)]) -> RootDatabase {
+    let mut db = RootDatabase::builder()
+        .build()
+        .expect("failed to create native test RootDatabase");
+    let db_ref: &dyn salsa::Database = &db;
+    let mut crate_configs = files_group_input(db_ref)
+        .crate_configs(db_ref)
+        .clone()
+        .unwrap_or_default();
+    for (crate_input, root) in crates {
+        fs::create_dir_all(root).expect("failed to create crate source root");
+        crate_configs.insert(
+            crate_input.clone(),
+            CrateConfigurationInput {
+                root: cairo_lang_filesystem::ids::DirectoryInput::Real(root.clone()),
+                settings: Default::default(),
+                cache_file: None,
+            },
+        );
+    }
+    set_crate_configs_input(&mut db, crate_configs);
+    db
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_select_primary_contract_crate_ids_prefers_root_and_name_match() {
+    let dir = unique_test_dir("uc-native-contract-crate-scope-root-match");
+    let root_src = dir.join("workspace/src");
+    let dep_src = dir.join("deps/demo/src");
+    let util_src = dir.join("deps/util/src");
+
+    let root_input = CrateInput::Real {
+        name: "demo".to_string(),
+        discriminator: None,
+    };
+    let dep_input = CrateInput::Real {
+        name: "demo".to_string(),
+        discriminator: Some("dep".to_string()),
+    };
+    let util_input = CrateInput::Real {
+        name: "util".to_string(),
+        discriminator: None,
+    };
+
+    let db = native_test_db_with_real_crates(&[
+        (root_input.clone(), root_src.clone()),
+        (dep_input.clone(), dep_src),
+        (util_input.clone(), util_src),
+    ]);
+    let all = CrateInput::into_crate_ids(
+        &db,
+        [root_input.clone(), dep_input.clone(), util_input.clone()],
+    );
+    let expected = CrateInput::into_crate_ids(&db, [root_input])
+        .into_iter()
+        .next()
+        .expect("root crate should intern");
+    let context = native_test_context_for_contract_scope("demo", root_src);
+
+    let selected = native_select_primary_contract_crate_ids(&db, &all, &context);
+    assert_eq!(
+        selected,
+        vec![expected],
+        "contract discovery should target only the workspace root crate when available"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_select_primary_contract_crate_ids_falls_back_to_name_match_when_root_differs() {
+    let dir = unique_test_dir("uc-native-contract-crate-scope-name-fallback");
+    let demo_src = dir.join("workspace/demo/src");
+    let util_src = dir.join("workspace/util/src");
+
+    let demo_input = CrateInput::Real {
+        name: "demo".to_string(),
+        discriminator: None,
+    };
+    let util_input = CrateInput::Real {
+        name: "util".to_string(),
+        discriminator: None,
+    };
+
+    let db = native_test_db_with_real_crates(&[
+        (demo_input.clone(), demo_src.clone()),
+        (util_input.clone(), util_src),
+    ]);
+    let all = CrateInput::into_crate_ids(&db, [demo_input.clone(), util_input.clone()]);
+    let expected = CrateInput::into_crate_ids(&db, [demo_input])
+        .into_iter()
+        .next()
+        .expect("demo crate should intern");
+    let context = native_test_context_for_contract_scope("demo", dir.join("missing/src"));
+
+    let selected = native_select_primary_contract_crate_ids(&db, &all, &context);
+    assert_eq!(
+        selected,
+        vec![expected],
+        "when source-root match is unavailable, scope should still target matching crate names"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_select_primary_contract_crate_ids_falls_back_to_all_crates_when_unmatched() {
+    let dir = unique_test_dir("uc-native-contract-crate-scope-all-fallback");
+    let demo_src = dir.join("workspace/demo/src");
+    let util_src = dir.join("workspace/util/src");
+
+    let demo_input = CrateInput::Real {
+        name: "demo".to_string(),
+        discriminator: None,
+    };
+    let util_input = CrateInput::Real {
+        name: "util".to_string(),
+        discriminator: None,
+    };
+
+    let db = native_test_db_with_real_crates(&[
+        (demo_input.clone(), demo_src),
+        (util_input.clone(), util_src),
+    ]);
+    let all = CrateInput::into_crate_ids(&db, [demo_input, util_input]);
+    let context = native_test_context_for_contract_scope("missing", dir.join("missing/src"));
+
+    let selected = native_select_primary_contract_crate_ids(&db, &all, &context);
+    assert_eq!(
+        selected, all,
+        "unmatched crate names should preserve previous full-scope behavior for safety"
+    );
+}
+
+#[cfg(feature = "native-compile")]
 #[test]
 fn write_native_sierra_artifact_does_not_prune_when_write_fails() {
     let dir = unique_test_dir("uc-native-write-before-prune");
