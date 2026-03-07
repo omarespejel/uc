@@ -1,3 +1,7 @@
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use anyhow::{bail, Context, Result};
 use blake3::Hasher;
 #[cfg(feature = "native-compile")]
@@ -20,7 +24,7 @@ use cairo_lang_filesystem::db::{
 #[cfg(feature = "native-compile")]
 use cairo_lang_filesystem::detect::detect_corelib;
 #[cfg(feature = "native-compile")]
-use cairo_lang_filesystem::ids::{BlobLongId, CrateInput, CrateLongId, Directory};
+use cairo_lang_filesystem::ids::{BlobLongId, CrateId, CrateInput, CrateLongId, Directory};
 #[cfg(feature = "native-compile")]
 use cairo_lang_filesystem::ids::{FileId, FileLongId};
 #[cfg(feature = "native-compile")]
@@ -40,6 +44,12 @@ use cairo_lang_starknet_classes::casm_contract_class::CasmContractClass;
 #[cfg(feature = "native-compile")]
 use cairo_lang_starknet_classes::contract_class::ContractClass;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+#[cfg(all(
+    feature = "native-compile",
+    feature = "embedded-corelib",
+    not(uc_no_embedded_corelib)
+))]
+use include_dir::{include_dir, Dir};
 #[cfg(feature = "native-compile")]
 use notify::event::{ModifyKind as NotifyModifyKind, RenameMode as NotifyRenameMode};
 #[cfg(feature = "native-compile")]
@@ -52,7 +62,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
-#[cfg(target_os = "linux")]
+#[cfg(all(unix, feature = "embedded-corelib"))]
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStrExt;
@@ -91,6 +101,18 @@ use commands::{run_build, run_compare_build, run_metadata, run_migrate};
 #[allow(unused_imports)]
 use daemon::*;
 use fingerprint::*;
+
+/// Embedded corelib source tree (Phase 5: cold-path supremacy).
+/// At compile time, build.rs discovers the Cairo corelib and sets
+/// `UC_CORELIB_SRC_DIR`; we embed the entire `corelib/src/` directory
+/// so the binary is self-contained and the runtime corelib search is
+/// eliminated on first run.
+#[cfg(all(
+    feature = "native-compile",
+    feature = "embedded-corelib",
+    not(uc_no_embedded_corelib)
+))]
+static EMBEDDED_CORELIB: Dir<'_> = include_dir!("$UC_CORELIB_SRC_DIR");
 
 const BUILD_CACHE_SCHEMA_VERSION: u32 = 1;
 const MIN_HASH_LEN: usize = 2;
@@ -176,13 +198,21 @@ const DEFAULT_NATIVE_COMPILE_SESSION_MEMORY_MULTIPLIER: u64 = 64;
 #[cfg(feature = "native-compile")]
 const DEFAULT_NATIVE_COMPILE_SESSION_MEMORY_BASE_OVERHEAD_BYTES: u64 = 32 * 1024 * 1024;
 #[cfg(feature = "native-compile")]
-const NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION: u32 = 1;
+// Phase 4: bumped from 1 → 2 for postcard binary serialization (with JSON-v1 fallback).
+const NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION: u32 = 2;
+#[cfg(feature = "native-compile")]
+const NATIVE_COMPILE_SESSION_IMAGE_LEGACY_JSON_SCHEMA_VERSION: u32 = 1;
 #[cfg(feature = "native-compile")]
 const MAX_NATIVE_COMPILE_SESSION_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 #[cfg(feature = "native-compile")]
-const NATIVE_BUILDINFO_SCHEMA_VERSION: u32 = 1;
+// Phase 4: bumped from 1 → 2 for postcard binary serialization (with JSON-v1 fallback).
+const NATIVE_BUILDINFO_SCHEMA_VERSION: u32 = 2;
+#[cfg(feature = "native-compile")]
+const NATIVE_BUILDINFO_LEGACY_JSON_SCHEMA_VERSION: u32 = 1;
 #[cfg(feature = "native-compile")]
 const MAX_NATIVE_BUILDINFO_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(feature = "native-compile")]
+const MAX_CORELIB_SIERRA_BLOB_BYTES: u64 = 64 * 1024 * 1024;
 #[cfg(feature = "native-compile")]
 const NATIVE_CRATE_CACHE_ENTRY_SCHEMA_VERSION: u32 = 1;
 #[cfg(feature = "native-compile")]
@@ -275,10 +305,17 @@ struct CacheArgs {
 #[derive(Subcommand, Debug)]
 enum CacheCommand {
     Clean(CacheCleanArgs),
+    Inspect(CacheInspectArgs),
 }
 
 #[derive(Args, Debug, Clone)]
 struct CacheCleanArgs {
+    #[arg(long)]
+    manifest_path: Option<PathBuf>,
+}
+
+#[derive(Args, Debug, Clone)]
+struct CacheInspectArgs {
     #[arg(long)]
     manifest_path: Option<PathBuf>,
 }
@@ -565,6 +602,23 @@ struct BuildPhaseTelemetry {
     native_impacted_subset_used: bool,
     #[serde(default)]
     native_journal_fallback_full_scan: bool,
+    // Phase 0 cold-path diagnostics: sub-timings for session_prepare_ms breakdown
+    #[serde(default)]
+    native_db_init_ms: f64,
+    #[serde(default)]
+    native_setup_project_ms: f64,
+    #[serde(default)]
+    native_crate_cache_restore_ms: f64,
+    #[serde(default)]
+    native_source_scan_ms: f64,
+    #[serde(default)]
+    native_find_contracts_ms: f64,
+    #[serde(default)]
+    native_session_image_persist_ms: f64,
+    #[serde(default)]
+    native_buildinfo_persist_ms: f64,
+    #[serde(default)]
+    native_drift_scan_ms: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -581,6 +635,15 @@ struct NativeBuildPhaseTelemetry {
     compiled_contracts: u64,
     impacted_subset_used: bool,
     journal_fallback_full_scan: bool,
+    // Phase 0 sub-timings: break down session_prepare_ms into actionable components
+    db_init_ms: f64,
+    setup_project_ms: f64,
+    crate_cache_restore_ms: f64,
+    source_scan_ms: f64,
+    find_contracts_ms: f64,
+    session_image_persist_ms: f64,
+    buildinfo_persist_ms: f64,
+    drift_scan_ms: f64,
 }
 
 #[derive(Copy, Clone)]
@@ -916,6 +979,17 @@ struct NativeCompileSessionState {
     source_root_modified_unix_ms: u64,
     contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
     contract_output_plans: Vec<NativeContractOutputPlan>,
+    // Phase 0 sub-timings from build_native_compile_session_state
+    build_db_init_ms: f64,
+    build_setup_project_ms: f64,
+    build_crate_cache_restore_ms: f64,
+    build_source_scan_ms: f64,
+    build_session_image_persist_ms: f64,
+    build_buildinfo_persist_ms: f64,
+    // Phase 2: true when tracked_sources were freshly scanned from disk
+    // (not restored from image/buildinfo/replay). Only skip the drift scan
+    // when this is true, since restored tracked_sources may be stale.
+    fresh_source_scan: bool,
 }
 
 #[cfg(feature = "native-compile")]
@@ -927,6 +1001,20 @@ struct NativeCompileSessionSnapshot {
     journal_fallback_full_scan: bool,
     contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
     contract_output_plans: Vec<NativeContractOutputPlan>,
+    build_db_init_ms: f64,
+    build_setup_project_ms: f64,
+    build_crate_cache_restore_ms: f64,
+    build_source_scan_ms: f64,
+    build_session_image_persist_ms: f64,
+    build_buildinfo_persist_ms: f64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+#[cfg(feature = "native-compile")]
+struct NativeSessionRuntimeTelemetry {
+    drift_scan_ms: f64,
+    session_image_persist_ms: f64,
+    buildinfo_persist_ms: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1566,7 +1654,7 @@ fn main() -> Result<()> {
     init_observability();
     let cli = Cli::parse();
 
-    match cli.command {
+    let result = match cli.command {
         Commands::Daemon(args) => run_daemon(args),
         #[cfg(feature = "dev-benchmark-command")]
         Commands::Benchmark(args) => benchmark_cmd::run(args),
@@ -1576,7 +1664,12 @@ fn main() -> Result<()> {
         Commands::Metadata(args) => run_metadata(args),
         Commands::CompareBuild(args) => run_compare_build(args),
         Commands::Migrate(args) => run_migrate(args),
-    }
+    };
+    // Phase 1: drain any in-flight async persistence threads before exiting
+    // so that session images / buildinfo sidecars are fully written to disk.
+    #[cfg(feature = "native-compile")]
+    cold_path_async_persist_drain();
+    result
 }
 
 fn init_observability() {
@@ -2494,6 +2587,7 @@ fn run_daemon(args: DaemonArgs) -> Result<()> {
 fn run_cache(args: CacheArgs) -> Result<()> {
     match args.command {
         CacheCommand::Clean(clean) => run_cache_clean(clean),
+        CacheCommand::Inspect(inspect) => run_cache_inspect(inspect),
     }
 }
 
@@ -2512,6 +2606,61 @@ fn run_cache_clean(args: CacheCleanArgs) -> Result<()> {
         .with_context(|| format!("failed to remove cache directory {}", cache_root.display()))?;
     println!("uc cache cleaned: {}", cache_root.display());
     Ok(())
+}
+
+fn run_cache_inspect(args: CacheInspectArgs) -> Result<()> {
+    let manifest_path = resolve_manifest_path(&args.manifest_path)?;
+    let workspace_root = manifest_path
+        .parent()
+        .context("manifest path has no parent")?
+        .to_path_buf();
+    #[cfg(not(feature = "native-compile"))]
+    {
+        let _ = workspace_root;
+        bail!("`uc cache inspect` requires the `native-compile` feature");
+    }
+    #[cfg(feature = "native-compile")]
+    {
+        let image_path = native_compile_session_image_path(&workspace_root)?;
+        let buildinfo_path = native_buildinfo_sidecar_path(&workspace_root)?;
+        let mut found_any = false;
+
+        if image_path.is_file() {
+            found_any = true;
+            let (image, encoding) = decode_native_compile_session_image_file(&image_path)?;
+            println!(
+                "session_image: path={} encoding={} schema_version={}",
+                image_path.display(),
+                encoding,
+                image.schema_version
+            );
+            println!("{}", serde_json::to_string_pretty(&image)?);
+        } else {
+            println!("session_image: missing ({})", image_path.display());
+        }
+
+        if buildinfo_path.is_file() {
+            found_any = true;
+            let (buildinfo, encoding) = decode_native_buildinfo_file(&buildinfo_path)?;
+            println!(
+                "buildinfo: path={} encoding={} schema_version={}",
+                buildinfo_path.display(),
+                encoding,
+                buildinfo.schema_version
+            );
+            println!("{}", serde_json::to_string_pretty(&buildinfo)?);
+        } else {
+            println!("buildinfo: missing ({})", buildinfo_path.display());
+        }
+
+        if !found_any {
+            println!(
+                "uc cache inspect: no native session/buildinfo files found under {}",
+                workspace_root.join(".uc/cache").display()
+            );
+        }
+        Ok(())
+    }
 }
 
 fn run_daemon_start(args: DaemonSocketArgs) -> Result<()> {
@@ -3847,6 +3996,15 @@ fn run_build_with_uc_cache(
         telemetry.native_impacted_subset_used = native_phase_telemetry.impacted_subset_used;
         telemetry.native_journal_fallback_full_scan =
             native_phase_telemetry.journal_fallback_full_scan;
+        // Phase 0: propagate cold-path sub-timings for diagnostics
+        telemetry.native_db_init_ms = native_phase_telemetry.db_init_ms;
+        telemetry.native_setup_project_ms = native_phase_telemetry.setup_project_ms;
+        telemetry.native_crate_cache_restore_ms = native_phase_telemetry.crate_cache_restore_ms;
+        telemetry.native_source_scan_ms = native_phase_telemetry.source_scan_ms;
+        telemetry.native_find_contracts_ms = native_phase_telemetry.find_contracts_ms;
+        telemetry.native_session_image_persist_ms = native_phase_telemetry.session_image_persist_ms;
+        telemetry.native_buildinfo_persist_ms = native_phase_telemetry.buildinfo_persist_ms;
+        telemetry.native_drift_scan_ms = native_phase_telemetry.drift_scan_ms;
     }
 
     if run.exit_code == 0 {
@@ -4144,8 +4302,492 @@ fn toml_escape_basic_string(raw: &str) -> String {
     escaped
 }
 
+/// Returns the platform-appropriate global cache directory for uc.
+/// macOS: ~/Library/Caches/uc
+/// Linux: ~/.cache/uc
+#[cfg(feature = "native-compile")]
+fn uc_global_cache_dir() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME environment variable not set")?;
+    #[cfg(target_os = "macos")]
+    let base = home.join("Library/Caches/uc");
+    #[cfg(not(target_os = "macos"))]
+    let base = home.join(".cache/uc");
+    Ok(base)
+}
+
+#[cfg(all(
+    feature = "native-compile",
+    feature = "embedded-corelib",
+    not(uc_no_embedded_corelib),
+    unix
+))]
+fn acquire_embedded_corelib_extraction_lock(cache_dir: &Path, version: &str) -> Result<File> {
+    let lock_path = cache_dir.join(format!("corelib-v{version}.extract.lock"));
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open {}", lock_path.display()))?;
+    // Try non-blocking first so we can log a diagnostic if another process holds it.
+    // SAFETY: `lock_file` is a valid open fd; flock is signal-safe.
+    let nb_result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if nb_result != 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::WouldBlock {
+            tracing::info!(
+                path = %lock_path.display(),
+                "phase-5: another process is extracting the embedded corelib; waiting for lock"
+            );
+            // SAFETY: same fd, blocking this time.
+            let blocking_result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
+            if blocking_result != 0 {
+                bail!(
+                    "failed to lock embedded corelib extraction file {}: {}",
+                    lock_path.display(),
+                    io::Error::last_os_error()
+                );
+            }
+        } else {
+            bail!(
+                "failed to lock embedded corelib extraction file {}: {}",
+                lock_path.display(),
+                err
+            );
+        }
+    }
+    Ok(lock_file)
+}
+
+/// Extract the compile-time-embedded corelib to a versioned cache directory.
+/// Returns the path to the extracted `corelib/src/` directory.
+///
+/// The extraction is idempotent: a `.uc-extracted-ok` marker file is written
+/// after successful extraction, and subsequent calls return immediately.
+#[cfg(all(
+    feature = "native-compile",
+    feature = "embedded-corelib",
+    not(uc_no_embedded_corelib)
+))]
+fn extract_embedded_corelib() -> Result<PathBuf> {
+    let version = native_cairo_lang_compiler_version();
+    let cache_dir = uc_global_cache_dir()?;
+    let target_root = cache_dir.join(format!("corelib-v{version}"));
+    let target_dir = target_root.join("src");
+    let marker = target_dir.join(".uc-extracted-ok");
+
+    if marker.is_file() && native_corelib_layout_looks_compatible(&target_dir) {
+        tracing::debug!(
+            corelib_src = %target_dir.display(),
+            "phase-5: using previously extracted embedded corelib"
+        );
+        return Ok(target_dir);
+    }
+
+    fs::create_dir_all(&cache_dir)
+        .with_context(|| format!("failed to create cache dir {}", cache_dir.display()))?;
+    // Serialize extraction into the shared cache to avoid concurrent remove/write races.
+    #[cfg(unix)]
+    let _extract_lock = acquire_embedded_corelib_extraction_lock(&cache_dir, &version)?;
+
+    // Another process may have completed extraction while we waited on the lock.
+    if marker.is_file() && native_corelib_layout_looks_compatible(&target_dir) {
+        tracing::debug!(
+            corelib_src = %target_dir.display(),
+            "phase-5: using previously extracted embedded corelib after lock acquisition"
+        );
+        return Ok(target_dir);
+    }
+
+    // Clean up stale staging directories left behind by killed processes.
+    let tmp_prefix = format!("corelib-v{version}.tmp-");
+    if let Ok(entries) = fs::read_dir(&cache_dir) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&tmp_prefix)
+            {
+                tracing::debug!(
+                    path = %entry.path().display(),
+                    "phase-5: removing stale staging directory"
+                );
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+
+    let stage_root = cache_dir.join(format!(
+        "corelib-v{version}.tmp-{}-{}",
+        std::process::id(),
+        epoch_ms_u64().unwrap_or_default()
+    ));
+    let stage_dir = stage_root.join("src");
+    if stage_root.exists() {
+        let _ = fs::remove_dir_all(&stage_root);
+    }
+    // Marker missing or layout broken; (re-)extract into the staging directory.
+    if target_root.exists() {
+        tracing::debug!(
+            target = %target_root.display(),
+            "phase-5: removing stale embedded corelib extraction"
+        );
+        let _ = fs::remove_dir_all(&target_root);
+    }
+
+    let file_count = count_embedded_files(&EMBEDDED_CORELIB);
+    tracing::debug!(
+        target = %target_root.display(),
+        file_count,
+        "phase-5: extracting embedded corelib to staging cache directory"
+    );
+
+    let start = Instant::now();
+    extract_embedded_dir_recursive(&EMBEDDED_CORELIB, &stage_dir)?;
+
+    // Write marker after all files are on disk in staging.
+    fs::write(
+        stage_dir.join(".uc-extracted-ok"),
+        format!(
+            "extracted by uc v{} at {}\n",
+            env!("CARGO_PKG_VERSION"),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        ),
+    )
+    .context("failed to write embedded corelib extraction marker")?;
+    if target_root.exists() {
+        fs::remove_dir_all(&target_root).with_context(|| {
+            format!(
+                "failed to remove stale embedded corelib target {}",
+                target_root.display()
+            )
+        })?;
+    }
+    if let Err(err) = fs::rename(&stage_root, &target_root) {
+        let _ = fs::remove_dir_all(&stage_root);
+        return Err(err).with_context(|| {
+            format!(
+                "failed to atomically move {} into {}",
+                stage_root.display(),
+                target_root.display()
+            )
+        });
+    }
+
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    tracing::debug!(
+        elapsed_ms,
+        target = %target_root.display(),
+        file_count,
+        "phase-5: embedded corelib extraction complete"
+    );
+
+    Ok(target_dir)
+}
+
+#[cfg(all(
+    feature = "native-compile",
+    feature = "embedded-corelib",
+    not(uc_no_embedded_corelib)
+))]
+fn extract_embedded_dir_recursive(dir: &Dir<'_>, target: &Path) -> Result<()> {
+    fs::create_dir_all(target)
+        .with_context(|| format!("failed to create dir {}", target.display()))?;
+    for file in dir.files() {
+        let file_name = file
+            .path()
+            .file_name()
+            .context("embedded file has no name")?;
+        fs::write(target.join(file_name), file.contents()).with_context(|| {
+            format!(
+                "failed to write embedded file {}",
+                target.join(file_name).display()
+            )
+        })?;
+    }
+    for subdir in dir.dirs() {
+        let subdir_name = subdir
+            .path()
+            .file_name()
+            .context("embedded dir has no name")?;
+        extract_embedded_dir_recursive(subdir, &target.join(subdir_name))?;
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    feature = "native-compile",
+    feature = "embedded-corelib",
+    not(uc_no_embedded_corelib)
+))]
+fn count_embedded_files(dir: &Dir<'_>) -> usize {
+    let mut count = dir.files().count();
+    for subdir in dir.dirs() {
+        count += count_embedded_files(subdir);
+    }
+    count
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: Pre-compiled corelib Sierra blob
+// ---------------------------------------------------------------------------
+//
+// The corelib is identical for a given cairo-lang compiler version. We can
+// generate its lowering cache blob once (after the first build) and reuse it
+// across ALL projects, eliminating ~300-500ms of Salsa evaluation on every
+// cold start.
+
+#[cfg(feature = "native-compile")]
+fn corelib_source_tree_fingerprint(corelib_src: &Path) -> Result<String> {
+    let canonical_corelib_src = corelib_src
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", corelib_src.display()))?;
+    let mut files = Vec::<(String, u64, String)>::new();
+    let mut total_bytes: u64 = 0;
+    for entry in WalkDir::new(&canonical_corelib_src)
+        .follow_links(false)
+        .into_iter()
+        .flatten()
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if files.len() >= max_fingerprint_files() {
+            bail!(
+                "corelib fingerprint scan found too many files (>{}) under {}",
+                max_fingerprint_files(),
+                canonical_corelib_src.display()
+            );
+        }
+        let metadata = fs::metadata(entry.path())
+            .with_context(|| format!("failed to stat {}", entry.path().display()))?;
+        if metadata.len() > max_fingerprint_file_bytes() {
+            bail!(
+                "corelib fingerprint input {} exceeds per-file limit ({} > {})",
+                entry.path().display(),
+                metadata.len(),
+                max_fingerprint_file_bytes()
+            );
+        }
+        total_bytes = total_bytes.saturating_add(metadata.len());
+        if total_bytes > max_fingerprint_total_bytes() {
+            bail!(
+                "corelib fingerprint inputs exceed total size limit ({} > {}) under {}",
+                total_bytes,
+                max_fingerprint_total_bytes(),
+                canonical_corelib_src.display()
+            );
+        }
+        let contents = read_bytes_with_limit(
+            entry.path(),
+            max_fingerprint_file_bytes(),
+            "corelib fingerprint input",
+        )?;
+        let content_hash = blake3::hash(&contents).to_hex().to_string();
+        let relative = entry
+            .path()
+            .strip_prefix(&canonical_corelib_src)
+            .unwrap_or(entry.path());
+        files.push((
+            normalize_fingerprint_path(relative),
+            metadata.len(),
+            content_hash,
+        ));
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = Hasher::new();
+    hasher.update(b"uc-corelib-sierra-blob-fingerprint-v2");
+    hasher.update(&(files.len() as u64).to_le_bytes());
+    for (path, size_bytes, content_hash) in files {
+        hasher.update(path.as_bytes());
+        hasher.update(&size_bytes.to_le_bytes());
+        hasher.update(content_hash.as_bytes());
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Path to the pre-compiled corelib Sierra blob in the global cache.
+#[cfg(feature = "native-compile")]
+fn corelib_sierra_blob_path(corelib_src: &Path) -> Result<PathBuf> {
+    let version = native_cairo_lang_compiler_version();
+    let fingerprint = corelib_source_tree_fingerprint(corelib_src)?;
+    let cache_dir = uc_global_cache_dir()?;
+    Ok(cache_dir.join(format!("corelib-sierra-v{version}-{fingerprint}.blob")))
+}
+
+/// Try to load a pre-compiled corelib Sierra blob and inject it into the
+/// corelib crate's `cache_file` in the DB.
+///
+/// Returns `true` if the blob was successfully loaded and injected.
+#[cfg(feature = "native-compile")]
+fn try_restore_corelib_sierra_blob(db: &mut RootDatabase, corelib_src: &Path) -> bool {
+    let blob_path = match corelib_sierra_blob_path(corelib_src) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(error = %e, "phase-6: cannot determine corelib sierra blob path");
+            return false;
+        }
+    };
+    if !blob_path.is_file() {
+        tracing::debug!(
+            path = %blob_path.display(),
+            "phase-6: no pre-compiled corelib sierra blob found"
+        );
+        return false;
+    }
+    let blob_bytes = match read_bytes_with_limit(
+        &blob_path,
+        MAX_CORELIB_SIERRA_BLOB_BYTES,
+        "corelib sierra blob",
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::debug!(
+                path = %blob_path.display(),
+                error = %e,
+                "phase-6: failed to read corelib sierra blob"
+            );
+            return false;
+        }
+    };
+    if blob_bytes.is_empty() {
+        tracing::debug!("phase-6: corelib sierra blob is empty; skipping");
+        return false;
+    }
+
+    // Inject the blob into the core crate's cache_file.
+    let core_input = CrateLongId::core(db).into_crate_input(db);
+    let db_ref: &dyn salsa::Database = db;
+    let mut crate_configs = files_group_input(db_ref)
+        .crate_configs(db_ref)
+        .clone()
+        .unwrap_or_default();
+
+    if let Some(existing) = crate_configs.get(&core_input.clone()).cloned() {
+        crate_configs.insert(
+            core_input.clone(),
+            CrateConfigurationInput {
+                root: existing.root,
+                settings: existing.settings,
+                cache_file: Some(BlobLongId::Virtual(blob_bytes.clone())),
+            },
+        );
+        set_crate_configs_input(db, crate_configs);
+        tracing::debug!(
+            path = %blob_path.display(),
+            blob_bytes = blob_bytes.len(),
+            "phase-6: injected pre-compiled corelib sierra blob"
+        );
+        true
+    } else {
+        tracing::debug!("phase-6: core crate not found in DB config; skipping blob injection");
+        false
+    }
+}
+
+/// Cheap check: does any corelib sierra blob for the current compiler version
+/// already exist in the global cache?  This avoids computing the expensive
+/// content-hash fingerprint on warm builds where the blob was already persisted.
+#[cfg(feature = "native-compile")]
+fn corelib_sierra_blob_likely_exists(corelib_src: &Path) -> bool {
+    let _ = corelib_src; // used only for consistency with the full path helper
+    let version = native_cairo_lang_compiler_version();
+    let cache_dir = match uc_global_cache_dir() {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    let prefix = format!("corelib-sierra-v{version}-");
+    match std::fs::read_dir(&cache_dir) {
+        Ok(entries) => entries
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with(&prefix)),
+        Err(_) => false,
+    }
+}
+
+/// Generate and persist the corelib's lowering cache blob to the global cache.
+/// Called after a successful build.
+#[cfg(feature = "native-compile")]
+fn persist_corelib_sierra_blob_best_effort(db: &RootDatabase, corelib_src: &Path) {
+    // Fast path: skip the expensive fingerprint computation if a blob for this
+    // compiler version already exists.  The fingerprint only changes when
+    // corelib source files change, which implies a compiler version bump.
+    if corelib_sierra_blob_likely_exists(corelib_src) {
+        tracing::debug!("phase-6: corelib sierra blob already exists (fast check); skipping persist");
+        return;
+    }
+
+    let blob_path = match corelib_sierra_blob_path(corelib_src) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(error = %e, "phase-6: cannot determine corelib sierra blob path for persist");
+            return;
+        }
+    };
+
+    // Skip if already persisted (exact fingerprint match).
+    if blob_path.is_file() {
+        tracing::debug!(
+            path = %blob_path.display(),
+            "phase-6: corelib sierra blob already exists; skipping persist"
+        );
+        return;
+    }
+
+    let core_crate_id = CrateId::core(db);
+    let blob = match generate_crate_cache(db, core_crate_id) {
+        Ok(blob) => blob,
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "phase-6: failed to generate corelib lowering cache"
+            );
+            return;
+        }
+    };
+
+    if blob.is_empty() {
+        tracing::debug!("phase-6: generated corelib blob is empty; skipping persist");
+        return;
+    }
+
+    if let Some(parent) = blob_path.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            tracing::debug!(
+                error = %e,
+                path = %parent.display(),
+                "phase-6: failed to create corelib sierra blob cache directory"
+            );
+            return;
+        }
+    }
+
+    match atomic_write_bytes(&blob_path, &blob, "corelib sierra blob") {
+        Ok(()) => {
+            tracing::debug!(
+                path = %blob_path.display(),
+                blob_bytes = blob.len(),
+                "phase-6: persisted pre-compiled corelib sierra blob"
+            );
+        }
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                path = %blob_path.display(),
+                "phase-6: failed to persist corelib sierra blob"
+            );
+        }
+    }
+}
+
 #[cfg(feature = "native-compile")]
 fn resolve_native_corelib_src(workspace_root: &Path) -> Result<PathBuf> {
+    // Explicit env override always wins (also used by tests to control resolution).
     if let Some(path) = std::env::var_os("UC_NATIVE_CORELIB_SRC") {
         let candidate = PathBuf::from(path);
         let canonical = candidate.canonicalize().with_context(|| {
@@ -4174,6 +4816,27 @@ fn resolve_native_corelib_src(workspace_root: &Path) -> Result<PathBuf> {
             canonical.display(),
             native_cairo_lang_compiler_version()
         )));
+    }
+
+    // Phase 5: try embedded corelib before filesystem search.
+    #[cfg(all(feature = "embedded-corelib", not(uc_no_embedded_corelib)))]
+    if std::env::var_os("UC_DISABLE_EMBEDDED_CORELIB").is_none() {
+        match extract_embedded_corelib() {
+            Ok(path) => {
+                tracing::debug!(
+                    source = "embedded",
+                    corelib_src = %path.display(),
+                    "phase-5: selected embedded native corelib source path"
+                );
+                return Ok(path);
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "phase-5: embedded corelib extraction failed; falling back to filesystem search"
+                );
+            }
+        }
     }
 
     let candidates = native_corelib_candidate_paths(workspace_root);
@@ -5919,24 +6582,43 @@ fn native_collect_contract_dependency_updates(
 }
 
 #[cfg(feature = "native-compile")]
+fn native_compile_session_handle_if_cached(
+    workspace_root: &Path,
+) -> Option<Arc<Mutex<NativeCompileSessionState>>> {
+    let cache_key = native_compile_session_cache_key(workspace_root);
+    let now_ms = epoch_ms_u64().unwrap_or_default();
+    let mut cache = native_compile_session_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    evict_expired_native_compile_session_cache_entries(
+        &mut cache,
+        now_ms,
+        native_compile_session_cache_ttl_ms(),
+    );
+    let entry = cache.get_mut(&cache_key)?;
+    entry.last_access_epoch_ms = now_ms;
+    Some(entry.session.clone())
+}
+
+#[cfg(feature = "native-compile")]
 fn native_update_compile_session_post_build_state(
     workspace_root: &Path,
     signature: &NativeCompileSessionSignature,
     dependency_updates: &[(String, BTreeSet<String>)],
     contract_output_plans: Option<&[NativeContractOutputPlan]>,
-) {
+) -> NativeSessionRuntimeTelemetry {
+    let mut runtime_telemetry = NativeSessionRuntimeTelemetry::default();
     if dependency_updates.is_empty() && contract_output_plans.is_none() {
-        return;
+        return runtime_telemetry;
     }
-    let session_handle = match native_compile_session_handle(workspace_root, signature) {
-        Ok((handle, _session_cache_hit)) => handle,
-        Err(err) => {
+    let session_handle = match native_compile_session_handle_if_cached(workspace_root) {
+        Some(handle) => handle,
+        None => {
             tracing::warn!(
                 workspace_root = %workspace_root.display(),
-                error = %format!("{err:#}"),
-                "failed to update native session post-build state"
+                "native session was evicted before post-build state update; skipping"
             );
-            return;
+            return runtime_telemetry;
         }
     };
     let (estimated_bytes, image_snapshot, buildinfo_snapshot) = {
@@ -5944,7 +6626,7 @@ fn native_update_compile_session_post_build_state(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if session.signature != *signature {
-            return;
+            return runtime_telemetry;
         }
         let mut state_changed = false;
         for (module_path, dependencies) in dependency_updates {
@@ -5983,12 +6665,29 @@ fn native_update_compile_session_post_build_state(
         )
     };
     update_native_compile_session_cached_estimated_bytes(workspace_root, estimated_bytes);
-    if let Some(image_snapshot) = image_snapshot {
-        persist_native_compile_session_image_snapshot_best_effort(workspace_root, &image_snapshot);
+    // Phase 1: async persistence for post-build state update persist calls
+    if image_snapshot.is_some() || buildinfo_snapshot.is_some() {
+        let persist_image = image_snapshot.is_some();
+        let persist_buildinfo = buildinfo_snapshot.is_some();
+        let schedule_start = Instant::now();
+        let ws_root = workspace_root.to_path_buf();
+        cold_path_async_persist_spawn(move || {
+            if let Some(image) = image_snapshot {
+                persist_native_compile_session_image_snapshot_best_effort(&ws_root, &image);
+            }
+            if let Some(buildinfo) = buildinfo_snapshot {
+                persist_native_buildinfo_sidecar_best_effort(&ws_root, &buildinfo);
+            }
+        });
+        let persist_schedule_ms = schedule_start.elapsed().as_secs_f64() * 1000.0;
+        if persist_image {
+            runtime_telemetry.session_image_persist_ms += persist_schedule_ms;
+        }
+        if persist_buildinfo {
+            runtime_telemetry.buildinfo_persist_ms += persist_schedule_ms;
+        }
     }
-    if let Some(buildinfo_snapshot) = buildinfo_snapshot {
-        persist_native_buildinfo_sidecar_best_effort(workspace_root, &buildinfo_snapshot);
-    }
+    runtime_telemetry
 }
 
 #[cfg(feature = "native-compile")]
@@ -6475,7 +7174,9 @@ fn persist_native_compile_session_image_snapshot(
         journal_cursor_applied: snapshot.journal_cursor_applied,
         generated_at_epoch_ms: epoch_ms_u64().unwrap_or_default(),
     };
-    let bytes = serde_json::to_vec(&image).context("failed to encode native session image")?;
+    // Phase 4: use postcard binary serialization (~2-5x faster than serde_json, ~40-60% smaller)
+    let bytes = postcard::to_allocvec(&image)
+        .context("failed to encode native session image (postcard)")?;
     if bytes.len() as u64 > MAX_NATIVE_COMPILE_SESSION_IMAGE_BYTES {
         tracing::warn!(
             path = %image_path.display(),
@@ -6485,6 +7186,11 @@ fn persist_native_compile_session_image_snapshot(
         );
         return Ok(());
     }
+    tracing::trace!(
+        path = %image_path.display(),
+        bytes = bytes.len(),
+        "cold-path phase-4: writing session image with postcard binary encoding"
+    );
     atomic_write_bytes(&image_path, &bytes, "native session image")
 }
 
@@ -6500,6 +7206,41 @@ fn persist_native_compile_session_image_snapshot_best_effort(
             "failed to persist native session image"
         );
     }
+}
+
+#[cfg(feature = "native-compile")]
+fn decode_native_compile_session_image_file(
+    image_path: &Path,
+) -> Result<(NativeCompileSessionImageFile, &'static str)> {
+    let bytes = read_bytes_with_limit(
+        image_path,
+        MAX_NATIVE_COMPILE_SESSION_IMAGE_BYTES,
+        "native session image",
+    )?;
+    if let Ok(image) = postcard::from_bytes::<NativeCompileSessionImageFile>(&bytes) {
+        if image.schema_version == NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION
+            || image.schema_version == NATIVE_COMPILE_SESSION_IMAGE_LEGACY_JSON_SCHEMA_VERSION
+        {
+            return Ok((image, "postcard"));
+        }
+    }
+    let image =
+        serde_json::from_slice::<NativeCompileSessionImageFile>(&bytes).with_context(|| {
+            format!(
+                "native session image {} is neither valid postcard nor valid JSON",
+                image_path.display()
+            )
+        })?;
+    if image.schema_version != NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION
+        && image.schema_version != NATIVE_COMPILE_SESSION_IMAGE_LEGACY_JSON_SCHEMA_VERSION
+    {
+        bail!(
+            "native session image {} has unsupported schema_version {}",
+            image_path.display(),
+            image.schema_version
+        );
+    }
+    Ok((image, "json"))
 }
 
 #[cfg(feature = "native-compile")]
@@ -6541,36 +7282,23 @@ fn try_native_compile_session_image_restore(
         let _ = fs::remove_file(&image_path);
         return None;
     }
-    let bytes = match read_bytes_with_limit(
-        &image_path,
-        MAX_NATIVE_COMPILE_SESSION_IMAGE_BYTES,
-        "native session image",
-    ) {
-        Ok(bytes) => bytes,
+    let (decoded, encoding) = match decode_native_compile_session_image_file(&image_path) {
+        Ok(value) => value,
         Err(err) => {
             tracing::warn!(
                 path = %image_path.display(),
                 error = %format!("{err:#}"),
-                "failed to read native session image; ignoring"
-            );
-            return None;
-        }
-    };
-    let decoded: NativeCompileSessionImageFile = match serde_json::from_slice::<
-        NativeCompileSessionImageFile,
-    >(&bytes)
-    {
-        Ok(image) if image.schema_version == NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION => image,
-        Ok(_) => return None,
-        Err(err) => {
-            tracing::warn!(
-                path = %image_path.display(),
-                error = %err,
                 "failed to decode native session image; ignoring"
             );
             return None;
         }
     };
+    tracing::trace!(
+        path = %image_path.display(),
+        schema_version = decoded.schema_version,
+        encoding,
+        "cold-path phase-4: decoded session image"
+    );
     let signature_hash = native_compile_session_signature_hash(signature);
     if decoded.signature_hash != signature_hash {
         return None;
@@ -6880,7 +7608,9 @@ fn persist_native_buildinfo_sidecar(
         .parent()
         .context("native buildinfo path has no parent directory")?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
-    let bytes = serde_json::to_vec(buildinfo).context("failed to encode native buildinfo")?;
+    // Phase 4: use postcard binary serialization for buildinfo
+    let bytes =
+        postcard::to_allocvec(buildinfo).context("failed to encode native buildinfo (postcard)")?;
     if bytes.len() as u64 > MAX_NATIVE_BUILDINFO_BYTES {
         tracing::warn!(
             path = %sidecar_path.display(),
@@ -6890,6 +7620,11 @@ fn persist_native_buildinfo_sidecar(
         );
         return Ok(());
     }
+    tracing::trace!(
+        path = %sidecar_path.display(),
+        bytes = bytes.len(),
+        "cold-path phase-4: writing buildinfo with postcard binary encoding"
+    );
     atomic_write_bytes(&sidecar_path, &bytes, "native buildinfo")
 }
 
@@ -6905,6 +7640,40 @@ fn persist_native_buildinfo_sidecar_best_effort(
             "failed to persist native buildinfo sidecar"
         );
     }
+}
+
+#[cfg(feature = "native-compile")]
+fn decode_native_buildinfo_file(
+    buildinfo_path: &Path,
+) -> Result<(NativeBuildInfoFile, &'static str)> {
+    let bytes = read_bytes_with_limit(
+        buildinfo_path,
+        MAX_NATIVE_BUILDINFO_BYTES,
+        "native buildinfo sidecar",
+    )?;
+    if let Ok(file) = postcard::from_bytes::<NativeBuildInfoFile>(&bytes) {
+        if file.schema_version == NATIVE_BUILDINFO_SCHEMA_VERSION
+            || file.schema_version == NATIVE_BUILDINFO_LEGACY_JSON_SCHEMA_VERSION
+        {
+            return Ok((file, "postcard"));
+        }
+    }
+    let file = serde_json::from_slice::<NativeBuildInfoFile>(&bytes).with_context(|| {
+        format!(
+            "native buildinfo sidecar {} is neither valid postcard nor valid JSON",
+            buildinfo_path.display()
+        )
+    })?;
+    if file.schema_version != NATIVE_BUILDINFO_SCHEMA_VERSION
+        && file.schema_version != NATIVE_BUILDINFO_LEGACY_JSON_SCHEMA_VERSION
+    {
+        bail!(
+            "native buildinfo sidecar {} has unsupported schema_version {}",
+            buildinfo_path.display(),
+            file.schema_version
+        );
+    }
+    Ok((file, "json"))
 }
 
 #[cfg(feature = "native-compile")]
@@ -6945,33 +7714,23 @@ fn load_native_buildinfo_sidecar_snapshot(
         let _ = fs::remove_file(&sidecar_path);
         return None;
     }
-    let bytes = match read_bytes_with_limit(
-        &sidecar_path,
-        MAX_NATIVE_BUILDINFO_BYTES,
-        "native buildinfo sidecar",
-    ) {
-        Ok(bytes) => bytes,
+    let (decoded, encoding) = match decode_native_buildinfo_file(&sidecar_path) {
+        Ok(value) => value,
         Err(err) => {
             tracing::warn!(
                 path = %sidecar_path.display(),
                 error = %format!("{err:#}"),
-                "failed to read native buildinfo sidecar; ignoring"
-            );
-            return None;
-        }
-    };
-    let decoded = match serde_json::from_slice::<NativeBuildInfoFile>(&bytes) {
-        Ok(file) if file.schema_version == NATIVE_BUILDINFO_SCHEMA_VERSION => file,
-        Ok(_) => return None,
-        Err(err) => {
-            tracing::warn!(
-                path = %sidecar_path.display(),
-                error = %err,
                 "failed to decode native buildinfo sidecar; ignoring"
             );
             return None;
         }
     };
+    tracing::trace!(
+        path = %sidecar_path.display(),
+        schema_version = decoded.schema_version,
+        encoding,
+        "cold-path phase-4: decoded buildinfo"
+    );
     let signature_hash = native_compile_session_signature_hash(signature);
     if decoded.signature_hash != signature_hash {
         return None;
@@ -7555,6 +8314,128 @@ fn native_persist_crate_cache_after_build_best_effort(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 1: Async persistence helpers for cold-path latency reduction
+// ---------------------------------------------------------------------------
+// In-flight counter tracks background persist threads so we can wait for them
+// on process exit.  This avoids the only real risk of async persistence: the
+// process exiting before the write completes.
+#[cfg(feature = "native-compile")]
+fn cold_path_async_persist_in_flight() -> &'static AtomicUsize {
+    static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+    &IN_FLIGHT
+}
+
+#[cfg(feature = "native-compile")]
+type ColdPathPersistTask = Box<dyn FnOnce() + Send + 'static>;
+
+#[cfg(feature = "native-compile")]
+fn run_cold_path_async_persist_worker(receiver: Receiver<ColdPathPersistTask>) {
+    while let Ok(task) = receiver.recv() {
+        let _guard = ColdPathPersistGuard;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (task)();
+        }));
+    }
+}
+
+#[cfg(feature = "native-compile")]
+fn cold_path_async_persist_sender() -> Option<&'static SyncSender<ColdPathPersistTask>> {
+    static SENDER: OnceLock<Option<SyncSender<ColdPathPersistTask>>> = OnceLock::new();
+    SENDER
+        .get_or_init(|| {
+            let (sender, receiver) = mpsc::sync_channel::<ColdPathPersistTask>(ASYNC_PERSIST_QUEUE_LIMIT);
+            match thread::Builder::new()
+                .name("uc-cold-persist".to_string())
+                .spawn(move || run_cold_path_async_persist_worker(receiver))
+            {
+                Ok(_handle) => Some(sender),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "cold-path: failed to spawn async persist worker; falling back to inline writes"
+                    );
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// Queue a best-effort persistence closure on a single worker thread.
+/// Tasks are processed FIFO so older snapshots cannot overtake newer ones.
+#[cfg(feature = "native-compile")]
+fn cold_path_async_persist_spawn<F: FnOnce() + Send + 'static>(f: F) {
+    cold_path_async_persist_in_flight().fetch_add(1, Ordering::SeqCst);
+    let mut pending: Option<ColdPathPersistTask> = Some(Box::new(f));
+    if let Some(sender) = cold_path_async_persist_sender() {
+        if let Some(task) = pending.take() {
+            match sender.try_send(task) {
+                Ok(()) => return,
+                Err(TrySendError::Full(task)) => {
+                    tracing::warn!(
+                        limit = ASYNC_PERSIST_QUEUE_LIMIT,
+                        "cold-path: async persist queue is full; running task inline"
+                    );
+                    pending = Some(task);
+                }
+                Err(TrySendError::Disconnected(task)) => {
+                    tracing::warn!(
+                        "cold-path: async persist worker disconnected; running task inline"
+                    );
+                    pending = Some(task);
+                }
+            }
+        }
+    }
+    // Fallback path if worker startup or queue send failed.
+    if let Some(task) = pending {
+        let _guard = ColdPathPersistGuard;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (task)();
+        }));
+    }
+}
+
+/// RAII guard that decrements the in-flight counter on drop, ensuring
+/// the counter is always decremented even if the closure panics.
+#[cfg(feature = "native-compile")]
+struct ColdPathPersistGuard;
+
+#[cfg(feature = "native-compile")]
+impl Drop for ColdPathPersistGuard {
+    fn drop(&mut self) {
+        cold_path_async_persist_in_flight().fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Block until all in-flight async persist threads have completed.
+/// Call this from the process exit path to avoid truncated writes.
+#[cfg(feature = "native-compile")]
+fn cold_path_async_persist_drain() {
+    let start = Instant::now();
+    let max_wait = Duration::from_secs(5);
+    loop {
+        let remaining = cold_path_async_persist_in_flight().load(Ordering::SeqCst);
+        if remaining == 0 {
+            break;
+        }
+        if start.elapsed() > max_wait {
+            tracing::warn!(
+                remaining_tasks = remaining,
+                elapsed_ms = start.elapsed().as_millis(),
+                "cold-path: gave up waiting for async persist threads after 5 s"
+            );
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    let drain_ms = start.elapsed().as_secs_f64() * 1000.0;
+    if drain_ms > 1.0 {
+        tracing::debug!(drain_ms, "cold-path: async persist drain completed");
+    }
+}
+
 #[cfg(feature = "native-compile")]
 fn build_native_compile_session_state(
     workspace_root: &Path,
@@ -7572,6 +8453,13 @@ fn build_native_compile_session_state(
         .context("failed to initialize native cairo compiler database")?;
     let db_init_ms = db_start.elapsed().as_secs_f64() * 1000.0;
     init_dev_corelib(&mut db, signature.context.corelib_src.clone());
+    // Phase 6: inject pre-compiled corelib Sierra blob if available.
+    let corelib_blob_restored =
+        try_restore_corelib_sierra_blob(&mut db, &signature.context.corelib_src);
+    tracing::debug!(
+        corelib_blob_restored,
+        "phase-6: corelib sierra blob restore attempted"
+    );
     let setup_start = Instant::now();
     let main_crate_inputs = setup_project(&mut db, &signature.context.cairo_project_dir)
         .with_context(|| {
@@ -7628,6 +8516,7 @@ fn build_native_compile_session_state(
         buildinfo_hit,
         buildinfo_replay_hit,
         journal_cursor_applied,
+        fresh_source_scan,
     ) = if let Some(image) = restored_image {
         (
             image.tracked_sources,
@@ -7638,6 +8527,7 @@ fn build_native_compile_session_state(
             false,
             false,
             image.journal_cursor_applied,
+            false,
         )
     } else if let Some(buildinfo) = restored_buildinfo {
         (
@@ -7649,6 +8539,7 @@ fn build_native_compile_session_state(
             true,
             false,
             buildinfo.journal_cursor_applied,
+            false,
         )
     } else if let Some(buildinfo) = replayed_buildinfo {
         (
@@ -7660,6 +8551,7 @@ fn build_native_compile_session_state(
             false,
             true,
             buildinfo.journal_cursor_applied,
+            false,
         )
     } else {
         let (tracked_sources, tracked_source_bytes) =
@@ -7679,6 +8571,7 @@ fn build_native_compile_session_state(
             false,
             false,
             native_current_source_journal_cursor(workspace_root),
+            true, // fresh_source_scan: tracked_sources are from a live filesystem scan
         )
     };
     let source_scan_ms = scan_start.elapsed().as_secs_f64() * 1000.0;
@@ -7726,7 +8619,7 @@ fn build_native_compile_session_state(
             "native session skipped eager keyed file-override slot priming"
         );
     }
-    let state = NativeCompileSessionState {
+    let mut state = NativeCompileSessionState {
         signature,
         db,
         main_crate_inputs,
@@ -7736,15 +8629,61 @@ fn build_native_compile_session_state(
         source_root_modified_unix_ms,
         contract_source_dependencies,
         contract_output_plans,
+        build_db_init_ms: db_init_ms,
+        build_setup_project_ms: setup_project_ms,
+        build_crate_cache_restore_ms: crate_cache_restore_ms,
+        build_source_scan_ms: source_scan_ms,
+        build_session_image_persist_ms: 0.0,
+        build_buildinfo_persist_ms: 0.0,
+        fresh_source_scan,
     };
-    if !session_image_hit {
-        let snapshot = native_compile_session_image_snapshot_from_state(&state);
-        persist_native_compile_session_image_snapshot_best_effort(workspace_root, &snapshot);
+    // Phase 1: move persistence off the critical path by spawning a background thread.
+    // Persistence is already best-effort (failures are logged and ignored), so it is safe
+    // to run asynchronously.  The cold-build latency saving is ~150-250 ms for JSON
+    // serialization + atomic writes + fsync on typical workspaces.
+    let persist_start = Instant::now();
+    let needs_image_persist = !session_image_hit;
+    let needs_buildinfo_persist = !buildinfo_hit || !session_image_hit;
+    if needs_image_persist || needs_buildinfo_persist {
+        let image_snapshot = if needs_image_persist {
+            Some(native_compile_session_image_snapshot_from_state(&state))
+        } else {
+            None
+        };
+        let buildinfo_snapshot = if needs_buildinfo_persist {
+            Some(native_buildinfo_file_from_state(
+                &state,
+                state.journal_cursor_applied,
+            ))
+        } else {
+            None
+        };
+        let ws_root = workspace_root.to_path_buf();
+        cold_path_async_persist_spawn(move || {
+            if let Some(image) = image_snapshot {
+                persist_native_compile_session_image_snapshot_best_effort(&ws_root, &image);
+            }
+            if let Some(buildinfo) = buildinfo_snapshot {
+                persist_native_buildinfo_sidecar_best_effort(&ws_root, &buildinfo);
+            }
+        });
+        tracing::debug!(
+            needs_image_persist,
+            needs_buildinfo_persist,
+            "cold-path: spawned async persistence for session image/buildinfo (build_native_compile_session_state)"
+        );
     }
-    if !buildinfo_hit || !session_image_hit {
-        let buildinfo = native_buildinfo_file_from_state(&state, state.journal_cursor_applied);
-        persist_native_buildinfo_sidecar_best_effort(workspace_root, &buildinfo);
+    let persist_schedule_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
+    if needs_image_persist {
+        state.build_session_image_persist_ms = persist_schedule_ms;
     }
+    if needs_buildinfo_persist {
+        state.build_buildinfo_persist_ms = persist_schedule_ms;
+    }
+    tracing::debug!(
+        persist_schedule_ms,
+        "cold-path: async persist scheduling overhead"
+    );
     Ok(state)
 }
 
@@ -8428,6 +9367,15 @@ fn native_should_force_full_rebuild_on_empty_delta(
 }
 
 #[cfg(feature = "native-compile")]
+fn native_should_skip_drift_scan_for_fresh_session(
+    session_cache_hit: bool,
+    fresh_source_scan: bool,
+    needs_full_rebuild: bool,
+) -> bool {
+    !needs_full_rebuild && !session_cache_hit && fresh_source_scan
+}
+
+#[cfg(feature = "native-compile")]
 fn native_should_try_cached_noop_reuse(
     changed_files: &[String],
     removed_files: &[String],
@@ -8521,17 +9469,22 @@ fn with_native_compile_session<T>(
     daemon_context: bool,
     rebuild_on_empty_delta: bool,
     f: impl FnOnce(&NativeCompileSessionSnapshot) -> Result<T>,
-) -> Result<T> {
+) -> Result<(
+    T,
+    NativeSessionRuntimeTelemetry,
+    NativeCompileSessionSnapshot,
+)> {
     let source_roots = native_compile_source_roots(&signature.context);
     let (session_handle, session_cache_hit) =
         native_compile_session_handle(workspace_root, signature)?;
-    let (needs_full_rebuild, session_applied_cursor) = {
+    let (needs_full_rebuild, session_applied_cursor, fresh_source_scan) = {
         let session = session_handle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         (
             session.signature != *signature,
             session.journal_cursor_applied,
+            session.fresh_source_scan,
         )
     };
     let snapshot_previous_sources = || {
@@ -8550,6 +9503,20 @@ fn with_native_compile_session<T>(
         source_root_mtime,
         mut journal_fallback_full_scan,
     ) = if needs_full_rebuild {
+        (Vec::new(), Vec::new(), None, 0_u64, false)
+    } else if native_should_skip_drift_scan_for_fresh_session(
+        session_cache_hit,
+        fresh_source_scan,
+        needs_full_rebuild,
+    ) {
+        // Phase 2: skip redundant source scan on cold path.  The session was just
+        // freshly built by build_native_compile_session_state with a live filesystem
+        // scan, so tracked_sources already reflect the current state.  Re-scanning
+        // here would be a ~30-80 ms double scan with zero new information.
+        // Only safe when fresh_source_scan is true (not restored from cache/replay).
+        tracing::debug!(
+            "cold-path phase-2: skipping drift scan for freshly-built session with fresh source scan"
+        );
         (Vec::new(), Vec::new(), None, 0_u64, false)
     } else if daemon_context {
         match native_take_source_journal_delta(
@@ -8650,6 +9617,10 @@ fn with_native_compile_session<T>(
         )
     };
     let drift_scan_ms = drift_scan_start.elapsed().as_secs_f64() * 1000.0;
+    let mut runtime_telemetry = NativeSessionRuntimeTelemetry {
+        drift_scan_ms,
+        ..NativeSessionRuntimeTelemetry::default()
+    };
 
     let changed_source_set_detected = !changed_files.is_empty() || !removed_files.is_empty();
     let force_full_rebuild_on_empty_delta = native_should_force_full_rebuild_on_empty_delta(
@@ -8812,6 +9783,12 @@ fn with_native_compile_session<T>(
                 journal_fallback_full_scan,
                 contract_source_dependencies: session.contract_source_dependencies.clone(),
                 contract_output_plans: session.contract_output_plans.clone(),
+                build_db_init_ms: session.build_db_init_ms,
+                build_setup_project_ms: session.build_setup_project_ms,
+                build_crate_cache_restore_ms: session.build_crate_cache_restore_ms,
+                build_source_scan_ms: session.build_source_scan_ms,
+                build_session_image_persist_ms: session.build_session_image_persist_ms,
+                build_buildinfo_persist_ms: session.build_buildinfo_persist_ms,
             },
             state_mutated.then(|| native_compile_session_image_snapshot_from_state(&session)),
             state_mutated.then(|| {
@@ -8820,11 +9797,27 @@ fn with_native_compile_session<T>(
         )
     };
     update_native_compile_session_cached_estimated_bytes(workspace_root, estimated_bytes);
-    if let Some(image_snapshot) = image_snapshot {
-        persist_native_compile_session_image_snapshot_best_effort(workspace_root, &image_snapshot);
-    }
-    if let Some(buildinfo_snapshot) = buildinfo_snapshot {
-        persist_native_buildinfo_sidecar_best_effort(workspace_root, &buildinfo_snapshot);
+    // Phase 1: async persistence for session snapshot refresh persist calls
+    if image_snapshot.is_some() || buildinfo_snapshot.is_some() {
+        let persist_image = image_snapshot.is_some();
+        let persist_buildinfo = buildinfo_snapshot.is_some();
+        let schedule_start = Instant::now();
+        let ws_root = workspace_root.to_path_buf();
+        cold_path_async_persist_spawn(move || {
+            if let Some(image) = image_snapshot {
+                persist_native_compile_session_image_snapshot_best_effort(&ws_root, &image);
+            }
+            if let Some(buildinfo) = buildinfo_snapshot {
+                persist_native_buildinfo_sidecar_best_effort(&ws_root, &buildinfo);
+            }
+        });
+        let persist_schedule_ms = schedule_start.elapsed().as_secs_f64() * 1000.0;
+        if persist_image {
+            runtime_telemetry.session_image_persist_ms += persist_schedule_ms;
+        }
+        if persist_buildinfo {
+            runtime_telemetry.buildinfo_persist_ms += persist_schedule_ms;
+        }
     }
     let result = f(&snapshot);
     if result.is_ok() && daemon_context {
@@ -8847,22 +9840,34 @@ fn with_native_compile_session<T>(
                         )
                     }
                 };
-                if let Some(image_snapshot) = image_snapshot {
-                    persist_native_compile_session_image_snapshot_best_effort(
-                        workspace_root,
-                        &image_snapshot,
-                    );
-                }
-                if let Some(buildinfo_snapshot) = buildinfo_snapshot {
-                    persist_native_buildinfo_sidecar_best_effort(
-                        workspace_root,
-                        &buildinfo_snapshot,
-                    );
+                // Phase 1: async persistence for journal-commit persist calls
+                if image_snapshot.is_some() || buildinfo_snapshot.is_some() {
+                    let persist_image = image_snapshot.is_some();
+                    let persist_buildinfo = buildinfo_snapshot.is_some();
+                    let schedule_start = Instant::now();
+                    let ws_root = workspace_root.to_path_buf();
+                    cold_path_async_persist_spawn(move || {
+                        if let Some(image) = image_snapshot {
+                            persist_native_compile_session_image_snapshot_best_effort(
+                                &ws_root, &image,
+                            );
+                        }
+                        if let Some(buildinfo) = buildinfo_snapshot {
+                            persist_native_buildinfo_sidecar_best_effort(&ws_root, &buildinfo);
+                        }
+                    });
+                    let persist_schedule_ms = schedule_start.elapsed().as_secs_f64() * 1000.0;
+                    if persist_image {
+                        runtime_telemetry.session_image_persist_ms += persist_schedule_ms;
+                    }
+                    if persist_buildinfo {
+                        runtime_telemetry.buildinfo_persist_ms += persist_schedule_ms;
+                    }
                 }
             }
         }
     }
-    result
+    result.map(|value| (value, runtime_telemetry, snapshot))
 }
 
 #[cfg(feature = "native-compile")]
@@ -9039,19 +10044,24 @@ fn run_native_build_inner(
     let compile_start = Instant::now();
     let session_scope_start = Instant::now();
     let (
-        artifact_count,
-        frontend_compile_ms,
-        casm_ms,
-        artifact_write_ms,
-        produced_paths,
-        changed_files_count,
-        removed_files_count,
-        total_contracts,
-        compiled_contracts,
-        impacted_subset_used,
-        journal_fallback_full_scan,
-        dependency_updates,
-        contract_output_plans,
+        (
+            artifact_count,
+            frontend_compile_ms,
+            casm_ms,
+            artifact_write_ms,
+            produced_paths,
+            changed_files_count,
+            removed_files_count,
+            total_contracts,
+            compiled_contracts,
+            impacted_subset_used,
+            journal_fallback_full_scan,
+            dependency_updates,
+            contract_output_plans,
+            find_contracts_ms,
+        ),
+        mut session_runtime_telemetry,
+        session_snapshot,
     ) = with_native_compile_session(
         workspace_root,
         &signature,
@@ -9099,12 +10109,24 @@ fn run_native_build_inner(
                         session.journal_fallback_full_scan,
                         Vec::new(),
                         None,
+                        0.0_f64, // find_contracts_ms: noop reuse path
                     ));
                 }
             }
             let crate_ids =
                 CrateInput::into_crate_ids(&session.db, session.main_crate_inputs.iter().cloned());
+            // Phase 0: instrument find_contracts() — on cold builds this triggers lazy
+            // Salsa evaluation of the entire corelib parse→semantic chain, which can
+            // dominate session_prepare_ms.
+            let find_contracts_start = Instant::now();
             let contracts = find_contracts(&session.db, &crate_ids);
+            let find_contracts_ms = find_contracts_start.elapsed().as_secs_f64() * 1000.0;
+            tracing::debug!(
+                find_contracts_ms,
+                contract_count = contracts.len(),
+                "cold-path phase-0: find_contracts() completed — this cost is the deferred \
+                 Salsa cold-eval of corelib parse/semantic on virgin cold builds"
+            );
 
             if contracts.is_empty() {
                 let frontend_compile_start = Instant::now();
@@ -9147,6 +10169,7 @@ fn run_native_build_inner(
                     session.journal_fallback_full_scan,
                     Vec::new(),
                     Some(Vec::new()),
+                    find_contracts_ms,
                 ));
             }
 
@@ -9391,15 +10414,20 @@ fn run_native_build_inner(
                 session.journal_fallback_full_scan,
                 dependency_updates,
                 Some(all_plans),
+                find_contracts_ms,
             ))
         },
     )?;
-    native_update_compile_session_post_build_state(
+    let post_build_runtime_telemetry = native_update_compile_session_post_build_state(
         workspace_root,
         &signature,
         &dependency_updates,
         contract_output_plans.as_deref(),
     );
+    session_runtime_telemetry.session_image_persist_ms +=
+        post_build_runtime_telemetry.session_image_persist_ms;
+    session_runtime_telemetry.buildinfo_persist_ms +=
+        post_build_runtime_telemetry.buildinfo_persist_ms;
     native_persist_crate_cache_after_build_best_effort(
         workspace_root,
         &signature,
@@ -9408,10 +10436,27 @@ fn run_native_build_inner(
         removed_files_count,
         compiled_contracts,
     );
+    // Phase 6: persist corelib sierra blob to global cache (best-effort, async).
+    // Unlike per-workspace crate cache, this runs on every build since the corelib
+    // blob is the same for all projects with the same compiler version.
+    {
+        let db_for_phase6 = session_snapshot.db.snapshot();
+        let corelib_for_phase6 = signature.context.corelib_src.clone();
+        cold_path_async_persist_spawn(move || {
+            persist_corelib_sierra_blob_best_effort(&db_for_phase6, &corelib_for_phase6);
+        });
+    }
     let compile_ms = compile_start.elapsed().as_secs_f64() * 1000.0;
     let session_scope_ms = session_scope_start.elapsed().as_secs_f64() * 1000.0;
     let session_prepare_ms =
         (session_scope_ms - frontend_compile_ms - casm_ms - artifact_write_ms).max(0.0);
+    // Phase 0: read sub-timings from the live session snapshot used for this build.
+    let build_db_init_ms = session_snapshot.build_db_init_ms;
+    let build_setup_project_ms = session_snapshot.build_setup_project_ms;
+    let build_crate_cache_restore_ms = session_snapshot.build_crate_cache_restore_ms;
+    let build_source_scan_ms = session_snapshot.build_source_scan_ms;
+    let build_session_image_persist_ms = session_snapshot.build_session_image_persist_ms;
+    let build_buildinfo_persist_ms = session_snapshot.build_buildinfo_persist_ms;
     let native_phase_telemetry = NativeBuildPhaseTelemetry {
         context_ms,
         target_dir_ms,
@@ -9425,6 +10470,16 @@ fn run_native_build_inner(
         compiled_contracts,
         impacted_subset_used,
         journal_fallback_full_scan,
+        db_init_ms: build_db_init_ms,
+        setup_project_ms: build_setup_project_ms,
+        crate_cache_restore_ms: build_crate_cache_restore_ms,
+        source_scan_ms: build_source_scan_ms,
+        find_contracts_ms,
+        session_image_persist_ms: build_session_image_persist_ms
+            + session_runtime_telemetry.session_image_persist_ms,
+        buildinfo_persist_ms: build_buildinfo_persist_ms
+            + session_runtime_telemetry.buildinfo_persist_ms,
+        drift_scan_ms: session_runtime_telemetry.drift_scan_ms,
     };
     let run = CommandRun {
         command: vec![
@@ -9459,6 +10514,10 @@ fn run_native_build_inner(
         compiled_contracts,
         impacted_subset_used,
         journal_fallback_full_scan,
+        find_contracts_ms,
+        session_image_persist_ms = native_phase_telemetry.session_image_persist_ms,
+        buildinfo_persist_ms = native_phase_telemetry.buildinfo_persist_ms,
+        drift_scan_ms = native_phase_telemetry.drift_scan_ms,
         "native build cold-path telemetry"
     );
     Ok((run, native_phase_telemetry, produced_paths))

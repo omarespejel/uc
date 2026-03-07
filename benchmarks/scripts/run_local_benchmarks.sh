@@ -313,8 +313,8 @@ fi
 if [[ "${#SCENARIO_FILTERS[@]}" -gt 0 ]]; then
   for scenario in "${SCENARIO_FILTERS[@]}"; do
     case "$MATRIX:$scenario" in
-      research:build.cold|research:build.warm_noop|research:build.warm_edit|research:build.warm_edit_semantic|research:metadata.online_cold|research:metadata.offline_warm) ;;
-      smoke:build.cold|smoke:build.warm_noop|smoke:build.warm_edit|smoke:build.warm_edit_semantic) ;;
+      research:build.cold|research:build.returning_cold|research:build.warm_noop|research:build.warm_edit|research:build.warm_edit_semantic|research:metadata.online_cold|research:metadata.offline_warm) ;;
+      smoke:build.cold|smoke:build.returning_cold|smoke:build.warm_noop|smoke:build.warm_edit|smoke:build.warm_edit_semantic) ;;
       *)
         echo "Scenario '$scenario' is not supported for matrix '$MATRIX'" >&2
         exit 1
@@ -605,7 +605,16 @@ pattern = re.compile(
     r"native_session_prepare=(?P<native_session_prepare>[0-9.]+)\s+"
     r"native_frontend_compile=(?P<native_frontend_compile>[0-9.]+)\s+"
     r"native_casm=(?P<native_casm>[0-9.]+)\s+"
-    r"native_artifact_write=(?P<native_artifact_write>[0-9.]+))?"
+    r"native_artifact_write=(?P<native_artifact_write>[0-9.]+)"
+    r"(?:\s+native_find_contracts=(?P<native_find_contracts>[0-9.]+))?"
+    r"(?:\s+native_db_init=(?P<native_db_init>[0-9.]+))?"
+    r"(?:\s+native_setup_project=(?P<native_setup_project>[0-9.]+))?"
+    r"(?:\s+native_crate_cache_restore=(?P<native_crate_cache_restore>[0-9.]+))?"
+    r"(?:\s+native_source_scan=(?P<native_source_scan>[0-9.]+))?"
+    r"(?:\s+native_session_image_persist=(?P<native_session_image_persist>[0-9.]+))?"
+    r"(?:\s+native_buildinfo_persist=(?P<native_buildinfo_persist>[0-9.]+))?"
+    r"(?:\s+native_drift_scan=(?P<native_drift_scan>[0-9.]+))?"
+    r")?"
 )
 match = pattern.search(line)
 if not match:
@@ -636,6 +645,14 @@ payload = {
     "native_frontend_compile_ms": as_float(match.group("native_frontend_compile")),
     "native_casm_ms": as_float(match.group("native_casm")),
     "native_artifact_write_ms": as_float(match.group("native_artifact_write")),
+    "native_find_contracts_ms": as_float(match.group("native_find_contracts")),
+    "native_db_init_ms": as_float(match.group("native_db_init")),
+    "native_setup_project_ms": as_float(match.group("native_setup_project")),
+    "native_crate_cache_restore_ms": as_float(match.group("native_crate_cache_restore")),
+    "native_source_scan_ms": as_float(match.group("native_source_scan")),
+    "native_session_image_persist_ms": as_float(match.group("native_session_image_persist")),
+    "native_buildinfo_persist_ms": as_float(match.group("native_buildinfo_persist")),
+    "native_drift_scan_ms": as_float(match.group("native_drift_scan")),
 }
 with open(phase_file, "a", encoding="utf-8") as f:
     f.write(json.dumps(payload))
@@ -800,7 +817,7 @@ prepare_workload_copy() {
 ensure_isolated_workload_dir() {
   local path="$1"
   case "$path" in
-    "$TMP_DIR"/workloads/*) ;;
+    "$TMP_DIR"/workloads/*|"$TMP_DIR"/cold-runs/*|"$TMP_DIR"/returning-cold-runs/*) ;;
     *)
       echo "Refusing destructive benchmark cleanup outside isolated workspace: $path" >&2
       exit 1
@@ -826,6 +843,13 @@ reset_workload_outputs() {
   ensure_isolated_workload_dir "$cwd"
   assert_no_active_uc_cache_lock "$cwd"
   rm -rf "$cwd/target" "$cwd/.uc" "$cwd/.scarb"
+}
+
+reset_workload_outputs_returning_cold() {
+  local cwd="$1"
+  ensure_isolated_workload_dir "$cwd"
+  assert_no_active_uc_cache_lock "$cwd"
+  rm -rf "$cwd/target"
 }
 
 reset_daemon_shared_cache_for_cold_run() {
@@ -902,6 +926,51 @@ run_build_cold() {
   done
 
   append_result "build.cold" "$workload" "$command_string" "$samples_file" "$runs" "$phase_file"
+}
+
+run_build_returning_cold() {
+  local workload="$1"
+  local cwd="$2"
+  local runs="$3"
+  local samples_file="$TMP_DIR/${TOOL}-${workload//\//_}-build-returning-cold.samples"
+  local phase_file="$TMP_DIR/${TOOL}-${workload//\//_}-build-returning-cold.phases.ndjson"
+  local seed_dir="$TMP_DIR/returning-cold-seed/${workload//\//_}"
+  local run_root="$TMP_DIR/returning-cold-runs/${workload//\//_}"
+  local command_string=""
+  : > "$samples_file"
+  : > "$phase_file"
+
+  ensure_isolated_workload_dir "$cwd"
+  mkdir -p "$(dirname "$seed_dir")"
+  rm -rf "$seed_dir"
+  cp -PR "$cwd" "$seed_dir"
+
+  local seed_manifest="$seed_dir/Scarb.toml"
+  local -a seed_command=()
+  build_command_for_manifest_with_mode "$seed_manifest" "$BUILD_OFFLINE"
+  seed_command=("${CMD_REPLY[@]}")
+  command_string="$(command_to_string "${seed_command[@]}")"
+  if ! measure_command_ms "$seed_dir" "${seed_command[@]}" >/dev/null; then
+    echo "ERROR: returning-cold seed build failed for $workload (${seed_command[*]})" >&2
+    return 1
+  fi
+
+  for i in $(seq 1 "$runs"); do
+    local run_dir="$run_root/run-$i"
+    local run_manifest="$run_dir/Scarb.toml"
+    local -a run_command=()
+    mkdir -p "$(dirname "$run_dir")"
+    rm -rf "$run_dir"
+    cp -PR "$seed_dir" "$run_dir"
+    reset_workload_outputs_returning_cold "$run_dir"
+    reset_daemon_shared_cache_for_cold_run
+    build_command_for_manifest_with_mode "$run_manifest" "$BUILD_OFFLINE"
+    run_command=("${CMD_REPLY[@]}")
+    measure_command_ms "$run_dir" "${run_command[@]}" >> "$samples_file"
+    record_uc_phase_sample "$phase_file"
+  done
+
+  append_result "build.returning_cold" "$workload" "$command_string" "$samples_file" "$runs" "$phase_file"
 }
 
 run_build_warm_noop() {
@@ -1105,13 +1174,16 @@ if [[ "$MATRIX" == "research" ]]; then
   build_command_for_manifest "$WS_MANIFEST"
   WS_BUILD_CMD=("${CMD_REPLY[@]}")
 
-  if scenario_enabled "build.cold" || scenario_enabled "build.warm_noop" || scenario_enabled "build.warm_edit" || scenario_enabled "build.warm_edit_semantic"; then
+  if scenario_enabled "build.cold" || scenario_enabled "build.returning_cold" || scenario_enabled "build.warm_noop" || scenario_enabled "build.warm_edit" || scenario_enabled "build.warm_edit_semantic"; then
     prime_build_dependencies_if_needed "hello_world" "$HELLO_MANIFEST"
     prime_build_dependencies_if_needed "workspaces" "$WS_MANIFEST"
   fi
 
   if scenario_enabled "build.cold"; then
     run_build_cold "hello_world" "$HELLO_DIR" "$COLD_RUNS"
+  fi
+  if scenario_enabled "build.returning_cold"; then
+    run_build_returning_cold "hello_world" "$HELLO_DIR" "$COLD_RUNS"
   fi
   if scenario_enabled "build.warm_noop"; then
     run_build_warm_noop "hello_world" "$HELLO_DIR" "$RUNS" "${HELLO_BUILD_CMD[@]}"
@@ -1125,6 +1197,9 @@ if [[ "$MATRIX" == "research" ]]; then
 
   if scenario_enabled "build.cold"; then
     run_build_cold "workspaces" "$WS_DIR" "$COLD_RUNS"
+  fi
+  if scenario_enabled "build.returning_cold"; then
+    run_build_returning_cold "workspaces" "$WS_DIR" "$COLD_RUNS"
   fi
   if scenario_enabled "build.warm_noop"; then
     run_build_warm_noop "workspaces" "$WS_DIR" "$RUNS" "${WS_BUILD_CMD[@]}"
@@ -1158,12 +1233,15 @@ elif [[ "$MATRIX" == "smoke" ]]; then
   build_command_for_manifest "$SMOKE_MANIFEST"
   SMOKE_BUILD_CMD=("${CMD_REPLY[@]}")
 
-  if scenario_enabled "build.cold" || scenario_enabled "build.warm_noop" || scenario_enabled "build.warm_edit" || scenario_enabled "build.warm_edit_semantic"; then
+  if scenario_enabled "build.cold" || scenario_enabled "build.returning_cold" || scenario_enabled "build.warm_noop" || scenario_enabled "build.warm_edit" || scenario_enabled "build.warm_edit_semantic"; then
     prime_build_dependencies_if_needed "scarb_smoke" "$SMOKE_MANIFEST"
   fi
 
   if scenario_enabled "build.cold"; then
     run_build_cold "scarb_smoke" "$SMOKE_DIR" "$COLD_RUNS"
+  fi
+  if scenario_enabled "build.returning_cold"; then
+    run_build_returning_cold "scarb_smoke" "$SMOKE_DIR" "$COLD_RUNS"
   fi
   if scenario_enabled "build.warm_noop"; then
     run_build_warm_noop "scarb_smoke" "$SMOKE_DIR" "$RUNS" "${SMOKE_BUILD_CMD[@]}"
