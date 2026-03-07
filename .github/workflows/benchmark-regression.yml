@@ -229,20 +229,20 @@ jobs:
               cat "$log_path" >&2
               exit 1
             fi
-            python3 - <<'PY' "$report_path" "$tag"
-            import json
-            import sys
-            from pathlib import Path
+          python3 - <<'PY' "$report_path" "$tag"
+          import json
+          import sys
+          from pathlib import Path
 
-            report_path = Path(sys.argv[1])
-            tag = sys.argv[2]
-            report = json.loads(report_path.read_text(encoding="utf-8"))
-            if report.get("exit_code") != 0:
-                raise SystemExit(f"native-only gate failed: non-zero report exit code for {tag}: {report.get('exit_code')}")
-            command = report.get("command") or []
-            if command and command[0] == "scarb":
-                raise SystemExit(f"native-only gate failed: fallback to scarb detected for {tag}")
-            PY
+          report_path = Path(sys.argv[1])
+          tag = sys.argv[2]
+          report = json.loads(report_path.read_text(encoding="utf-8"))
+          if report.get("exit_code") != 0:
+              raise SystemExit(f"native-only gate failed: non-zero report exit code for {tag}: {report.get('exit_code')}")
+          command = report.get("command") or []
+          if command and command[0] == "scarb":
+              raise SystemExit(f"native-only gate failed: fallback to scarb detected for {tag}")
+          PY
           }
 
           run_native_only "benchmarks/fixtures/scarb_smoke/Scarb.toml" "smoke"

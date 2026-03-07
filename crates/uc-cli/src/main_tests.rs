@@ -2914,11 +2914,8 @@ openzeppelin = "0.20.0"
     )
     .expect("failed to write manifest");
     fs::write(&lock_path, "version = 1\n").expect("failed to write lock file");
-    fs::write(
-        source_dir.join("lib.cairo"),
-        "fn main() -> felt252 { 1 }\n",
-    )
-    .expect("failed to write source file");
+    fs::write(source_dir.join("lib.cairo"), "fn main() -> felt252 { 1 }\n")
+        .expect("failed to write source file");
     fs::write(
         workspace.join("deps/openzeppelin/Scarb.toml"),
         r#"[package]
@@ -3049,6 +3046,29 @@ edition = "2024_07"
     );
 
     fs::remove_dir_all(&workspace).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn parse_native_scarb_metadata_document_accepts_prefixed_progress_lines() {
+    let stdout = "    Updating git repository https://example.test/repo\n Downloading dep v1.0.0\n{\"packages\":[],\"compilation_units\":[]}\n";
+    let metadata = parse_native_scarb_metadata_document(stdout)
+        .expect("parser should recover JSON payload after progress logs");
+    assert!(
+        metadata.packages.is_empty() && metadata.compilation_units.is_empty(),
+        "metadata payload should decode after stripping progress prelude"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn parse_native_scarb_metadata_document_rejects_non_json_output() {
+    let err = parse_native_scarb_metadata_document("Downloading dependencies...\n")
+        .expect_err("non-JSON output should fail decoding");
+    assert!(
+        format!("{err:#}").contains("failed to decode scarb metadata JSON payload"),
+        "error should explain metadata JSON decoding failure"
+    );
 }
 
 #[cfg(feature = "native-compile")]

@@ -4713,6 +4713,24 @@ fn native_dependency_manifest_path(source_root: &Path) -> PathBuf {
 }
 
 #[cfg(feature = "native-compile")]
+fn parse_native_scarb_metadata_document(stdout: &str) -> Result<NativeScarbMetadataDocument> {
+    let trimmed = stdout.trim_start();
+    if let Ok(metadata) = serde_json::from_str::<NativeScarbMetadataDocument>(trimmed) {
+        return Ok(metadata);
+    }
+
+    // Some Scarb versions emit progress lines before JSON when fetching dependencies.
+    if let Some(json_start) = trimmed.find('{') {
+        let candidate = &trimmed[json_start..];
+        if let Ok(metadata) = serde_json::from_str::<NativeScarbMetadataDocument>(candidate) {
+            return Ok(metadata);
+        }
+    }
+
+    bail!("failed to decode scarb metadata JSON payload from command output");
+}
+
+#[cfg(feature = "native-compile")]
 fn collect_native_dependency_surface_from_scarb_metadata(
     manifest_path: &Path,
     root_package_name: &str,
@@ -4747,7 +4765,9 @@ fn collect_native_dependency_surface_from_scarb_metadata(
         return Ok(None);
     }
 
-    let metadata: NativeScarbMetadataDocument = match serde_json::from_str(&run.stdout) {
+    let metadata: NativeScarbMetadataDocument = match parse_native_scarb_metadata_document(
+        &run.stdout,
+    ) {
         Ok(metadata) => metadata,
         Err(err) => {
             tracing::debug!(
