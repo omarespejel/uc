@@ -219,6 +219,18 @@ test_rejects_source_package_dedupe_without_id() {
   expect_builder_failure "$inventory_dir/inventory.json" "source_package_id must be a non-empty string when deduplication.key is source_package"
 }
 
+test_rejects_null_source_package_id_when_present() {
+  local case_root="$TEST_TMP_DIR/source-package-null/cases"
+  local inventory_dir="$TEST_TMP_DIR/source-package-null/inventory"
+  mkdir -p "$inventory_dir"
+  write_manifest_case "$case_root" "a"
+  local record
+  record="$(inventory_record_json a "../cases/a/Scarb.toml" "0x01" "2.14.0")"
+  write_inventory_file "$inventory_dir/inventory.json" sample class_hash "$record"
+  mutate_inventory "$inventory_dir/inventory.json" '.records[0].source_package_id = null'
+  expect_builder_failure "$inventory_dir/inventory.json" "inventory.records[0].source_package_id must be a string"
+}
+
 test_rejects_inventory_output_overwrite_aliases() {
   local case_root="$TEST_TMP_DIR/overwrite/cases"
   local inventory_dir="$TEST_TMP_DIR/overwrite/inventory"
@@ -255,6 +267,7 @@ run_test "builds deduped source index and corpus" test_builds_deduped_source_ind
 run_test "rejects unknown keys and boolean ints" test_rejects_unknown_keys_and_boolean_ints
 run_test "rejects duplicate tags and absolute manifest" test_rejects_duplicate_tags_and_absolute_manifest
 run_test "rejects source_package dedupe without id" test_rejects_source_package_dedupe_without_id
+run_test "rejects null source_package_id when present" test_rejects_null_source_package_id_when_present
 run_test "rejects inventory output overwrite aliases" test_rejects_inventory_output_overwrite_aliases
 
 echo "build_deployed_contract_source_index_test.sh: ok"

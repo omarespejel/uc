@@ -255,7 +255,7 @@ for index, raw_record in enumerate(records):
     source_package_id = record.get("source_package_id")
     if dedupe_key == "source_package" and (not isinstance(source_package_id, str) or not source_package_id):
         fail(f"inventory.records[{index}].source_package_id must be a non-empty string when deduplication.key is source_package")
-    if source_package_id is not None:
+    if "source_package_id" in record:
         optional_str(record, "source_package_id", f"inventory.records[{index}]")
 
     normalized = {key: record[key] for key in SOURCE_INDEX_ITEM_KEYS if key in record}
