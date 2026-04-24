@@ -6686,7 +6686,10 @@ fn native_tracked_sources_content_hash(
             if path.is_absolute() {
                 path.to_path_buf()
             } else {
-                let absolute = workspace_root.join(path);
+                let relative = validated_relative_artifact_path(tracked_path).with_context(|| {
+                    format!("native tracked source hash path contains invalid components: {tracked_path}")
+                })?;
+                let absolute = workspace_root.join(&relative);
                 ensure_path_within_root(
                     workspace_root,
                     &absolute,

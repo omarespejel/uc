@@ -6,14 +6,15 @@ OUT="${1:-$ROOT/docs/agent/REPO_MAP.md}"
 if command -v mktemp >/dev/null 2>&1; then
   TMP="$(mktemp)"
 else
-  TMP="$(/usr/bin/mktemp)"
+  echo "mktemp not found; please install coreutils or provide mktemp in PATH" >&2
+  exit 1
 fi
 
 line_of() {
   local pattern="$1"
   local file="$2"
   local line
-  line="$(rg -n "$pattern" "$file" | head -n 1 | cut -d: -f1)"
+  line="$({ rg -n "$pattern" "$file" || true; } | head -n 1 | cut -d: -f1)"
   if [[ -n "$line" ]]; then
     printf '%s' "$line"
   else

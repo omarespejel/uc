@@ -26,14 +26,16 @@ done
 if command -v mktemp >/dev/null 2>&1; then
   tmp_map="$(mktemp)"
 else
-  tmp_map="$(/usr/bin/mktemp)"
+  echo "mktemp not found; please install coreutils or provide mktemp in PATH" >&2
+  exit 1
 fi
+trap 'rm -f "$tmp_map"' EXIT
 ./scripts/refresh_repo_map.sh "$tmp_map" >/dev/null
 if ! diff -u "$tmp_map" docs/agent/REPO_MAP.md; then
   echo "repo map is stale; run make agent-map" >&2
-  rm -f "$tmp_map"
   exit 1
 fi
+trap - EXIT
 rm -f "$tmp_map"
 
 echo "agent surface validated"

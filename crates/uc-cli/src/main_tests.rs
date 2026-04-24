@@ -5969,6 +5969,38 @@ fn native_tracked_sources_content_hash_accepts_absolute_dependency_paths() {
 
 #[cfg(feature = "native-compile")]
 #[test]
+fn native_tracked_sources_content_hash_rejects_parent_dir_escape_paths() {
+    let dir = unique_test_dir("uc-native-tracked-hash-parent-escape");
+    let outside = dir
+        .parent()
+        .expect("test dir should have parent")
+        .join("outside.cairo");
+    fs::write(&outside, "fn outside() {}\n").expect("failed to write outside fixture");
+    let tracked_sources = BTreeMap::from([(
+        "../outside.cairo".to_string(),
+        NativeTrackedFileState {
+            size_bytes: fs::metadata(&outside).expect("outside metadata").len(),
+            modified_unix_ms: metadata_modified_unix_ms(
+                &fs::metadata(&outside).expect("outside metadata"),
+            )
+            .expect("outside mtime"),
+        },
+    )]);
+
+    let err = native_tracked_sources_content_hash(&dir, &tracked_sources)
+        .expect_err("parent-dir escape must be rejected");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("invalid components"),
+        "unexpected error for parent-dir escape: {message}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+    fs::remove_file(&outside).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
 fn native_compile_session_image_restore_rejects_signature_and_content_hash_mismatches() {
     let dir = unique_test_dir("uc-native-session-image-invalidations");
     let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");

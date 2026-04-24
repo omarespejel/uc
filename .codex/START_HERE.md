@@ -1,6 +1,7 @@
 # uc Start Here
 
 ## 5-Minute Bootstrap
+
 1. `make doctor`
 2. `make agent-validate`
 3. Read `docs/agent/REPO_MAP.md`
@@ -13,6 +14,7 @@
 6. Open normal PRs, not draft PRs, so CodeRabbit and Qodo review the branch immediately.
 
 ## Common Commands
+
 - Format: `cargo fmt --all`
 - Fast validation: `make validate-fast`
 - Native validation: `make validate-native`
@@ -21,6 +23,7 @@
 - Strict research benchmark: `make benchmark-strict-research`
 
 ## Key Files
+
 - `crates/uc-cli/src/main.rs`: build path, daemon, native compile session, persisted state.
 - `crates/uc-cli/src/fingerprint.rs`: semantic hashing and fingerprint cache.
 - `crates/uc-cli/src/main_tests.rs`: regression-heavy unit coverage.
@@ -28,6 +31,7 @@
 - `.coderabbit.yaml`, `.pr_agent.toml`, `best_practices.md`, `pr_compliance_checklist.yaml`: PR bot behavior.
 
 ## Expected Workflow
+
 - Start in a fresh clone or worktree.
 - Make the smallest coherent change that can be tested.
 - Add tests before or with risky code changes.

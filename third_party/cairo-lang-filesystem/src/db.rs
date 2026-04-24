@@ -229,15 +229,18 @@ pub type ExtAsVirtual =
     Arc<dyn for<'a> Fn(&'a dyn Database, salsa::Id) -> &'a VirtualFile<'a> + Send + Sync>;
 
 fn should_log_uc_native_progress() -> bool {
-    matches!(
-        std::env::var("UC_NATIVE_PROGRESS")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("1" | "true" | "yes" | "on")
-    )
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("UC_NATIVE_PROGRESS")
+                .ok()
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("1" | "true" | "yes" | "on")
+        )
+    })
 }
 
 fn log_uc_native_progress(message: impl AsRef<str>) {
