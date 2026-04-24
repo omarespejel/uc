@@ -53,6 +53,23 @@ Stability runs default to `--host-preflight require` and fail fast if noisy host
 ./benchmarks/scripts/compare_benchmark_results.sh --baseline <scarb.json> --candidate <uc.json> --out <delta.md>
 ```
 
+## CI Native Gates
+```bash
+./benchmarks/scripts/run_native_only_gate.sh \
+  --uc-bin ./target/release/uc \
+  --results-dir benchmarks/results \
+  --case benchmarks/fixtures/scarb_smoke/Scarb.toml smoke 0
+
+./benchmarks/scripts/run_native_real_repo_smoke.sh \
+  --uc-bin ./target/release/uc \
+  --results-dir benchmarks/results \
+  --strict-case /abs/path/to/project/Scarb.toml sample  \
+  --backend-case /abs/path/to/project/Scarb.toml sample-fallback scarb,uc-native
+```
+
+These checked-in scripts back the GitHub Actions native-only and real-repo smoke gates.
+Keep CI gate logic in scripts instead of workflow heredocs so it stays testable and reviewable.
+
 ## Fast Iteration Loop (Developer Lane)
 ```bash
 ./benchmarks/scripts/run_fast_perf_check.sh
