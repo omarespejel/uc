@@ -1769,21 +1769,48 @@ fn manifest_package_cairo_version(manifest: &TomlValue) -> Option<String> {
 
 #[cfg(feature = "native-compile")]
 fn ensure_native_manifest_cairo_version_supported(manifest: &TomlValue) -> Result<()> {
+    ensure_native_manifest_cairo_version_supported_with_compiler(
+        manifest,
+        native_cairo_lang_compiler_version(),
+    )
+}
+
+#[cfg(feature = "native-compile")]
+fn ensure_native_manifest_cairo_version_supported_with_compiler(
+    manifest: &TomlValue,
+    compiler: &str,
+) -> Result<()> {
     let Some(requested) = manifest_package_cairo_version(manifest) else {
         return Ok(());
     };
     let Some(requested_major_minor) = parse_cairo_version_major_minor(&requested) else {
+        tracing::warn!(
+            compiler = %compiler,
+            requested = %requested,
+            "native compile preflight rejected unsupported cairo-version constraint"
+        );
         return Err(native_fallback_eligible_error(format!(
             "native compile requires an exact cairo-version (major.minor[.patch]); unsupported constraint `{requested}`",
         )));
     };
-    let compiler = native_cairo_lang_compiler_version();
     let Some(compiler_major_minor) = parse_cairo_version_major_minor(compiler) else {
-        return Ok(());
+        tracing::warn!(
+            compiler = %compiler,
+            requested = %requested,
+            "native compile preflight rejected unparseable native compiler version"
+        );
+        return Err(native_fallback_eligible_error(format!(
+            "native compiler version `{compiler}` is unknown or unparseable; native requires an exact cairo major.minor match with package cairo-version {requested}"
+        )));
     };
     if compiler_major_minor == requested_major_minor {
         return Ok(());
     }
+    tracing::warn!(
+        compiler = %compiler,
+        requested = %requested,
+        "native compile preflight rejected cairo-version mismatch"
+    );
     Err(native_fallback_eligible_error(format!(
         "native cairo-lang {compiler} is incompatible with package cairo-version {requested}; native requires the same cairo major.minor as the package"
     )))

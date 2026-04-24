@@ -1775,6 +1775,35 @@ cairo-version = "{}.{compiler_minor}.0"
     );
 }
 
+#[cfg(feature = "native-compile")]
+#[test]
+fn ensure_native_manifest_cairo_version_supported_rejects_unparseable_compiler_version() {
+    let manifest: TomlValue = toml::from_str(
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+cairo-version = "2.14.0"
+"#,
+    )
+    .expect("manifest should parse");
+
+    let err = ensure_native_manifest_cairo_version_supported_with_compiler(
+        &manifest,
+        "lockhash-deadbeefdeadbeefdeadbeefdeadbeef",
+    )
+    .expect_err("unparseable native compiler version should be rejected");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("unknown or unparseable"),
+        "error should explain that the native compiler version could not be parsed"
+    );
+    assert!(
+        native_error_allows_scarb_fallback(&err),
+        "unparseable native compiler version should allow scarb fallback"
+    );
+}
+
 #[test]
 fn daemon_build_plan_cache_key_is_order_independent_for_features() {
     let common_a = BuildCommonArgs {
