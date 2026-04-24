@@ -145,6 +145,7 @@ if [[ ! -f "$LOCKFILE_PATH" ]]; then
 fi
 
 lane_digits="${LANE//./}"
+HELPER_FEATURE="helper-cairo-${lane_digits}"
 if [[ -z "$OUTPUT" ]]; then
   OUTPUT="$HOME/.uc/toolchain-helpers/uc-cairo${lane_digits}-helper/bin/uc"
 fi
@@ -225,11 +226,11 @@ mkdir -p "$TARGET_DIR"
 if (( CHECK_ONLY == 1 )); then
   (
     cd "$STAGING_DIR"
-    CARGO_TARGET_DIR="$TARGET_DIR" cargo test --locked --features helper-cairo-214 -p uc-cli \
+    CARGO_TARGET_DIR="$TARGET_DIR" cargo test --locked --features "$HELPER_FEATURE" -p uc-cli \
       native_helper_cairo214_skip_unused_import_diagnostics_is_not_session_keyed -- --nocapture
-    CARGO_TARGET_DIR="$TARGET_DIR" cargo test --locked --features helper-cairo-214 -p uc-cli \
+    CARGO_TARGET_DIR="$TARGET_DIR" cargo test --locked --features "$HELPER_FEATURE" -p uc-cli \
       native_crate_cache_restore_preserves_existing_config_fields -- --nocapture
-    CARGO_TARGET_DIR="$TARGET_DIR" cargo test --locked --features helper-cairo-214 -p uc-cli \
+    CARGO_TARGET_DIR="$TARGET_DIR" cargo test --locked --features "$HELPER_FEATURE" -p uc-cli \
       native_apply_file_keyed_session_updates_skips_untracked_removed_file_slots -- --nocapture
   )
   printf 'Validated helper lane %s with targeted cargo tests\n' "$LANE"
@@ -240,7 +241,7 @@ fi
 mkdir -p "$(dirname "$OUTPUT")"
 (
   cd "$STAGING_DIR"
-  CARGO_TARGET_DIR="$TARGET_DIR" cargo build --locked --release --features helper-cairo-214 --bin uc
+  CARGO_TARGET_DIR="$TARGET_DIR" cargo build --locked --release --features "$HELPER_FEATURE" --bin uc
 )
 cp "$TARGET_DIR/release/uc" "$OUTPUT"
 chmod +x "$OUTPUT"

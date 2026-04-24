@@ -2245,14 +2245,18 @@ cairo-version = "{requested_version}"
         diagnostic
             .how_to_fix
             .iter()
-            .any(|fix| fix.contains("./scripts/build_native_toolchain_helper.sh --lane")),
+            .any(|fix| fix.contains(&format!(
+                "./scripts/build_native_toolchain_helper.sh --lane {requested_major_minor}"
+            ))),
         "missing helper diagnostics should point agents to the productized helper builder"
     );
     assert!(
         diagnostic
             .next_commands
             .iter()
-            .any(|cmd| cmd.contains("./scripts/build_native_toolchain_helper.sh --lane")),
+            .any(|cmd| cmd.contains(&format!(
+                "./scripts/build_native_toolchain_helper.sh --lane {requested_major_minor}"
+            ))),
         "agent diagnostics should include an executable next command"
     );
     assert_eq!(
@@ -2326,15 +2330,30 @@ cairo-version = "{requested_version}"
         .as_array()
         .expect("how_to_fix should stay an array");
     assert!(
-        fixes.iter().any(|fix| fix
-            .as_str()
-            .unwrap_or_default()
-            .contains("UC_NATIVE_TOOLCHAIN")),
+        fixes
+            .iter()
+            .any(|fix| fix.as_str().unwrap_or_default().contains(&helper_env)),
         "doctor depends on remediation mentioning the helper env var"
+    );
+    assert!(
+        fixes
+            .iter()
+            .any(|fix| fix.as_str().unwrap_or_default().contains(&format!(
+                "./scripts/build_native_toolchain_helper.sh --lane {requested_major_minor}"
+            ))),
+        "doctor depends on lane-specific helper build remediation"
     );
     let commands = json["diagnostics"][0]["next_commands"]
         .as_array()
         .expect("next_commands should stay an array");
+    assert!(
+        commands
+            .iter()
+            .any(|cmd| cmd.as_str().unwrap_or_default().contains(&format!(
+                "./scripts/build_native_toolchain_helper.sh --lane {requested_major_minor}"
+            ))),
+        "agent diagnostics should include the exact helper lane build command"
+    );
     assert!(
         commands
             .iter()

@@ -9,7 +9,7 @@
 
 ```bash
 ./scripts/build_native_toolchain_helper.sh --lane 2.14
-export UC_NATIVE_TOOLCHAIN_2_14_BIN="$HOME/.uc/toolchain-helpers/uc-cairo214-helper/bin/uc"
+# Then run the exact `export UC_NATIVE_TOOLCHAIN_2_14_BIN=...` command printed by the script.
 ```
 
 To validate the compatibility lane without producing a release binary:
@@ -22,7 +22,7 @@ The helper builder:
 - stages an isolated copy of the current repo
 - rewrites the workspace Cairo dependencies to exact `2.14.0`
 - removes the local `third_party` Cairo patches that only apply to the main `2.16` lane
-- builds the current `uc` command surface with the `helper-cairo-214` compatibility feature enabled
+- builds the current `uc` command surface with the lane-specific helper compatibility feature enabled
 - runs targeted `uc-cli` regression tests for the helper-only compatibility paths
 
 ## Preflight A Real Manifest

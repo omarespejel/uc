@@ -60,6 +60,7 @@
 Native auto mode still falls back to Scarb only when the failure class is explicitly marked fallback-eligible. The fallback path is now surfaced in build reports and benchmark support-matrix output instead of being inferred from logs.
 
 ## Helper Lane Operations
+
 - `./scripts/build_native_toolchain_helper.sh --lane 2.14`
   - Builds a Cairo `2.14` helper binary from the current repo in an isolated staging tree.
   - Produces a binary suitable for `UC_NATIVE_TOOLCHAIN_2_14_BIN`.

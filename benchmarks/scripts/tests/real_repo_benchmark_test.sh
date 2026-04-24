@@ -87,10 +87,7 @@ if [[ "$1" == "build" ]]; then
       count=$((count + 1))
       printf '%s' "$count" > "$count_file"
       if [[ "$count" -eq 4 ]]; then
-        python3 - <<'PY'
-import time
-time.sleep(1.5)
-PY
+        sleep 1.5
       fi
     fi
   fi
