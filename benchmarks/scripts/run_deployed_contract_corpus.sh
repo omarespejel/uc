@@ -185,6 +185,10 @@ def require_str(obj, key, ctx):
         fail(f"{ctx}.{key} must be a non-empty string")
     return value
 
+def optional_str(obj, key, ctx):
+    if key in obj and not isinstance(obj.get(key), str):
+        fail(f"{ctx}.{key} must be a string")
+
 def require_int(obj, key, ctx):
     value = obj.get(key)
     if type(value) is not int or value < 0:
@@ -215,6 +219,7 @@ if doc.get("schema_version") != 1:
     fail("corpus.schema_version must be 1")
 corpus_id = require_str(doc, "corpus_id", "corpus")
 chain = require_str(doc, "chain", "corpus")
+optional_str(doc, "license_policy", "corpus")
 selection = require_obj(doc.get("selection"), "corpus.selection")
 reject_unknown_keys(
     selection,
@@ -230,6 +235,7 @@ if to_block < from_block:
 coverage = require_str(selection, "coverage", "corpus.selection")
 if coverage not in {"sample", "complete_deployed_contracts"}:
     fail("corpus.selection.coverage must be sample or complete_deployed_contracts")
+optional_str(selection, "notes", "corpus.selection")
 dedup = require_obj(doc.get("deduplication"), "corpus.deduplication")
 reject_unknown_keys(dedup, {"key", "input_count", "deduped_count", "rules"}, "corpus.deduplication")
 dedupe_key = require_str(dedup, "key", "corpus.deduplication")
@@ -237,6 +243,7 @@ if dedupe_key not in {"class_hash", "source_package", "none"}:
     fail("corpus.deduplication.key must be class_hash, source_package, or none")
 input_count = require_int(dedup, "input_count", "corpus.deduplication")
 deduped_count = require_int(dedup, "deduped_count", "corpus.deduplication")
+optional_str(dedup, "rules", "corpus.deduplication")
 items = doc.get("items")
 if not isinstance(items, list) or not items:
     fail("corpus.items must be a non-empty array")
@@ -289,6 +296,8 @@ for index, item in enumerate(items):
     normalized["contract_address"] = require_str(item, "contract_address", f"corpus.items[{index}]")
     normalized["source_ref"] = require_str(item, "source_ref", f"corpus.items[{index}]")
     normalized["cairo_version"] = require_str(item, "cairo_version", f"corpus.items[{index}]")
+    for optional_key in ["scarb_version", "license", "notes"]:
+        optional_str(item, optional_key, f"corpus.items[{index}]")
     normalized_items.append(normalized)
 
 versions = sorted({item["cairo_version"] for item in normalized_items}, key=version_key)

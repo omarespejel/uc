@@ -387,6 +387,51 @@ test_rejects_boolean_integer_fields() {
   fi
 }
 
+test_rejects_non_string_optional_fields() {
+  local case_root="$TEST_TMP_DIR/optional-strings/cases"
+  local corpus_dir="$TEST_TMP_DIR/optional-strings/corpora"
+  local results_dir="$TEST_TMP_DIR/optional-strings/results"
+  mkdir -p "$corpus_dir" "$results_dir"
+  write_manifest_case "$case_root" "a"
+  local item
+  item="$(item_json a "../cases/a/Scarb.toml" "0x01" "2.14.0")"
+
+  local -a filters=(
+    '.license_policy = false'
+    '.selection.notes = {}'
+    '.deduplication.rules = []'
+    '.items[0].scarb_version = false'
+    '.items[0].license = {}'
+    '.items[0].notes = []'
+  )
+  local -a contexts=(
+    'corpus.license_policy must be a string'
+    'corpus.selection.notes must be a string'
+    'corpus.deduplication.rules must be a string'
+    'corpus.items[0].scarb_version must be a string'
+    'corpus.items[0].license must be a string'
+    'corpus.items[0].notes must be a string'
+  )
+
+  local index corpus_path stderr_path
+  for index in "${!filters[@]}"; do
+    corpus_path="$corpus_dir/corpus-$index.json"
+    write_corpus_file "$corpus_path" sample class_hash "$item"
+    jq "${filters[$index]}" "$corpus_path" > "$corpus_dir/corpus-$index.tmp"
+    mv "$corpus_dir/corpus-$index.tmp" "$corpus_path"
+    stderr_path="$TEST_TMP_DIR/optional-strings-$index.err"
+    if "$CORPUS_SCRIPT" --corpus "$corpus_path" --results-dir "$results_dir/$index" --plan-only >"$TEST_TMP_DIR/optional-strings-$index.out" 2>"$stderr_path"; then
+      echo "expected non-string optional field to be rejected for ${filters[$index]}" >&2
+      return 1
+    fi
+    if ! grep -Fq "${contexts[$index]}" "$stderr_path"; then
+      echo "expected optional string validation error for ${filters[$index]}" >&2
+      cat "$stderr_path" >&2
+      return 1
+    fi
+  done
+}
+
 run_corpus_benchmark() {
   local coverage="$1"
   local corpus_dir="$TEST_TMP_DIR/run-$coverage/corpora"
@@ -559,6 +604,8 @@ run_test "rejects_unknown_top_level_keys" \
   test_rejects_unknown_top_level_keys
 run_test "rejects_boolean_integer_fields" \
   test_rejects_boolean_integer_fields
+run_test "rejects_non_string_optional_fields" \
+  test_rejects_non_string_optional_fields
 run_test "sample_corpus_blocks_compiled_all_claim" \
   test_sample_corpus_blocks_compiled_all_claim
 run_test "complete_corpus_with_fallback_blocks_compiled_all_claim" \
