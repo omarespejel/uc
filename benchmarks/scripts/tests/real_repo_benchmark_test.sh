@@ -214,6 +214,10 @@ if [[ -z "$manifest" ]]; then
   exit 20
 fi
 printf 'cwd=%s subcommand=%s manifest=%s\n' "$PWD" "$subcommand" "$manifest" >> "$args_log"
+if [[ "$subcommand" == "fetch" && "$manifest" == *"fails-fetch"* ]]; then
+  echo "forced scarb fetch failure for $manifest" >&2
+  exit 18
+fi
 if [[ "$subcommand" == "build" && "$manifest" == *"fails-build"* ]]; then
   echo "forced scarb build failure for $manifest" >&2
   exit 17
@@ -274,6 +278,24 @@ test_real_repo_benchmark_rejects_zero_runs_from_environment() {
   fi
   if ! grep -q "RUNS must be a positive integer" "$stderr_path"; then
     echo "expected explicit RUNS validation failure" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+}
+
+test_real_repo_benchmark_rejects_no_cases_with_updated_usage() {
+  local stderr_path="$TEST_TMP_DIR/no-cases.err"
+  if "$BENCH_SCRIPT" >"$TEST_TMP_DIR/no-cases.out" 2>"$stderr_path"; then
+    echo "expected real repo benchmark script to reject missing cases" >&2
+    return 1
+  fi
+  if ! grep -q "requires at least one case via --case or --cases-file" "$stderr_path"; then
+    echo "expected updated no-cases validation message" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+  if ! grep -q "Provide at least one case via --case or --cases-file" "$stderr_path"; then
+    echo "expected updated no-cases usage guidance" >&2
     cat "$stderr_path" >&2
     return 1
   fi
@@ -496,6 +518,47 @@ test_real_repo_benchmark_records_supported_build_failures() {
   assert_contains "$markdown_text" "| fails-build | scarb | build.cold | 17 |"
 }
 
+test_real_repo_benchmark_reports_prefetch_failure_context() {
+  local cases_root="$TEST_TMP_DIR/prefetch-cases"
+  local mock_bin_dir="$TEST_TMP_DIR/prefetch-mock-bin"
+  local mock_uc="$mock_bin_dir/uc"
+  local mock_scarb="$mock_bin_dir/scarb"
+  local results_dir="$TEST_TMP_DIR/prefetch-results"
+  local stderr_path="$TEST_TMP_DIR/prefetch.err"
+  mkdir -p "$mock_bin_dir" "$results_dir"
+  write_mock_uc_bin "$mock_uc"
+  write_mock_scarb_bin "$mock_scarb"
+  write_manifest_case "$cases_root" "fails-fetch"
+
+  if PATH="$mock_bin_dir:$PATH" \
+    MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/prefetch-uc.args" \
+    MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/prefetch-scarb.args" \
+    "$BENCH_SCRIPT" \
+      --uc-bin "$mock_uc" \
+      --results-dir "$results_dir" \
+      --runs 1 \
+      --cold-runs 1 \
+      --warm-settle-seconds 0 \
+      --case "$cases_root/fails-fetch/Scarb.toml" fails-fetch \
+      >"$TEST_TMP_DIR/prefetch.out" 2>"$stderr_path"; then
+    echo "expected prefetch failure to fail the benchmark run" >&2
+    return 1
+  fi
+
+  if ! grep -q "forced scarb fetch failure" "$stderr_path"; then
+    echo "expected underlying scarb fetch failure in stderr" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+  local expected_manifest
+  expected_manifest="$(cd "$cases_root/fails-fetch" && pwd -P)/Scarb.toml"
+  if ! grep -q "scarb fetch failed for manifest_path=$expected_manifest" "$stderr_path"; then
+    echo "expected manifest-scoped scarb fetch failure context" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+}
+
 test_real_repo_benchmark_surfaces_stability_warnings() {
   local cases_root="$TEST_TMP_DIR/stability-cases"
   local mock_bin_dir="$TEST_TMP_DIR/stability-mock-bin"
@@ -629,6 +692,8 @@ run_test "real_repo_benchmark_rejects_missing_case_values" \
   test_real_repo_benchmark_rejects_missing_case_values
 run_test "real_repo_benchmark_rejects_zero_runs_from_environment" \
   test_real_repo_benchmark_rejects_zero_runs_from_environment
+run_test "real_repo_benchmark_rejects_no_cases_with_updated_usage" \
+  test_real_repo_benchmark_rejects_no_cases_with_updated_usage
 run_test "real_repo_benchmark_accepts_cases_file" \
   test_real_repo_benchmark_accepts_cases_file
 run_test "real_repo_benchmark_rejects_malformed_cases_file_rows" \
@@ -637,6 +702,8 @@ run_test "real_repo_benchmark_records_support_matrix_categories" \
   test_real_repo_benchmark_records_support_matrix_categories
 run_test "real_repo_benchmark_records_supported_build_failures" \
   test_real_repo_benchmark_records_supported_build_failures
+run_test "real_repo_benchmark_reports_prefetch_failure_context" \
+  test_real_repo_benchmark_reports_prefetch_failure_context
 run_test "real_repo_benchmark_surfaces_stability_warnings" \
   test_real_repo_benchmark_surfaces_stability_warnings
 run_test "real_repo_benchmark_keeps_unstable_lanes_on_partial_failures" \

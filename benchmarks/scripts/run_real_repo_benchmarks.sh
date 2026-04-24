@@ -27,8 +27,9 @@ Usage:
   run_real_repo_benchmarks.sh [--uc-bin /abs/path/to/uc] [--results-dir /abs/path]
     [--runs <n>] [--cold-runs <n>] [--timeout-secs <seconds>]
     [--warm-settle-seconds <seconds>]
-    [--cases-file <tsv-with-manifest-and-tag>]
-    --case <manifest-path> <tag> [--case <manifest-path> <tag> ...]
+    [--cases-file <tsv-with-manifest-and-tag>] [--case <manifest-path> <tag> ...]
+
+  Provide at least one case via --case or --cases-file.
 USAGE
 }
 
@@ -191,7 +192,7 @@ validate_positive_int "COLD_RUNS" "$COLD_RUNS"
 validate_non_negative_number "WARM_SETTLE_SECONDS" "$WARM_SETTLE_SECONDS"
 
 if [[ "${#CASE_MANIFESTS[@]}" -eq 0 ]]; then
-  echo "run_real_repo_benchmarks.sh requires at least one --case" >&2
+  echo "run_real_repo_benchmarks.sh requires at least one case via --case or --cases-file" >&2
   usage >&2
   exit 2
 fi
@@ -332,7 +333,10 @@ prefetch_manifest_dependencies() {
   if [[ -n "${PREFETCHED_MANIFESTS[$manifest_path]:-}" ]]; then
     return
   fi
-  scarb --manifest-path "$manifest_path" --offline fetch >/dev/null
+  if ! scarb --manifest-path "$manifest_path" --offline fetch >/dev/null; then
+    echo "scarb fetch failed for manifest_path=$manifest_path" >&2
+    return 1
+  fi
   PREFETCHED_MANIFESTS["$manifest_path"]=1
 }
 
