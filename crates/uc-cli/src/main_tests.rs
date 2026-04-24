@@ -6032,7 +6032,7 @@ fn native_tracked_sources_content_hash_accepts_absolute_dependency_paths() {
         "absolute dependency tracked-source hash should produce a digest"
     );
     thread::sleep(Duration::from_millis(20));
-    fs::write(&dep_file, "fn dep() -> felt252 { 88 }\n").expect("failed to mutate dependency file");
+    fs::write(&dep_file, "fn dep() -> felt252 { 8 }\n").expect("failed to mutate dependency file");
     let updated_tracked_sources = BTreeMap::from([(
         normalize_fingerprint_path(&dep_file),
         NativeTrackedFileState {
@@ -7270,7 +7270,7 @@ fn with_native_compile_session_recomputes_content_hash_after_daemon_journal_delt
     }
 
     thread::sleep(Duration::from_millis(20));
-    fs::write(&source_file, "fn value() -> felt252 { 22 }\n").expect("failed to mutate source");
+    fs::write(&source_file, "fn value() -> felt252 { 2 }\n").expect("failed to mutate source");
     persist_native_source_change_journal(
         &dir,
         &NativeSourceChangeJournal {
