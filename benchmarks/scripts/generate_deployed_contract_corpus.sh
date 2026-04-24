@@ -85,6 +85,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 source_index_path = Path(sys.argv[1])
@@ -118,6 +119,16 @@ ITEM_KEYS = {
 def fail(message):
     print(message, file=sys.stderr)
     raise SystemExit(1)
+
+def reject_output_source_alias():
+    if out_path.exists():
+        if out_path.is_dir():
+            fail(f"--out must be a file path, got directory: {out_path}")
+        try:
+            if os.path.samefile(source_index_path, out_path):
+                fail(f"Refusing to overwrite source index with generated corpus: {source_index_path.resolve()}")
+        except OSError as exc:
+            fail(f"unable to validate --out path: {exc}")
 
 def require_obj(value, name):
     if not isinstance(value, dict):
@@ -247,13 +258,24 @@ corpus = {
     "license_policy": license_policy,
     "items": normalized_items,
 }
-if out_path.exists():
-    try:
-        if os.path.samefile(source_index_path, out_path):
-            fail(f"Refusing to overwrite source index with generated corpus: {source_index_path.resolve()}")
-    except OSError as exc:
-        fail(f"unable to validate --out path: {exc}")
-out_path.write_text(json.dumps(corpus, indent=2, sort_keys=True) + "\n")
+payload = json.dumps(corpus, indent=2, sort_keys=True) + "\n"
+reject_output_source_alias()
+tmp_fd, tmp_name = tempfile.mkstemp(
+    prefix=".tmp.deployed-contract-corpus.",
+    suffix=".json",
+    dir=str(out_path.parent),
+)
+tmp_path = Path(tmp_name)
+try:
+    with os.fdopen(tmp_fd, "w", encoding="utf-8") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    reject_output_source_alias()
+    os.replace(tmp_path, out_path)
+finally:
+    if tmp_path.exists():
+        tmp_path.unlink()
 PY
 
 echo "Corpus JSON: $OUT_ABS"
