@@ -21,7 +21,7 @@ To validate the compatibility lane without producing a release binary:
 The helper builder:
 - stages an isolated copy of the current repo
 - rewrites the workspace Cairo dependencies to exact `2.14.0`
-- removes the local `third_party` Cairo patches that only apply to the main `2.16` lane
+- removes the local `third_party` Cairo patches that only apply to the main lane's cairo-lang version
 - builds the current `uc` command surface with the lane-specific helper compatibility feature enabled
 - runs targeted `uc-cli` regression tests for the helper-only compatibility paths
 

@@ -2368,8 +2368,17 @@ cairo-version = "{requested_version}"
         json["diagnostics"][0]["toolchain_expected"],
         requested_major_minor
     );
+    let diagnostic_json = json["diagnostics"][0]
+        .as_object()
+        .expect("diagnostic should serialize as an object");
     assert!(
-        json["diagnostics"][0]["toolchain_found"].is_null(),
+        diagnostic_json.contains_key("toolchain_found"),
+        "missing helper diagnostics should serialize toolchain_found explicitly"
+    );
+    assert!(
+        diagnostic_json
+            .get("toolchain_found")
+            .is_some_and(serde_json::Value::is_null),
         "missing helper diagnostics should expose null found toolchain"
     );
     let fixes = json["diagnostics"][0]["how_to_fix"]

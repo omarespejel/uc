@@ -52,9 +52,28 @@ test_unsupported_lane_reports_actionable_error() {
   fi
 }
 
+test_existing_staging_dir_is_not_removed_on_failure() {
+  local stage_dir="$TMP_DIR/preexisting-stage"
+  local stdout_path="$TMP_DIR/preexisting-stage.out"
+  mkdir -p "$stage_dir"
+  printf 'do not delete\n' > "$stage_dir/sentinel.txt"
+
+  if "$HELPER_SCRIPT" --lane 2.14 --staging-dir "$stage_dir" --check-only >"$stdout_path" 2>&1; then
+    echo "expected pre-existing staging dir to fail" >&2
+    return 1
+  fi
+  grep -q 'staging dir already exists:' "$stdout_path"
+  if [[ ! -f "$stage_dir/sentinel.txt" ]]; then
+    echo "pre-existing staging dir was removed by cleanup trap" >&2
+    return 1
+  fi
+}
+
 run_test "prepare_only_rewrites_workspace_manifest_for_cairo214" \
   test_prepare_only_rewrites_workspace_manifest_for_cairo214
 run_test "prepare_only_and_check_only_are_mutually_exclusive" \
   test_prepare_only_and_check_only_are_mutually_exclusive
 run_test "unsupported_lane_reports_actionable_error" \
   test_unsupported_lane_reports_actionable_error
+run_test "existing_staging_dir_is_not_removed_on_failure" \
+  test_existing_staging_dir_is_not_removed_on_failure

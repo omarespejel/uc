@@ -460,7 +460,6 @@ struct NativeDiagnostic {
     fallback_used: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     toolchain_expected: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     toolchain_found: Option<String>,
 }
 

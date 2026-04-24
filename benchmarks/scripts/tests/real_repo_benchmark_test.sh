@@ -79,7 +79,9 @@ if [[ "$1" == "build" ]]; then
     state_dir="${MOCK_UC_STATE_DIR:-}"
     if [[ -n "$state_dir" ]]; then
       mkdir -p "$state_dir"
-      count_file="$state_dir/unstable-supported.count"
+      case_tag="$(basename "$(dirname "$manifest")")"
+      case_tag="${case_tag//[^A-Za-z0-9_.-]/_}"
+      count_file="$state_dir/${case_tag}.count"
       count=0
       if [[ -f "$count_file" ]]; then
         count="$(cat "$count_file")"
@@ -429,7 +431,9 @@ test_real_repo_benchmark_surfaces_stability_warnings() {
 
   local unstable_count
   unstable_count="$(jq -r '.summary.unstable_lane_count' "$json_path")"
-  if [[ "$unstable_count" -lt 1 ]]; then
+  local has_expected_unstable_tag
+  has_expected_unstable_tag="$(jq -r '.summary.unstable_lanes | any(.tag=="unstable-supported")' "$json_path")"
+  if [[ "$unstable_count" -lt 1 || "$has_expected_unstable_tag" != "true" ]]; then
     echo "expected unstable lane warning to be recorded" >&2
     cat "$json_path" >&2
     return 1
@@ -479,7 +483,9 @@ test_real_repo_benchmark_keeps_unstable_lanes_on_partial_failures() {
 
   local unstable_count
   unstable_count="$(jq -r '.summary.unstable_lane_count' "$json_path")"
-  if [[ "$unstable_count" -lt 1 ]]; then
+  local has_expected_unstable_tag
+  has_expected_unstable_tag="$(jq -r '.summary.unstable_lanes | any(.tag=="unstable-fails-build")' "$json_path")"
+  if [[ "$unstable_count" -lt 1 || "$has_expected_unstable_tag" != "true" ]]; then
     echo "expected unstable ok lanes to remain visible despite a failed sibling lane" >&2
     cat "$json_path" >&2
     return 1

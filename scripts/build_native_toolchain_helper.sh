@@ -9,6 +9,7 @@ TARGET_DIR=""
 PREPARE_ONLY=0
 CHECK_ONLY=0
 KEEP_STAGING=0
+STAGING_CREATED=0
 
 usage() {
   cat <<'USAGE'
@@ -157,7 +158,7 @@ if [[ -z "$TARGET_DIR" ]]; then
 fi
 
 cleanup() {
-  if (( KEEP_STAGING == 0 )) && (( PREPARE_ONLY == 0 )) && [[ -d "$STAGING_DIR" ]]; then
+  if (( KEEP_STAGING == 0 )) && (( PREPARE_ONLY == 0 )) && (( STAGING_CREATED == 1 )) && [[ -d "$STAGING_DIR" ]]; then
     rm -rf "$STAGING_DIR"
   fi
 }
@@ -168,6 +169,7 @@ if [[ -e "$STAGING_DIR" ]]; then
   exit 1
 fi
 mkdir -p "$STAGING_DIR"
+STAGING_CREATED=1
 
 prepare_staging_tree() {
   tar -C "$ROOT" \
