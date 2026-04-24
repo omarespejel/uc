@@ -104,6 +104,7 @@ fn native_progress_hook_lock() -> &'static Mutex<()> {
 #[cfg(feature = "native-compile")]
 struct NativeProgressHookRestore {
     previous: Option<NativeProgressTestHook>,
+    _integration_guard: std::sync::MutexGuard<'static, ()>,
     _guard: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -116,7 +117,9 @@ impl Drop for NativeProgressHookRestore {
 }
 
 #[cfg(feature = "native-compile")]
-fn capture_native_progress_messages() -> (Arc<Mutex<Vec<String>>>, NativeProgressHookRestore) {
+fn capture_native_progress_messages(
+    integration_guard: std::sync::MutexGuard<'static, ()>,
+) -> (Arc<Mutex<Vec<String>>>, NativeProgressHookRestore) {
     let guard = native_progress_hook_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -131,6 +134,7 @@ fn capture_native_progress_messages() -> (Arc<Mutex<Vec<String>>>, NativeProgres
         messages,
         NativeProgressHookRestore {
             previous,
+            _integration_guard: integration_guard,
             _guard: guard,
         },
     )
@@ -7728,10 +7732,10 @@ fn native_compile_batch_ranges_split_selected_contracts() {
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_run_contract_compile_batches_emits_progress_for_every_batch() {
-    let _guard = integration_env_lock()
+    let integration_guard = integration_env_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (messages, _hook_restore) = capture_native_progress_messages();
+    let (messages, _hook_restore) = capture_native_progress_messages(integration_guard);
     let plans = (0..5)
         .map(|index| NativeContractOutputPlan {
             module_path: format!("demo::contract_{index}"),
