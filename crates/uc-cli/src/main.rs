@@ -2257,9 +2257,39 @@ fn native_progress_compile_batch_size() -> usize {
 
 #[cfg(feature = "native-compile")]
 fn native_progress_log(message: impl AsRef<str>) {
-    if native_progress_enabled() {
-        eprintln!("uc: {}", message.as_ref());
+    let message = message.as_ref();
+    #[cfg(test)]
+    {
+        let hook = native_progress_test_hook()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook(message.to_string());
+        }
     }
+    if native_progress_enabled() {
+        eprintln!("uc: {message}");
+    }
+}
+
+#[cfg(all(feature = "native-compile", test))]
+type NativeProgressTestHook = Arc<dyn Fn(String) + Send + Sync>;
+
+#[cfg(all(feature = "native-compile", test))]
+fn native_progress_test_hook() -> &'static Mutex<Option<NativeProgressTestHook>> {
+    static VALUE: OnceLock<Mutex<Option<NativeProgressTestHook>>> = OnceLock::new();
+    VALUE.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(all(feature = "native-compile", test))]
+fn set_native_progress_test_hook(
+    hook: Option<NativeProgressTestHook>,
+) -> Option<NativeProgressTestHook> {
+    let mut slot = native_progress_test_hook()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::mem::replace(&mut *slot, hook)
 }
 
 #[cfg(feature = "native-compile")]
@@ -6293,6 +6323,63 @@ fn native_compile_batch_summary(
 }
 
 #[cfg(feature = "native-compile")]
+fn native_run_contract_compile_batches<T>(
+    all_plans: &[NativeContractOutputPlan],
+    selected_indices: &[usize],
+    configured_batch_size: usize,
+    mut compile_batch: impl FnMut(&[usize]) -> Result<Vec<T>>,
+) -> Result<(f64, Vec<T>)> {
+    if selected_indices.is_empty() {
+        return Ok((0.0, Vec::new()));
+    }
+    let batch_ranges = native_compile_batch_ranges(selected_indices.len(), configured_batch_size);
+    native_progress_log(format!(
+        "native contract compile start (selected={}, total={}, batches={}, summary={})",
+        selected_indices.len(),
+        all_plans.len(),
+        batch_ranges.len(),
+        native_compile_batch_summary(all_plans, selected_indices)
+    ));
+    let frontend_compile_start = Instant::now();
+    let mut compiled = Vec::with_capacity(selected_indices.len());
+    for (batch_ordinal, (start, end)) in batch_ranges.iter().copied().enumerate() {
+        let batch_indices = &selected_indices[start..end];
+        let batch_label = format!(
+            "native contract compile batch {}/{}",
+            batch_ordinal + 1,
+            batch_ranges.len()
+        );
+        native_progress_log(format!(
+            "{batch_label} start (contracts={}, summary={})",
+            batch_indices.len(),
+            native_compile_batch_summary(all_plans, batch_indices)
+        ));
+        let _heartbeat = NativeProgressHeartbeat::start(batch_label.clone());
+        let batch_compile_start = Instant::now();
+        let mut batch_results = compile_batch(batch_indices)?;
+        if batch_results.len() != batch_indices.len() {
+            bail!(
+                "native compile returned mismatched batch result count in batch {} (expected {}, got {})",
+                batch_ordinal + 1,
+                batch_indices.len(),
+                batch_results.len()
+            );
+        }
+        native_progress_log(format!(
+            "{batch_label} finished in {:.1}ms",
+            batch_compile_start.elapsed().as_secs_f64() * 1000.0
+        ));
+        compiled.append(&mut batch_results);
+    }
+    let frontend_compile_ms = frontend_compile_start.elapsed().as_secs_f64() * 1000.0;
+    native_progress_log(format!(
+        "native contract compile finished in {:.1}ms",
+        frontend_compile_ms
+    ));
+    Ok((frontend_compile_ms, compiled))
+}
+
+#[cfg(feature = "native-compile")]
 fn native_contract_from_module_path<'db>(
     db: &'db RootDatabase,
     crate_ids: &[CrateId<'db>],
@@ -6655,9 +6742,61 @@ fn native_compile_session_signature_hash(signature: &NativeCompileSessionSignatu
 
 #[cfg(feature = "native-compile")]
 fn native_source_hash_index_path(workspace_root: &Path) -> Result<PathBuf> {
-    let path = workspace_root.join(".uc/cache/native-session/source-hash-index-v1.json");
+    let path = workspace_root.join(".uc/cache/native-session/source-hash-index-v2.json");
     ensure_path_within_root(workspace_root, &path, "native source hash index path")?;
     Ok(path)
+}
+
+#[cfg(feature = "native-compile")]
+fn native_normalize_tracked_source_key(
+    workspace_root: &Path,
+    tracked_path: &str,
+) -> Result<String> {
+    let path = Path::new(tracked_path);
+    if path.is_absolute() {
+        if let Ok(relative) = path.strip_prefix(workspace_root) {
+            let relative = normalize_fingerprint_path(relative);
+            let relative = validated_relative_artifact_path(&relative).with_context(|| {
+                format!("native tracked source key contains invalid components: {tracked_path}")
+            })?;
+            return Ok(normalize_fingerprint_path(&relative));
+        }
+        return Ok(normalize_fingerprint_path(path));
+    }
+    let relative = validated_relative_artifact_path(tracked_path).with_context(|| {
+        format!("native tracked source key contains invalid components: {tracked_path}")
+    })?;
+    Ok(normalize_fingerprint_path(&relative))
+}
+
+#[cfg(feature = "native-compile")]
+fn native_normalize_tracked_sources(
+    workspace_root: &Path,
+    tracked_sources: BTreeMap<String, NativeTrackedFileState>,
+) -> Result<(BTreeMap<String, NativeTrackedFileState>, bool)> {
+    let mut normalized = BTreeMap::new();
+    let mut changed = false;
+    for (tracked_path, state) in tracked_sources {
+        let canonical_key = native_normalize_tracked_source_key(workspace_root, &tracked_path)?;
+        if canonical_key != tracked_path {
+            changed = true;
+        }
+        match normalized.entry(canonical_key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(state);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                if entry.get() != &state {
+                    bail!(
+                        "duplicate canonical tracked source key with conflicting metadata: {}",
+                        entry.key()
+                    );
+                }
+                changed = true;
+            }
+        }
+    }
+    Ok((normalized, changed))
 }
 
 #[cfg(feature = "native-compile")]
@@ -6678,16 +6817,20 @@ fn native_tracked_sources_content_hash(
     let recheck_window_ms = fingerprint_mtime_recheck_window_ms();
     let mut updated_entries = BTreeMap::new();
     let mut hasher = Hasher::new();
-    hasher.update(b"uc-native-tracked-sources-content-hash-v1");
+    hasher.update(b"uc-native-tracked-sources-content-hash-v2");
 
+    let mut canonical_sources = Vec::with_capacity(tracked_sources.len());
     for tracked_path in tracked_sources.keys() {
+        let canonical_key = native_normalize_tracked_source_key(workspace_root, tracked_path)?;
         let absolute = {
             let path = Path::new(tracked_path);
             if path.is_absolute() {
                 path.to_path_buf()
             } else {
                 let relative = validated_relative_artifact_path(tracked_path).with_context(|| {
-                    format!("native tracked source hash path contains invalid components: {tracked_path}")
+                    format!(
+                        "native tracked source hash path contains invalid components: {tracked_path}"
+                    )
                 })?;
                 let absolute = workspace_root.join(&relative);
                 ensure_path_within_root(
@@ -6698,6 +6841,11 @@ fn native_tracked_sources_content_hash(
                 absolute
             }
         };
+        canonical_sources.push((canonical_key, tracked_path.clone(), absolute));
+    }
+    canonical_sources.sort_by(|left, right| left.0.cmp(&right.0));
+
+    for (canonical_key, original_key, absolute) in canonical_sources {
         let metadata = fs::metadata(&absolute)
             .with_context(|| format!("failed to stat {}", absolute.display()))?;
         if !metadata.is_file() {
@@ -6705,7 +6853,11 @@ fn native_tracked_sources_content_hash(
         }
         let size_bytes = metadata.len();
         let modified_unix_ms = metadata_modified_unix_ms(&metadata)?;
-        let file_hash = if let Some(cached) = index.entries.get(tracked_path) {
+        let cached_entry = index
+            .entries
+            .get(&canonical_key)
+            .or_else(|| index.entries.get(&original_key));
+        let file_hash = if let Some(cached) = cached_entry {
             let should_rehash_recent = now_ms.saturating_sub(modified_unix_ms) <= recheck_window_ms;
             if cached.size_bytes == size_bytes
                 && cached.modified_unix_ms == modified_unix_ms
@@ -6718,15 +6870,18 @@ fn native_tracked_sources_content_hash(
         } else {
             hash_fingerprint_source_file(&absolute)?
         };
+        if updated_entries.contains_key(&canonical_key) {
+            bail!("duplicate canonical tracked source key: {canonical_key}");
+        }
         updated_entries.insert(
-            tracked_path.clone(),
+            canonical_key.clone(),
             FingerprintIndexEntry {
                 size_bytes,
                 modified_unix_ms,
                 blake3_hex: file_hash.clone(),
             },
         );
-        hasher.update(tracked_path.as_bytes());
+        hasher.update(canonical_key.as_bytes());
         hasher.update(b":");
         hasher.update(file_hash.as_bytes());
         hasher.update(b"\n");
@@ -6939,9 +7094,9 @@ fn try_native_compile_session_image_restore(
         if decoded.signature_hash != signature_hash {
             continue;
         }
-        let tracked_source_bytes =
-            match native_tracked_sources_total_bytes(&decoded.tracked_sources) {
-                Ok(bytes) => bytes,
+        let (tracked_sources, tracked_sources_normalized) =
+            match native_normalize_tracked_sources(workspace_root, decoded.tracked_sources) {
+                Ok(value) => value,
                 Err(err) => {
                     tracing::warn!(
                         path = %image_path.display(),
@@ -6951,21 +7106,33 @@ fn try_native_compile_session_image_restore(
                     continue;
                 }
             };
-        let computed_content_hash = if decoded.tracked_sources_content_hash.is_empty() {
-            match native_tracked_sources_content_hash(workspace_root, &decoded.tracked_sources) {
-                Ok(hash) => hash,
-                Err(err) => {
-                    tracing::warn!(
-                        path = %image_path.display(),
-                        error = %format!("{err:#}"),
-                        "failed to compute content hash for {label}; ignoring"
-                    );
-                    continue;
-                }
+        let tracked_source_bytes = match native_tracked_sources_total_bytes(&tracked_sources) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!(
+                    path = %image_path.display(),
+                    error = %format!("{err:#}"),
+                    "{label} tracked source set is invalid; ignoring"
+                );
+                continue;
             }
-        } else {
-            decoded.tracked_sources_content_hash.clone()
         };
+        let computed_content_hash =
+            if tracked_sources_normalized || decoded.tracked_sources_content_hash.is_empty() {
+                match native_tracked_sources_content_hash(workspace_root, &tracked_sources) {
+                    Ok(hash) => hash,
+                    Err(err) => {
+                        tracing::warn!(
+                            path = %image_path.display(),
+                            error = %format!("{err:#}"),
+                            "failed to compute content hash for {label}; ignoring"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                decoded.tracked_sources_content_hash.clone()
+            };
         if computed_content_hash != tracked_sources_content_hash {
             continue;
         }
@@ -6980,7 +7147,7 @@ fn try_native_compile_session_image_restore(
         return Some(NativeCompileSessionImageSnapshot {
             signature_hash: signature_hash.clone(),
             source_root_modified_unix_ms: decoded.source_root_modified_unix_ms,
-            tracked_sources: decoded.tracked_sources,
+            tracked_sources,
             tracked_source_bytes,
             tracked_sources_content_hash: computed_content_hash,
             contract_source_dependencies: decoded.contract_source_dependencies,
@@ -7401,9 +7568,10 @@ fn load_native_buildinfo_sidecar_snapshot(
         if decoded.signature_hash != signature_hash {
             continue;
         }
-        let tracked_source_bytes =
-            match native_tracked_sources_total_bytes(&decoded.tracked_sources) {
-                Ok(bytes) => bytes,
+        let legacy_signature = native_tracked_sources_signature(&decoded.tracked_sources);
+        let (tracked_sources, tracked_sources_normalized) =
+            match native_normalize_tracked_sources(workspace_root, decoded.tracked_sources) {
+                Ok(value) => value,
                 Err(err) => {
                     tracing::warn!(
                         path = %sidecar_path.display(),
@@ -7413,29 +7581,49 @@ fn load_native_buildinfo_sidecar_snapshot(
                     continue;
                 }
             };
-        let tracked_sources_signature = native_tracked_sources_signature(&decoded.tracked_sources);
-        if decoded.tracked_sources_signature != tracked_sources_signature {
-            tracing::warn!(
-                path = %sidecar_path.display(),
-                "{label} tracked source signature mismatch; ignoring"
-            );
-            continue;
-        }
-        let tracked_sources_content_hash = if decoded.tracked_sources_content_hash.is_empty() {
-            match native_tracked_sources_content_hash(workspace_root, &decoded.tracked_sources) {
-                Ok(hash) => hash,
-                Err(err) => {
-                    tracing::warn!(
-                        path = %sidecar_path.display(),
-                        error = %format!("{err:#}"),
-                        "failed to compute content hash for {label}; ignoring"
-                    );
-                    continue;
-                }
+        let tracked_source_bytes = match native_tracked_sources_total_bytes(&tracked_sources) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!(
+                    path = %sidecar_path.display(),
+                    error = %format!("{err:#}"),
+                    "{label} tracked source set is invalid; ignoring"
+                );
+                continue;
             }
-        } else {
-            decoded.tracked_sources_content_hash.clone()
         };
+        let tracked_sources_signature = native_tracked_sources_signature(&tracked_sources);
+        if decoded.tracked_sources_signature != tracked_sources_signature {
+            if !(tracked_sources_normalized
+                && decoded.tracked_sources_signature == legacy_signature)
+            {
+                tracing::warn!(
+                    path = %sidecar_path.display(),
+                    "{label} tracked source signature mismatch; ignoring"
+                );
+                continue;
+            }
+            tracing::debug!(
+                path = %sidecar_path.display(),
+                "{label} tracked source signature normalized from legacy absolute keys"
+            );
+        }
+        let tracked_sources_content_hash =
+            if tracked_sources_normalized || decoded.tracked_sources_content_hash.is_empty() {
+                match native_tracked_sources_content_hash(workspace_root, &tracked_sources) {
+                    Ok(hash) => hash,
+                    Err(err) => {
+                        tracing::warn!(
+                            path = %sidecar_path.display(),
+                            error = %format!("{err:#}"),
+                            "failed to compute content hash for {label}; ignoring"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                decoded.tracked_sources_content_hash.clone()
+            };
         if tracked_source_bytes != decoded.tracked_source_bytes {
             tracing::warn!(
                 path = %sidecar_path.display(),
@@ -7446,7 +7634,7 @@ fn load_native_buildinfo_sidecar_snapshot(
         }
         return Some((
             NativeBuildInfoSnapshot {
-                tracked_sources: decoded.tracked_sources,
+                tracked_sources,
                 tracked_source_bytes,
                 tracked_sources_content_hash,
                 contract_source_dependencies: decoded.contract_source_dependencies,
@@ -9360,6 +9548,10 @@ fn with_native_compile_session<T>(
                 session.tracked_source_bytes = tracked_source_bytes;
                 session.tracked_sources_content_hash = tracked_sources_content_hash;
                 state_mutated = true;
+            } else if source_delta_applied_pre_refresh {
+                session.tracked_sources_content_hash =
+                    native_tracked_sources_content_hash(workspace_root, &session.tracked_sources)?;
+                state_mutated = true;
             }
             if source_root_mtime != 0 {
                 session.source_root_modified_unix_ms = source_root_mtime;
@@ -9923,72 +10115,32 @@ fn run_native_build_inner(
             let (frontend_compile_ms, contract_classes) = if selected_indices.is_empty() {
                 (0.0, Vec::new())
             } else {
-                let batch_ranges = native_compile_batch_ranges(
-                    selected_indices.len(),
+                native_run_contract_compile_batches(
+                    &all_plans,
+                    &selected_indices,
                     native_progress_compile_batch_size(),
-                );
-                native_progress_log(format!(
-                    "native contract compile start (selected={}, total={}, batches={}, summary={})",
-                    selected_indices.len(),
-                    contracts.len(),
-                    batch_ranges.len(),
-                    native_compile_batch_summary(&all_plans, &selected_indices)
-                ));
-                let frontend_compile_start = Instant::now();
-                let mut contract_classes = Vec::with_capacity(selected_indices.len());
-                for (batch_ordinal, (start, end)) in batch_ranges.iter().copied().enumerate() {
-                    let batch_indices = &selected_indices[start..end];
-                    let batch_label = format!(
-                        "native contract compile batch {}/{}",
-                        batch_ordinal + 1,
-                        batch_ranges.len()
-                    );
-                    native_progress_log(format!(
-                        "{batch_label} start (contracts={}, summary={})",
-                        batch_indices.len(),
-                        native_compile_batch_summary(&all_plans, batch_indices)
-                    ));
-                    let _heartbeat = NativeProgressHeartbeat::start(batch_label.clone());
-                    let batch_compile_start = Instant::now();
-                    let contract_refs: Vec<_> = batch_indices
-                        .iter()
-                        .map(|index| &contracts[*index])
-                        .collect();
-                    let mut batch_classes = compile_starknet_prepared_db(
-                        &session.db,
-                        &contract_refs,
-                        native_compiler_config(
-                            &session.main_crate_inputs,
-                            profile,
-                            capture_statement_locations,
-                        ),
-                    )
-                    .map_err(|err| {
-                        mark_native_fallback_eligible_for_external_dependencies(
-                            err.context("native starknet compile failed"),
-                            &context,
+                    |batch_indices| {
+                        let contract_refs: Vec<_> = batch_indices
+                            .iter()
+                            .map(|index| &contracts[*index])
+                            .collect();
+                        compile_starknet_prepared_db(
+                            &session.db,
+                            &contract_refs,
+                            native_compiler_config(
+                                &session.main_crate_inputs,
+                                profile,
+                                capture_statement_locations,
+                            ),
                         )
-                    })?;
-                    if batch_classes.len() != batch_indices.len() {
-                        bail!(
-                            "native compile returned mismatched contract classes in batch {} (expected {}, got {})",
-                            batch_ordinal + 1,
-                            batch_indices.len(),
-                            batch_classes.len()
-                        );
-                    }
-                    native_progress_log(format!(
-                        "{batch_label} finished in {:.1}ms",
-                        batch_compile_start.elapsed().as_secs_f64() * 1000.0
-                    ));
-                    contract_classes.append(&mut batch_classes);
-                }
-                let frontend_compile_ms = frontend_compile_start.elapsed().as_secs_f64() * 1000.0;
-                native_progress_log(format!(
-                    "native contract compile finished in {:.1}ms",
-                    frontend_compile_ms
-                ));
-                (frontend_compile_ms, contract_classes)
+                        .map_err(|err| {
+                            mark_native_fallback_eligible_for_external_dependencies(
+                                err.context("native starknet compile failed"),
+                                &context,
+                            )
+                        })
+                    },
+                )?
             };
             #[cfg(debug_assertions)]
             {

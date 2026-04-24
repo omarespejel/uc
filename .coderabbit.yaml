@@ -44,7 +44,7 @@ reviews:
   auto_review:
     enabled: true
     auto_incremental_review: true
-    drafts: true
+    drafts: false
   tools:
     shellcheck:
       enabled: true
@@ -70,7 +70,6 @@ reviews:
     semgrep:
       enabled: false
     ast-grep:
-      enabled: false
 chat:
   auto_reply: true
 knowledge_base:

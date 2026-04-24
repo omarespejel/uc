@@ -9,7 +9,7 @@ Use this skill when addressing PR comments or preparing a branch for review.
 4. Implement the smallest coherent fix.
 5. Run focused validation first, then broader validation if the risk justifies it.
 6. Run `make agent-validate` if repo entrypoints or docs changed.
-7. Before merge, ensure the PR is quiet for 5 minutes with no new actionable AI bot feedback.
+7. Before merge, ensure the PR is quiet for at least 3 minutes with no new actionable AI bot feedback.
 
 ## Review Priorities
 - correctness regressions

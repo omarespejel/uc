@@ -18,5 +18,9 @@ jobs:
       - name: Validate checked-in agent surface
         run: |
           chmod +x scripts/doctor.sh scripts/refresh_repo_map.sh scripts/validate_agent_surface.sh
-          make agent-map
           make agent-validate
+
+      - name: Regenerate repo map
+        run: |
+          chmod +x scripts/refresh_repo_map.sh
+          make agent-map
