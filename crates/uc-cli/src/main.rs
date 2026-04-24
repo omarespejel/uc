@@ -6244,6 +6244,13 @@ fn native_filter_changed_files_to_contract_source_index(
     by_source: &HashMap<String, Vec<usize>>,
     dependency_index_complete: bool,
 ) -> (Vec<String>, Vec<String>) {
+    let has_absolute_paths = changed_files
+        .iter()
+        .chain(removed_files.iter())
+        .any(|source| Path::new(source).is_absolute());
+    if has_absolute_paths {
+        return (changed_files.to_vec(), removed_files.to_vec());
+    }
     if !dependency_index_complete {
         return (changed_files.to_vec(), removed_files.to_vec());
     }
@@ -6269,6 +6276,13 @@ fn native_changed_files_affect_tracked_contracts(
 ) -> bool {
     if changed_files.is_empty() && removed_files.is_empty() {
         return false;
+    }
+    if changed_files
+        .iter()
+        .chain(removed_files.iter())
+        .any(|source| Path::new(source).is_absolute())
+    {
+        return true;
     }
     let (by_source, dependency_index_complete) =
         native_contract_source_index(contract_output_plans, contract_source_dependencies);

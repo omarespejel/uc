@@ -371,15 +371,19 @@ pub fn set_crate_configs_input(
     crate_configs: OrderedHashMap<CrateInput, CrateConfigurationInput>,
 ) {
     let len = crate_configs.len();
-    log_uc_native_progress(format!("set_crate_configs_input start (len={len})"));
+    if should_log_uc_native_progress() {
+        log_uc_native_progress(format!("set_crate_configs_input start (len={len})"));
+    }
     let started = std::time::Instant::now();
     files_group_input(db)
         .set_crate_configs(db)
         .to(Some(crate_configs));
-    log_uc_native_progress(format!(
-        "set_crate_configs_input finished (len={len}, elapsed_ms={:.1})",
-        started.elapsed().as_secs_f64() * 1000.0
-    ));
+    if should_log_uc_native_progress() {
+        log_uc_native_progress(format!(
+            "set_crate_configs_input finished (len={len}, elapsed_ms={:.1})",
+            started.elapsed().as_secs_f64() * 1000.0
+        ));
+    }
 }
 
 /// Ensures keyed override slots exist for the provided files.
@@ -564,7 +568,11 @@ pub fn update_crate_configuration_input_helper(
     root: Option<CrateConfiguration<'_>>,
 ) -> OrderedHashMap<CrateInput, CrateConfigurationInput> {
     let crt = db.crate_input(crt);
-    log_uc_native_progress(format!("update_crate_configuration_input_helper start ({crt:?})"));
+    if should_log_uc_native_progress() {
+        log_uc_native_progress(format!(
+            "update_crate_configuration_input_helper start ({crt:?})"
+        ));
+    }
     let db_ref: &dyn Database = db;
     let mut crate_configs = files_group_input(db_ref)
         .crate_configs(db_ref)
@@ -574,10 +582,12 @@ pub fn update_crate_configuration_input_helper(
         Some(root) => crate_configs.insert(crt.clone(), db.crate_configuration_input(root).clone()),
         None => crate_configs.swap_remove(crt),
     };
-    log_uc_native_progress(format!(
-        "update_crate_configuration_input_helper finished ({crt:?}, len={})",
-        crate_configs.len()
-    ));
+    if should_log_uc_native_progress() {
+        log_uc_native_progress(format!(
+            "update_crate_configuration_input_helper finished ({crt:?}, len={})",
+            crate_configs.len()
+        ));
+    }
     crate_configs
 }
 

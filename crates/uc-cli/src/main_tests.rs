@@ -7717,6 +7717,33 @@ fn native_changed_files_affect_tracked_contracts_stays_conservative_when_index_i
 
 #[cfg(feature = "native-compile")]
 #[test]
+fn native_changed_files_affect_tracked_contracts_stays_conservative_for_absolute_paths() {
+    let plans = vec![NativeContractOutputPlan {
+        module_path: "pkg::contract_a".to_string(),
+        artifact_id: "a".to_string(),
+        package_name: "pkg".to_string(),
+        contract_name: "contract_a".to_string(),
+        artifact_file: "pkg_contract_a.contract_class.json".to_string(),
+        casm_file: Some("pkg_contract_a.compiled_contract_class.json".to_string()),
+    }];
+    let dependencies = BTreeMap::from([(
+        "pkg::contract_a".to_string(),
+        BTreeSet::from(["src/contract_a.cairo".to_string()]),
+    )]);
+
+    assert!(
+        native_changed_files_affect_tracked_contracts(
+            &[String::from("/tmp/external-dep/src/lib.cairo")],
+            &[],
+            &plans,
+            &dependencies
+        ),
+        "absolute dependency paths must stay conservative to avoid noop false hits"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
 fn native_impacted_indices_falls_back_when_complete_index_misses_tracked_source() {
     let module_paths = vec!["pkg::contract_a".to_string()];
     let tracked_sources = vec![Some("src/contract_a.cairo".to_string())];
@@ -7826,6 +7853,24 @@ fn native_apply_file_keyed_session_updates_batches_changed_and_removed_files() {
     );
 
     fs::remove_dir_all(&workspace).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_filter_changed_files_to_contract_source_index_keeps_absolute_paths_conservative() {
+    let by_source = HashMap::from([("src/contract_a.cairo".to_string(), vec![0])]);
+    let changed_files = vec![String::from("/tmp/external-dep/src/lib.cairo")];
+
+    let (scoped_changed, scoped_removed) =
+        native_filter_changed_files_to_contract_source_index(&changed_files, &[], &by_source, true);
+    assert_eq!(
+        scoped_changed, changed_files,
+        "absolute tracked-source edits should not be filtered into an apparently safe no-op set"
+    );
+    assert!(
+        scoped_removed.is_empty(),
+        "no removed files were provided for the conservative absolute-path case"
+    );
 }
 
 #[cfg(feature = "native-compile")]
