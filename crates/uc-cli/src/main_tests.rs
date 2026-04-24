@@ -68,6 +68,12 @@ impl ScopedEnvVar {
         std::env::set_var(key, value);
         Self { key, previous }
     }
+
+    fn unset_with_lock(_guard: &std::sync::MutexGuard<'_, ()>, key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::remove_var(key);
+        Self { key, previous }
+    }
 }
 
 impl Drop for ScopedEnvVar {
@@ -7618,6 +7624,40 @@ fn native_run_contract_compile_batches_emits_progress_for_every_batch() {
             "missing progress message containing `{expected}` in {messages:?}"
         );
     }
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn load_native_progress_compile_batch_size_reads_documented_env_var() {
+    let guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _unset_legacy = ScopedEnvVar::unset_with_lock(&guard, "UC_NATIVE_COMPILE_BATCH_SIZE");
+    let _batch_size =
+        ScopedEnvVar::set_with_lock(&guard, "UC_NATIVE_PROGRESS_COMPILE_BATCH_SIZE", "7");
+
+    assert_eq!(
+        load_native_progress_compile_batch_size(),
+        7,
+        "documented native progress batch-size env var should be honored"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn load_native_progress_compile_batch_size_ignores_undocumented_legacy_env_var() {
+    let guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _unset_documented =
+        ScopedEnvVar::unset_with_lock(&guard, "UC_NATIVE_PROGRESS_COMPILE_BATCH_SIZE");
+    let _legacy = ScopedEnvVar::set_with_lock(&guard, "UC_NATIVE_COMPILE_BATCH_SIZE", "9");
+
+    assert_eq!(
+        load_native_progress_compile_batch_size(),
+        DEFAULT_NATIVE_PROGRESS_COMPILE_BATCH_SIZE,
+        "undocumented legacy batch-size env var must not change native progress batching"
+    );
 }
 
 #[cfg(feature = "native-compile")]

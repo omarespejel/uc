@@ -2231,28 +2231,17 @@ fn native_progress_heartbeat_secs() -> u64 {
 }
 
 #[cfg(feature = "native-compile")]
+fn load_native_progress_compile_batch_size() -> usize {
+    parse_env_usize(
+        "UC_NATIVE_PROGRESS_COMPILE_BATCH_SIZE",
+        DEFAULT_NATIVE_PROGRESS_COMPILE_BATCH_SIZE,
+    )
+}
+
+#[cfg(feature = "native-compile")]
 fn native_progress_compile_batch_size() -> usize {
     static VALUE: OnceLock<usize> = OnceLock::new();
-    *VALUE.get_or_init(
-        || match std::env::var("UC_NATIVE_PROGRESS_COMPILE_BATCH_SIZE") {
-            Ok(raw) => match raw.parse::<usize>() {
-                Ok(value) => value,
-                Err(_) => {
-                    tracing::warn!(
-                        env = "UC_NATIVE_PROGRESS_COMPILE_BATCH_SIZE",
-                        value = %raw,
-                        default = DEFAULT_NATIVE_PROGRESS_COMPILE_BATCH_SIZE,
-                        "invalid numeric setting; using default"
-                    );
-                    DEFAULT_NATIVE_PROGRESS_COMPILE_BATCH_SIZE
-                }
-            },
-            Err(_) => parse_env_usize(
-                "UC_NATIVE_COMPILE_BATCH_SIZE",
-                DEFAULT_NATIVE_PROGRESS_COMPILE_BATCH_SIZE,
-            ),
-        },
-    )
+    *VALUE.get_or_init(load_native_progress_compile_batch_size)
 }
 
 #[cfg(feature = "native-compile")]
