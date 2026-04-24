@@ -5910,7 +5910,8 @@ fn native_test_compile_session_signature(
 fn write_native_tracked_source_fixtures(
     workspace_root: &Path,
     tracked_sources: &BTreeMap<String, NativeTrackedFileState>,
-) {
+) -> BTreeMap<String, NativeTrackedFileState> {
+    let mut materialized = BTreeMap::new();
     for relative in tracked_sources.keys() {
         let path = workspace_root.join(relative);
         if let Some(parent) = path.parent() {
@@ -5921,7 +5922,17 @@ fn write_native_tracked_source_fixtures(
             format!("// fixture for {relative}\nfn fixture() -> felt252 {{ 1 }}\n"),
         )
         .expect("failed to write tracked source fixture");
+        let metadata = fs::metadata(&path).expect("failed to stat tracked source fixture");
+        materialized.insert(
+            relative.clone(),
+            NativeTrackedFileState {
+                size_bytes: metadata.len(),
+                modified_unix_ms: metadata_modified_unix_ms(&metadata)
+                    .expect("tracked source fixture mtime"),
+            },
+        );
     }
+    materialized
 }
 
 #[cfg(feature = "native-compile")]
@@ -5929,25 +5940,27 @@ fn write_native_tracked_source_fixtures(
 fn native_compile_session_image_round_trip_restores_tracked_sources_and_dependency_index() {
     let dir = unique_test_dir("uc-native-session-image-roundtrip");
     let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
-    let tracked_sources = BTreeMap::from([
-        (
-            "src/lib.cairo".to_string(),
-            NativeTrackedFileState {
-                size_bytes: 42,
-                modified_unix_ms: 101,
-            },
-        ),
-        (
-            "src/math.cairo".to_string(),
-            NativeTrackedFileState {
-                size_bytes: 12,
-                modified_unix_ms: 102,
-            },
-        ),
-    ]);
+    let tracked_sources = write_native_tracked_source_fixtures(
+        &dir,
+        &BTreeMap::from([
+            (
+                "src/lib.cairo".to_string(),
+                NativeTrackedFileState {
+                    size_bytes: 42,
+                    modified_unix_ms: 101,
+                },
+            ),
+            (
+                "src/math.cairo".to_string(),
+                NativeTrackedFileState {
+                    size_bytes: 12,
+                    modified_unix_ms: 102,
+                },
+            ),
+        ]),
+    );
     let tracked_source_bytes = native_tracked_sources_total_bytes(&tracked_sources)
         .expect("tracked source bytes should be computed");
-    write_native_tracked_source_fixtures(&dir, &tracked_sources);
     let tracked_sources_content_hash =
         native_tracked_sources_content_hash(&dir, &tracked_sources).expect("content hash");
     let dependencies = BTreeMap::from([(
@@ -6084,16 +6097,18 @@ fn native_tracked_sources_content_hash_rejects_parent_dir_escape_paths() {
 fn native_compile_session_image_restore_rejects_signature_and_content_hash_mismatches() {
     let dir = unique_test_dir("uc-native-session-image-invalidations");
     let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
-    let tracked_sources = BTreeMap::from([(
-        "src/lib.cairo".to_string(),
-        NativeTrackedFileState {
-            size_bytes: 5,
-            modified_unix_ms: 11,
-        },
-    )]);
+    let tracked_sources = write_native_tracked_source_fixtures(
+        &dir,
+        &BTreeMap::from([(
+            "src/lib.cairo".to_string(),
+            NativeTrackedFileState {
+                size_bytes: 5,
+                modified_unix_ms: 11,
+            },
+        )]),
+    );
     let tracked_source_bytes = native_tracked_sources_total_bytes(&tracked_sources)
         .expect("tracked source bytes should be computed");
-    write_native_tracked_source_fixtures(&dir, &tracked_sources);
     let tracked_sources_content_hash =
         native_tracked_sources_content_hash(&dir, &tracked_sources).expect("content hash");
     let snapshot = NativeCompileSessionImageSnapshot {
@@ -6214,25 +6229,27 @@ fn native_compile_session_image_restore_normalizes_workspace_absolute_tracked_so
 fn native_buildinfo_sidecar_round_trip_restores_tracked_sources_and_dependency_index() {
     let dir = unique_test_dir("uc-native-buildinfo-roundtrip");
     let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
-    let tracked_sources = BTreeMap::from([
-        (
-            "src/lib.cairo".to_string(),
-            NativeTrackedFileState {
-                size_bytes: 42,
-                modified_unix_ms: 101,
-            },
-        ),
-        (
-            "src/math.cairo".to_string(),
-            NativeTrackedFileState {
-                size_bytes: 12,
-                modified_unix_ms: 102,
-            },
-        ),
-    ]);
+    let tracked_sources = write_native_tracked_source_fixtures(
+        &dir,
+        &BTreeMap::from([
+            (
+                "src/lib.cairo".to_string(),
+                NativeTrackedFileState {
+                    size_bytes: 42,
+                    modified_unix_ms: 101,
+                },
+            ),
+            (
+                "src/math.cairo".to_string(),
+                NativeTrackedFileState {
+                    size_bytes: 12,
+                    modified_unix_ms: 102,
+                },
+            ),
+        ]),
+    );
     let tracked_source_bytes = native_tracked_sources_total_bytes(&tracked_sources)
         .expect("tracked source bytes should be computed");
-    write_native_tracked_source_fixtures(&dir, &tracked_sources);
     let tracked_sources_content_hash =
         native_tracked_sources_content_hash(&dir, &tracked_sources).expect("content hash");
     let dependencies = BTreeMap::from([(
@@ -6376,16 +6393,18 @@ fn native_buildinfo_sidecar_restore_normalizes_workspace_absolute_tracked_source
 fn native_buildinfo_sidecar_journal_replay_seed_restores_when_pending_delta_exists() {
     let dir = unique_test_dir("uc-native-buildinfo-journal-replay-seed");
     let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
-    let tracked_sources = BTreeMap::from([(
-        "src/lib.cairo".to_string(),
-        NativeTrackedFileState {
-            size_bytes: 42,
-            modified_unix_ms: 101,
-        },
-    )]);
+    let tracked_sources = write_native_tracked_source_fixtures(
+        &dir,
+        &BTreeMap::from([(
+            "src/lib.cairo".to_string(),
+            NativeTrackedFileState {
+                size_bytes: 42,
+                modified_unix_ms: 101,
+            },
+        )]),
+    );
     let tracked_source_bytes = native_tracked_sources_total_bytes(&tracked_sources)
         .expect("tracked source bytes should be computed");
-    write_native_tracked_source_fixtures(&dir, &tracked_sources);
     let tracked_sources_content_hash =
         native_tracked_sources_content_hash(&dir, &tracked_sources).expect("content hash");
     let buildinfo = native_buildinfo_file_from_snapshot(
@@ -6435,16 +6454,18 @@ fn native_buildinfo_sidecar_journal_replay_seed_restores_when_pending_delta_exis
 fn native_buildinfo_sidecar_journal_replay_seed_rejects_ambiguous_cursor_state() {
     let dir = unique_test_dir("uc-native-buildinfo-journal-replay-ambiguous");
     let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
-    let tracked_sources = BTreeMap::from([(
-        "src/lib.cairo".to_string(),
-        NativeTrackedFileState {
-            size_bytes: 5,
-            modified_unix_ms: 11,
-        },
-    )]);
+    let tracked_sources = write_native_tracked_source_fixtures(
+        &dir,
+        &BTreeMap::from([(
+            "src/lib.cairo".to_string(),
+            NativeTrackedFileState {
+                size_bytes: 5,
+                modified_unix_ms: 11,
+            },
+        )]),
+    );
     let tracked_source_bytes = native_tracked_sources_total_bytes(&tracked_sources)
         .expect("tracked source bytes should be computed");
-    write_native_tracked_source_fixtures(&dir, &tracked_sources);
     let tracked_sources_content_hash =
         native_tracked_sources_content_hash(&dir, &tracked_sources).expect("content hash");
     let buildinfo = native_buildinfo_file_from_snapshot(
