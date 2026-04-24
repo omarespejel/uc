@@ -189,7 +189,8 @@ write_corpus_file() {
   local coverage="$2"
   local dedupe_key="$3"
   shift 3
-  local items_json="[$(IFS=,; echo "$*")]"
+  local items_json
+  items_json="[$(IFS=,; echo "$*")]"
   cat > "$path" <<JSON
 {
   "schema_version": 1,
@@ -411,6 +412,50 @@ test_complete_corpus_with_fallback_blocks_compiled_all_claim() {
   fi
 }
 
+test_complete_corpus_with_unsupported_blocks_compiled_all_claim() {
+  local corpus_dir="$TEST_TMP_DIR/native-block/corpora"
+  local case_root="$TEST_TMP_DIR/native-block/cases"
+  local results_dir="$TEST_TMP_DIR/native-block/results"
+  local mock_bin_dir="$TEST_TMP_DIR/native-block/mock-bin"
+  mkdir -p "$corpus_dir" "$case_root" "$results_dir" "$mock_bin_dir"
+  write_manifest_case "$case_root" "cairo214"
+  write_manifest_case "$case_root" "unsupported"
+  write_mock_uc_bin "$mock_bin_dir/uc"
+  write_mock_scarb_bin "$mock_bin_dir/scarb"
+
+  local item_a item_b
+  item_a="$(item_json cairo214 "../cases/cairo214/Scarb.toml" "0x214" "2.14.0")"
+  item_b="$(item_json unsupported "../cases/unsupported/Scarb.toml" "0xunsupported" "2.14.0")"
+  write_corpus_file "$corpus_dir/corpus.json" complete_deployed_contracts class_hash "$item_a" "$item_b"
+
+  local stdout_text
+  stdout_text="$(
+    PATH="$mock_bin_dir:$PATH" \
+    MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/native-block/uc.args" \
+    MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/native-block/scarb.args" \
+    "$CORPUS_SCRIPT" \
+      --uc-bin "$mock_bin_dir/uc" \
+      --results-dir "$results_dir" \
+      --runs 1 \
+      --cold-runs 1 \
+      --warm-settle-seconds 0 \
+      --corpus "$corpus_dir/corpus.json"
+  )"
+
+  local json_path safe reason native_unsupported claim
+  json_path="$(awk -F': ' '/Corpus Benchmark JSON:/ {print $2}' <<<"$stdout_text")"
+  [[ -f "$json_path" ]] || { echo "missing corpus benchmark json: $json_path" >&2; return 1; }
+  safe="$(jq -r '.claim_guard.safe_to_say_compiled_all_deployed_contracts_in_corpus' "$json_path")"
+  reason="$(jq -r '.claim_guard.reason' "$json_path")"
+  native_unsupported="$(jq -r '.summary.support_matrix.native_unsupported' "$json_path")"
+  claim="$(jq -r '.claim_guard.compiled_all_claim_text // ""' "$json_path")"
+  if [[ "$safe" != "false" || "$reason" != *"native_unsupported"* || "$native_unsupported" != "1" || -n "$claim" ]]; then
+    echo "native-unsupported complete corpus should not emit compiled-all launch claim" >&2
+    cat "$json_path" >&2
+    return 1
+  fi
+}
+
 test_sample_corpus_blocks_compiled_all_claim() {
   local stdout_text
   stdout_text="$(run_corpus_benchmark sample)"
@@ -468,5 +513,7 @@ run_test "sample_corpus_blocks_compiled_all_claim" \
   test_sample_corpus_blocks_compiled_all_claim
 run_test "complete_corpus_with_fallback_blocks_compiled_all_claim" \
   test_complete_corpus_with_fallback_blocks_compiled_all_claim
+run_test "complete_corpus_with_unsupported_blocks_compiled_all_claim" \
+  test_complete_corpus_with_unsupported_blocks_compiled_all_claim
 run_test "complete_supported_corpus_emits_bounded_claim" \
   test_complete_supported_corpus_emits_bounded_claim

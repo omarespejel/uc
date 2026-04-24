@@ -116,8 +116,14 @@ a combined JSON/Markdown artifact with:
 - Cairo version min/max across the corpus,
 - a support matrix for `native_supported`, `native_unsupported`,
   `fallback_used`, and `build_failed`,
-- guarded launch-claim text only when the corpus declares
-  `coverage=complete_deployed_contracts` and every item is native-supported.
+- guarded claim text via explicit guards:
+  - `.claim_guard.compiled_all_claim_text` only when
+    `.claim_guard.safe_to_say_compiled_all_deployed_contracts_in_corpus=true`;
+    this requires `coverage=complete_deployed_contracts`, every item classified
+    as `native_supported`, no fallback, no unsupported rows, no build failures,
+    and no failed native benchmark cases
+  - `.claim_guard.native_supported_claim_text` only when
+    `.claim_guard.safe_to_say_all_items_native_supported=true`
 
 Do not turn sample-corpus output into launch copy. A `coverage=sample` corpus is
 valid for smoke testing the artifact path, but the generated claim guard will
