@@ -3,8 +3,11 @@
 ## Start Here
 - Read `.codex/START_HERE.md` before making changes.
 - Treat `AGENTS.md`, `.codex/START_HERE.md`, and `docs/agent/*.md` as the checked-in source of truth for agents and review bots.
-- Run `make doctor` before the first edit in a fresh clone.
+- Run `make bootstrap && make doctor` before the first edit in a fresh clone.
 - Run `make agent-validate` before pushing changes that touch docs, bot config, scripts, or repo structure.
+- GitHub Actions are not the default validation path in this repo. Run local gates first and treat GitHub workflows as manual-only escape hatches.
+- Never rely on automatic GitHub CI for routine PR validation here. Keep CodeRabbit and Qodo on PRs, but run tests and benchmarks locally.
+- Do not use `git push --no-verify` in normal repo work. The checked-in pre-push hook is part of the required validation contract.
 
 ## PR-First Rule
 - Do all non-trivial work in a fresh branch and open a normal ready-for-review PR early; do not use draft PRs because AI review bots do not fully engage on drafts.
@@ -20,7 +23,9 @@
 - If a change affects native compile, cache restore, daemon behavior, benchmark harnesses, or artifact format, add or update regression tests in `crates/uc-cli/src/main_tests.rs` or `crates/uc-cli/tests/`.
 
 ## Commands
+- Bootstrap hooks: `make bootstrap` or `make install-hooks`
 - Fast repo check: `make doctor && make agent-validate`
+- Local push gate: `make local-ci`
 - Format: `cargo fmt --all`
 - Fast Rust validation: `make validate-fast`
 - Native-focused validation: `make validate-native`
@@ -44,6 +49,7 @@
 - Do not claim speedups without stating the exact lane and conditions.
 - Keep pinned-host benchmark settings strict by default: offline, explicit daemon mode, CPU pinning when supported, and stable sample counts.
 - Do not loosen gate thresholds or sample counts to “make green”.
+- Do not re-enable automatic GitHub benchmark workflows to compensate for missing local discipline. Fix the local validation lane instead.
 
 ## Native Debugging
 - Use `UC_PHASE_TIMING=1` for phase telemetry.

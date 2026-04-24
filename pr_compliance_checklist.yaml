@@ -17,6 +17,12 @@ pr_compliances:
     success_criteria: PRs that change repo bootstrap, commands, docs, or review tooling update the relevant files under `AGENTS.md`, `.codex/`, and `docs/agent/`.
     failure_criteria: Repo entrypoints drift or become stale after a command, path, or workflow change.
 
+  - title: Local validation stays authoritative
+    compliance_label: true
+    objective: Routine validation should run locally instead of spending GitHub Actions minutes by default.
+    success_criteria: Workflow-trigger or validation-surface PRs keep repo-managed hooks, local validation scripts, and agent docs aligned, and do not reintroduce automatic GitHub CI without an explicit documented decision.
+    failure_criteria: Automatic GitHub CI is reintroduced casually, or local hook/gate/documentation paths drift so agents can push without the intended local checks.
+
   - title: Daemon and fallback behavior remain explicit
     compliance_label: true
     objective: Build execution should not fail or fall back silently in ways that hide risk.

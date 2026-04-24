@@ -15,6 +15,13 @@ Modern repo-agent workflows work best when review instructions live with the cod
 - CodeRabbit recommends repo-root YAML config and can read code-guideline files like `AGENTS.md` automatically.
 - Qodo supports repo-root `.pr_agent.toml`, `best_practices.md`, `pr_compliance_checklist.yaml`, and auto-detects `AGENTS.md`.
 
+This repo also uses a checked-in local validation contract:
+- repo-managed Git hooks under `.githooks/`
+- a path-aware local push gate in `scripts/local_ci_gate.sh`
+- manual-only GitHub Actions workflows for exceptional remote runs
+
+That split keeps PR bot review on GitHub while moving routine tests and benchmarks back to the developer machine.
+
 ## Sources
 
 - CodeRabbit configuration overview: <https://docs.coderabbit.ai/guides/configuration-overview>
@@ -24,3 +31,5 @@ Modern repo-agent workflows work best when review instructions live with the cod
 - Qodo `AGENTS.md`: <https://docs.qodo.ai/qodo-gen/agent/agents.md-support>
 - Qodo best practices: <https://docs.qodo.ai/v1/features/best-practices>
 - Qodo compliance checklist: <https://docs.qodo.ai/qodo-documentation/qodo-merge/pr-agent/tools/compliance>
+- GitHub manual workflows (`workflow_dispatch`): <https://docs.github.com/en/actions/how-tos/managing-workflow-runs-and-deployments/managing-workflow-runs/manually-running-a-workflow>
+- Git hooks and `core.hooksPath`: <https://git-scm.com/docs/githooks>

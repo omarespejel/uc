@@ -17,3 +17,4 @@
 
 ## Docs and commands
 - If a command surface or repo bootstrap step changes, update `AGENTS.md`, `.codex/START_HERE.md`, and `docs/agent/REPO_MAP.md` in the same PR.
+- Local validation is authoritative. Keep the repo-managed hook and `scripts/local_ci_gate.sh` aligned with the documented commands whenever workflows, tests, or benchmark lanes change.
