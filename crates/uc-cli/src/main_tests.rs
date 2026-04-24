@@ -1777,6 +1777,47 @@ cairo-version = "{}.{compiler_minor}.0"
 
 #[cfg(feature = "native-compile")]
 #[test]
+fn ensure_native_manifest_cairo_version_supported_rejects_legacy_edition_without_cairo_version() {
+    let manifest: TomlValue = toml::from_str(
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2023_01"
+"#,
+    )
+    .expect("manifest should parse");
+
+    let err = ensure_native_manifest_cairo_version_supported(&manifest)
+        .expect_err("legacy floating manifests should be rejected");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("requires an exact [package].cairo-version for legacy edition 2023_01"),
+        "error should explain that legacy editions must pin cairo-version"
+    );
+    assert!(
+        native_error_allows_scarb_fallback(&err),
+        "legacy floating manifests should allow scarb fallback"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn ensure_native_manifest_cairo_version_supported_allows_modern_edition_without_cairo_version() {
+    let manifest: TomlValue = toml::from_str(
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("manifest should parse");
+
+    ensure_native_manifest_cairo_version_supported(&manifest)
+        .expect("modern floating manifests should remain eligible");
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
 fn ensure_native_manifest_cairo_version_supported_rejects_unparseable_compiler_version() {
     let manifest: TomlValue = toml::from_str(
         r#"[package]
@@ -1801,6 +1842,41 @@ cairo-version = "2.14.0"
     assert!(
         native_error_allows_scarb_fallback(&err),
         "unparseable native compiler version should allow scarb fallback"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_support_report_from_manifest_path_marks_legacy_edition_without_cairo_version_unsupported()
+{
+    let dir = unique_test_dir("uc-native-support-report-legacy-edition");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let manifest_path = dir.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2023_01"
+"#,
+    )
+    .expect("write legacy manifest");
+
+    let report = native_support_report_from_manifest_path(&manifest_path)
+        .expect("legacy manifest should still produce a report");
+    assert_eq!(report.status, NativeSupportStatus::Unsupported);
+    assert!(!report.supported);
+    assert_eq!(
+        report.issue_kind.as_deref(),
+        Some("legacy_edition_requires_pinned_cairo_version")
+    );
+    assert!(
+        report
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("requires an exact [package].cairo-version for legacy edition 2023_01"),
+        "report should explain why legacy floating manifests are unsupported"
     );
 }
 

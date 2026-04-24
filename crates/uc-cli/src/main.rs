@@ -1850,8 +1850,27 @@ fn manifest_package_cairo_version(manifest: &TomlValue) -> Option<String> {
 }
 
 #[cfg(feature = "native-compile")]
+fn manifest_effective_package_edition(manifest: &TomlValue) -> String {
+    manifest
+        .get("package")
+        .and_then(TomlValue::as_table)
+        .and_then(|table| table.get("edition"))
+        .and_then(TomlValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_CAIRO_EDITION)
+        .to_string()
+}
+
+#[cfg(feature = "native-compile")]
+fn cairo_edition_requires_pinned_native_version(edition: &str) -> bool {
+    matches!(edition.trim(), "2023_01" | "2023_10" | "2023_11")
+}
+
+#[cfg(feature = "native-compile")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum NativeCompileSupportIssue {
+    LegacyEditionRequiresPinnedCairoVersion { edition: String },
     UnsupportedManifestConstraint { requested: String },
     UnparseableCompilerVersion { requested: String, compiler: String },
     CompilerVersionMismatch { requested: String, compiler: String },
@@ -1861,6 +1880,9 @@ enum NativeCompileSupportIssue {
 impl NativeCompileSupportIssue {
     fn kind(&self) -> &'static str {
         match self {
+            Self::LegacyEditionRequiresPinnedCairoVersion { .. } => {
+                "legacy_edition_requires_pinned_cairo_version"
+            }
             Self::UnsupportedManifestConstraint { .. } => "unsupported_manifest_constraint",
             Self::UnparseableCompilerVersion { .. } => "unparseable_compiler_version",
             Self::CompilerVersionMismatch { .. } => "compiler_version_mismatch",
@@ -1869,6 +1891,9 @@ impl NativeCompileSupportIssue {
 
     fn log_message(&self) -> &'static str {
         match self {
+            Self::LegacyEditionRequiresPinnedCairoVersion { .. } => {
+                "native compile preflight rejected legacy edition without exact cairo-version"
+            }
             Self::UnsupportedManifestConstraint { .. } => {
                 "native compile preflight rejected unsupported cairo-version constraint"
             }
@@ -1883,6 +1908,9 @@ impl NativeCompileSupportIssue {
 
     fn reason(&self) -> String {
         match self {
+            Self::LegacyEditionRequiresPinnedCairoVersion { edition } => format!(
+                "native compile currently requires an exact [package].cairo-version for legacy edition {edition}; floating legacy-edition manifests are unsupported because the native compiler major.minor cannot be verified"
+            ),
             Self::UnsupportedManifestConstraint { requested } => format!(
                 "native compile requires an exact cairo-version (major.minor[.patch]); unsupported constraint `{requested}`"
             ),
@@ -1907,7 +1935,17 @@ fn native_compile_support_issue_with_compiler(
     manifest: &TomlValue,
     compiler: &str,
 ) -> Option<NativeCompileSupportIssue> {
-    let requested = manifest_package_cairo_version(manifest)?;
+    let requested = manifest_package_cairo_version(manifest);
+    if requested.is_none() {
+        let edition = manifest_effective_package_edition(manifest);
+        if cairo_edition_requires_pinned_native_version(&edition) {
+            return Some(
+                NativeCompileSupportIssue::LegacyEditionRequiresPinnedCairoVersion { edition },
+            );
+        }
+        return None;
+    }
+    let requested = requested.expect("checked is_some above");
     let Some(requested_major_minor) = parse_cairo_version_major_minor(&requested) else {
         return Some(NativeCompileSupportIssue::UnsupportedManifestConstraint { requested });
     };
@@ -2003,6 +2041,14 @@ fn ensure_native_manifest_cairo_version_supported_with_compiler(
         return Ok(());
     };
     match &issue {
+        NativeCompileSupportIssue::LegacyEditionRequiresPinnedCairoVersion { edition } => {
+            tracing::warn!(
+                compiler = %compiler,
+                edition = %edition,
+                message = issue.log_message(),
+                "native compile support issue"
+            );
+        }
         NativeCompileSupportIssue::UnsupportedManifestConstraint { requested }
         | NativeCompileSupportIssue::UnparseableCompilerVersion { requested, .. }
         | NativeCompileSupportIssue::CompilerVersionMismatch { requested, .. } => {
