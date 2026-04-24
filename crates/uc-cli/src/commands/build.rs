@@ -2,8 +2,10 @@ use super::*;
 
 const DAEMON_LOCAL_PROBE_HINT_SUFFIX: &str = ".fallback-session-key";
 const DAEMON_LOCAL_NATIVE_SUPPORTED_HINT_SUFFIX: &str = ".native-supported";
+const DAEMON_LOCAL_NATIVE_UNSUPPORTED_HINT_SUFFIX: &str = ".native-unsupported";
 const DAEMON_LOCAL_PROBE_HINT_DIR: &str = "fallback-keys";
 const DAEMON_LOCAL_NATIVE_SUPPORTED_HINT_DIR: &str = "native-supported";
+const DAEMON_LOCAL_NATIVE_UNSUPPORTED_HINT_DIR: &str = "native-unsupported";
 const UC_NATIVE_FALLBACK_HINT_RETRY_SECS_ENV: &str = "UC_NATIVE_FALLBACK_HINT_RETRY_SECS";
 const DEFAULT_UC_NATIVE_FALLBACK_HINT_RETRY_SECS: u64 = 30 * 60;
 // Budget applies per hint directory (`fallback-keys/` and `native-supported/`),
@@ -42,6 +44,17 @@ fn daemon_local_native_supported_hint_dir(workspace_root: &Path) -> Result<PathB
     Ok(hint_dir)
 }
 
+fn daemon_local_native_unsupported_hint_dir(workspace_root: &Path) -> Result<PathBuf> {
+    let hint_dir =
+        daemon_probe_hint_root_dir(workspace_root)?.join(DAEMON_LOCAL_NATIVE_UNSUPPORTED_HINT_DIR);
+    ensure_path_within_root(
+        workspace_root,
+        &hint_dir,
+        "daemon local native-unsupported hint directory",
+    )?;
+    Ok(hint_dir)
+}
+
 fn daemon_local_probe_hint_legacy_path(
     workspace_root: &Path,
     primary_session_key: &str,
@@ -71,6 +84,23 @@ fn daemon_local_native_supported_hint_path(
     let hint_dir = daemon_local_native_supported_hint_dir(workspace_root)?;
     let hint_path = hint_dir.join(format!(
         "{primary_session_key}{DAEMON_LOCAL_NATIVE_SUPPORTED_HINT_SUFFIX}"
+    ));
+    ensure_path_within_root(workspace_root, &hint_path, "daemon local probe hint path")?;
+    Ok(hint_path)
+}
+
+fn daemon_local_native_unsupported_hint_path(
+    workspace_root: &Path,
+    primary_session_key: &str,
+) -> Result<PathBuf> {
+    validate_hex_digest(
+        "daemon local probe primary session key",
+        primary_session_key,
+        SESSION_KEY_LEN,
+    )?;
+    let hint_dir = daemon_local_native_unsupported_hint_dir(workspace_root)?;
+    let hint_path = hint_dir.join(format!(
+        "{primary_session_key}{DAEMON_LOCAL_NATIVE_UNSUPPORTED_HINT_SUFFIX}"
     ));
     ensure_path_within_root(workspace_root, &hint_path, "daemon local probe hint path")?;
     Ok(hint_path)
@@ -267,6 +297,7 @@ fn prune_legacy_daemon_probe_hint_root_if_needed(workspace_root: &Path, active_h
         &[
             DAEMON_LOCAL_PROBE_HINT_SUFFIX,
             DAEMON_LOCAL_NATIVE_SUPPORTED_HINT_SUFFIX,
+            DAEMON_LOCAL_NATIVE_UNSUPPORTED_HINT_SUFFIX,
         ],
     ) {
         tracing::warn!(
@@ -461,6 +492,91 @@ fn clear_daemon_local_native_supported_hint(
     Ok(())
 }
 
+fn load_daemon_local_native_unsupported_hint(
+    workspace_root: &Path,
+    primary_session_key: &str,
+) -> Result<Option<String>> {
+    let hint_path = daemon_local_native_unsupported_hint_path(workspace_root, primary_session_key)?;
+    let contents = match fs::read_to_string(&hint_path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                hint_path = %hint_path.display(),
+                "failed to read native-unsupported hint; treating as unknown support"
+            );
+            return Ok(None);
+        }
+    };
+    let reason = contents.trim().to_string();
+    if reason.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(reason))
+}
+
+fn persist_daemon_local_native_unsupported_hint(
+    workspace_root: &Path,
+    primary_session_key: &str,
+    reason: &str,
+) -> Result<()> {
+    let trimmed_reason = reason.trim();
+    if trimmed_reason.is_empty() {
+        return Ok(());
+    }
+    let hint_path = daemon_local_native_unsupported_hint_path(workspace_root, primary_session_key)?;
+    let parent = hint_path
+        .parent()
+        .context("native-unsupported hint path has no parent directory")?;
+    if let Err(err) = fs::create_dir_all(parent) {
+        tracing::warn!(
+            error = %err,
+            dir = %parent.display(),
+            "failed to create native-unsupported hint dir; skipping hint persistence"
+        );
+        return Ok(());
+    }
+    if let Err(err) = write_hint_file_if_changed(&hint_path, &format!("{trimmed_reason}\n")) {
+        tracing::warn!(
+            error = %format!("{err:#}"),
+            hint_path = %hint_path.display(),
+            "failed to persist native-unsupported hint"
+        );
+        return Ok(());
+    }
+    if let Err(err) =
+        prune_daemon_local_probe_hints(parent, &[DAEMON_LOCAL_NATIVE_UNSUPPORTED_HINT_SUFFIX])
+    {
+        tracing::warn!(
+            error = %format!("{err:#}"),
+            hint_dir = %parent.display(),
+            "failed to prune native-unsupported hints"
+        );
+    }
+    prune_legacy_daemon_probe_hint_root_if_needed(workspace_root, parent);
+    Ok(())
+}
+
+fn clear_daemon_local_native_unsupported_hint(
+    workspace_root: &Path,
+    primary_session_key: &str,
+) -> Result<()> {
+    let hint_path = daemon_local_native_unsupported_hint_path(workspace_root, primary_session_key)?;
+    match fs::remove_file(&hint_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                hint_path = %hint_path.display(),
+                "failed to remove native-unsupported hint; continuing"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn should_probe_local_before_daemon(
     daemon_mode: DaemonModeArg,
     daemon_socket_available: bool,
@@ -499,25 +615,27 @@ fn daemon_backend_policy(
 fn daemon_backend_policy_with_hint_state(
     configured_mode: NativeBuildMode,
     native_auto_eligible: bool,
-    native_supported_hint: bool,
-    has_scarb_probe_hint: bool,
+    hint_state: &NativeAutoPreflightHintState,
     disallow_native_fallback: bool,
 ) -> Result<(BuildCompileBackend, bool)> {
     let (backend, native_fallback_to_scarb) =
         daemon_backend_policy(configured_mode, native_auto_eligible);
-    if backend == BuildCompileBackend::Native
-        && native_fallback_to_scarb
-        && !native_supported_hint
-        && has_scarb_probe_hint
-    {
-        if disallow_native_fallback {
-            bail!(
-                "native fallback is disallowed (UC_NATIVE_DISALLOW_SCARB_FALLBACK=1): fallback hint present"
-            );
+    if backend != BuildCompileBackend::Native || !native_fallback_to_scarb {
+        return Ok((backend, native_fallback_to_scarb));
+    }
+    match hint_state {
+        NativeAutoPreflightHintState::Supported | NativeAutoPreflightHintState::Unknown => {
+            Ok((backend, native_fallback_to_scarb))
         }
-        Ok((BuildCompileBackend::Scarb, false))
-    } else {
-        Ok((backend, native_fallback_to_scarb))
+        NativeAutoPreflightHintState::FallbackHint(reason)
+        | NativeAutoPreflightHintState::UnsupportedHint(reason) => {
+            if disallow_native_fallback {
+                bail!(
+                    "native fallback is disallowed (UC_NATIVE_DISALLOW_SCARB_FALLBACK=1): {reason}"
+                );
+            }
+            Ok((BuildCompileBackend::Scarb, false))
+        }
     }
 }
 
@@ -531,6 +649,11 @@ fn native_auto_preflight_hint_reason(
     if native_supported_hint {
         return Ok(None);
     }
+    if let Some(reason) =
+        load_daemon_local_native_unsupported_hint(workspace_root, native_session_key)?
+    {
+        return Ok(Some(reason));
+    }
     if load_daemon_local_probe_hint(workspace_root, native_session_key)?.is_some() {
         return Ok(Some(format!(
             "cached fallback hint present for session key {native_session_key}"
@@ -542,6 +665,7 @@ fn native_auto_preflight_hint_reason(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum NativeAutoPreflightHintState {
     Supported,
+    UnsupportedHint(String),
     FallbackHint(String),
     Unknown,
 }
@@ -554,6 +678,11 @@ fn native_auto_preflight_hint_state(
         daemon_local_native_supported_hint(workspace_root, native_session_key)?;
     if native_supported_hint {
         return Ok(NativeAutoPreflightHintState::Supported);
+    }
+    if let Some(reason) =
+        load_daemon_local_native_unsupported_hint(workspace_root, native_session_key)?
+    {
+        return Ok(NativeAutoPreflightHintState::UnsupportedHint(reason));
     }
     if load_daemon_local_probe_hint(workspace_root, native_session_key)?.is_some() {
         return Ok(NativeAutoPreflightHintState::FallbackHint(format!(
@@ -680,16 +809,41 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                     .deterministic_key_hex();
                     match native_auto_preflight_hint_state(&workspace_root, &native_session_key)? {
                         NativeAutoPreflightHintState::Supported => None,
+                        NativeAutoPreflightHintState::UnsupportedHint(reason) => Some(reason),
                         NativeAutoPreflightHintState::FallbackHint(reason) => Some(reason),
                         NativeAutoPreflightHintState::Unknown => {
-                            match native_compile_preflight(&common, &manifest_path, &workspace_root)
-                            {
-                                Ok(()) => None,
-                                Err(err) => {
-                                    if native_error_allows_scarb_fallback(&err) {
-                                        Some(format!("{err:#}"))
-                                    } else {
-                                        return Err(err);
+                            if let Some(reason) = native_compile_support_reason(&manifest_path)? {
+                                let _ = persist_daemon_local_native_unsupported_hint(
+                                    &workspace_root,
+                                    &native_session_key,
+                                    &reason,
+                                );
+                                let _ = clear_daemon_local_probe_hint(
+                                    &workspace_root,
+                                    &native_session_key,
+                                );
+                                let _ = clear_daemon_local_native_supported_hint(
+                                    &workspace_root,
+                                    &native_session_key,
+                                );
+                                Some(reason)
+                            } else {
+                                let _ = clear_daemon_local_native_unsupported_hint(
+                                    &workspace_root,
+                                    &native_session_key,
+                                );
+                                match native_compile_preflight(
+                                    &common,
+                                    &manifest_path,
+                                    &workspace_root,
+                                ) {
+                                    Ok(()) => None,
+                                    Err(err) => {
+                                        if native_error_allows_scarb_fallback(&err) {
+                                            Some(format!("{err:#}"))
+                                        } else {
+                                            return Err(err);
+                                        }
                                     }
                                 }
                             }
@@ -825,6 +979,10 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                 &workspace_root,
                                 &native_session_key,
                             );
+                            let _ = clear_daemon_local_native_unsupported_hint(
+                                &workspace_root,
+                                &native_session_key,
+                            );
                             return Ok((run, cache_hit, fingerprint, local_session_key, telemetry));
                         }
                         match run_local_with_backend(
@@ -838,6 +996,10 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                     &native_session_key,
                                 );
                                 let _ = persist_daemon_local_native_supported_hint(
+                                    &workspace_root,
+                                    &native_session_key,
+                                );
+                                let _ = clear_daemon_local_native_unsupported_hint(
                                     &workspace_root,
                                     &native_session_key,
                                 );
@@ -871,6 +1033,10 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                     &local_session_key,
                                 );
                                 let _ = clear_daemon_local_native_supported_hint(
+                                    &workspace_root,
+                                    &native_session_key,
+                                );
+                                let _ = clear_daemon_local_native_unsupported_hint(
                                     &workspace_root,
                                     &native_session_key,
                                 );
@@ -920,29 +1086,47 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                     if daemon_compile_backend == BuildCompileBackend::Native
                         && daemon_native_fallback_to_scarb
                     {
-                        let native_supported_hint = daemon_local_native_supported_hint(
-                            &workspace_root,
-                            &local_session_key,
-                        )?;
-                        let has_scarb_probe_hint = if native_supported_hint {
-                            false
-                        } else {
-                            load_daemon_local_probe_hint(&workspace_root, &local_session_key)?
-                                .is_some()
-                        };
+                        let mut hint_state =
+                            native_auto_preflight_hint_state(&workspace_root, &local_session_key)?;
+                        if matches!(hint_state, NativeAutoPreflightHintState::Unknown) {
+                            if let Some(reason) = native_compile_support_reason(&manifest_path)? {
+                                let _ = persist_daemon_local_native_unsupported_hint(
+                                    &workspace_root,
+                                    &local_session_key,
+                                    &reason,
+                                );
+                                let _ = clear_daemon_local_probe_hint(
+                                    &workspace_root,
+                                    &local_session_key,
+                                );
+                                let _ = clear_daemon_local_native_supported_hint(
+                                    &workspace_root,
+                                    &local_session_key,
+                                );
+                                hint_state = NativeAutoPreflightHintState::UnsupportedHint(reason);
+                            }
+                        }
                         (daemon_compile_backend, daemon_native_fallback_to_scarb) =
                             daemon_backend_policy_with_hint_state(
                                 configured_native_mode,
                                 native_auto_eligible,
-                                native_supported_hint,
-                                has_scarb_probe_hint,
+                                &hint_state,
                                 disallow_native_fallback,
                             )?;
                         if daemon_compile_backend == BuildCompileBackend::Scarb {
                             record_native_fallback(NativeFallbackReason::DaemonBackendDowngrade);
+                            let reason = match &hint_state {
+                                NativeAutoPreflightHintState::UnsupportedHint(reason)
+                                | NativeAutoPreflightHintState::FallbackHint(reason) => {
+                                    reason.as_str()
+                                }
+                                NativeAutoPreflightHintState::Supported
+                                | NativeAutoPreflightHintState::Unknown => "unknown reason",
+                            };
                             tracing::debug!(
                                 session_key = %local_session_key,
-                                "native auto fallback hint present; preferring scarb backend for daemon request"
+                                reason,
+                                "native auto preflight ineligible; preferring scarb backend for daemon request"
                             );
                             compiler_version = scarb_version_line()?;
                             local_session_key = build_session_key_for_compiler(&compiler_version)?;
@@ -1023,6 +1207,10 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             &workspace_root,
                             primary_session_key,
                         );
+                        let _ = clear_daemon_local_native_unsupported_hint(
+                            &workspace_root,
+                            primary_session_key,
+                        );
                     }
                     return Ok(Some((
                         run,
@@ -1052,6 +1240,10 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                 &scarb_session_key,
                             );
                             let _ = clear_daemon_local_native_supported_hint(
+                                &workspace_root,
+                                primary_session_key,
+                            );
+                            let _ = clear_daemon_local_native_unsupported_hint(
                                 &workspace_root,
                                 primary_session_key,
                             );
@@ -1122,6 +1314,10 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                     &workspace_root,
                                     &local_session_key,
                                 );
+                                let _ = clear_daemon_local_native_unsupported_hint(
+                                    &workspace_root,
+                                    &local_session_key,
+                                );
                             } else if response.session_key == local_session_key {
                                 let _ = clear_daemon_local_probe_hint(
                                     &workspace_root,
@@ -1129,6 +1325,10 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                 );
                                 if response.compile_backend == DaemonBuildBackend::Native {
                                     let _ = persist_daemon_local_native_supported_hint(
+                                        &workspace_root,
+                                        &local_session_key,
+                                    );
+                                    let _ = clear_daemon_local_native_unsupported_hint(
                                         &workspace_root,
                                         &local_session_key,
                                     );
@@ -1175,11 +1375,19 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                 &workspace_root,
                                 &local_session_key,
                             );
+                            let _ = clear_daemon_local_native_unsupported_hint(
+                                &workspace_root,
+                                &local_session_key,
+                            );
                         } else if response.session_key == local_session_key {
                             let _ =
                                 clear_daemon_local_probe_hint(&workspace_root, &local_session_key);
                             if response.compile_backend == DaemonBuildBackend::Native {
                                 let _ = persist_daemon_local_native_supported_hint(
+                                    &workspace_root,
+                                    &local_session_key,
+                                );
+                                let _ = clear_daemon_local_native_unsupported_hint(
                                     &workspace_root,
                                     &local_session_key,
                                 );
@@ -1704,35 +1912,64 @@ mod tests {
     #[test]
     fn daemon_backend_policy_with_hint_state_prefers_scarb_after_known_auto_fallback() {
         assert_eq!(
-            daemon_backend_policy_with_hint_state(NativeBuildMode::Auto, true, false, true, false)
-                .expect("hint downgrade should be allowed when fallback is enabled"),
+            daemon_backend_policy_with_hint_state(
+                NativeBuildMode::Auto,
+                true,
+                &NativeAutoPreflightHintState::FallbackHint("cached fallback".to_string()),
+                false,
+            )
+            .expect("hint downgrade should be allowed when fallback is enabled"),
             (BuildCompileBackend::Scarb, false)
         );
         assert_eq!(
-            daemon_backend_policy_with_hint_state(NativeBuildMode::Auto, true, true, true, false)
-                .expect("native-supported hint should keep native backend"),
+            daemon_backend_policy_with_hint_state(
+                NativeBuildMode::Auto,
+                true,
+                &NativeAutoPreflightHintState::Supported,
+                false,
+            )
+            .expect("native-supported hint should keep native backend"),
             (BuildCompileBackend::Native, true)
         );
         assert_eq!(
-            daemon_backend_policy_with_hint_state(NativeBuildMode::Auto, true, false, false, false)
-                .expect("missing fallback hint should keep native backend"),
+            daemon_backend_policy_with_hint_state(
+                NativeBuildMode::Auto,
+                true,
+                &NativeAutoPreflightHintState::Unknown,
+                false,
+            )
+            .expect("missing fallback hint should keep native backend"),
             (BuildCompileBackend::Native, true)
+        );
+        assert_eq!(
+            daemon_backend_policy_with_hint_state(
+                NativeBuildMode::Auto,
+                true,
+                &NativeAutoPreflightHintState::UnsupportedHint("native unsupported".to_string()),
+                false,
+            )
+            .expect("unsupported hint should downgrade to scarb"),
+            (BuildCompileBackend::Scarb, false)
         );
     }
 
     #[test]
     fn daemon_backend_policy_with_hint_state_keeps_non_auto_modes_unchanged() {
         assert_eq!(
-            daemon_backend_policy_with_hint_state(NativeBuildMode::Off, false, false, true, false)
-                .expect("off mode should bypass hint downgrade logic"),
+            daemon_backend_policy_with_hint_state(
+                NativeBuildMode::Off,
+                false,
+                &NativeAutoPreflightHintState::FallbackHint("cached fallback".to_string()),
+                false,
+            )
+            .expect("off mode should bypass hint downgrade logic"),
             (BuildCompileBackend::Scarb, false)
         );
         assert_eq!(
             daemon_backend_policy_with_hint_state(
                 NativeBuildMode::Require,
                 true,
-                false,
-                true,
+                &NativeAutoPreflightHintState::FallbackHint("cached fallback".to_string()),
                 false
             )
             .expect("require mode should bypass hint downgrade logic"),
@@ -1742,9 +1979,13 @@ mod tests {
 
     #[test]
     fn daemon_backend_policy_with_hint_state_rejects_hint_downgrade_when_fallback_disallowed() {
-        let err =
-            daemon_backend_policy_with_hint_state(NativeBuildMode::Auto, true, false, true, true)
-                .expect_err("hint-based downgrade should fail when fallback is disallowed");
+        let err = daemon_backend_policy_with_hint_state(
+            NativeBuildMode::Auto,
+            true,
+            &NativeAutoPreflightHintState::FallbackHint("cached fallback".to_string()),
+            true,
+        )
+        .expect_err("hint-based downgrade should fail when fallback is disallowed");
         assert!(
             format!("{err:#}").contains("native fallback is disallowed"),
             "unexpected error: {err:#}"
@@ -1800,6 +2041,36 @@ mod tests {
     }
 
     #[test]
+    fn native_auto_preflight_hint_reason_prefers_unsupported_hint_over_fallback_hint() {
+        let _guard = env_var_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _retry_interval_guard =
+            ScopedEnvVar::set(UC_NATIVE_FALLBACK_HINT_RETRY_SECS_ENV, "1800");
+        let workspace = unique_test_dir("uc-native-preflight-hint-native-unsupported");
+        let primary_session_key = "a".repeat(SESSION_KEY_LEN);
+        let hinted_session_key = "b".repeat(SESSION_KEY_LEN);
+        persist_daemon_local_probe_hint(&workspace, &primary_session_key, &hinted_session_key)
+            .expect("failed to persist daemon fallback hint");
+        persist_daemon_local_native_unsupported_hint(
+            &workspace,
+            &primary_session_key,
+            "native unsupported because cairo-version is pinned",
+        )
+        .expect("failed to persist native-unsupported hint");
+
+        let reason = native_auto_preflight_hint_reason(&workspace, &primary_session_key)
+            .expect("failed to resolve native preflight hint reason");
+        assert_eq!(
+            reason.as_deref(),
+            Some("native unsupported because cairo-version is pinned"),
+            "native-unsupported hint should take precedence over generic fallback hints"
+        );
+
+        fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[test]
     fn native_auto_preflight_hint_state_resolves_supported_hint() {
         let _guard = env_var_lock()
             .lock()
@@ -1840,6 +2111,35 @@ mod tests {
         assert!(
             matches!(state, NativeAutoPreflightHintState::FallbackHint(_)),
             "fallback hint should report ineligible hint state"
+        );
+
+        fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[test]
+    fn native_auto_preflight_hint_state_resolves_unsupported_hint() {
+        let _guard = env_var_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _retry_interval_guard =
+            ScopedEnvVar::set(UC_NATIVE_FALLBACK_HINT_RETRY_SECS_ENV, "1800");
+        let workspace = unique_test_dir("uc-native-preflight-hint-state-unsupported");
+        let primary_session_key = "c".repeat(SESSION_KEY_LEN);
+        persist_daemon_local_native_unsupported_hint(
+            &workspace,
+            &primary_session_key,
+            "native unsupported because cairo-version is pinned",
+        )
+        .expect("failed to persist native-unsupported hint");
+
+        let state = native_auto_preflight_hint_state(&workspace, &primary_session_key)
+            .expect("failed to resolve native preflight hint state");
+        assert_eq!(
+            state,
+            NativeAutoPreflightHintState::UnsupportedHint(
+                "native unsupported because cairo-version is pinned".to_string()
+            ),
+            "native-unsupported hint should report unsupported preflight state"
         );
 
         fs::remove_dir_all(&workspace).ok();
