@@ -110,14 +110,14 @@ JSON
 expect_generator_failure() {
   local source_index_path="$1"
   local expected="$2"
-  local out_path="$TEST_TMP_DIR/failure-out.json"
+  local out_path="${3:-$TEST_TMP_DIR/failure-out.json}"
   local stderr_path="$TEST_TMP_DIR/failure.err"
   if "$GENERATOR_SCRIPT" --source-index "$source_index_path" --out "$out_path" >"$TEST_TMP_DIR/failure.out" 2>"$stderr_path"; then
     echo "expected generator to fail" >&2
     cat "$TEST_TMP_DIR/failure.out" >&2
     return 1
   fi
-  if ! grep -Fq "$expected" "$stderr_path"; then
+  if ! grep -Fq -- "$expected" "$stderr_path"; then
     echo "expected generator error: $expected" >&2
     cat "$stderr_path" >&2
     return 1
@@ -268,6 +268,17 @@ test_rejects_missing_manifest_path() {
   expect_generator_failure "$index_dir/source-index.json" "manifest_path does not exist for missing"
 }
 
+test_rejects_absolute_manifest_path() {
+  local case_root="$TEST_TMP_DIR/absolute-manifest/cases"
+  local index_dir="$TEST_TMP_DIR/absolute-manifest/index"
+  mkdir -p "$index_dir"
+  write_manifest_case "$case_root" "a"
+  local item
+  item="$(source_item_json absolute "$case_root/a/Scarb.toml" "0x01" "2.14.0")"
+  write_source_index_file "$index_dir/source-index.json" sample class_hash "$item"
+  expect_generator_failure "$index_dir/source-index.json" "manifest_path for absolute must be relative to the source index"
+}
+
 test_rejects_manifest_not_named_scarb_toml() {
   local case_root="$TEST_TMP_DIR/wrong-name/cases"
   local index_dir="$TEST_TMP_DIR/wrong-name/index"
@@ -296,6 +307,31 @@ test_rejects_deduped_count_mismatch() {
   expect_generator_failure "$index_dir/source-index.json" "source_index.deduplication.deduped_count (2) must equal items length (1)"
 }
 
+test_rejects_source_index_output_overwrite() {
+  local case_root="$TEST_TMP_DIR/overwrite/cases"
+  local index_dir="$TEST_TMP_DIR/overwrite/index"
+  mkdir -p "$index_dir"
+  write_manifest_case "$case_root" "a"
+  local item source_index_path
+  item="$(source_item_json a "../cases/a/Scarb.toml" "0x01" "2.14.0")"
+  source_index_path="$index_dir/source-index.json"
+  write_source_index_file "$source_index_path" sample class_hash "$item"
+  expect_generator_failure "$source_index_path" "Refusing to overwrite source index with generated corpus" "$source_index_path"
+}
+
+test_rejects_output_directory() {
+  local case_root="$TEST_TMP_DIR/out-dir/cases"
+  local index_dir="$TEST_TMP_DIR/out-dir/index"
+  local out_dir="$TEST_TMP_DIR/out-dir/generated"
+  mkdir -p "$index_dir" "$out_dir"
+  write_manifest_case "$case_root" "a"
+  local item source_index_path
+  item="$(source_item_json a "../cases/a/Scarb.toml" "0x01" "2.14.0")"
+  source_index_path="$index_dir/source-index.json"
+  write_source_index_file "$source_index_path" sample class_hash "$item"
+  expect_generator_failure "$source_index_path" "--out must be a file path, got directory" "$out_dir"
+}
+
 run_test "generates_corpus_and_plan_only_accepts_it" \
   test_generates_corpus_and_plan_only_accepts_it
 run_test "rejects_unknown_top_level_keys" \
@@ -310,7 +346,13 @@ run_test "rejects_duplicate_class_hash_when_class_deduped" \
   test_rejects_duplicate_class_hash_when_class_deduped
 run_test "rejects_missing_manifest_path" \
   test_rejects_missing_manifest_path
+run_test "rejects_absolute_manifest_path" \
+  test_rejects_absolute_manifest_path
 run_test "rejects_manifest_not_named_scarb_toml" \
   test_rejects_manifest_not_named_scarb_toml
 run_test "rejects_deduped_count_mismatch" \
   test_rejects_deduped_count_mismatch
+run_test "rejects_source_index_output_overwrite" \
+  test_rejects_source_index_output_overwrite
+run_test "rejects_output_directory" \
+  test_rejects_output_directory

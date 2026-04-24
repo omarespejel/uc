@@ -64,7 +64,12 @@
           "contract_address": { "type": "string", "minLength": 1 },
           "class_hash": { "type": "string", "minLength": 1 },
           "source_ref": { "type": "string", "minLength": 1 },
-          "manifest_path": { "type": "string", "minLength": 1 },
+          "manifest_path": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^/].*",
+            "description": "Path to Scarb.toml relative to this source-index file."
+          },
           "cairo_version": { "type": "string", "minLength": 1 },
           "scarb_version": { "type": "string" },
           "license": { "type": "string" },

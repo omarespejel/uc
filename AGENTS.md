@@ -32,7 +32,8 @@
 - Validate Cairo 2.14 helper compatibility: `make validate-helper-lane`
 - Strict smoke benchmark: `make benchmark-strict-smoke`
 - Strict research benchmark: `make benchmark-strict-research`
-- Deployed-contract corpus evidence: `benchmarks/scripts/run_deployed_contract_corpus.sh --corpus /abs/path/to/corpus.json`
+- Generate deployed-contract corpus: `benchmarks/scripts/generate_deployed_contract_corpus.sh --source-index /abs/path/to/source-index.json --out /abs/path/to/generated-corpus.json`
+- Run deployed-contract corpus evidence: `benchmarks/scripts/run_deployed_contract_corpus.sh --corpus /abs/path/to/generated-corpus.json`
 
 ## High-Risk Areas
 - `crates/uc-cli/src/main.rs`: native compile session state, cache restore, daemon, build execution.
@@ -59,4 +60,4 @@
 - When debugging hard native stalls, prefer `--engine uc --daemon-mode off --offline` first to remove daemon noise.
 - Build older native lanes with `./scripts/build_native_toolchain_helper.sh --lane 2.14`, then export the printed `UC_NATIVE_TOOLCHAIN_2_14_BIN` value.
 - Probe helper-lane readiness before measuring a repo with `./scripts/doctor.sh --uc-bin /abs/path/to/uc --manifest-path /abs/path/to/Scarb.toml`.
-- For deployed-contract launch claims, use `benchmarks/scripts/run_deployed_contract_corpus.sh`; only quote generated claim text when the artifact's `claim_guard` marks it safe.
+- For deployed-contract launch claims, generate the run corpus from a reviewed source index with `benchmarks/scripts/generate_deployed_contract_corpus.sh`, then use `benchmarks/scripts/run_deployed_contract_corpus.sh`; only quote generated claim text when the artifact's `claim_guard` marks it safe.

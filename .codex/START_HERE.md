@@ -25,7 +25,8 @@
 - Refresh repo map: `make agent-map`
 - Strict smoke benchmark: `make benchmark-strict-smoke`
 - Strict research benchmark: `make benchmark-strict-research`
-- Deployed-contract corpus evidence: `benchmarks/scripts/run_deployed_contract_corpus.sh --corpus /abs/path/to/corpus.json`
+- Generate deployed-contract corpus: `benchmarks/scripts/generate_deployed_contract_corpus.sh --source-index /abs/path/to/source-index.json --out /abs/path/to/generated-corpus.json`
+- Run deployed-contract corpus evidence: `benchmarks/scripts/run_deployed_contract_corpus.sh --corpus /abs/path/to/generated-corpus.json`
 
 ## Key Files
 
@@ -44,7 +45,7 @@
 - Re-run focused validation before broader benchmarks.
 - For older Cairo native repos, build the helper with `./scripts/build_native_toolchain_helper.sh --lane 2.14` and export the printed `UC_NATIVE_TOOLCHAIN_2_14_BIN`.
 - Before measuring a real manifest, run `./scripts/doctor.sh --uc-bin /abs/path/to/uc --manifest-path /abs/path/to/Scarb.toml` to catch missing helper lanes early.
-- For deployed-contract corpus claims, run `benchmarks/scripts/run_deployed_contract_corpus.sh` and only quote `.claim_guard.compiled_all_claim_text` when the guard is true.
+- For deployed-contract corpus claims, generate the run corpus from a reviewed source index with `benchmarks/scripts/generate_deployed_contract_corpus.sh`, then run `benchmarks/scripts/run_deployed_contract_corpus.sh` and only quote `.claim_guard.compiled_all_claim_text` when the guard is true.
 - Update `docs/agent/REPO_MAP.md` with `make agent-map` when repo entrypoints change.
 - Push coherent slices to a PR instead of holding large local diffs.
 - Assume GitHub Actions are disabled or manual-only. If you need a remote workflow run, trigger it deliberately with `workflow_dispatch`; do not expect automatic CI on push or PR.

@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SOURCE_INDEX_PATH=""
 OUT_PATH=""
 
@@ -72,6 +71,14 @@ fi
 SOURCE_INDEX_ABS="$(cd "$(dirname "$SOURCE_INDEX_PATH")" && pwd -P)/$(basename "$SOURCE_INDEX_PATH")"
 mkdir -p "$(dirname "$OUT_PATH")"
 OUT_ABS="$(cd "$(dirname "$OUT_PATH")" && pwd -P)/$(basename "$OUT_PATH")"
+if [[ "$SOURCE_INDEX_ABS" == "$OUT_ABS" ]]; then
+  echo "Refusing to overwrite source index with generated corpus: $SOURCE_INDEX_ABS" >&2
+  exit 2
+fi
+if [[ -d "$OUT_ABS" ]]; then
+  echo "--out must be a file path, got directory: $OUT_ABS" >&2
+  exit 2
+fi
 
 python3 - "$SOURCE_INDEX_ABS" "$OUT_ABS" <<'PY'
 import json
@@ -151,8 +158,9 @@ def require_int(obj, key, ctx):
 
 def resolve_manifest_path(raw, tag):
     manifest_path = Path(raw)
-    if not manifest_path.is_absolute():
-        manifest_path = base_dir / manifest_path
+    if manifest_path.is_absolute():
+        fail(f"manifest_path for {tag} must be relative to the source index: {manifest_path}")
+    manifest_path = base_dir / manifest_path
     manifest_path = manifest_path.resolve()
     if not manifest_path.is_file():
         fail(f"manifest_path does not exist for {tag}: {manifest_path}")

@@ -110,9 +110,9 @@ instead of aborting the whole benchmark run.
 The source index is the durable selection artifact for deployed-contract
 evidence. It records chain/snapshot/block selection, deduplication, license
 policy, source availability, and the local `Scarb.toml` chosen for each contract
-or deduped class. The generator validates
+or deduped class. The generator enforces the constraints mirrored in
 `benchmarks/corpora/deployed-contract-source-index.schema.json`, resolves all
-manifest paths to absolute paths, and writes a strict
+relative manifest paths to absolute paths, and writes a strict
 `deployed-contract-corpus.schema.json` file for the benchmark runner.
 
 Do not hand-author launch corpus JSON. Keep the source index as the reviewed
