@@ -6012,13 +6012,19 @@ fn native_tracked_sources_content_hash_accepts_absolute_dependency_paths() {
 #[test]
 fn native_tracked_sources_content_hash_rejects_parent_dir_escape_paths() {
     let dir = unique_test_dir("uc-native-tracked-hash-parent-escape");
+    let outside_name = format!(
+        "outside-{}.cairo",
+        dir.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("fixture")
+    );
     let outside = dir
         .parent()
         .expect("test dir should have parent")
-        .join("outside.cairo");
+        .join(&outside_name);
     fs::write(&outside, "fn outside() {}\n").expect("failed to write outside fixture");
     let tracked_sources = BTreeMap::from([(
-        "../outside.cairo".to_string(),
+        format!("../{outside_name}"),
         NativeTrackedFileState {
             size_bytes: fs::metadata(&outside).expect("outside metadata").len(),
             modified_unix_ms: metadata_modified_unix_ms(
