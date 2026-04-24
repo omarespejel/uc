@@ -2290,7 +2290,9 @@ cairo-version = "{requested_version}"
         "diagnostics should expose an absolute docs URL"
     );
     assert!(
-        diagnostic.docs_url.ends_with("AGENT_DIAGNOSTICS.md#ucn1004"),
+        diagnostic
+            .docs_url
+            .ends_with("AGENT_DIAGNOSTICS.md#ucn1004"),
         "diagnostics should point agents to stable remediation docs anchors"
     );
     assert!(
