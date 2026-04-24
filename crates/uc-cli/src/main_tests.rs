@@ -7894,12 +7894,21 @@ fn native_changed_files_affect_tracked_contracts_stays_conservative_for_absolute
 
     assert!(
         native_changed_files_affect_tracked_contracts(
-            &[absolute_dependency],
+            &[absolute_dependency.clone()],
             &[],
             &plans,
             &dependencies
         ),
         "absolute dependency paths must stay conservative to avoid noop false hits"
+    );
+    assert!(
+        native_changed_files_affect_tracked_contracts(
+            &[],
+            &[absolute_dependency],
+            &plans,
+            &dependencies
+        ),
+        "absolute removed dependency paths must stay conservative to avoid noop false hits"
     );
 }
 
@@ -7918,12 +7927,23 @@ fn native_impacted_contract_indices_stays_conservative_for_absolute_paths() {
         native_impacted_contract_indices(
             &module_paths,
             &contract_source_paths,
-            &[absolute_dependency],
+            &[absolute_dependency.clone()],
             &[],
             &dependencies,
         )
         .is_none(),
         "absolute dependency paths must force conservative fallback to avoid stale artifact reuse"
+    );
+    assert!(
+        native_impacted_contract_indices(
+            &module_paths,
+            &contract_source_paths,
+            &[],
+            &[absolute_dependency],
+            &dependencies,
+        )
+        .is_none(),
+        "absolute removed dependency paths must force conservative fallback to avoid stale artifact reuse"
     );
 }
 
@@ -8057,6 +8077,20 @@ fn native_filter_changed_files_to_contract_source_index_keeps_absolute_paths_con
     assert!(
         scoped_removed.is_empty(),
         "no removed files were provided for the conservative absolute-path case"
+    );
+
+    let removed_files = vec![unique_platform_absolute_fixture_path(
+        "uc-native-index-external-removed",
+    )];
+    let (scoped_changed, scoped_removed) =
+        native_filter_changed_files_to_contract_source_index(&[], &removed_files, &by_source, true);
+    assert!(
+        scoped_changed.is_empty(),
+        "no changed files were provided for the conservative removed-file case"
+    );
+    assert_eq!(
+        scoped_removed, removed_files,
+        "absolute removed tracked-source edits should not be filtered into an apparently safe no-op set"
     );
 }
 
