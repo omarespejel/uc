@@ -258,11 +258,38 @@ enum Commands {
     #[command(hide = true)]
     Benchmark(benchmark_cmd::BenchmarkArgs),
     Cache(CacheArgs),
+    Support(SupportArgs),
     SessionKey(SessionKeyArgs),
     Build(BuildArgs),
     Metadata(MetadataArgs),
     CompareBuild(CompareBuildArgs),
     Migrate(MigrateArgs),
+}
+
+#[derive(Args, Debug)]
+struct SupportArgs {
+    #[command(subcommand)]
+    command: SupportCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum SupportCommand {
+    Native(NativeSupportArgs),
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum SupportFormatArg {
+    Text,
+    Json,
+}
+
+#[derive(Args, Debug, Clone)]
+struct NativeSupportArgs {
+    #[arg(long)]
+    manifest_path: Option<PathBuf>,
+
+    #[arg(long, value_enum, default_value_t = SupportFormatArg::Text)]
+    format: SupportFormatArg,
 }
 
 #[derive(Args, Debug)]
@@ -361,6 +388,29 @@ enum NativeBuildMode {
     Off,
     Auto,
     Require,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum NativeSupportStatus {
+    Supported,
+    Unsupported,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct NativeSupportReport {
+    manifest_path: String,
+    status: NativeSupportStatus,
+    supported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compiler_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    package_cairo_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issue_kind: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1601,6 +1651,7 @@ fn main() -> Result<()> {
         #[cfg(feature = "dev-benchmark-command")]
         Commands::Benchmark(args) => benchmark_cmd::run(args),
         Commands::Cache(args) => run_cache(args),
+        Commands::Support(args) => run_support(args),
         Commands::SessionKey(args) => run_session_key(args),
         Commands::Build(args) => run_build(args),
         Commands::Metadata(args) => run_metadata(args),
@@ -1625,6 +1676,37 @@ fn init_observability() {
             .without_time()
             .try_init();
     });
+}
+
+fn run_support(args: SupportArgs) -> Result<()> {
+    match args.command {
+        SupportCommand::Native(args) => run_native_support(args),
+    }
+}
+
+fn run_native_support(args: NativeSupportArgs) -> Result<()> {
+    let manifest_path = resolve_manifest_path(&args.manifest_path)?;
+    let report = native_support_report_from_manifest_path(&manifest_path)?;
+    match args.format {
+        SupportFormatArg::Text => {
+            if report.supported {
+                println!("supported");
+            } else {
+                println!(
+                    "unsupported: {}",
+                    report.reason.as_deref().unwrap_or("unknown reason")
+                );
+            }
+        }
+        SupportFormatArg::Json => {
+            println!(
+                "{}",
+                serde_json::to_string(&report)
+                    .context("failed to serialize native support report")?
+            );
+        }
+    }
+    Ok(())
 }
 
 fn parse_diagnostics_threshold(input: &str) -> std::result::Result<f64, String> {
@@ -1777,6 +1859,14 @@ enum NativeCompileSupportIssue {
 
 #[cfg(feature = "native-compile")]
 impl NativeCompileSupportIssue {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::UnsupportedManifestConstraint { .. } => "unsupported_manifest_constraint",
+            Self::UnparseableCompilerVersion { .. } => "unparseable_compiler_version",
+            Self::CompilerVersionMismatch { .. } => "compiler_version_mismatch",
+        }
+    }
+
     fn log_message(&self) -> &'static str {
         match self {
             Self::UnsupportedManifestConstraint { .. } => {
@@ -1848,6 +1938,52 @@ fn native_compile_support_reason(manifest_path: &Path) -> Result<Option<String>>
         native_compile_support_issue_with_compiler(&manifest, native_cairo_lang_compiler_version())
             .map(|issue| issue.reason()),
     )
+}
+
+#[cfg(feature = "native-compile")]
+fn native_support_report_from_manifest_path(manifest_path: &Path) -> Result<NativeSupportReport> {
+    let manifest_text = read_text_file_with_limit(manifest_path, MAX_MANIFEST_BYTES, "manifest")?;
+    let manifest = parse_manifest_toml(
+        &manifest_text,
+        manifest_path,
+        "failed to parse manifest for native support probe",
+    )?;
+    let compiler_version = native_cairo_lang_compiler_version().to_string();
+    let package_cairo_version = manifest_package_cairo_version(&manifest);
+    let issue = native_compile_support_issue_with_compiler(&manifest, &compiler_version);
+    let (status, supported, reason, issue_kind) = match issue {
+        Some(issue) => (
+            NativeSupportStatus::Unsupported,
+            false,
+            Some(issue.reason()),
+            Some(issue.kind().to_string()),
+        ),
+        None => (NativeSupportStatus::Supported, true, None, None),
+    };
+    Ok(NativeSupportReport {
+        manifest_path: manifest_path.display().to_string(),
+        status,
+        supported,
+        reason,
+        compiler_version: Some(compiler_version),
+        package_cairo_version,
+        issue_kind,
+    })
+}
+
+#[cfg(not(feature = "native-compile"))]
+fn native_support_report_from_manifest_path(manifest_path: &Path) -> Result<NativeSupportReport> {
+    Ok(NativeSupportReport {
+        manifest_path: manifest_path.display().to_string(),
+        status: NativeSupportStatus::Unavailable,
+        supported: false,
+        reason: Some(
+            "native compile support probing is unavailable because this uc binary was built without native-compile".to_string(),
+        ),
+        compiler_version: None,
+        package_cairo_version: None,
+        issue_kind: Some("native_compile_feature_disabled".to_string()),
+    })
 }
 
 #[cfg(feature = "native-compile")]

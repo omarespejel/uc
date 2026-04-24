@@ -28,11 +28,16 @@
 5. `uc session-key`
 - Generates deterministic session key from normalized input fields.
 
-6. `uc migrate`
+6. `uc support native`
+- Probes whether a manifest is eligible for native compile in the current `uc` binary.
+- Supports: `--manifest-path`, `--format text|json`.
+- Returns a structured reason for ineligible manifests so scripts and local benchmark harnesses can classify cases before measuring them.
+
+7. `uc migrate`
 - Analyzes `Scarb.toml` and emits a migration readiness report.
 - Optional `--emit-uc-toml <path>` generates a starter `Uc.toml` scaffold.
 
-7. `uc daemon`
+8. `uc daemon`
 - `start`: launches local background daemon (`~/.uc/daemon/uc.sock` by default).
 - `status`: checks daemon reachability and reports pid/start timestamp.
 - `stop`: requests graceful shutdown.
