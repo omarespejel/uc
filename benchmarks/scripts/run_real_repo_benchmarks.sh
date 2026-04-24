@@ -27,7 +27,9 @@ Usage:
   run_real_repo_benchmarks.sh [--uc-bin /abs/path/to/uc] [--results-dir /abs/path]
     [--runs <n>] [--cold-runs <n>] [--timeout-secs <seconds>]
     [--warm-settle-seconds <seconds>]
-    --case <manifest-path> <tag> [--case <manifest-path> <tag> ...]
+    [--cases-file <tsv-with-manifest-and-tag>] [--case <manifest-path> <tag> ...]
+
+  Provide at least one case via --case or --cases-file.
 USAGE
 }
 
@@ -82,6 +84,49 @@ validate_case_tag() {
   SEEN_TAGS["$tag"]=1
 }
 
+add_case() {
+  local manifest_path="$1"
+  local tag="$2"
+  require_option_value "case manifest-path" "$manifest_path"
+  require_option_value "case tag" "$tag"
+  validate_case_tag "$tag"
+  CASE_MANIFESTS+=("$manifest_path")
+  CASE_TAGS+=("$tag")
+}
+
+load_cases_file() {
+  local cases_file="$1"
+  require_option_value "--cases-file" "$cases_file"
+  if [[ ! -f "$cases_file" ]]; then
+    echo "Cases file not found: $cases_file" >&2
+    exit 1
+  fi
+
+  local line_no=0
+  local raw_line=""
+  local manifest_path=""
+  local tag=""
+  while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+    line_no=$((line_no + 1))
+    if [[ -z "$raw_line" ]]; then
+      continue
+    fi
+    local without_tabs="${raw_line//$'\t'/}"
+    local tab_count=$(( ${#raw_line} - ${#without_tabs} ))
+    if [[ "$tab_count" -ne 1 ]]; then
+      echo "Invalid cases file row $line_no in $cases_file; expected: <manifest-path><TAB><tag>" >&2
+      exit 2
+    fi
+    manifest_path="${raw_line%%$'\t'*}"
+    tag="${raw_line#*$'\t'}"
+    if [[ -z "$manifest_path" || -z "$tag" ]]; then
+      echo "Invalid cases file row $line_no in $cases_file; expected: <manifest-path><TAB><tag>" >&2
+      exit 2
+    fi
+    add_case "$manifest_path" "$tag"
+  done < "$cases_file"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --uc-bin)
@@ -117,16 +162,17 @@ while [[ $# -gt 0 ]]; do
       WARM_SETTLE_SECONDS="$2"
       shift 2
       ;;
+    --cases-file)
+      require_option_value "$1" "${2-}"
+      load_cases_file "$2"
+      shift 2
+      ;;
     --case)
       if [[ $# -lt 3 ]]; then
         usage >&2
         exit 2
       fi
-      require_option_value "--case manifest-path" "${2-}"
-      require_option_value "--case tag" "${3-}"
-      validate_case_tag "$3"
-      CASE_MANIFESTS+=("$2")
-      CASE_TAGS+=("$3")
+      add_case "$2" "$3"
       shift 3
       ;;
     --help|-h)
@@ -146,7 +192,7 @@ validate_positive_int "COLD_RUNS" "$COLD_RUNS"
 validate_non_negative_number "WARM_SETTLE_SECONDS" "$WARM_SETTLE_SECONDS"
 
 if [[ "${#CASE_MANIFESTS[@]}" -eq 0 ]]; then
-  echo "run_real_repo_benchmarks.sh requires at least one --case" >&2
+  echo "run_real_repo_benchmarks.sh requires at least one case via --case or --cases-file" >&2
   usage >&2
   exit 2
 fi
@@ -284,15 +330,13 @@ measurement_failure_json() {
 
 prefetch_manifest_dependencies() {
   local manifest_path="$1"
-  local manifest_dir
   if [[ -n "${PREFETCHED_MANIFESTS[$manifest_path]:-}" ]]; then
     return
   fi
-  manifest_dir="$(cd "$(dirname "$manifest_path")" && pwd -P)"
-  (
-    cd "$manifest_dir"
-    scarb fetch >/dev/null
-  )
+  if ! scarb --manifest-path "$manifest_path" --offline fetch >/dev/null; then
+    echo "scarb fetch failed for manifest_path=$manifest_path" >&2
+    return 1
+  fi
   PREFETCHED_MANIFESTS["$manifest_path"]=1
 }
 

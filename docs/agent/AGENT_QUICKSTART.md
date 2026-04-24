@@ -46,6 +46,29 @@ uc build --engine uc --daemon-mode off --manifest-path /abs/path/to/Scarb.toml -
 
 If `.diagnostics[].fallback_used` is true, classify the result as fallback-used even when the command exits successfully.
 
+## Deployed-Contract Corpus Evidence
+
+```sh
+./benchmarks/scripts/run_deployed_contract_corpus.sh \
+  --uc-bin /abs/path/to/uc \
+  --corpus /abs/path/to/pinned-deployed-contract-corpus.json \
+  --results-dir benchmarks/results \
+  --runs 5 \
+  --cold-runs 5
+```
+
+Read:
+
+- `.summary.support_matrix`
+- `.summary.cairo_version_min`
+- `.summary.cairo_version_max`
+- `.claim_guard.safe_to_say_compiled_all_deployed_contracts_in_corpus`
+- `.claim_guard.compiled_all_claim_text`
+
+Only use `.claim_guard.compiled_all_claim_text` when the guard is true. If the
+guard is false, report `.claim_guard.reason` and keep the artifact as support
+matrix evidence, not launch copy.
+
 ## Stop Conditions
 
 Stop and ask for human permission before:

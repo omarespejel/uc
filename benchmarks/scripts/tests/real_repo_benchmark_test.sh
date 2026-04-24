@@ -59,6 +59,8 @@ fi
 if [[ "$1" == "build" ]]; then
   manifest=""
   report_path=""
+  seen_offline=0
+  seen_daemon_off=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --manifest-path)
@@ -69,11 +71,31 @@ if [[ "$1" == "build" ]]; then
         report_path="${2-}"
         shift 2
         ;;
+      --daemon-mode)
+        if [[ "${2-}" != "off" ]]; then
+          echo "expected uc --daemon-mode off, got: ${2-}" >&2
+          exit 22
+        fi
+        seen_daemon_off=1
+        shift 2
+        ;;
+      --offline)
+        seen_offline=1
+        shift
+        ;;
       *)
         shift
       ;;
     esac
   done
+  if [[ "$seen_offline" -ne 1 ]]; then
+    echo "missing uc --offline" >&2
+    exit 23
+  fi
+  if [[ "$seen_daemon_off" -ne 1 ]]; then
+    echo "missing uc --daemon-mode off" >&2
+    exit 24
+  fi
   printf 'build %s disallow=%s corelib=%s report=%s\n' "$manifest" "${UC_NATIVE_DISALLOW_SCARB_FALLBACK:-}" "${UC_NATIVE_CORELIB_SRC:-}" "$report_path" >> "$args_log"
   if [[ "$manifest" == *"unstable"* && "${UC_NATIVE_DISALLOW_SCARB_FALLBACK:-}" == "1" ]]; then
     state_dir="${MOCK_UC_STATE_DIR:-}"
@@ -155,6 +177,7 @@ set -euo pipefail
 args_log="${MOCK_SCARB_ARGS_LOG:?}"
 manifest=""
 subcommand=""
+seen_offline=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --manifest-path)
@@ -166,6 +189,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --offline)
+      seen_offline=1
       shift
       ;;
     *)
@@ -178,6 +202,10 @@ if [[ -z "$subcommand" ]]; then
   echo "missing scarb subcommand" >&2
   exit 20
 fi
+if [[ "$seen_offline" -ne 1 ]]; then
+  echo "missing scarb --offline" >&2
+  exit 21
+fi
 if [[ -z "$manifest" && "$subcommand" == "fetch" ]]; then
   manifest="$PWD/Scarb.toml"
 fi
@@ -186,6 +214,10 @@ if [[ -z "$manifest" ]]; then
   exit 20
 fi
 printf 'cwd=%s subcommand=%s manifest=%s\n' "$PWD" "$subcommand" "$manifest" >> "$args_log"
+if [[ "$subcommand" == "fetch" && "$manifest" == *"fails-fetch"* ]]; then
+  echo "forced scarb fetch failure for $manifest" >&2
+  exit 18
+fi
 if [[ "$subcommand" == "build" && "$manifest" == *"fails-build"* ]]; then
   echo "forced scarb build failure for $manifest" >&2
   exit 17
@@ -249,6 +281,93 @@ test_real_repo_benchmark_rejects_zero_runs_from_environment() {
     cat "$stderr_path" >&2
     return 1
   fi
+}
+
+test_real_repo_benchmark_rejects_no_cases_with_updated_usage() {
+  local stderr_path="$TEST_TMP_DIR/no-cases.err"
+  if "$BENCH_SCRIPT" >"$TEST_TMP_DIR/no-cases.out" 2>"$stderr_path"; then
+    echo "expected real repo benchmark script to reject missing cases" >&2
+    return 1
+  fi
+  if ! grep -q "requires at least one case via --case or --cases-file" "$stderr_path"; then
+    echo "expected updated no-cases validation message" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+  if ! grep -q "Provide at least one case via --case or --cases-file" "$stderr_path"; then
+    echo "expected updated no-cases usage guidance" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+}
+
+test_real_repo_benchmark_accepts_cases_file() {
+  local cases_root="$TEST_TMP_DIR/cases-file-cases"
+  local mock_bin_dir="$TEST_TMP_DIR/cases-file-mock-bin"
+  local mock_uc="$mock_bin_dir/uc"
+  local mock_scarb="$mock_bin_dir/scarb"
+  local results_dir="$TEST_TMP_DIR/cases-file-results"
+  local cases_file="$TEST_TMP_DIR/cases-file.tsv"
+  mkdir -p "$mock_bin_dir" "$results_dir"
+  write_mock_uc_bin "$mock_uc"
+  write_mock_scarb_bin "$mock_scarb"
+  write_manifest_case "$cases_root" "supported"
+  write_manifest_case "$cases_root" "unsupported"
+  printf '%s\t%s\n' "$cases_root/supported/Scarb.toml" supported > "$cases_file"
+  printf '%s\t%s\n' "$cases_root/unsupported/Scarb.toml" unsupported >> "$cases_file"
+
+  local stdout_text
+  stdout_text="$(
+    PATH="$mock_bin_dir:$PATH" \
+    MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/cases-file-uc.args" \
+    MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/cases-file-scarb.args" \
+    "$BENCH_SCRIPT" \
+      --uc-bin "$mock_uc" \
+      --results-dir "$results_dir" \
+      --runs 1 \
+      --cold-runs 1 \
+      --warm-settle-seconds 0 \
+      --cases-file "$cases_file"
+  )"
+
+  local json_path
+  json_path="$(awk -F': ' '/Benchmark JSON:/ {print $2}' <<<"$stdout_text")"
+  [[ -f "$json_path" ]] || { echo "missing json report: $json_path" >&2; return 1; }
+
+  local supported_count unsupported_count
+  supported_count="$(jq -r '.summary.support_matrix.native_supported' "$json_path")"
+  unsupported_count="$(jq -r '.summary.support_matrix.native_unsupported' "$json_path")"
+  if [[ "$supported_count" != "1" || "$unsupported_count" != "1" ]]; then
+    echo "expected cases file to populate support matrix" >&2
+    cat "$json_path" >&2
+    return 1
+  fi
+}
+
+test_real_repo_benchmark_rejects_malformed_cases_file_rows() {
+  local cases_file="$TEST_TMP_DIR/malformed-cases-file.tsv"
+  local stderr_path="$TEST_TMP_DIR/malformed-cases-file.err"
+  local -a rows=(
+    $'/tmp/Scarb.toml\ttag\t'
+    $'/tmp/Scarb.toml\ttag\textra'
+    $'/tmp/Scarb.toml'
+    $'\ttag'
+    $'/tmp/Scarb.toml\t'
+  )
+
+  local index
+  for index in "${!rows[@]}"; do
+    printf '%s\n' "${rows[$index]}" > "$cases_file"
+    if "$BENCH_SCRIPT" --cases-file "$cases_file" >"$TEST_TMP_DIR/malformed-cases-file-$index.out" 2>"$stderr_path"; then
+      echo "expected malformed cases-file row to be rejected: ${rows[$index]}" >&2
+      return 1
+    fi
+    if ! grep -q "Invalid cases file row 1" "$stderr_path"; then
+      echo "expected malformed cases-file row validation error for: ${rows[$index]}" >&2
+      cat "$stderr_path" >&2
+      return 1
+    fi
+  done
 }
 
 test_real_repo_benchmark_records_support_matrix_categories() {
@@ -399,6 +518,47 @@ test_real_repo_benchmark_records_supported_build_failures() {
   assert_contains "$markdown_text" "| fails-build | scarb | build.cold | 17 |"
 }
 
+test_real_repo_benchmark_reports_prefetch_failure_context() {
+  local cases_root="$TEST_TMP_DIR/prefetch-cases"
+  local mock_bin_dir="$TEST_TMP_DIR/prefetch-mock-bin"
+  local mock_uc="$mock_bin_dir/uc"
+  local mock_scarb="$mock_bin_dir/scarb"
+  local results_dir="$TEST_TMP_DIR/prefetch-results"
+  local stderr_path="$TEST_TMP_DIR/prefetch.err"
+  mkdir -p "$mock_bin_dir" "$results_dir"
+  write_mock_uc_bin "$mock_uc"
+  write_mock_scarb_bin "$mock_scarb"
+  write_manifest_case "$cases_root" "fails-fetch"
+
+  if PATH="$mock_bin_dir:$PATH" \
+    MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/prefetch-uc.args" \
+    MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/prefetch-scarb.args" \
+    "$BENCH_SCRIPT" \
+      --uc-bin "$mock_uc" \
+      --results-dir "$results_dir" \
+      --runs 1 \
+      --cold-runs 1 \
+      --warm-settle-seconds 0 \
+      --case "$cases_root/fails-fetch/Scarb.toml" fails-fetch \
+      >"$TEST_TMP_DIR/prefetch.out" 2>"$stderr_path"; then
+    echo "expected prefetch failure to fail the benchmark run" >&2
+    return 1
+  fi
+
+  if ! grep -q "forced scarb fetch failure" "$stderr_path"; then
+    echo "expected underlying scarb fetch failure in stderr" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+  local expected_manifest
+  expected_manifest="$(cd "$cases_root/fails-fetch" && pwd -P)/Scarb.toml"
+  if ! grep -q "scarb fetch failed for manifest_path=$expected_manifest" "$stderr_path"; then
+    echo "expected manifest-scoped scarb fetch failure context" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+}
+
 test_real_repo_benchmark_surfaces_stability_warnings() {
   local cases_root="$TEST_TMP_DIR/stability-cases"
   local mock_bin_dir="$TEST_TMP_DIR/stability-mock-bin"
@@ -532,10 +692,18 @@ run_test "real_repo_benchmark_rejects_missing_case_values" \
   test_real_repo_benchmark_rejects_missing_case_values
 run_test "real_repo_benchmark_rejects_zero_runs_from_environment" \
   test_real_repo_benchmark_rejects_zero_runs_from_environment
+run_test "real_repo_benchmark_rejects_no_cases_with_updated_usage" \
+  test_real_repo_benchmark_rejects_no_cases_with_updated_usage
+run_test "real_repo_benchmark_accepts_cases_file" \
+  test_real_repo_benchmark_accepts_cases_file
+run_test "real_repo_benchmark_rejects_malformed_cases_file_rows" \
+  test_real_repo_benchmark_rejects_malformed_cases_file_rows
 run_test "real_repo_benchmark_records_support_matrix_categories" \
   test_real_repo_benchmark_records_support_matrix_categories
 run_test "real_repo_benchmark_records_supported_build_failures" \
   test_real_repo_benchmark_records_supported_build_failures
+run_test "real_repo_benchmark_reports_prefetch_failure_context" \
+  test_real_repo_benchmark_reports_prefetch_failure_context
 run_test "real_repo_benchmark_surfaces_stability_warnings" \
   test_real_repo_benchmark_surfaces_stability_warnings
 run_test "real_repo_benchmark_keeps_unstable_lanes_on_partial_failures" \

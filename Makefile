@@ -4,7 +4,7 @@ SHELL := /bin/sh
 
 bootstrap:
 	@mkdir -p benchmarks/results benchmarks/baselines
-	@chmod +x benchmarks/scripts/run_local_benchmarks.sh benchmarks/scripts/run_dual_run_comparator.sh benchmarks/scripts/run_fast_perf_check.sh benchmarks/scripts/run_stability_benchmarks.sh benchmarks/scripts/run_native_only_gate.sh benchmarks/scripts/run_native_real_repo_smoke.sh benchmarks/scripts/run_real_repo_benchmarks.sh benchmarks/scripts/tests/benchmark_host_preflight_test.sh benchmarks/scripts/tests/native_ci_gate_test.sh benchmarks/scripts/tests/real_repo_benchmark_test.sh scripts/github/bootstrap_github_stack.sh scripts/doctor.sh scripts/build_native_toolchain_helper.sh scripts/refresh_repo_map.sh scripts/validate_agent_surface.sh scripts/install_git_hooks.sh scripts/local_ci_gate.sh scripts/tests/local_ci_gate_test.sh scripts/tests/doctor_test.sh scripts/tests/build_native_toolchain_helper_test.sh .githooks/pre-push
+	@chmod +x benchmarks/scripts/run_local_benchmarks.sh benchmarks/scripts/run_dual_run_comparator.sh benchmarks/scripts/run_fast_perf_check.sh benchmarks/scripts/run_stability_benchmarks.sh benchmarks/scripts/run_native_only_gate.sh benchmarks/scripts/run_native_real_repo_smoke.sh benchmarks/scripts/run_real_repo_benchmarks.sh benchmarks/scripts/run_deployed_contract_corpus.sh benchmarks/scripts/tests/benchmark_host_preflight_test.sh benchmarks/scripts/tests/native_ci_gate_test.sh benchmarks/scripts/tests/real_repo_benchmark_test.sh benchmarks/scripts/tests/deployed_contract_corpus_test.sh scripts/github/bootstrap_github_stack.sh scripts/doctor.sh scripts/build_native_toolchain_helper.sh scripts/refresh_repo_map.sh scripts/validate_agent_surface.sh scripts/install_git_hooks.sh scripts/local_ci_gate.sh scripts/tests/local_ci_gate_test.sh scripts/tests/doctor_test.sh scripts/tests/build_native_toolchain_helper_test.sh .githooks/pre-push
 	@$(MAKE) install-hooks
 	@echo "Bootstrap complete."
 
@@ -34,6 +34,7 @@ validate-bench-scripts:
 	@./benchmarks/scripts/tests/benchmark_host_preflight_test.sh
 	@./benchmarks/scripts/tests/native_ci_gate_test.sh
 	@./benchmarks/scripts/tests/real_repo_benchmark_test.sh
+	@./benchmarks/scripts/tests/deployed_contract_corpus_test.sh
 
 validate-fast:
 	@$(MAKE) agent-validate
