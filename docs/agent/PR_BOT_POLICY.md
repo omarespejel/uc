@@ -18,7 +18,8 @@
 - Keep repo-level standards concise so the agent actually applies them.
 
 ## Human Triage Rules
-- Open a PR early for any non-trivial change so review bots have a real diff to inspect.
+- Open a normal ready-for-review PR early for any non-trivial change so review bots have a real diff to inspect.
+- Do not use draft PRs for normal engineering work in this repo; CodeRabbit and Qodo need a reviewable PR state.
 - Treat the PR as the working unit: push small coherent slices, let bots review, then address relevant findings before expanding scope.
 - Treat CodeRabbit and Qodo as review accelerators, not as merge authority.
 - Fix real correctness or regression findings first.

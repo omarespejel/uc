@@ -7,7 +7,8 @@
 - Run `make agent-validate` before pushing changes that touch docs, bot config, scripts, or repo structure.
 
 ## PR-First Rule
-- Do all non-trivial work in a fresh branch and open a PR early; do not accumulate substantial local-only changes without a PR review surface.
+- Do all non-trivial work in a fresh branch and open a normal ready-for-review PR early; do not use draft PRs because AI review bots do not fully engage on drafts.
+- Do not accumulate substantial local-only changes without a PR review surface.
 - After pushing a coherent slice, start the review loop immediately: wait for CodeRabbit and Qodo, fix all relevant feedback, and push follow-up commits.
 - Merge only after all actionable human and AI feedback is addressed and the PR has been quiet for at least 3 minutes with no new useful bot comments.
 - If more work is needed after a merge, start a new branch and a new PR; do not keep stacking unrelated work into a merged PR.
@@ -36,6 +37,7 @@
 - Prioritize bugs, invalidation mistakes, silent fallback paths, daemon safety, artifact drift, and benchmark bias.
 - Prefer actionable findings over style nits.
 - If CI or bot feedback is stale, re-check the exact thread or check run before acting on it.
+- Keep PRs reviewable by bots at all times: open normal PRs, not drafts, unless a human explicitly asks for a draft and accepts the loss of bot review.
 - Merge only after the PR is quiet for at least 3 minutes with no new useful AI bot feedback and all actionable comments are addressed or explicitly rejected.
 
 ## Performance Rules
