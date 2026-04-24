@@ -85,6 +85,9 @@ This local-only harness uses `uc support native --format json` to classify each
 manifest before any timed run. Native-eligible cases are benchmarked against
 Scarb on `build.cold` and `build.warm_noop`; native-ineligible cases are listed
 separately with the exact unsupported reason and are excluded from speedup claims.
+If a native-eligible case fails during `scarb` or `uc` execution, the harness
+records that build failure in a separate section with exit code and log path
+instead of aborting the whole benchmark run.
 
 ## Fast Iteration Loop (Developer Lane)
 ```bash

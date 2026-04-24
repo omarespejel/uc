@@ -28,6 +28,7 @@ Before changing `uc` engine behavior, rerun baseline against current Scarb and s
 Do not mix native-ineligible manifests into `uc` vs Scarb speedup claims.
 Benchmark reports must separate:
 - native-eligible workloads that were actually measured against `uc` native build
+- native-eligible workloads that failed during timed execution, with exit code and log path
 - native-ineligible workloads that were skipped, along with the exact reason
 
 ## Comparator Rule
