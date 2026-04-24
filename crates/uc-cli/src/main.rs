@@ -509,7 +509,7 @@ struct NativeSupportReport {
     issue_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     toolchain: Option<NativeToolchainReport>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     diagnostics: Vec<NativeDiagnostic>,
 }
 
@@ -7975,15 +7975,6 @@ fn compile_native_casm_contract(
 }
 
 #[cfg(all(feature = "native-compile", feature = "helper-cairo-214"))]
-fn compile_starknet_prepared_db_without_diagnostics(
-    db: &RootDatabase,
-    contracts: &[&ContractDeclaration],
-    compiler_config: CompilerConfig<'_>,
-) -> Result<Vec<ContractClass>> {
-    compile_starknet_prepared_db(db, contracts, compiler_config)
-}
-
-#[cfg(all(feature = "native-compile", feature = "helper-cairo-214"))]
 fn ensure_keyed_file_override_slots(
     _db: &mut RootDatabase,
     _files: impl IntoIterator<Item = FileInput>,
@@ -8032,7 +8023,7 @@ fn native_removed_override_slot_exists(
     }
     #[cfg(feature = "helper-cairo-214")]
     {
-        file_overrides(db).contains_key(&_file_id)
+        file_overrides(db).contains_key(&_file_id) || db.file_content(_file_id).is_some()
     }
 }
 
@@ -11594,6 +11585,9 @@ fn run_native_build_inner(
                         &session.contract_output_plans,
                         session.contract_output_plans_verified,
                     );
+                // Cairo 2.14 lacks the no-diagnostics compiler entrypoint, so
+                // helper builds must not claim or select that fast path.
+                #[cfg(not(feature = "helper-cairo-214"))]
                 if skip_global_contract_diagnostics {
                     native_progress_log(
                         "native contract compile using verified no-diagnostics fast path",
@@ -11613,20 +11607,32 @@ fn run_native_build_inner(
                             profile,
                             capture_statement_locations,
                         );
-                        if skip_global_contract_diagnostics {
-                            compile_starknet_prepared_db_without_diagnostics(
-                                &session.db,
-                                &contract_refs,
-                                compiler_config,
-                            )
-                        } else {
+                        #[cfg(not(feature = "helper-cairo-214"))]
+                        let result = {
+                            if skip_global_contract_diagnostics {
+                                compile_starknet_prepared_db_without_diagnostics(
+                                    &session.db,
+                                    &contract_refs,
+                                    compiler_config,
+                                )
+                            } else {
+                                compile_starknet_prepared_db(
+                                    &session.db,
+                                    &contract_refs,
+                                    compiler_config,
+                                )
+                            }
+                        };
+                        #[cfg(feature = "helper-cairo-214")]
+                        let result = {
+                            let _ = skip_global_contract_diagnostics;
                             compile_starknet_prepared_db(
                                 &session.db,
                                 &contract_refs,
                                 compiler_config,
                             )
-                        }
-                        .map_err(|err| {
+                        };
+                        result.map_err(|err| {
                             mark_native_fallback_eligible_for_external_dependencies(
                                 err.context("native starknet compile failed"),
                                 &context,

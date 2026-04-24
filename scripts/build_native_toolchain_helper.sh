@@ -229,6 +229,8 @@ if (( CHECK_ONLY == 1 )); then
     CARGO_TARGET_DIR="$TARGET_DIR" cargo test --locked --features "$HELPER_FEATURE" -p uc-cli \
       native_helper_cairo214_skip_unused_import_diagnostics_is_not_session_keyed -- --nocapture
     CARGO_TARGET_DIR="$TARGET_DIR" cargo test --locked --features "$HELPER_FEATURE" -p uc-cli \
+      native_helper_cairo214_removed_unmodified_tracked_file_invalidates_cached_content -- --nocapture
+    CARGO_TARGET_DIR="$TARGET_DIR" cargo test --locked --features "$HELPER_FEATURE" -p uc-cli \
       native_crate_cache_restore_preserves_existing_config_fields -- --nocapture
     CARGO_TARGET_DIR="$TARGET_DIR" cargo test --locked --features "$HELPER_FEATURE" -p uc-cli \
       native_apply_file_keyed_session_updates_skips_untracked_removed_file_slots -- --nocapture

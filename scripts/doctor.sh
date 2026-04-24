@@ -110,6 +110,11 @@ probe_manifest_native_support() {
     failures=$((failures + 1))
     return
   fi
+  if ! jq -e . >/dev/null 2>&1 <<<"$report_json"; then
+    printf '[missing] native support probe returned invalid JSON for %s via %s\n' "$manifest_path" "$UC_BIN" >&2
+    failures=$((failures + 1))
+    return
+  fi
 
   local supported issue_code reason
   supported="$(jq -r '.supported' <<<"$report_json")"

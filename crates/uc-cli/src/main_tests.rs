@@ -1709,6 +1709,52 @@ fn native_helper_cairo214_skip_unused_import_diagnostics_is_not_session_keyed() 
     fs::remove_dir_all(&dir).ok();
 }
 
+#[cfg(all(feature = "native-compile", feature = "helper-cairo-214"))]
+#[test]
+fn native_helper_cairo214_removed_unmodified_tracked_file_invalidates_cached_content() {
+    let workspace = unique_test_dir("uc-helper-removed-tracked-file");
+    let src_dir = workspace.join("src");
+    fs::create_dir_all(&src_dir).expect("failed to create src dir");
+    let tracked_path = src_dir.join("tracked.cairo");
+    fs::write(&tracked_path, "fn tracked() -> felt252 { 7 }\n")
+        .expect("failed to write tracked source");
+
+    let mut db = RootDatabase::builder()
+        .with_optimizations(Optimizations::enabled_with_default_movable_functions(
+            InliningStrategy::Default,
+        ))
+        .with_default_plugin_suite(starknet_plugin_suite())
+        .build()
+        .expect("failed to build root database");
+    {
+        let file_id = FileId::new(&db, FileLongId::OnDisk(tracked_path.clone()));
+        assert!(
+            db.file_content(file_id).is_some(),
+            "test must prime the helper lane's cached file content"
+        );
+    }
+
+    fs::remove_file(&tracked_path).expect("failed to remove tracked source");
+    let removed_applied = native_apply_file_keyed_session_updates(
+        &mut db,
+        &workspace,
+        &[],
+        &[String::from("src/tracked.cairo")],
+    )
+    .expect("removed tracked file update should succeed");
+    assert!(
+        removed_applied,
+        "helper lane must invalidate removed tracked files even without a pre-existing override slot"
+    );
+    assert!(
+        db.file_content(FileId::new(&db, FileLongId::OnDisk(tracked_path)))
+            .is_none(),
+        "removed tracked files should clear cached helper file content"
+    );
+
+    fs::remove_dir_all(&workspace).ok();
+}
+
 #[test]
 fn parse_lockfile_dependency_version_extracts_target_package() {
     let lockfile = r#"
