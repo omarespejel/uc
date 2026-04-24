@@ -25,6 +25,16 @@ Usage:
 USAGE
 }
 
+require_option_value() {
+  local flag="$1"
+  local value="${2-}"
+  if [[ -z "$value" || "$value" == --* ]]; then
+    echo "Missing value for $flag" >&2
+    usage >&2
+    exit 2
+  fi
+}
+
 cleanup() {
   if [[ -n "$NO_SCARB_PATH" && -d "$NO_SCARB_PATH" ]]; then
     rm -rf "$NO_SCARB_PATH"
@@ -35,10 +45,12 @@ trap cleanup EXIT
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --uc-bin)
+      require_option_value "$1" "${2-}"
       UC_BIN="$2"
       shift 2
       ;;
     --results-dir)
+      require_option_value "$1" "${2-}"
       RESULTS_DIR="$2"
       shift 2
       ;;

@@ -15,6 +15,15 @@ fn unique_test_dir(prefix: &str) -> PathBuf {
     dir
 }
 
+#[cfg(feature = "native-compile")]
+fn unique_platform_absolute_fixture_path(prefix: &str) -> String {
+    normalize_fingerprint_path(
+        &std::env::temp_dir()
+            .join(format!("{prefix}-{}", std::process::id()))
+            .join("src/lib.cairo"),
+    )
+}
+
 #[cfg(unix)]
 fn unique_unix_socket_path(prefix: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -87,18 +96,30 @@ impl Drop for ScopedEnvVar {
 }
 
 #[cfg(feature = "native-compile")]
-struct NativeProgressHookRestore(Option<NativeProgressTestHook>);
+fn native_progress_hook_lock() -> &'static Mutex<()> {
+    static LOCK: TestOnceLock<Mutex<()>> = TestOnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[cfg(feature = "native-compile")]
+struct NativeProgressHookRestore {
+    previous: Option<NativeProgressTestHook>,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
 
 #[cfg(feature = "native-compile")]
 impl Drop for NativeProgressHookRestore {
     fn drop(&mut self) {
-        let previous = self.0.take();
+        let previous = self.previous.take();
         let _ = set_native_progress_test_hook(previous);
     }
 }
 
 #[cfg(feature = "native-compile")]
 fn capture_native_progress_messages() -> (Arc<Mutex<Vec<String>>>, NativeProgressHookRestore) {
+    let guard = native_progress_hook_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let messages = Arc::new(Mutex::new(Vec::new()));
     let sink = messages.clone();
     let previous = set_native_progress_test_hook(Some(Arc::new(move |message| {
@@ -106,7 +127,13 @@ fn capture_native_progress_messages() -> (Arc<Mutex<Vec<String>>>, NativeProgres
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(message);
     })));
-    (messages, NativeProgressHookRestore(previous))
+    (
+        messages,
+        NativeProgressHookRestore {
+            previous,
+            _guard: guard,
+        },
+    )
 }
 
 fn scarb_available() -> bool {
@@ -6483,7 +6510,7 @@ fn native_setup_project_matches_cairo_setup_project_results() {
         project_dir.join("cairo_project.toml"),
         format!(
             "[crate_roots]\nmain = \"src\"\ndep = \"{}\"\n",
-            dep_dir.display()
+            toml_escape_basic_string(&dep_dir.display().to_string())
         ),
     )
     .expect("failed to write cairo_project.toml");
@@ -7764,6 +7791,7 @@ fn native_changed_files_affect_tracked_contracts_stays_conservative_when_index_i
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_changed_files_affect_tracked_contracts_stays_conservative_for_absolute_paths() {
+    let absolute_dependency = unique_platform_absolute_fixture_path("uc-native-external-dep");
     let plans = vec![NativeContractOutputPlan {
         module_path: "pkg::contract_a".to_string(),
         artifact_id: "a".to_string(),
@@ -7779,7 +7807,7 @@ fn native_changed_files_affect_tracked_contracts_stays_conservative_for_absolute
 
     assert!(
         native_changed_files_affect_tracked_contracts(
-            &[String::from("/tmp/external-dep/src/lib.cairo")],
+            &[absolute_dependency],
             &[],
             &plans,
             &dependencies
@@ -7905,7 +7933,9 @@ fn native_apply_file_keyed_session_updates_batches_changed_and_removed_files() {
 #[test]
 fn native_filter_changed_files_to_contract_source_index_keeps_absolute_paths_conservative() {
     let by_source = HashMap::from([("src/contract_a.cairo".to_string(), vec![0])]);
-    let changed_files = vec![String::from("/tmp/external-dep/src/lib.cairo")];
+    let changed_files = vec![unique_platform_absolute_fixture_path(
+        "uc-native-index-external-dep",
+    )];
 
     let (scoped_changed, scoped_removed) =
         native_filter_changed_files_to_contract_source_index(&changed_files, &[], &by_source, true);

@@ -25,13 +25,25 @@ Usage:
 USAGE
 }
 
+require_option_value() {
+  local flag="$1"
+  local value="${2-}"
+  if [[ -z "$value" || "$value" == --* ]]; then
+    echo "Missing value for $flag" >&2
+    usage >&2
+    exit 2
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --uc-bin)
+      require_option_value "$1" "${2-}"
       UC_BIN="$2"
       shift 2
       ;;
     --results-dir)
+      require_option_value "$1" "${2-}"
       RESULTS_DIR="$2"
       shift 2
       ;;
@@ -66,6 +78,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ "${#STRICT_CASE_MANIFESTS[@]}" -eq 0 && "${#BACKEND_CASE_MANIFESTS[@]}" -eq 0 ]]; then
+  echo "run_native_real_repo_smoke.sh requires at least one --strict-case or --backend-case" >&2
+  usage >&2
+  exit 2
+fi
+
 if [[ ! -x "$UC_BIN" ]]; then
   echo "UC binary is missing or not executable: $UC_BIN" >&2
   exit 1
@@ -83,6 +101,7 @@ run_case() {
   "$UC_BIN" build \
     --engine uc \
     --daemon-mode off \
+    --offline \
     --manifest-path "$manifest_path" \
     --report-path "$report_path" \
     >"$log_path" 2>&1

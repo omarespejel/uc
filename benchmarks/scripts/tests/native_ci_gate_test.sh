@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 LIB_PATH="$SCRIPT_DIR/../lib/native_ci_gate.sh"
+NATIVE_ONLY_SCRIPT="$SCRIPT_DIR/../run_native_only_gate.sh"
+NATIVE_REAL_REPO_SMOKE_SCRIPT="$SCRIPT_DIR/../run_native_real_repo_smoke.sh"
 
 if [[ ! -f "$LIB_PATH" ]]; then
   echo "missing native CI gate library at $LIB_PATH" >&2
@@ -14,6 +16,16 @@ source "$LIB_PATH"
 
 TEST_TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEST_TMP_DIR"' EXIT
+
+assert_contains() {
+  local haystack="$1"
+  local needle="$2"
+  if [[ "$haystack" != *"$needle"* ]]; then
+    echo "assert_contains failed: expected to find '$needle'" >&2
+    echo "actual: $haystack" >&2
+    return 1
+  fi
+}
 
 run_test() {
   local name="$1"
@@ -28,6 +40,39 @@ write_file() {
   cat > "$path" <<EOF
 $*
 EOF
+}
+
+write_mock_uc_bin() {
+  local path="$1"
+  cat > "$path" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+args_log="${MOCK_UC_ARGS_LOG:?}"
+report_path=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --report-path)
+      report_path="${2-}"
+      shift 2
+      ;;
+    *)
+      printf '%s\n' "$1" >> "$args_log"
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$report_path" ]]; then
+  echo "mock uc missing --report-path" >&2
+  exit 1
+fi
+
+mkdir -p "$(dirname "$report_path")"
+printf '%s\n' "$report_path" >> "$args_log"
+printf '{"exit_code":0,"command":["uc-native","build"]}\n' > "$report_path"
+EOF
+  chmod +x "$path"
 }
 
 test_detects_unsupported_executable_fixture_log() {
@@ -95,9 +140,76 @@ test_verify_report_accepts_controlled_fallback_backend() {
   uc_native_ci_verify_report "$report_path" "controlled-fallback" "scarb,uc-native" >/dev/null
 }
 
+test_native_only_script_rejects_missing_uc_bin_value() {
+  local stderr_path="$TEST_TMP_DIR/native-only-missing-uc-bin.err"
+  if "$NATIVE_ONLY_SCRIPT" --uc-bin >"$TEST_TMP_DIR/native-only-missing-uc-bin.out" 2>"$stderr_path"; then
+    echo "expected native-only gate to reject missing --uc-bin value" >&2
+    return 1
+  fi
+
+  if ! grep -q "Missing value for --uc-bin" "$stderr_path"; then
+    echo "expected missing --uc-bin error" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+}
+
+test_native_real_repo_smoke_rejects_missing_results_dir_value() {
+  local stderr_path="$TEST_TMP_DIR/native-real-missing-results.err"
+  if "$NATIVE_REAL_REPO_SMOKE_SCRIPT" --results-dir >"$TEST_TMP_DIR/native-real-missing-results.out" 2>"$stderr_path"; then
+    echo "expected native real repo smoke script to reject missing --results-dir value" >&2
+    return 1
+  fi
+
+  if ! grep -q "Missing value for --results-dir" "$stderr_path"; then
+    echo "expected missing --results-dir error" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+}
+
+test_native_real_repo_smoke_requires_cases() {
+  local mock_uc="$TEST_TMP_DIR/mock-uc-no-cases"
+  write_mock_uc_bin "$mock_uc"
+  local stderr_path="$TEST_TMP_DIR/native-real-no-cases.err"
+  if MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/native-real-no-cases.args" \
+    "$NATIVE_REAL_REPO_SMOKE_SCRIPT" \
+      --uc-bin "$mock_uc" \
+      --results-dir "$TEST_TMP_DIR/results-no-cases" \
+      >"$TEST_TMP_DIR/native-real-no-cases.out" 2>"$stderr_path"; then
+    echo "expected native real repo smoke script to reject empty case configuration" >&2
+    return 1
+  fi
+
+  if ! grep -q "requires at least one --strict-case or --backend-case" "$stderr_path"; then
+    echo "expected empty case configuration error" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+}
+
+test_native_real_repo_smoke_passes_offline_to_uc() {
+  local mock_uc="$TEST_TMP_DIR/mock-uc-offline"
+  local args_log="$TEST_TMP_DIR/native-real-offline.args"
+  write_mock_uc_bin "$mock_uc"
+
+  MOCK_UC_ARGS_LOG="$args_log" \
+    "$NATIVE_REAL_REPO_SMOKE_SCRIPT" \
+      --uc-bin "$mock_uc" \
+      --results-dir "$TEST_TMP_DIR/results-offline" \
+      --backend-case "$TEST_TMP_DIR/fake/Scarb.toml" fake-case uc-native \
+      >"$TEST_TMP_DIR/native-real-offline.out" 2>"$TEST_TMP_DIR/native-real-offline.err"
+
+  assert_contains "$(cat "$args_log")" "--offline"
+}
+
 run_test "detects unsupported executable fixture log" test_detects_unsupported_executable_fixture_log
 run_test "detects generic unsupported capability log" test_detects_generic_unsupported_capability_log
 run_test "ignores generic failure log" test_ignores_generic_failure_log
 run_test "verify report accepts uc-native backend" test_verify_report_accepts_uc_native_backend
 run_test "verify report rejects scarb fallback for native-only" test_verify_report_rejects_scarb_fallback_for_native_only
 run_test "verify report accepts controlled fallback backend" test_verify_report_accepts_controlled_fallback_backend
+run_test "native-only script rejects missing uc-bin value" test_native_only_script_rejects_missing_uc_bin_value
+run_test "native real repo smoke rejects missing results-dir value" test_native_real_repo_smoke_rejects_missing_results_dir_value
+run_test "native real repo smoke requires cases" test_native_real_repo_smoke_requires_cases
+run_test "native real repo smoke passes offline to uc" test_native_real_repo_smoke_passes_offline_to_uc

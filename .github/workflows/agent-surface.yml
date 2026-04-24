@@ -20,7 +20,8 @@ jobs:
           chmod +x scripts/doctor.sh scripts/refresh_repo_map.sh scripts/validate_agent_surface.sh
           make agent-validate
 
-      - name: Regenerate repo map
+      - name: Regenerate repo map and assert checked-in output is current
         run: |
           chmod +x scripts/refresh_repo_map.sh
           make agent-map
+          git diff --exit-code -- docs/agent/REPO_MAP.md

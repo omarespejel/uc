@@ -45,10 +45,11 @@ benchmark-delta:
 	@echo "Use benchmarks/scripts/compare_benchmark_results.sh with explicit baseline/candidate JSON files."
 
 benchmark-strict-smoke:
-	@./benchmarks/scripts/run_stability_benchmarks.sh --matrix smoke --runs 12 --cold-runs 12 --cycles 5 --cpu-set 0 --strict-pinning --host-preflight warn --uc-daemon-mode require
+	@./benchmarks/scripts/run_stability_benchmarks.sh --matrix smoke --runs 12 --cold-runs 12 --cycles 5 --cpu-set 0 --strict-pinning --host-preflight warn --uc-daemon-mode require --gate-config benchmarks/gates/perf-gate-smoke.json
 
 benchmark-strict-research:
-	@./benchmarks/scripts/run_stability_benchmarks.sh --matrix research --runs 12 --cold-runs 12 --cycles 5 --cpu-set 0 --strict-pinning --host-preflight warn --uc-daemon-mode require
+	@: "$${UC_RESEARCH_ROOT:?set UC_RESEARCH_ROOT to the cloned research workspace root}"
+	@./benchmarks/scripts/run_stability_benchmarks.sh --matrix research --workspace-root "$$UC_RESEARCH_ROOT" --runs 12 --cold-runs 12 --cycles 5 --cpu-set 0 --strict-pinning --host-preflight require --uc-daemon-mode require --gate-config benchmarks/gates/perf-gate-research.json
 
 perf-fast:
 	@./benchmarks/scripts/run_fast_perf_check.sh
