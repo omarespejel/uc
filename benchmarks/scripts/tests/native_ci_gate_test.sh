@@ -328,9 +328,9 @@ test_native_real_repo_smoke_passes_offline_to_uc() {
       --backend-case "$fake_manifest_dir/Scarb.toml" fake-case uc-native \
       >"$TEST_TMP_DIR/native-real-offline.out" 2>"$TEST_TMP_DIR/native-real-offline.err"
 
-  assert_contains "$(cat "$args_log")" "--offline"
-  assert_contains "$(cat "$args_log")" "--daemon-mode"
-  assert_contains "$(cat "$args_log")" "off"
+  grep -Fxq -- "--offline" "$args_log"
+  grep -Fxq -- "--daemon-mode" "$args_log"
+  grep -Fxq -- "off" "$args_log"
   assert_contains "$(cat "$TEST_TMP_DIR/native-real-offline.scarb.args")" "cwd=$fake_manifest_dir_abs"
   assert_contains "$(cat "$TEST_TMP_DIR/native-real-offline.scarb.args")" "cmd=fetch"
 }

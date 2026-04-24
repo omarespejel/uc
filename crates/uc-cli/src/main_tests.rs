@@ -6121,13 +6121,16 @@ fn native_compile_session_image_restore_rejects_signature_and_content_hash_misma
     );
     fs::write(dir.join("src/lib.cairo"), "fn changed() -> felt252 { 2 }\n")
         .expect("failed to mutate tracked source");
+    let changed_metadata =
+        fs::metadata(dir.join("src/lib.cairo")).expect("failed to stat mutated tracked source");
     let changed_hash = native_tracked_sources_content_hash(
         &dir,
         &BTreeMap::from([(
             "src/lib.cairo".to_string(),
             NativeTrackedFileState {
-                size_bytes: 5,
-                modified_unix_ms: 11,
+                size_bytes: changed_metadata.len(),
+                modified_unix_ms: metadata_modified_unix_ms(&changed_metadata)
+                    .expect("changed source mtime"),
             },
         )]),
     )
@@ -6281,8 +6284,20 @@ fn native_buildinfo_sidecar_round_trip_restores_tracked_sources_and_dependency_i
     );
     fs::write(dir.join("src/lib.cairo"), "fn changed() -> felt252 { 2 }\n")
         .expect("failed to mutate tracked source");
-    let changed_hash =
-        native_tracked_sources_content_hash(&dir, &tracked_sources).expect("changed content hash");
+    let changed_metadata =
+        fs::metadata(dir.join("src/lib.cairo")).expect("failed to stat mutated tracked source");
+    let changed_hash = native_tracked_sources_content_hash(
+        &dir,
+        &BTreeMap::from([(
+            "src/lib.cairo".to_string(),
+            NativeTrackedFileState {
+                size_bytes: changed_metadata.len(),
+                modified_unix_ms: metadata_modified_unix_ms(&changed_metadata)
+                    .expect("changed source mtime"),
+            },
+        )]),
+    )
+    .expect("changed content hash");
     assert!(
         try_native_buildinfo_sidecar_restore(&dir, &signature, &changed_hash).is_none(),
         "content hash mismatch must invalidate persisted buildinfo sidecar"
