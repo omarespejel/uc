@@ -89,6 +89,40 @@ If a native-eligible case fails during `scarb` or `uc` execution, the harness
 records that build failure in a separate section with exit code and log path
 instead of aborting the whole benchmark run.
 
+## Run Deployed-Contract Corpus Evidence
+```bash
+# Validate and normalize a corpus without running builds.
+./benchmarks/scripts/run_deployed_contract_corpus.sh \
+  --corpus benchmarks/corpora/deployed-contract-corpus.example.json \
+  --results-dir benchmarks/results \
+  --plan-only
+
+# Run the corpus through the real-repo support matrix and benchmark harness.
+./benchmarks/scripts/run_deployed_contract_corpus.sh \
+  --uc-bin ./target/release/uc \
+  --corpus /abs/path/to/pinned-deployed-contract-corpus.json \
+  --results-dir benchmarks/results \
+  --runs 5 \
+  --cold-runs 5
+```
+
+The corpus wrapper is the launch-evidence path for deployed-contract claims. It
+validates `benchmarks/corpora/deployed-contract-corpus.schema.json`, resolves
+each item to a local `Scarb.toml`, runs `run_real_repo_benchmarks.sh`, and emits
+a combined JSON/Markdown artifact with:
+
+- the pinned chain/snapshot/block-range selection,
+- deduplication and source/license policy metadata,
+- Cairo version min/max across the corpus,
+- a support matrix for `native_supported`, `native_unsupported`,
+  `fallback_used`, and `build_failed`,
+- guarded launch-claim text only when the corpus declares
+  `coverage=complete_deployed_contracts` and every item is native-supported.
+
+Do not turn sample-corpus output into launch copy. A `coverage=sample` corpus is
+valid for smoke testing the artifact path, but the generated claim guard will
+mark the “compiled every deployed contract” sentence unsafe.
+
 ## Fast Iteration Loop (Developer Lane)
 ```bash
 ./benchmarks/scripts/run_fast_perf_check.sh

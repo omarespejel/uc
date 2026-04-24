@@ -20,10 +20,14 @@ Measure and prove that `uc` outperforms Scarb on real workflows while maintainin
 - JSON per run under `benchmarks/results/`.
 - Markdown summary per run under `benchmarks/results/`.
 - Reviewed baseline snapshots under `benchmarks/baselines/`.
+- Deployed-contract corpus plan/benchmark artifacts under `benchmarks/results/`,
+  generated from `benchmarks/corpora/deployed-contract-corpus.schema.json`.
 
 ## Execution Policy
 - Benchmarks are local-first. Reproduction must work from checked-in scripts plus pinned manifest paths; do not require GitHub Actions or hosted CI to verify the numbers.
 - Before comparing before/after performance claims, rerun both sides in the same binary/toolchain window on the same machine.
+- Deployed-contract claims must go through `run_deployed_contract_corpus.sh`; do
+  not manually aggregate real-repo benchmark output into launch copy.
 
 ## Baseline Rule
 Before changing `uc` engine behavior, rerun baseline against current Scarb and snapshot results.
@@ -71,4 +75,12 @@ UC_NATIVE_TOOLCHAIN_2_14_BIN=/abs/path/to/uc-cairo214-helper \
 ./benchmarks/scripts/run_real_repo_benchmarks.sh \
   --uc-bin /abs/path/to/uc \
   --case /abs/path/to/repo/Scarb.toml repo-tag
+
+# Pinned deployed-contract corpus support matrix and guarded claim artifact
+./benchmarks/scripts/run_deployed_contract_corpus.sh \
+  --uc-bin /abs/path/to/uc \
+  --corpus /abs/path/to/pinned-deployed-contract-corpus.json \
+  --results-dir benchmarks/results \
+  --runs 5 \
+  --cold-runs 5
 ```

@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "corpus_id": "example-sample-do-not-use-for-launch-claims",
+  "chain": "starknet-mainnet",
+  "selection": {
+    "source": "example local fixture list",
+    "snapshot_id": "example-only",
+    "from_block": 0,
+    "to_block": 0,
+    "coverage": "sample",
+    "notes": "This is only a shape example. It is not a deployed-contract universe snapshot."
+  },
+  "deduplication": {
+    "key": "class_hash",
+    "input_count": 1,
+    "deduped_count": 1,
+    "rules": "One row per unique class hash when a complete snapshot is available."
+  },
+  "license_policy": "Only include rows whose source manifests are locally available and legally benchmarkable.",
+  "items": [
+    {
+      "tag": "example-contract",
+      "contract_address": "0x0",
+      "class_hash": "0x0",
+      "source_ref": "local fixture",
+      "manifest_path": "../fixtures/scarb_smoke/Scarb.toml",
+      "cairo_version": "2.16.0",
+      "scarb_version": "2.14.0",
+      "license": "fixture"
+    }
+  ]
+}
