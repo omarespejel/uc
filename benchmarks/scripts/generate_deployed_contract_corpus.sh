@@ -82,6 +82,7 @@ fi
 
 python3 - "$SOURCE_INDEX_ABS" "$OUT_ABS" <<'PY'
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -258,6 +259,12 @@ corpus = {
     "license_policy": license_policy,
     "items": normalized_items,
 }
+if out_path.exists():
+    try:
+        if os.path.samefile(source_index_path, out_path):
+            fail(f"Refusing to overwrite source index with generated corpus: {source_index_path.resolve()}")
+    except OSError as exc:
+        fail(f"unable to validate --out path: {exc}")
 out_path.write_text(json.dumps(corpus, indent=2, sort_keys=True) + "\n")
 PY
 

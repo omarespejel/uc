@@ -307,6 +307,20 @@ test_rejects_deduped_count_mismatch() {
   expect_generator_failure "$index_dir/source-index.json" "source_index.deduplication.deduped_count (2) must equal items length (1)"
 }
 
+test_rejects_input_count_less_than_deduped() {
+  local case_root="$TEST_TMP_DIR/input-lt-deduped/cases"
+  local index_dir="$TEST_TMP_DIR/input-lt-deduped/index"
+  mkdir -p "$index_dir"
+  write_manifest_case "$case_root" "a"
+  write_manifest_case "$case_root" "b"
+  local item_a item_b
+  item_a="$(source_item_json a "../cases/a/Scarb.toml" "0x01" "2.14.0")"
+  item_b="$(source_item_json b "../cases/b/Scarb.toml" "0x02" "2.14.0")"
+  write_source_index_file "$index_dir/source-index.json" sample class_hash "$item_a" "$item_b"
+  mutate_source_index "$index_dir/source-index.json" '.deduplication.input_count = 1'
+  expect_generator_failure "$index_dir/source-index.json" "source_index.deduplication.input_count must be >= deduped_count"
+}
+
 test_rejects_source_index_output_overwrite() {
   local case_root="$TEST_TMP_DIR/overwrite/cases"
   local index_dir="$TEST_TMP_DIR/overwrite/index"
@@ -383,6 +397,8 @@ run_test "rejects_manifest_not_named_scarb_toml" \
   test_rejects_manifest_not_named_scarb_toml
 run_test "rejects_deduped_count_mismatch" \
   test_rejects_deduped_count_mismatch
+run_test "rejects_input_count_less_than_deduped" \
+  test_rejects_input_count_less_than_deduped
 run_test "rejects_source_index_output_overwrite" \
   test_rejects_source_index_output_overwrite
 run_test "rejects_source_index_output_symlink_overwrite" \
