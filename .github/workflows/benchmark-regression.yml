@@ -260,7 +260,7 @@ jobs:
           fi
           echo "UC_REAL_REPOS_ROOT=$REAL_REPOS_ROOT" >> "$GITHUB_ENV"
 
-      - name: Native strict smoke on starknet-agentic
+      - name: Native strict smoke on supported starknet-agentic manifests
         env:
           UC_NATIVE_BUILD_MODE: require
           UC_NATIVE_DISALLOW_SCARB_FALLBACK: "1"
@@ -271,9 +271,20 @@ jobs:
             --uc-bin ./target/release/uc \
             --results-dir benchmarks/results \
             --strict-case "$UC_REAL_REPOS_ROOT/starknet-agentic/contracts/huginn-registry/Scarb.toml" agentic-huginn-registry \
-            --strict-case "$UC_REAL_REPOS_ROOT/starknet-agentic/contracts/erc8004-cairo/Scarb.toml" agentic-erc8004-cairo \
             --strict-case "$UC_REAL_REPOS_ROOT/starknet-agentic/contracts/agent-account/Scarb.toml" agentic-agent-account \
             --strict-case "$UC_REAL_REPOS_ROOT/starknet-agentic/contracts/session-account/Scarb.toml" agentic-session-account
+
+      - name: UC smoke on agentic erc8004 (controlled fallback allowed)
+        env:
+          UC_NATIVE_BUILD_MODE: auto
+          UC_NATIVE_DISALLOW_SCARB_FALLBACK: "0"
+          UC_NATIVE_CORELIB_SRC: ${{ env.UC_NATIVE_CORELIB_SRC }}
+        run: |
+          chmod +x benchmarks/scripts/run_native_real_repo_smoke.sh
+          ./benchmarks/scripts/run_native_real_repo_smoke.sh \
+            --uc-bin ./target/release/uc \
+            --results-dir benchmarks/results \
+            --backend-case "$UC_REAL_REPOS_ROOT/starknet-agentic/contracts/erc8004-cairo/Scarb.toml" agentic-erc8004-cairo scarb,uc-native
 
       - name: UC smoke on monero-starknet-atomic-swap (controlled fallback allowed)
         env:
