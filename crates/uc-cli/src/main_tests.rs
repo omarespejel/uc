@@ -7264,7 +7264,7 @@ fn with_native_compile_session_recomputes_content_hash_after_daemon_journal_delt
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         cache.insert(
-            cache_key,
+            cache_key.clone(),
             NativeCompileSessionCacheEntry {
                 session: Arc::new(Mutex::new(session)),
                 last_access_epoch_ms: epoch_ms_u64().unwrap_or_default(),
@@ -7300,8 +7300,35 @@ fn with_native_compile_session_recomputes_content_hash_after_daemon_journal_delt
             .expect("source mtime"),
         },
     )]);
+    let expected_tracked_source_bytes =
+        native_tracked_sources_total_bytes(&updated_tracked_sources)
+            .expect("tracked source bytes should be recomputed");
     let expected_hash =
         native_tracked_sources_content_hash(&dir, &updated_tracked_sources).expect("content hash");
+    let cached_session = {
+        let cache = native_compile_session_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = cache
+            .get(&cache_key)
+            .expect("daemon cache entry should remain populated after refresh");
+        entry.session.clone()
+    };
+    let cached_session = cached_session
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(
+        cached_session.tracked_sources, updated_tracked_sources,
+        "daemon cache should hold refreshed tracked sources after journal replay"
+    );
+    assert_eq!(
+        cached_session.tracked_source_bytes, expected_tracked_source_bytes,
+        "daemon cache should hold refreshed tracked-source bytes after journal replay"
+    );
+    assert_eq!(
+        cached_session.tracked_sources_content_hash, expected_hash,
+        "daemon cache should hold refreshed tracked-source content hash after journal replay"
+    );
     assert!(
         try_native_compile_session_image_restore(&dir, &signature, &expected_hash).is_some(),
         "persisted session image should reuse the refreshed journal hash"
@@ -7757,7 +7784,17 @@ fn native_run_contract_compile_batches_emits_progress_for_every_batch() {
         })
         .expect("batched compile progress runner should succeed");
 
-    assert_eq!(compiled.len(), 5);
+    assert_eq!(
+        compiled,
+        vec![
+            "compiled-0".to_string(),
+            "compiled-1".to_string(),
+            "compiled-2".to_string(),
+            "compiled-3".to_string(),
+            "compiled-4".to_string(),
+        ],
+        "batched compile runner must preserve batch output order"
+    );
     assert!(elapsed_ms >= 0.0);
     let messages = messages
         .lock()
@@ -7778,6 +7815,69 @@ fn native_run_contract_compile_batches_emits_progress_for_every_batch() {
             "missing progress message containing `{expected}` in {messages:?}"
         );
     }
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_run_contract_compile_batches_emits_in_flight_progress_before_batch_finish() {
+    let integration_guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (messages, _hook_restore) = capture_native_progress_messages(integration_guard);
+    let plans = (0..3)
+        .map(|index| NativeContractOutputPlan {
+            module_path: format!("demo::contract_{index}"),
+            artifact_id: format!("artifact-{index}"),
+            package_name: "demo".to_string(),
+            contract_name: format!("contract_{index}"),
+            artifact_file: format!("demo_contract_{index}.contract_class.json"),
+            casm_file: None,
+        })
+        .collect::<Vec<_>>();
+    let selected_indices = vec![0, 1, 2];
+
+    let (_elapsed_ms, compiled) =
+        native_run_contract_compile_batches(&plans, &selected_indices, 2, |batch_indices| {
+            native_progress_log(format!(
+                "native contract compile batch in-flight (batch={batch_indices:?})"
+            ));
+            thread::sleep(Duration::from_millis(10));
+            Ok(batch_indices
+                .iter()
+                .map(|index| format!("compiled-{index}"))
+                .collect::<Vec<_>>())
+        })
+        .expect("batched compile progress runner should succeed");
+
+    assert_eq!(
+        compiled,
+        vec![
+            "compiled-0".to_string(),
+            "compiled-1".to_string(),
+            "compiled-2".to_string(),
+        ],
+        "in-flight progress coverage must still preserve output order"
+    );
+    let messages = messages
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let batch_start = messages
+        .iter()
+        .position(|message| message.contains("native contract compile batch 1/2 start"))
+        .expect("batch start message should be emitted");
+    let in_flight = messages
+        .iter()
+        .position(|message| message.contains("native contract compile batch in-flight"))
+        .expect("in-flight progress message should be emitted");
+    let batch_finish = messages
+        .iter()
+        .position(|message| message.contains("native contract compile batch 1/2 finished"))
+        .expect("batch finish message should be emitted");
+    assert!(
+        batch_start < in_flight && in_flight < batch_finish,
+        "in-flight progress must appear after batch start and before batch finish: {messages:?}"
+    );
 }
 
 #[cfg(feature = "native-compile")]
