@@ -64,7 +64,7 @@ main() {
           ;;
       esac
       case "$path" in
-        scripts/build_native_toolchain_helper.sh|scripts/tests/*|docs/NATIVE_TOOLCHAIN_HELPERS.md)
+        scripts/doctor.sh|scripts/build_native_toolchain_helper.sh|scripts/tests/*|docs/NATIVE_TOOLCHAIN_HELPERS.md)
           script_changed=1
           ;;
       esac

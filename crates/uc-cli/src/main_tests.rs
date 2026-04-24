@@ -2199,6 +2199,13 @@ cairo-version = "{requested_version}"
         .expect("missing helper diagnostic should be present");
     assert_eq!(diagnostic.code, "UCN1004");
     assert_eq!(diagnostic.category, "toolchain_lane_unavailable");
+    assert!(
+        diagnostic
+            .how_to_fix
+            .iter()
+            .any(|fix| fix.contains("./scripts/build_native_toolchain_helper.sh --lane")),
+        "missing helper diagnostics should point agents to the productized helper builder"
+    );
     assert_eq!(
         report
             .toolchain
@@ -7872,6 +7879,80 @@ fn native_crate_cache_restore_rejects_signature_mismatch() {
         .cache_file
         .is_none(),
         "signature mismatch must not inject cached blob"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_crate_cache_restore_preserves_existing_config_fields() {
+    let dir = unique_test_dir("uc-native-crate-cache-preserve-config");
+    let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
+    let signature_hash = native_compile_session_signature_hash(&signature);
+    let (mut db, crate_input) = native_test_db_with_single_real_crate(&dir, "demo");
+    let (descriptor, original_root, original_settings) = {
+        let crate_id = CrateInput::into_crate_ids(&db, [crate_input.clone()])
+            .into_iter()
+            .next()
+            .expect("crate id should be interned");
+        let original_config = db
+            .crate_config(crate_id)
+            .expect("crate config should exist before restore");
+        (
+            native_crate_cache_descriptor_for_crate(&db, crate_id)
+                .expect("real crate config should produce cache descriptor"),
+            format!("{:?}", original_config.root),
+            format!("{:?}", original_config.settings),
+        )
+    };
+    let entry_hash = native_crate_cache_entry_hash(&signature_hash, &descriptor.cache_key);
+    let (blob_path, entry_path) = native_crate_cache_entry_paths(&dir, &entry_hash)
+        .expect("native crate cache paths should resolve");
+    let cache_blob = b"native-cache-blob".to_vec();
+    if let Some(parent) = blob_path.parent() {
+        fs::create_dir_all(parent).expect("failed to create native cache directory");
+    }
+    atomic_write_bytes(&blob_path, &cache_blob, "test native crate cache blob")
+        .expect("failed to write native crate cache blob");
+    let entry = NativeCrateCacheEntryFile {
+        schema_version: NATIVE_CRATE_CACHE_ENTRY_SCHEMA_VERSION,
+        signature_hash: signature_hash.clone(),
+        crate_cache_key: descriptor.cache_key,
+        blob_hash: blake3::hash(&cache_blob).to_hex().to_string(),
+        blob_size: cache_blob.len() as u64,
+        generated_at_epoch_ms: epoch_ms_u64().unwrap_or_default(),
+    };
+    let entry_bytes = serde_json::to_vec(&entry).expect("failed to encode cache entry");
+    atomic_write_bytes(
+        &entry_path,
+        &entry_bytes,
+        "test native crate cache metadata",
+    )
+    .expect("failed to write native crate cache metadata");
+
+    let stats = native_restore_crate_cache_into_db(&dir, &signature_hash, &mut db);
+    assert_eq!(stats.restored, 1);
+    let crate_id = CrateInput::into_crate_ids(&db, [crate_input.clone()])
+        .into_iter()
+        .next()
+        .expect("crate id should be interned after restore");
+    let restored_config = db
+        .crate_config(crate_id)
+        .expect("crate config should exist after restore");
+    assert_eq!(
+        format!("{:?}", restored_config.root),
+        original_root,
+        "restore must preserve the existing crate root while injecting cache_file"
+    );
+    assert_eq!(
+        format!("{:?}", restored_config.settings),
+        original_settings,
+        "restore must preserve existing crate settings while injecting cache_file"
+    );
+    assert!(
+        restored_config.cache_file.is_some(),
+        "restore should inject cache_file without replacing other config fields"
     );
 
     fs::remove_dir_all(&dir).ok();

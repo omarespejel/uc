@@ -13,7 +13,12 @@ This is not yet a "faster everywhere" launch.
 
 ## What We Can Claim
 
-Based on the same-window sweep in `benchmarks/results/current-contracts-native-productized-20260424T213026Z/`:
+Based on the same-window lane `current-contracts-native-productized-20260424T213026Z`:
+
+- host: Apple M3 Pro, 18 GiB RAM, macOS 26.4.1
+- binaries: `target/release/uc` plus `UC_NATIVE_TOOLCHAIN_2_14_BIN=.uc/toolchain-helpers/uc-cairo214-helper/bin/uc`
+- scenario: local offline Scarb manifests, `--daemon-mode off`, strict native benchmark mode, 5 cold runs, 5 warm-noop runs, 2.2s warm-settle
+- dataset: `erc8004`, `agent-account`, `token-factory`, `braavos`, and `monero` real repo manifests listed in the benchmark JSON
 
 - support matrix: 5 `native_supported`, 0 `fallback_used`, 0 `native_unsupported`, 0 `build_failed`
 - `erc8004`: cold `2.277x`, warm-noop `6.058x`

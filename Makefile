@@ -1,6 +1,6 @@
 SHELL := /bin/sh
 
-.PHONY: bootstrap install-hooks doctor agent-map agent-validate validate-local-ci validate-scripts validate-bench-scripts validate-fast validate-native local-ci benchmark-local benchmark-uc benchmark-smoke benchmark-delta benchmark-strict-smoke benchmark-strict-research perf-fast perf-fast-semantic compare-local gh-bootstrap
+.PHONY: bootstrap install-hooks doctor agent-map agent-validate validate-local-ci validate-scripts validate-helper-lane validate-bench-scripts validate-fast validate-native local-ci benchmark-local benchmark-uc benchmark-smoke benchmark-delta benchmark-strict-smoke benchmark-strict-research perf-fast perf-fast-semantic compare-local gh-bootstrap
 
 bootstrap:
 	@mkdir -p benchmarks/results benchmarks/baselines
@@ -27,6 +27,9 @@ validate-scripts:
 	@./scripts/tests/doctor_test.sh
 	@./scripts/tests/build_native_toolchain_helper_test.sh
 
+validate-helper-lane:
+	@./scripts/build_native_toolchain_helper.sh --lane 2.14 --check-only
+
 validate-bench-scripts:
 	@./benchmarks/scripts/tests/benchmark_host_preflight_test.sh
 	@./benchmarks/scripts/tests/native_ci_gate_test.sh
@@ -44,6 +47,7 @@ validate-native:
 	@$(MAKE) agent-validate
 	@$(MAKE) validate-local-ci
 	@$(MAKE) validate-scripts
+	@$(MAKE) validate-helper-lane
 	@$(MAKE) validate-bench-scripts
 	@cargo test -p uc-cli main_tests::native_ -- --nocapture
 	@cargo test -p uc-cli commands::build::tests::native_ -- --nocapture

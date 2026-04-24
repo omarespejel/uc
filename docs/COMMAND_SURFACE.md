@@ -63,6 +63,8 @@ Native auto mode still falls back to Scarb only when the failure class is explic
 - `./scripts/build_native_toolchain_helper.sh --lane 2.14`
   - Builds a Cairo `2.14` helper binary from the current repo in an isolated staging tree.
   - Produces a binary suitable for `UC_NATIVE_TOOLCHAIN_2_14_BIN`.
+- `./scripts/build_native_toolchain_helper.sh --lane 2.14 --check-only`
+  - Compiles the helper compatibility feature against the pinned Cairo `2.14` staging tree without producing a release binary.
 - `./scripts/doctor.sh --uc-bin /abs/path/to/uc --manifest-path /abs/path/to/Scarb.toml`
   - Probes native support for a real manifest before build time.
   - Fails on missing or invalid helper-lane env vars for that manifest.

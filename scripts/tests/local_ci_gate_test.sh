@@ -35,6 +35,11 @@ run_case \
   $'make doctor\nmake validate-bench-scripts\n'
 
 run_case \
+  "doctor-script" \
+  $'scripts/doctor.sh\n' \
+  $'make doctor\nmake validate-scripts\nmake agent-validate\n'
+
+run_case \
   "rust-fast" \
   $'crates/uc-core/src/lib.rs\n' \
   $'make doctor\nmake validate-fast\n'

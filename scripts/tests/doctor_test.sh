@@ -74,5 +74,24 @@ test_doctor_manifest_probe_fails_for_missing_helper_lane() {
   grep -q 'UC_NATIVE_TOOLCHAIN_2_14_BIN' "$stdout_path"
 }
 
+test_doctor_requires_python_tomllib() {
+  local fake_bin_dir="$TMP_DIR/fake-python-bin"
+  local stdout_path="$TMP_DIR/python-tomllib.out"
+  mkdir -p "$fake_bin_dir"
+  cat > "$fake_bin_dir/python3" <<'PYTHON'
+#!/usr/bin/env bash
+exit 1
+PYTHON
+  chmod +x "$fake_bin_dir/python3"
+
+  if PATH="$fake_bin_dir:$PATH" "$DOCTOR_SCRIPT" >"$stdout_path" 2>&1; then
+    echo "expected doctor to fail when python3 lacks tomllib support" >&2
+    return 1
+  fi
+  grep -q 'python3 >= 3.11 with tomllib is required for native helper builds' "$stdout_path"
+}
+
 run_test "doctor_manifest_probe_fails_for_missing_helper_lane" \
   test_doctor_manifest_probe_fails_for_missing_helper_lane
+run_test "doctor_requires_python_tomllib" \
+  test_doctor_requires_python_tomllib

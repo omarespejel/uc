@@ -7,17 +7,19 @@ OUTPUT=""
 STAGING_DIR=""
 TARGET_DIR=""
 PREPARE_ONLY=0
+CHECK_ONLY=0
 KEEP_STAGING=0
 
 usage() {
   cat <<'USAGE'
 Usage:
   build_native_toolchain_helper.sh --lane <major.minor> [--output /abs/path/to/uc]
-    [--staging-dir /abs/path] [--target-dir /abs/path] [--prepare-only] [--keep-staging]
+    [--staging-dir /abs/path] [--target-dir /abs/path] [--prepare-only] [--check-only] [--keep-staging]
 
 Examples:
   ./scripts/build_native_toolchain_helper.sh --lane 2.14
   ./scripts/build_native_toolchain_helper.sh --lane 2.14 --output "$HOME/.uc/toolchain-helpers/uc-cairo214/bin/uc"
+  ./scripts/build_native_toolchain_helper.sh --lane 2.14 --check-only
 USAGE
 }
 
@@ -57,6 +59,10 @@ while [[ $# -gt 0 ]]; do
       PREPARE_ONLY=1
       shift
       ;;
+    --check-only)
+      CHECK_ONLY=1
+      shift
+      ;;
     --keep-staging)
       KEEP_STAGING=1
       shift
@@ -78,6 +84,11 @@ if [[ -z "$LANE" ]]; then
   usage >&2
   exit 2
 fi
+if (( PREPARE_ONLY == 1 && CHECK_ONLY == 1 )); then
+  echo "--prepare-only and --check-only cannot be used together" >&2
+  usage >&2
+  exit 2
+fi
 
 if ! command -v cargo >/dev/null 2>&1; then
   echo "cargo is required" >&2
@@ -85,6 +96,15 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 if ! command -v python3 >/dev/null 2>&1; then
   echo "python3 is required" >&2
+  exit 1
+fi
+if ! python3 - <<'PY' >/dev/null 2>&1
+import sys, tomllib
+if sys.version_info < (3, 11):
+    raise SystemExit(1)
+PY
+then
+  echo "python3 >= 3.11 with tomllib is required to rewrite helper manifests" >&2
   exit 1
 fi
 
@@ -188,8 +208,18 @@ if (( PREPARE_ONLY == 1 )); then
   exit 0
 fi
 
-mkdir -p "$(dirname "$OUTPUT")"
 mkdir -p "$TARGET_DIR"
+if (( CHECK_ONLY == 1 )); then
+  (
+    cd "$STAGING_DIR"
+    CARGO_TARGET_DIR="$TARGET_DIR" cargo check --locked --features helper-cairo-214 --bin uc -p uc-cli
+  )
+  printf 'Validated helper lane %s with cargo check\n' "$LANE"
+  printf 'Cargo target dir: %s\n' "$TARGET_DIR"
+  exit 0
+fi
+
+mkdir -p "$(dirname "$OUTPUT")"
 (
   cd "$STAGING_DIR"
   CARGO_TARGET_DIR="$TARGET_DIR" cargo build --locked --release --features helper-cairo-214 --bin uc

@@ -169,6 +169,19 @@ fi
 if command -v scarb >/dev/null 2>&1; then
   printf 'scarb: %s\n' "$(scarb --version | head -n 1)"
 fi
+if command -v python3 >/dev/null 2>&1; then
+  if python3 - <<'PY' >/dev/null 2>&1
+import sys, tomllib
+if sys.version_info < (3, 11):
+    raise SystemExit(1)
+PY
+  then
+    printf '[ok] python3 tomllib support\n'
+  else
+    printf '[missing] python3 >= 3.11 with tomllib is required for native helper builds\n' >&2
+    failures=$((failures + 1))
+  fi
+fi
 if [[ -n "${UC_NATIVE_CORELIB_SRC:-}" ]]; then
   if [[ -d "${UC_NATIVE_CORELIB_SRC}" ]]; then
     printf '[ok] UC_NATIVE_CORELIB_SRC=%s\n' "$UC_NATIVE_CORELIB_SRC"

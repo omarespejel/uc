@@ -75,16 +75,6 @@ if [[ "$1" == "build" ]]; then
     esac
   done
   printf 'build %s disallow=%s corelib=%s report=%s\n' "$manifest" "${UC_NATIVE_DISALLOW_SCARB_FALLBACK:-}" "${UC_NATIVE_CORELIB_SRC:-}" "$report_path" >> "$args_log"
-  if [[ -n "$report_path" ]]; then
-    mkdir -p "$(dirname "$report_path")"
-    compile_backend="uc_native"
-    fallback_used="false"
-    diagnostics='[]'
-  if [[ "$manifest" == *"fallback-used"* ]]; then
-    compile_backend="scarb_fallback"
-    fallback_used="true"
-    diagnostics='[{"code":"UCN2002","category":"native_fallback_local_native_error","severity":"warn","title":"Native local build downgraded to Scarb","what_happened":"native failed","why":"native failed","how_to_fix":["fix native"],"retryable":true,"fallback_used":true,"toolchain_expected":"2.16.0","toolchain_found":"2.16.0"}]'
-  fi
   if [[ "$manifest" == *"unstable-supported"* && "${UC_NATIVE_DISALLOW_SCARB_FALLBACK:-}" == "1" ]]; then
     state_dir="${MOCK_UC_STATE_DIR:-}"
     if [[ -n "$state_dir" ]]; then
@@ -99,10 +89,20 @@ if [[ "$1" == "build" ]]; then
       if [[ "$count" -eq 4 ]]; then
         python3 - <<'PY'
 import time
-time.sleep(0.45)
+time.sleep(1.5)
 PY
       fi
     fi
+  fi
+  if [[ -n "$report_path" ]]; then
+    mkdir -p "$(dirname "$report_path")"
+    compile_backend="uc_native"
+    fallback_used="false"
+    diagnostics='[]'
+  if [[ "$manifest" == *"fallback-used"* ]]; then
+    compile_backend="scarb_fallback"
+    fallback_used="true"
+    diagnostics='[{"code":"UCN2002","category":"native_fallback_local_native_error","severity":"warn","title":"Native local build downgraded to Scarb","what_happened":"native failed","why":"native failed","how_to_fix":["fix native"],"retryable":true,"fallback_used":true,"toolchain_expected":"2.16.0","toolchain_found":"2.16.0"}]'
   fi
   cat > "$report_path" <<REPORT
 {

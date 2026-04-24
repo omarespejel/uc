@@ -29,6 +29,7 @@
 - Format: `cargo fmt --all`
 - Fast Rust validation: `make validate-fast`
 - Native-focused validation: `make validate-native`
+- Validate Cairo 2.14 helper compatibility: `make validate-helper-lane`
 - Strict smoke benchmark: `make benchmark-strict-smoke`
 - Strict research benchmark: `make benchmark-strict-research`
 
@@ -55,3 +56,5 @@
 - Use `UC_PHASE_TIMING=1` for phase telemetry.
 - Use `RUST_LOG=uc=debug` for detailed trace output.
 - When debugging hard native stalls, prefer `--engine uc --daemon-mode off --offline` first to remove daemon noise.
+- Build older native lanes with `./scripts/build_native_toolchain_helper.sh --lane 2.14`, then export the printed `UC_NATIVE_TOOLCHAIN_2_14_BIN` value.
+- Probe helper-lane readiness before measuring a repo with `./scripts/doctor.sh --uc-bin /abs/path/to/uc --manifest-path /abs/path/to/Scarb.toml`.

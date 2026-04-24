@@ -28,5 +28,16 @@ test_prepare_only_rewrites_workspace_manifest_for_cairo214() {
   cmp "$ROOT/toolchains/cairo-2.14/Cargo.lock" "$stage_dir/Cargo.lock" >/dev/null
 }
 
+test_prepare_only_and_check_only_are_mutually_exclusive() {
+  local stdout_path="$TMP_DIR/mutually-exclusive.out"
+  if "$HELPER_SCRIPT" --lane 2.14 --prepare-only --check-only >"$stdout_path" 2>&1; then
+    echo "expected mutually exclusive helper modes to fail" >&2
+    return 1
+  fi
+  grep -q -- '--prepare-only and --check-only cannot be used together' "$stdout_path"
+}
+
 run_test "prepare_only_rewrites_workspace_manifest_for_cairo214" \
   test_prepare_only_rewrites_workspace_manifest_for_cairo214
+run_test "prepare_only_and_check_only_are_mutually_exclusive" \
+  test_prepare_only_and_check_only_are_mutually_exclusive

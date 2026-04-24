@@ -12,6 +12,12 @@
 export UC_NATIVE_TOOLCHAIN_2_14_BIN="$HOME/.uc/toolchain-helpers/uc-cairo214-helper/bin/uc"
 ```
 
+To validate the compatibility lane without producing a release binary:
+
+```bash
+./scripts/build_native_toolchain_helper.sh --lane 2.14 --check-only
+```
+
 The helper builder:
 - stages an isolated copy of the current repo
 - rewrites the workspace Cairo dependencies to exact `2.14.0`
