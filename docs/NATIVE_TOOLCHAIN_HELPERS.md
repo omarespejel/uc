@@ -25,6 +25,17 @@ The helper builder:
 - builds the current `uc` command surface with the lane-specific helper compatibility feature enabled
 - runs targeted `uc-cli` regression tests for the helper-only compatibility paths
 
+## Compatibility Guardrails
+
+The helper rewriter is fail-closed: it rewrites only the current workspace dependency shape and exits if a required Cairo dependency line cannot be rewritten exactly once. A `[patch.crates-io]` section is optional; when present, the helper staging tree drops it because the main-lane `third_party` Cairo patches are not compatible with the helper lane.
+
+The helper-lane compatibility shims are covered by targeted regressions for:
+
+- unused-import diagnostics not becoming part of the helper session key
+- removed tracked files invalidating cached native content
+- native crate-cache restore preserving existing config fields
+- file-keyed update behavior for removed untracked file slots
+
 ## Preflight A Real Manifest
 
 ```bash

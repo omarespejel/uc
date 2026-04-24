@@ -206,8 +206,8 @@ text, count = re.subn(r'^salsa\s*=\s*".*"$', f'salsa = "{salsa_version}"', text,
 if count != 1:
     raise SystemExit(f"failed to rewrite salsa in {path}")
 text, count = re.subn(r'\n\[patch\.crates-io\]\n(?:.*\n)*?(?=\n\[|\Z)', '\n', text, flags=re.MULTILINE)
-if count != 1:
-    raise SystemExit(f"failed to drop [patch.crates-io] section in {path}")
+if count > 1:
+    raise SystemExit(f"found multiple [patch.crates-io] sections in {path}")
 path.write_text(text)
 PY
 }

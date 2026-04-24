@@ -28,6 +28,53 @@ test_prepare_only_rewrites_workspace_manifest_for_cairo214() {
   cmp "$ROOT/toolchains/cairo-2.14/Cargo.lock" "$stage_dir/Cargo.lock" >/dev/null
 }
 
+write_minimal_helper_repo_without_patch_section() {
+  local repo_root="$1"
+  mkdir -p "$repo_root/scripts" "$repo_root/toolchains/cairo-2.14"
+  cp "$HELPER_SCRIPT" "$repo_root/scripts/build_native_toolchain_helper.sh"
+  cp "$ROOT/toolchains/cairo-2.14/Cargo.lock" "$repo_root/toolchains/cairo-2.14/Cargo.lock"
+  cat > "$repo_root/Cargo.toml" <<'TOML'
+[workspace]
+members = []
+resolver = "2"
+
+[workspace.dependencies]
+cairo-lang-compiler = "2.16.0"
+cairo-lang-defs = "2.16.0"
+cairo-lang-filesystem = "2.16.0"
+cairo-lang-lowering = "2.16.0"
+cairo-lang-semantic = "2.16.0"
+cairo-lang-starknet = "2.16.0"
+cairo-lang-starknet-classes = "2.16.0"
+salsa = "0.26.0"
+
+[workspace.metadata.uc-native-toolchain-helpers."2.14"]
+cairo-version = "2.14.0"
+salsa-version = "0.24.0"
+lockfile = "toolchains/cairo-2.14/Cargo.lock"
+TOML
+}
+
+test_prepare_only_accepts_workspace_manifest_without_patch_section() {
+  local fake_root="$TMP_DIR/no-patch-root"
+  local stage_dir="$TMP_DIR/no-patch-stage"
+  local stdout_path="$TMP_DIR/no-patch.out"
+  write_minimal_helper_repo_without_patch_section "$fake_root"
+
+  "$fake_root/scripts/build_native_toolchain_helper.sh" \
+    --lane 2.14 \
+    --staging-dir "$stage_dir" \
+    --prepare-only >"$stdout_path"
+
+  grep -q "Prepared helper staging tree:" "$stdout_path"
+  grep -q 'cairo-lang-compiler = "=2.14.0"' "$stage_dir/Cargo.toml"
+  grep -q 'salsa = "0.24.0"' "$stage_dir/Cargo.toml"
+  if grep -q '^\[patch\.crates-io\]' "$stage_dir/Cargo.toml"; then
+    echo "unexpected [patch.crates-io] section in no-patch helper staging Cargo.toml" >&2
+    return 1
+  fi
+}
+
 test_prepare_only_and_check_only_are_mutually_exclusive() {
   local stdout_path="$TMP_DIR/mutually-exclusive.out"
   if "$HELPER_SCRIPT" --lane 2.14 --prepare-only --check-only >"$stdout_path" 2>&1; then
@@ -71,6 +118,8 @@ test_existing_staging_dir_is_not_removed_on_failure() {
 
 run_test "prepare_only_rewrites_workspace_manifest_for_cairo214" \
   test_prepare_only_rewrites_workspace_manifest_for_cairo214
+run_test "prepare_only_accepts_workspace_manifest_without_patch_section" \
+  test_prepare_only_accepts_workspace_manifest_without_patch_section
 run_test "prepare_only_and_check_only_are_mutually_exclusive" \
   test_prepare_only_and_check_only_are_mutually_exclusive
 run_test "unsupported_lane_reports_actionable_error" \

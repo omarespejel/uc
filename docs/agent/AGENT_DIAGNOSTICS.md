@@ -116,6 +116,16 @@ Agents may perform only safe actions by default:
 
 Agents must not edit Cairo source, dependency ranges, lockfiles, or release metadata unless the user or calling tool explicitly grants source-edit permission.
 
+## Compatibility Notes
+
+Schema version `1` is intentionally explicit rather than sparse:
+
+- `diagnostics` serializes as an array, including `[]` when no diagnostics were emitted.
+- `toolchain_found` serializes as `null` when no matching helper/compiler was found.
+- `docs_url` is an absolute GitHub URL so agents can dereference it without knowing the repository checkout path.
+
+Consumers should gate on `schema_version` and stable `code`/`category` values instead of relying on omitted optional fields.
+
 ## Sources
 
 - AGENTS.md describes repository instructions as a predictable agent context surface: <https://agents.md/>
