@@ -11,6 +11,8 @@ use cairo_lang_defs::db::DefsGroup;
 #[cfg(feature = "native-compile")]
 use cairo_lang_defs::ids::ModuleId;
 #[cfg(feature = "native-compile")]
+use cairo_lang_defs::ids::NamedLanguageElementId;
+#[cfg(feature = "native-compile")]
 use cairo_lang_defs::ids::TopLevelLanguageElementId;
 #[cfg(feature = "native-compile")]
 use cairo_lang_filesystem::db::{
@@ -20,7 +22,7 @@ use cairo_lang_filesystem::db::{
 #[cfg(feature = "native-compile")]
 use cairo_lang_filesystem::detect::detect_corelib;
 #[cfg(feature = "native-compile")]
-use cairo_lang_filesystem::ids::{BlobLongId, CrateInput, CrateLongId, Directory};
+use cairo_lang_filesystem::ids::{BlobLongId, CrateId, CrateInput, CrateLongId, Directory};
 #[cfg(feature = "native-compile")]
 use cairo_lang_filesystem::ids::{FileId, FileLongId};
 #[cfg(feature = "native-compile")]
@@ -32,7 +34,7 @@ use cairo_lang_lowering::utils::InliningStrategy;
 #[cfg(feature = "native-compile")]
 use cairo_lang_starknet::compile::compile_prepared_db as compile_starknet_prepared_db;
 #[cfg(feature = "native-compile")]
-use cairo_lang_starknet::contract::{find_contracts, ContractDeclaration};
+use cairo_lang_starknet::contract::{find_contracts, module_contract, ContractDeclaration};
 #[cfg(feature = "native-compile")]
 use cairo_lang_starknet::starknet_plugin_suite;
 #[cfg(feature = "native-compile")]
@@ -6038,6 +6040,21 @@ fn native_collect_contract_dependency_updates(
 }
 
 #[cfg(feature = "native-compile")]
+fn native_prune_contract_source_dependencies_for_output_plans(
+    contract_source_dependencies: &mut BTreeMap<String, BTreeSet<String>>,
+    contract_output_plans: &[NativeContractOutputPlan],
+) -> bool {
+    let allowed_module_paths = contract_output_plans
+        .iter()
+        .map(|plan| plan.module_path.as_str())
+        .collect::<HashSet<_>>();
+    let dependency_count_before = contract_source_dependencies.len();
+    contract_source_dependencies
+        .retain(|module_path, _| allowed_module_paths.contains(module_path.as_str()));
+    contract_source_dependencies.len() != dependency_count_before
+}
+
+#[cfg(feature = "native-compile")]
 fn native_update_compile_session_post_build_state(
     workspace_root: &Path,
     signature: &NativeCompileSessionSignature,
@@ -6089,6 +6106,10 @@ fn native_update_compile_session_post_build_state(
         }
         if let Some(contract_output_plans) = contract_output_plans {
             if session.contract_output_plans != contract_output_plans {
+                native_prune_contract_source_dependencies_for_output_plans(
+                    &mut session.contract_source_dependencies,
+                    contract_output_plans,
+                );
                 session.contract_output_plans = contract_output_plans.to_vec();
                 state_changed = true;
             }
@@ -6269,6 +6290,51 @@ fn native_compile_batch_summary(
         return preview.join(", ");
     }
     format!("{} (+{} more)", preview.join(", "), remaining)
+}
+
+#[cfg(feature = "native-compile")]
+fn native_contract_from_module_path<'db>(
+    db: &'db RootDatabase,
+    crate_ids: &[CrateId<'db>],
+    module_path: &str,
+) -> Option<ContractDeclaration<'db>> {
+    let mut segments = module_path.split("::");
+    let crate_name = segments.next()?;
+    let crate_id = crate_ids
+        .iter()
+        .copied()
+        .find(|crate_id| ModuleId::CrateRoot(*crate_id).name(db).long(db) == crate_name)?;
+    let mut module_id = ModuleId::CrateRoot(crate_id);
+    for segment in segments {
+        let submodule_id = db
+            .module_submodules_ids(module_id)
+            .ok()?
+            .iter()
+            .copied()
+            .find(|submodule_id| submodule_id.name(db).long(db) == segment)?;
+        module_id = ModuleId::Submodule(submodule_id);
+    }
+    module_contract(db, module_id)
+}
+
+#[cfg(feature = "native-compile")]
+fn native_resolve_contracts_from_output_plans<'db>(
+    db: &'db RootDatabase,
+    crate_ids: &[CrateId<'db>],
+    contract_output_plans: &[NativeContractOutputPlan],
+) -> Option<Vec<ContractDeclaration<'db>>> {
+    if contract_output_plans.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut contracts = Vec::with_capacity(contract_output_plans.len());
+    for plan in contract_output_plans {
+        contracts.push(native_contract_from_module_path(
+            db,
+            crate_ids,
+            &plan.module_path,
+        )?);
+    }
+    Some(contracts)
 }
 
 #[cfg(all(feature = "native-compile", test))]
@@ -9648,18 +9714,69 @@ fn run_native_build_inner(
             }
             let crate_ids =
                 CrateInput::into_crate_ids(&session.db, session.main_crate_inputs.iter().cloned());
-            native_progress_log(format!(
-                "native find_contracts start (changed={}, removed={})",
-                session.changed_files.len(),
-                session.removed_files.len()
-            ));
-            let find_contracts_started_at = Instant::now();
-            let contracts = find_contracts(&session.db, &crate_ids);
-            native_progress_log(format!(
-                "native find_contracts finished in {:.1}ms (contracts={})",
-                find_contracts_started_at.elapsed().as_secs_f64() * 1000.0,
-                contracts.len()
-            ));
+            let (contracts, mut module_paths, mut contract_source_paths, mut all_plans) =
+                if session.changed_files.is_empty()
+                    && session.removed_files.is_empty()
+                    && !session.contract_output_plans.is_empty()
+                {
+                    native_progress_log(format!(
+                        "native contract discovery fast path start (persisted={})",
+                        session.contract_output_plans.len()
+                    ));
+                    let resolve_started_at = Instant::now();
+                    if let Some(contracts) = native_resolve_contracts_from_output_plans(
+                        &session.db,
+                        &crate_ids,
+                        &session.contract_output_plans,
+                    ) {
+                        native_progress_log(format!(
+                        "native contract discovery fast path finished in {:.1}ms (contracts={})",
+                        resolve_started_at.elapsed().as_secs_f64() * 1000.0,
+                        contracts.len()
+                    ));
+                        (
+                            contracts,
+                            session
+                                .contract_output_plans
+                                .iter()
+                                .map(|plan| plan.module_path.clone())
+                                .collect::<Vec<_>>(),
+                            Vec::new(),
+                            session.contract_output_plans.clone(),
+                        )
+                    } else {
+                        native_progress_log(
+                            "native contract discovery fast path missed; falling back to full scan",
+                        );
+                        native_progress_log(format!(
+                            "native find_contracts start (changed={}, removed={})",
+                            session.changed_files.len(),
+                            session.removed_files.len()
+                        ));
+                        let find_contracts_started_at = Instant::now();
+                        let contracts = find_contracts(&session.db, &crate_ids);
+                        native_progress_log(format!(
+                            "native find_contracts finished in {:.1}ms (contracts={})",
+                            find_contracts_started_at.elapsed().as_secs_f64() * 1000.0,
+                            contracts.len()
+                        ));
+                        (contracts, Vec::new(), Vec::new(), Vec::new())
+                    }
+                } else {
+                    native_progress_log(format!(
+                        "native find_contracts start (changed={}, removed={})",
+                        session.changed_files.len(),
+                        session.removed_files.len()
+                    ));
+                    let find_contracts_started_at = Instant::now();
+                    let contracts = find_contracts(&session.db, &crate_ids);
+                    native_progress_log(format!(
+                        "native find_contracts finished in {:.1}ms (contracts={})",
+                        find_contracts_started_at.elapsed().as_secs_f64() * 1000.0,
+                        contracts.len()
+                    ));
+                    (contracts, Vec::new(), Vec::new(), Vec::new())
+                };
 
             if contracts.is_empty() {
                 native_progress_log("native cairo program compile start");
@@ -9711,40 +9828,54 @@ fn run_native_build_inner(
                 ));
             }
 
-            let module_paths: Vec<String> = contracts
-                .iter()
-                .map(|contract| contract.submodule_id.full_path(&session.db))
-                .collect();
-            let contract_source_paths: Vec<Option<String>> = contracts
-                .iter()
-                .map(|contract| {
-                    native_contract_source_relative_path(&session.db, workspace_root, contract)
-                })
-                .collect();
-            let contract_stems = native_contract_file_stems(&module_paths);
-            let mut all_plans = Vec::with_capacity(module_paths.len());
-            for (module_path, contract_stem) in module_paths.iter().zip(contract_stems.iter()) {
-                let package_name = native_contract_package_name(module_path).to_string();
-                let contract_name = native_contract_name(module_path).to_string();
-                let artifact_id = native_starknet_artifact_id(&package_name, module_path);
-                let file_stem = format!(
-                    "{}_{}",
-                    context.package_name,
-                    sanitize_artifact_component(contract_stem)
+            if module_paths.is_empty() {
+                module_paths = contracts
+                    .iter()
+                    .map(|contract| contract.submodule_id.full_path(&session.db))
+                    .collect();
+            }
+            if contract_source_paths.is_empty() {
+                contract_source_paths = contracts
+                    .iter()
+                    .map(|contract| {
+                        native_contract_source_relative_path(&session.db, workspace_root, contract)
+                    })
+                    .collect();
+            }
+            if all_plans.is_empty() {
+                let contract_stems = native_contract_file_stems(&module_paths);
+                all_plans.reserve(module_paths.len());
+                for (module_path, contract_stem) in module_paths.iter().zip(contract_stems.iter()) {
+                    let package_name = native_contract_package_name(module_path).to_string();
+                    let contract_name = native_contract_name(module_path).to_string();
+                    let artifact_id = native_starknet_artifact_id(&package_name, module_path);
+                    let file_stem = format!(
+                        "{}_{}",
+                        context.package_name,
+                        sanitize_artifact_component(contract_stem)
+                    );
+                    let artifact_file = format!("{file_stem}.contract_class.json");
+                    let casm_file = context
+                        .starknet_target
+                        .casm
+                        .then(|| format!("{file_stem}.compiled_contract_class.json"));
+                    all_plans.push(NativeContractOutputPlan {
+                        module_path: module_path.clone(),
+                        artifact_id,
+                        package_name,
+                        contract_name,
+                        artifact_file,
+                        casm_file,
+                    });
+                }
+            }
+            if !all_plans.is_empty() {
+                native_update_compile_session_post_build_state(
+                    workspace_root,
+                    &signature,
+                    &[],
+                    Some(&all_plans),
                 );
-                let artifact_file = format!("{file_stem}.contract_class.json");
-                let casm_file = context
-                    .starknet_target
-                    .casm
-                    .then(|| format!("{file_stem}.compiled_contract_class.json"));
-                all_plans.push(NativeContractOutputPlan {
-                    module_path: module_path.clone(),
-                    artifact_id,
-                    package_name,
-                    contract_name,
-                    artifact_file,
-                    casm_file,
-                });
             }
 
             let mut selected_indices: Vec<usize> = (0..contracts.len()).collect();

@@ -6332,6 +6332,118 @@ fn native_setup_project_matches_cairo_setup_project_results() {
 
 #[cfg(feature = "native-compile")]
 #[test]
+fn native_resolve_contracts_from_output_plans_matches_find_contracts() {
+    let dir = unique_test_dir("uc-native-contract-discovery-fast-path");
+    let project_dir = dir.join("project");
+    let corelib_src = dir.join("toolchain/corelib/src");
+    fs::create_dir_all(project_dir.join("src")).expect("failed to create main src");
+    fs::create_dir_all(&corelib_src).expect("failed to create mock corelib src");
+    create_mock_native_corelib(&corelib_src);
+    fs::write(
+        project_dir.join("src/lib.cairo"),
+        r#"
+#[starknet::contract]
+mod contract_a {
+    #[storage]
+    struct Storage {}
+}
+
+#[starknet::contract]
+mod contract_b {
+    #[storage]
+    struct Storage {}
+}
+"#,
+    )
+    .expect("failed to write contract fixture");
+    fs::write(
+        project_dir.join("cairo_project.toml"),
+        "[crate_roots]\npkg = \"src\"\n",
+    )
+    .expect("failed to write cairo_project.toml");
+
+    let mut db =
+        native_seeded_root_database(&corelib_src).expect("root database should initialize");
+    let main_crate_inputs =
+        native_setup_project(&mut db, &project_dir).expect("native setup should work");
+    let crate_ids = CrateInput::into_crate_ids(&db, main_crate_inputs.iter().cloned());
+    let discovered = find_contracts(&db, &crate_ids);
+    assert_eq!(discovered.len(), 2, "fixture should expose two contracts");
+    let plans = discovered
+        .iter()
+        .map(|contract| {
+            let module_path = contract.submodule_id.full_path(&db);
+            NativeContractOutputPlan {
+                module_path: module_path.clone(),
+                artifact_id: format!("artifact::{module_path}"),
+                package_name: "pkg".to_string(),
+                contract_name: native_contract_name(&module_path).to_string(),
+                artifact_file: format!(
+                    "{}.contract_class.json",
+                    sanitize_artifact_component(&module_path)
+                ),
+                casm_file: None,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let resolved = native_resolve_contracts_from_output_plans(&db, &crate_ids, &plans)
+        .expect("persisted contract plans should resolve back into contract declarations");
+
+    let discovered_paths = discovered
+        .iter()
+        .map(|contract| contract.submodule_id.full_path(&db))
+        .collect::<Vec<_>>();
+    let resolved_paths = resolved
+        .iter()
+        .map(|contract| contract.submodule_id.full_path(&db))
+        .collect::<Vec<_>>();
+    assert_eq!(resolved_paths, discovered_paths);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_resolve_contracts_from_output_plans_rejects_missing_modules() {
+    let dir = unique_test_dir("uc-native-contract-discovery-missing");
+    let project_dir = dir.join("project");
+    let corelib_src = dir.join("toolchain/corelib/src");
+    fs::create_dir_all(project_dir.join("src")).expect("failed to create main src");
+    fs::create_dir_all(&corelib_src).expect("failed to create mock corelib src");
+    create_mock_native_corelib(&corelib_src);
+    fs::write(
+        project_dir.join("cairo_project.toml"),
+        "[crate_roots]\npkg = \"src\"\n",
+    )
+    .expect("failed to write cairo_project.toml");
+    fs::write(project_dir.join("src/lib.cairo"), "fn main() {}\n")
+        .expect("failed to write source fixture");
+
+    let mut db =
+        native_seeded_root_database(&corelib_src).expect("root database should initialize");
+    let main_crate_inputs =
+        native_setup_project(&mut db, &project_dir).expect("native setup should work");
+    let crate_ids = CrateInput::into_crate_ids(&db, main_crate_inputs.iter().cloned());
+    let plans = vec![NativeContractOutputPlan {
+        module_path: "pkg::missing_contract".to_string(),
+        artifact_id: "artifact::pkg::missing_contract".to_string(),
+        package_name: "pkg".to_string(),
+        contract_name: "missing_contract".to_string(),
+        artifact_file: "pkg_missing_contract.contract_class.json".to_string(),
+        casm_file: None,
+    }];
+
+    assert!(
+        native_resolve_contracts_from_output_plans(&db, &crate_ids, &plans).is_none(),
+        "stale persisted contract paths must fail closed and fall back to full discovery"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
 fn native_crate_cache_restore_injects_cached_blob_for_matching_signature() {
     let dir = unique_test_dir("uc-native-crate-cache-restore");
     let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
@@ -7114,6 +7226,47 @@ fn native_impacted_contract_indices_stays_conservative_when_dependency_index_is_
         .is_none(),
         "incomplete indexes must force full compile for unmatched changed files"
     );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_prune_contract_source_dependencies_for_output_plans_drops_stale_modules() {
+    let plans = vec![
+        NativeContractOutputPlan {
+            module_path: "pkg::contract_a".to_string(),
+            artifact_id: "a".to_string(),
+            package_name: "pkg".to_string(),
+            contract_name: "contract_a".to_string(),
+            artifact_file: "pkg_contract_a.contract_class.json".to_string(),
+            casm_file: None,
+        },
+        NativeContractOutputPlan {
+            module_path: "pkg::contract_b".to_string(),
+            artifact_id: "b".to_string(),
+            package_name: "pkg".to_string(),
+            contract_name: "contract_b".to_string(),
+            artifact_file: "pkg_contract_b.contract_class.json".to_string(),
+            casm_file: None,
+        },
+    ];
+    let mut dependencies = BTreeMap::from([
+        (
+            "pkg::contract_a".to_string(),
+            BTreeSet::from(["src/contract_a.cairo".to_string()]),
+        ),
+        (
+            "pkg::removed_contract".to_string(),
+            BTreeSet::from(["src/removed_contract.cairo".to_string()]),
+        ),
+    ]);
+
+    assert!(
+        native_prune_contract_source_dependencies_for_output_plans(&mut dependencies, &plans),
+        "removed contract dependency entries should be pruned when plans change"
+    );
+    assert_eq!(dependencies.len(), 1);
+    assert!(dependencies.contains_key("pkg::contract_a"));
+    assert!(!dependencies.contains_key("pkg::removed_contract"));
 }
 
 #[cfg(feature = "native-compile")]
