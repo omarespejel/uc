@@ -90,6 +90,11 @@ check_helper_env_vars() {
 probe_manifest_native_support() {
   local manifest_path="$1"
   local report_json
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '[missing] jq is required for manifest probe: %s\n' "$manifest_path" >&2
+    failures=$((failures + 1))
+    return
+  fi
   if [[ ! -x "$UC_BIN" ]]; then
     printf '[missing] uc binary is missing or not executable for manifest probe: %s\n' "$UC_BIN" >&2
     failures=$((failures + 1))

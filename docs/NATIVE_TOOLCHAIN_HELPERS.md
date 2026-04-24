@@ -23,6 +23,7 @@ The helper builder:
 - rewrites the workspace Cairo dependencies to exact `2.14.0`
 - removes the local `third_party` Cairo patches that only apply to the main `2.16` lane
 - builds the current `uc` command surface with the `helper-cairo-214` compatibility feature enabled
+- runs targeted `uc-cli` regression tests for the helper-only compatibility paths
 
 ## Preflight A Real Manifest
 

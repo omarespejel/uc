@@ -18,7 +18,7 @@ Usage:
 
 Examples:
   ./scripts/build_native_toolchain_helper.sh --lane 2.14
-  ./scripts/build_native_toolchain_helper.sh --lane 2.14 --output "$HOME/.uc/toolchain-helpers/uc-cairo214/bin/uc"
+  ./scripts/build_native_toolchain_helper.sh --lane 2.14 --output "$HOME/.uc/toolchain-helpers/uc-cairo214-helper/bin/uc"
   ./scripts/build_native_toolchain_helper.sh --lane 2.14 --check-only
 USAGE
 }
@@ -117,8 +117,21 @@ cargo_path = Path(sys.argv[1])
 lane = sys.argv[2]
 field = sys.argv[3]
 doc = tomllib.loads(cargo_path.read_text())
-entry = doc["workspace"]["metadata"]["uc-native-toolchain-helpers"][lane]
-print(entry[field])
+helpers = doc.get("workspace", {}).get("metadata", {}).get("uc-native-toolchain-helpers", {})
+if not isinstance(helpers, dict):
+    print("helper lane metadata is missing from workspace Cargo.toml", file=sys.stderr)
+    raise SystemExit(1)
+try:
+    entry = helpers[lane]
+except KeyError:
+    available = ", ".join(sorted(str(key) for key in helpers)) or "<none>"
+    print(f"unsupported helper lane: {lane}. Available lanes: {available}", file=sys.stderr)
+    raise SystemExit(1)
+try:
+    print(entry[field])
+except KeyError:
+    print(f"helper lane {lane} is missing metadata field: {field}", file=sys.stderr)
+    raise SystemExit(1)
 PY
 }
 
@@ -212,9 +225,14 @@ mkdir -p "$TARGET_DIR"
 if (( CHECK_ONLY == 1 )); then
   (
     cd "$STAGING_DIR"
-    CARGO_TARGET_DIR="$TARGET_DIR" cargo check --locked --features helper-cairo-214 --bin uc -p uc-cli
+    CARGO_TARGET_DIR="$TARGET_DIR" cargo test --locked --features helper-cairo-214 -p uc-cli \
+      native_helper_cairo214_skip_unused_import_diagnostics_is_not_session_keyed -- --nocapture
+    CARGO_TARGET_DIR="$TARGET_DIR" cargo test --locked --features helper-cairo-214 -p uc-cli \
+      native_crate_cache_restore_preserves_existing_config_fields -- --nocapture
+    CARGO_TARGET_DIR="$TARGET_DIR" cargo test --locked --features helper-cairo-214 -p uc-cli \
+      native_apply_file_keyed_session_updates_skips_untracked_removed_file_slots -- --nocapture
   )
-  printf 'Validated helper lane %s with cargo check\n' "$LANE"
+  printf 'Validated helper lane %s with targeted cargo tests\n' "$LANE"
   printf 'Cargo target dir: %s\n' "$TARGET_DIR"
   exit 0
 fi

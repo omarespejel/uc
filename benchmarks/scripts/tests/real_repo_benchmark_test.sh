@@ -75,7 +75,7 @@ if [[ "$1" == "build" ]]; then
     esac
   done
   printf 'build %s disallow=%s corelib=%s report=%s\n' "$manifest" "${UC_NATIVE_DISALLOW_SCARB_FALLBACK:-}" "${UC_NATIVE_CORELIB_SRC:-}" "$report_path" >> "$args_log"
-  if [[ "$manifest" == *"unstable-supported"* && "${UC_NATIVE_DISALLOW_SCARB_FALLBACK:-}" == "1" ]]; then
+  if [[ "$manifest" == *"unstable"* && "${UC_NATIVE_DISALLOW_SCARB_FALLBACK:-}" == "1" ]]; then
     state_dir="${MOCK_UC_STATE_DIR:-}"
     if [[ -n "$state_dir" ]]; then
       mkdir -p "$state_dir"
@@ -444,6 +444,51 @@ test_real_repo_benchmark_surfaces_stability_warnings() {
   assert_contains "$markdown_text" "| unstable-supported |"
 }
 
+test_real_repo_benchmark_keeps_unstable_lanes_on_partial_failures() {
+  local cases_root="$TEST_TMP_DIR/partial-stability-cases"
+  local mock_bin_dir="$TEST_TMP_DIR/partial-stability-mock-bin"
+  local mock_uc="$mock_bin_dir/uc"
+  local mock_scarb="$mock_bin_dir/scarb"
+  local results_dir="$TEST_TMP_DIR/partial-stability-results"
+  mkdir -p "$mock_bin_dir" "$results_dir"
+  write_mock_uc_bin "$mock_uc"
+  write_mock_scarb_bin "$mock_scarb"
+  write_manifest_case "$cases_root" "unstable-fails-build"
+
+  local stdout_text
+  stdout_text="$(
+    PATH="$mock_bin_dir:$PATH" \
+    MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/partial-stability-uc.args" \
+    MOCK_UC_STATE_DIR="$TEST_TMP_DIR/partial-stability-uc.state" \
+    MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/partial-stability-scarb.args" \
+    "$BENCH_SCRIPT" \
+      --uc-bin "$mock_uc" \
+      --results-dir "$results_dir" \
+      --runs 4 \
+      --cold-runs 5 \
+      --warm-settle-seconds 0 \
+      --case "$cases_root/unstable-fails-build/Scarb.toml" unstable-fails-build
+  )"
+  local json_path
+  json_path="$(awk -F': ' '/Benchmark JSON:/ {print $2}' <<<"$stdout_text")"
+
+  local benchmark_status
+  benchmark_status="$(jq -r '.cases[] | select(.tag=="unstable-fails-build") | .benchmark_status' "$json_path")"
+  if [[ "$benchmark_status" != "failed" ]]; then
+    echo "fixture should create a partially failed benchmark case" >&2
+    cat "$json_path" >&2
+    return 1
+  fi
+
+  local unstable_count
+  unstable_count="$(jq -r '.summary.unstable_lane_count' "$json_path")"
+  if [[ "$unstable_count" -lt 1 ]]; then
+    echo "expected unstable ok lanes to remain visible despite a failed sibling lane" >&2
+    cat "$json_path" >&2
+    return 1
+  fi
+}
+
 run_test "real_repo_benchmark_rejects_missing_case_values" \
   test_real_repo_benchmark_rejects_missing_case_values
 run_test "real_repo_benchmark_rejects_zero_runs_from_environment" \
@@ -454,3 +499,5 @@ run_test "real_repo_benchmark_records_supported_build_failures" \
   test_real_repo_benchmark_records_supported_build_failures
 run_test "real_repo_benchmark_surfaces_stability_warnings" \
   test_real_repo_benchmark_surfaces_stability_warnings
+run_test "real_repo_benchmark_keeps_unstable_lanes_on_partial_failures" \
+  test_real_repo_benchmark_keeps_unstable_lanes_on_partial_failures

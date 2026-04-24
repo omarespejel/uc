@@ -230,7 +230,7 @@ const DEFAULT_DAEMON_SHARED_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const DEFAULT_UC_DISABLE_SCARB_ARTIFACTS_FINGERPRINT: bool = true;
 const DEFAULT_UC_NATIVE_BUILD_MODE: &str = "auto";
 const DEFAULT_UC_NATIVE_DISALLOW_SCARB_FALLBACK: bool = false;
-#[cfg(feature = "native-compile")]
+#[cfg(all(feature = "native-compile", not(feature = "helper-cairo-214")))]
 const DEFAULT_UC_NATIVE_SKIP_UNUSED_IMPORT_DIAGNOSTICS: bool = true;
 const TOOLCHAIN_CHECK_CACHE_SCHEMA_VERSION: u32 = 1;
 const MAX_TOOLCHAIN_CHECK_CACHE_BYTES: u64 = 64 * 1024;
@@ -253,6 +253,8 @@ const CACHEABLE_ARTIFACT_SUFFIXES: [&str; 7] = [
     ".starknet_artifacts.json",
     ".executable.json",
 ];
+const UC_AGENT_JSON_SCHEMA_VERSION: u32 = 1;
+const UC_AGENT_DIAGNOSTICS_DOC_PATH: &str = "docs/agent/AGENT_DIAGNOSTICS.md";
 
 #[derive(Parser, Debug)]
 #[command(name = "uc")]
@@ -438,20 +440,40 @@ enum NativeDiagnosticSeverity {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct NativeDiagnostic {
+    #[serde(default = "uc_agent_json_schema_version")]
+    schema_version: u32,
     code: String,
     category: String,
     severity: NativeDiagnosticSeverity,
     title: String,
+    #[serde(default)]
+    docs_url: String,
     what_happened: String,
     why: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     how_to_fix: Vec<String>,
+    #[serde(default)]
+    next_commands: Vec<String>,
+    #[serde(default)]
+    safe_automated_action: String,
     retryable: bool,
     fallback_used: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     toolchain_expected: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     toolchain_found: Option<String>,
+}
+
+fn native_diagnostic_docs_url(code: &str) -> String {
+    format!(
+        "{}#{}",
+        UC_AGENT_DIAGNOSTICS_DOC_PATH,
+        code.to_ascii_lowercase()
+    )
+}
+
+fn uc_agent_json_schema_version() -> u32 {
+    UC_AGENT_JSON_SCHEMA_VERSION
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -472,6 +494,8 @@ struct NativeToolchainReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct NativeSupportReport {
+    #[serde(default = "uc_agent_json_schema_version")]
+    schema_version: u32,
     manifest_path: String,
     status: NativeSupportStatus,
     supported: bool,
@@ -883,6 +907,8 @@ struct StarknetArtifactFiles {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct BuildReport {
+    #[serde(default = "uc_agent_json_schema_version")]
+    schema_version: u32,
     generated_at_epoch_ms: u128,
     engine: String,
     daemon_used: bool,
@@ -1871,12 +1897,17 @@ fn parse_env_bool(name: &str, default: bool) -> bool {
     }
 }
 
-#[cfg(feature = "native-compile")]
+#[cfg(all(feature = "native-compile", not(feature = "helper-cairo-214")))]
 fn native_skip_unused_import_diagnostics() -> bool {
     parse_env_bool(
         "UC_NATIVE_SKIP_UNUSED_IMPORT_DIAGNOSTICS",
         DEFAULT_UC_NATIVE_SKIP_UNUSED_IMPORT_DIAGNOSTICS,
     )
+}
+
+#[cfg(all(feature = "native-compile", feature = "helper-cairo-214"))]
+fn native_skip_unused_import_diagnostics() -> bool {
+    false
 }
 
 #[cfg(feature = "native-compile")]
@@ -2402,6 +2433,64 @@ impl NativeCompileSupportIssue {
         }
     }
 
+    fn next_commands(&self) -> Vec<String> {
+        match self {
+            Self::LegacyEditionRequiresPinnedCairoVersion { .. } => vec![
+                "uc support native --manifest-path <Scarb.toml> --format json".to_string(),
+                "scarb metadata --manifest-path <Scarb.toml>".to_string(),
+            ],
+            Self::UnsupportedManifestConstraint { .. } => {
+                vec!["uc support native --manifest-path <Scarb.toml> --format json".to_string()]
+            }
+            Self::UnparseableCompilerVersion { .. } => vec![
+                "uc support native --manifest-path <Scarb.toml> --format json".to_string(),
+                "scarb --version".to_string(),
+            ],
+            Self::CompilerVersionMismatch { requested, .. } => {
+                let lane = requested.split('.').take(2).collect::<Vec<_>>().join(".");
+                vec![
+                    format!("./scripts/build_native_toolchain_helper.sh --lane {lane}"),
+                    "uc support native --manifest-path <Scarb.toml> --format json".to_string(),
+                ]
+            }
+            Self::MissingToolchainHelper {
+                requested,
+                helper_env,
+            } => {
+                let lane = requested.split('.').take(2).collect::<Vec<_>>().join(".");
+                vec![
+                    format!("./scripts/build_native_toolchain_helper.sh --lane {lane}"),
+                    format!("{helper_env}=<helper-uc-path> uc support native --manifest-path <Scarb.toml> --format json"),
+                ]
+            }
+            Self::InvalidToolchainHelper {
+                requested,
+                helper_env,
+                ..
+            } => {
+                let lane = requested.split('.').take(2).collect::<Vec<_>>().join(".");
+                vec![
+                    format!("./scripts/build_native_toolchain_helper.sh --lane {lane}"),
+                    format!("{helper_env}=<helper-uc-path> uc support native --manifest-path <Scarb.toml> --format json"),
+                ]
+            }
+        }
+    }
+
+    fn safe_automated_action(&self) -> &'static str {
+        match self {
+            Self::MissingToolchainHelper { .. } => "build_helper_lane",
+            Self::InvalidToolchainHelper { .. } => "rebuild_helper_lane",
+            Self::CompilerVersionMismatch { .. } | Self::UnparseableCompilerVersion { .. } => {
+                "select_matching_toolchain_lane"
+            }
+            Self::LegacyEditionRequiresPinnedCairoVersion { .. }
+            | Self::UnsupportedManifestConstraint { .. } => {
+                "manual_manifest_or_lockfile_fix_required"
+            }
+        }
+    }
+
     fn diagnostic(&self) -> NativeDiagnostic {
         let (toolchain_expected, toolchain_found) = match self {
             Self::LegacyEditionRequiresPinnedCairoVersion { .. } => (None, None),
@@ -2419,14 +2508,19 @@ impl NativeCompileSupportIssue {
                 requested, path, ..
             } => (Some(requested.clone()), Some(path.clone())),
         };
+        let code = self.code();
         NativeDiagnostic {
-            code: self.code().to_string(),
+            schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+            code: code.to_string(),
             category: self.category().to_string(),
             severity: NativeDiagnosticSeverity::Error,
             title: self.title().to_string(),
+            docs_url: native_diagnostic_docs_url(code),
             what_happened: self.what_happened(),
             why: self.reason(),
             how_to_fix: self.how_to_fix(),
+            next_commands: self.next_commands(),
+            safe_automated_action: self.safe_automated_action().to_string(),
             retryable: false,
             fallback_used: false,
             toolchain_expected,
@@ -2617,6 +2711,7 @@ fn native_support_report_from_manifest_path(manifest_path: &Path) -> Result<Nati
                 return Ok(report);
             }
             Ok(NativeSupportReport {
+                schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
                 manifest_path: manifest_path.display().to_string(),
                 status: NativeSupportStatus::Supported,
                 supported: true,
@@ -2629,6 +2724,7 @@ fn native_support_report_from_manifest_path(manifest_path: &Path) -> Result<Nati
             })
         }
         Err(issue) => Ok(NativeSupportReport {
+            schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
             manifest_path: manifest_path.display().to_string(),
             status: NativeSupportStatus::Unsupported,
             supported: false,
@@ -2645,6 +2741,7 @@ fn native_support_report_from_manifest_path(manifest_path: &Path) -> Result<Nati
 #[cfg(not(feature = "native-compile"))]
 fn native_support_report_from_manifest_path(manifest_path: &Path) -> Result<NativeSupportReport> {
     Ok(NativeSupportReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
         manifest_path: manifest_path.display().to_string(),
         status: NativeSupportStatus::Unavailable,
         supported: false,
@@ -2656,10 +2753,12 @@ fn native_support_report_from_manifest_path(manifest_path: &Path) -> Result<Nati
         issue_kind: Some("native_compile_feature_disabled".to_string()),
         toolchain: None,
         diagnostics: vec![NativeDiagnostic {
+            schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
             code: "UCN0001".to_string(),
             category: "feature_unavailable".to_string(),
             severity: NativeDiagnosticSeverity::Error,
             title: "Native compile feature is disabled".to_string(),
+            docs_url: native_diagnostic_docs_url("UCN0001"),
             what_happened:
                 "This uc binary was built without native-compile support.".to_string(),
             why: "The current executable cannot probe or run native Cairo compilation."
@@ -2667,6 +2766,11 @@ fn native_support_report_from_manifest_path(manifest_path: &Path) -> Result<Nati
             how_to_fix: vec![
                 "Use a uc binary built with the native-compile feature enabled.".to_string(),
             ],
+            next_commands: vec![
+                "cargo build -p uc-cli --features native-compile".to_string(),
+                "uc support native --manifest-path <Scarb.toml> --format json".to_string(),
+            ],
+            safe_automated_action: "use_native_enabled_binary".to_string(),
             retryable: false,
             fallback_used: false,
             toolchain_expected: None,
@@ -7908,6 +8012,8 @@ fn native_set_skip_unused_import_diagnostics(
     #[cfg(not(feature = "helper-cairo-214"))]
     db.set_skip_unused_import_diagnostics(skip_unused_import_diagnostics);
     #[cfg(feature = "helper-cairo-214")]
+    // Cairo 2.14 does not expose this database knob. Keep helper signatures
+    // stable by forcing the effective setting to false before this point.
     let _ = (db, skip_unused_import_diagnostics);
 }
 
@@ -7968,11 +8074,14 @@ fn native_compile_session_signature_hash(signature: &NativeCompileSessionSignatu
     } else {
         b"0"
     });
-    hasher.update(if signature.skip_unused_import_diagnostics {
-        b"skip-unused-import-diagnostics:1"
-    } else {
-        b"skip-unused-import-diagnostics:0"
-    });
+    #[cfg(not(feature = "helper-cairo-214"))]
+    {
+        hasher.update(if signature.skip_unused_import_diagnostics {
+            b"skip-unused-import-diagnostics:1"
+        } else {
+            b"skip-unused-import-diagnostics:0"
+        });
+    }
 
     let mut external_dependencies = signature.context.external_non_starknet_dependencies.clone();
     external_dependencies.sort();

@@ -1,0 +1,91 @@
+# Agent-First Launch Minimum 2026-04-24
+
+This is the launch-readiness checklist for presenting `uc` as an agent-first Cairo compiler, not merely a faster local cache.
+
+## Minimum Product State
+
+Launch only when all of these are true:
+
+- Cairo `2.14` and current built-in Cairo lanes are supported through explicit native toolchain selection.
+- `monero` and `braavos` are measured as supported workloads, not excluded workloads.
+- `uc support native --format json` emits stable diagnostics and toolchain fields.
+- `uc build --json` and `--report-path` include diagnostics and fallback status.
+- `scripts/doctor.sh` can detect missing helper lanes before compile/benchmark starts.
+- Real-repo benchmark reports include `native_supported`, `native_unsupported`, `fallback_used`, and `build_failed` classifications.
+- Same-window reruns are used for before/after speed comparisons.
+- All quoted benchmark numbers are backed by committed or immutable artifacts.
+- CodeRabbit and Qodo have no unresolved actionable feedback.
+- Local gates pass before merge/tag.
+
+## Current PR Claim Boundary
+
+This PR can credibly claim:
+
+- Productized Cairo `2.14` helper-lane support.
+- Manifest/lockfile-driven native lane selection.
+- Agent-grade diagnostics for native support and fallback classes.
+- Local-first support-matrix benchmark reporting.
+- Guardrails preventing unpublished local benchmark numbers from becoming launch copy.
+
+This PR should not claim:
+
+- Full MCP server support.
+- Flight-recorder/replay support.
+- SARIF export.
+- Deployed-contract universe coverage.
+- Uniform speedups across every Cairo repo.
+
+## Benchmark Message We Want
+
+The stronger future launch line is:
+
+> We compiled every contract in our pinned Starknet deployed-contract corpus from Cairo `<min_version>` through `<max_version>`, classified each project as native-supported, native-unsupported, fallback-used, or build-failed, and published the same-window benchmark artifacts.
+
+Do not publish that sentence until the corpus exists and the artifact is durable.
+
+Required evidence for that line:
+
+- A checked-in or immutable manifest of contract sources/classes.
+- The chain, block range, or index snapshot used to select deployed contracts.
+- Cairo/Scarb version extraction rules.
+- Deduplication rules for repeated class hashes or reused source packages.
+- License/source availability rules.
+- Same-window benchmark artifact directory.
+- Support matrix with every excluded case explained.
+- Host metadata, binary SHA, helper lane SHA, flags, and sample counts.
+
+## Real-Repo Launch Table
+
+The launch table should always include these columns:
+
+- repo/corpus item
+- Cairo version requested
+- selected native lane
+- support classification
+- fallback used
+- cold build median
+- warm noop median
+- instability warning
+- artifact link
+
+If any row falls back to Scarb, the headline must say so.
+
+## Agent Demo Requirement
+
+The demo should show the agent path, not only the human path:
+
+1. Repo fails native support because the helper lane is missing.
+2. Agent reads `UCN1004` from JSON.
+3. Agent runs the safe action `build_helper_lane`.
+4. Agent exports the helper env var.
+5. Agent reruns `uc support native --format json`.
+6. Agent runs the benchmark/support matrix.
+7. Agent reports supported/fallback/build-failed cases without parsing terminal prose.
+
+## Source-Backed Design Basis
+
+- AGENTS.md is the repo-instructions surface for coding agents: <https://agents.md/>
+- MCP expects tools to expose structured content that can conform to output schemas: <https://modelcontextprotocol.io/specification/2025-11-25/schema>
+- LSP exists because diagnostics/code actions should be reusable across editors and tools: <https://microsoft.github.io/language-server-protocol/>
+- SARIF exists as a standard static-analysis result interchange format and should be the later GitHub/code-scanning target: <https://docs.oasis-open.org/sarif/sarif/v2.1.0/os/sarif-v2.1.0-os.html>
+- GitHub code scanning uses SARIF categories/automation metadata to distinguish uploaded result sets: <https://docs.github.com/en/code-security/how-tos/scan-code-for-vulnerabilities/integrate-with-existing-tools/uploading-a-sarif-file-to-github>

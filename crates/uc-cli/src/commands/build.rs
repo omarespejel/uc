@@ -21,16 +21,23 @@ fn native_fallback_diagnostic(
     toolchain: Option<&NativeToolchainReport>,
 ) -> NativeDiagnostic {
     NativeDiagnostic {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
         code: code.to_string(),
         category: category.to_string(),
         severity: NativeDiagnosticSeverity::Warn,
         title: title.to_string(),
+        docs_url: native_diagnostic_docs_url(code),
         what_happened: reason.clone(),
         why: reason,
         how_to_fix: vec![
             "Review the selected native toolchain lane and the fallback reason.".to_string(),
             "If native is required, rerun with UC_NATIVE_DISALLOW_SCARB_FALLBACK=1 after fixing the mismatch.".to_string(),
         ],
+        next_commands: vec![
+            "uc support native --manifest-path <Scarb.toml> --format json".to_string(),
+            "UC_NATIVE_DISALLOW_SCARB_FALLBACK=1 uc build --engine uc --daemon-mode off --manifest-path <Scarb.toml>".to_string(),
+        ],
+        safe_automated_action: "inspect_native_support_then_retry".to_string(),
         retryable: true,
         fallback_used: true,
         toolchain_expected: toolchain
@@ -1693,6 +1700,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             .to_string()
         });
         let report = BuildReport {
+            schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
             generated_at_epoch_ms: epoch_ms()?,
             engine: engine.as_str().to_string(),
             daemon_used,
@@ -1815,13 +1823,19 @@ mod tests {
     #[test]
     fn build_report_compile_backend_labels_scarb_fallbacks() {
         let diagnostics = vec![NativeDiagnostic {
+            schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
             code: "UCN2002".to_string(),
             category: "native_fallback_local_native_error".to_string(),
             severity: NativeDiagnosticSeverity::Warn,
             title: "Native local build downgraded to Scarb".to_string(),
+            docs_url: native_diagnostic_docs_url("UCN2002"),
             what_happened: "native failed".to_string(),
             why: "native failed".to_string(),
             how_to_fix: vec!["fix native".to_string()],
+            next_commands: vec![
+                "uc support native --manifest-path <Scarb.toml> --format json".to_string(),
+            ],
+            safe_automated_action: "inspect_native_support_then_retry".to_string(),
             retryable: true,
             fallback_used: true,
             toolchain_expected: Some("2.14.0".to_string()),

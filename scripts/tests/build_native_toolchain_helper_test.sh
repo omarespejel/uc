@@ -37,7 +37,24 @@ test_prepare_only_and_check_only_are_mutually_exclusive() {
   grep -q -- '--prepare-only and --check-only cannot be used together' "$stdout_path"
 }
 
+test_unsupported_lane_reports_actionable_error() {
+  local stdout_path="$TMP_DIR/unsupported-lane.out"
+  if "$HELPER_SCRIPT" --lane 9.99 --prepare-only >"$stdout_path" 2>&1; then
+    echo "expected unsupported helper lane to fail" >&2
+    return 1
+  fi
+  grep -q 'unsupported helper lane: 9.99' "$stdout_path"
+  grep -q 'Available lanes: 2.14' "$stdout_path"
+  if grep -q 'Traceback' "$stdout_path"; then
+    echo "unsupported helper lane should not emit a Python traceback" >&2
+    cat "$stdout_path" >&2
+    return 1
+  fi
+}
+
 run_test "prepare_only_rewrites_workspace_manifest_for_cairo214" \
   test_prepare_only_rewrites_workspace_manifest_for_cairo214
 run_test "prepare_only_and_check_only_are_mutually_exclusive" \
   test_prepare_only_and_check_only_are_mutually_exclusive
+run_test "unsupported_lane_reports_actionable_error" \
+  test_unsupported_lane_reports_actionable_error

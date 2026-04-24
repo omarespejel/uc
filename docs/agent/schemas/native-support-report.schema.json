@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/omarespejel/uc/docs/agent/schemas/native-support-report.schema.json",
+  "title": "uc NativeSupportReport",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "manifest_path",
+    "status",
+    "supported",
+    "diagnostics"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "manifest_path": { "type": "string", "minLength": 1 },
+    "status": { "enum": ["supported", "unsupported", "unavailable"] },
+    "supported": { "type": "boolean" },
+    "reason": { "type": "string" },
+    "compiler_version": { "type": "string" },
+    "package_cairo_version": { "type": "string" },
+    "issue_kind": { "type": "string" },
+    "toolchain": { "type": "object" },
+    "diagnostics": {
+      "type": "array",
+      "items": { "$ref": "native-diagnostic.schema.json" }
+    }
+  }
+}

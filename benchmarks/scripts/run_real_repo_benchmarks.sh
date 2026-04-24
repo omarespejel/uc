@@ -644,25 +644,23 @@ jq -s \
   'def unstable_lanes:
       [
         .[] as $case
-        | if $case.benchmark_status != "ok" then empty else
-            [
-              {tool: "scarb", lane: $case.benchmarks.scarb.build.cold},
-              {tool: "scarb", lane: $case.benchmarks.scarb.build.warm_noop},
-              {tool: "uc", lane: $case.benchmarks.uc.build.cold},
-              {tool: "uc", lane: $case.benchmarks.uc.build.warm_noop}
-            ][]
-            | select(.lane.status == "ok" and (.lane.stability.unstable // false))
-            | {
-                tag: $case.tag,
-                tool: .tool,
-                stage: .lane.stage,
-                p50_ms: .lane.stats.p50_ms,
-                p95_ms: .lane.stats.p95_ms,
-                max_ms: .lane.stats.max_ms,
-                p95_over_p50: .lane.stability.p95_over_p50,
-                max_over_p50: .lane.stability.max_over_p50
-              }
-          end
+        | [
+            {tool: "scarb", lane: $case.benchmarks.scarb.build.cold},
+            {tool: "scarb", lane: $case.benchmarks.scarb.build.warm_noop},
+            {tool: "uc", lane: $case.benchmarks.uc.build.cold},
+            {tool: "uc", lane: $case.benchmarks.uc.build.warm_noop}
+          ][]
+        | select(.lane.status == "ok" and (.lane.stability.unstable // false))
+        | {
+            tag: $case.tag,
+            tool: .tool,
+            stage: .lane.stage,
+            p50_ms: .lane.stats.p50_ms,
+            p95_ms: .lane.stats.p95_ms,
+            max_ms: .lane.stats.max_ms,
+            p95_over_p50: .lane.stability.p95_over_p50,
+            max_over_p50: .lane.stability.max_over_p50
+          }
       ];
     {
     generated_at: $generated_at,

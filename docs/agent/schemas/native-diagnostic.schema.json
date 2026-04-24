@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/omarespejel/uc/docs/agent/schemas/native-diagnostic.schema.json",
+  "title": "uc NativeDiagnostic",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "code",
+    "category",
+    "severity",
+    "title",
+    "docs_url",
+    "what_happened",
+    "why",
+    "how_to_fix",
+    "next_commands",
+    "safe_automated_action",
+    "retryable",
+    "fallback_used"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "code": { "type": "string", "pattern": "^UCN[0-9]{4}$" },
+    "category": { "type": "string", "minLength": 1 },
+    "severity": { "enum": ["info", "warn", "error"] },
+    "title": { "type": "string", "minLength": 1 },
+    "docs_url": { "type": "string", "minLength": 1 },
+    "what_happened": { "type": "string", "minLength": 1 },
+    "why": { "type": "string", "minLength": 1 },
+    "how_to_fix": { "type": "array", "items": { "type": "string" } },
+    "next_commands": { "type": "array", "items": { "type": "string" } },
+    "safe_automated_action": { "type": "string", "minLength": 1 },
+    "retryable": { "type": "boolean" },
+    "fallback_used": { "type": "boolean" },
+    "toolchain_expected": { "type": "string" },
+    "toolchain_found": { "type": "string" }
+  }
+}
