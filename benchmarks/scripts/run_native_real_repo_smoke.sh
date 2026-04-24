@@ -94,6 +94,7 @@ mkdir -p "$RESULTS_DIR"
 
 prefetch_manifest_dependencies() {
   local manifest_path="$1"
+  local manifest_dir
   if [[ -n "${PREFETCHED_MANIFESTS[$manifest_path]:-}" ]]; then
     return
   fi
@@ -101,7 +102,11 @@ prefetch_manifest_dependencies() {
     echo "scarb is required to prefetch dependencies for offline real-repo smoke runs" >&2
     exit 1
   fi
-  scarb fetch --manifest-path "$manifest_path" >/dev/null
+  manifest_dir="$(cd "$(dirname "$manifest_path")" && pwd -P)"
+  (
+    cd "$manifest_dir"
+    scarb fetch >/dev/null
+  )
   PREFETCHED_MANIFESTS["$manifest_path"]=1
 }
 
