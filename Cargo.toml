@@ -3,7 +3,7 @@ members = [
   "crates/uc-cli",
   "crates/uc-core",
 ]
-exclude = ["third_party/cairo-lang-filesystem"]
+exclude = ["third_party/cairo-lang-filesystem", "third_party/cairo-lang-semantic"]
 resolver = "2"
 
 [workspace.package]
@@ -18,6 +18,7 @@ cairo-lang-compiler = "2.16.0"
 cairo-lang-defs = "2.16.0"
 cairo-lang-filesystem = "2.16.0"
 cairo-lang-lowering = "2.16.0"
+cairo-lang-semantic = "2.16.0"
 cairo-lang-starknet = "2.16.0"
 cairo-lang-starknet-classes = "2.16.0"
 clap = { version = "4", features = ["derive"] }
@@ -36,3 +37,4 @@ walkdir = "2"
 
 [patch.crates-io]
 cairo-lang-filesystem = { path = "third_party/cairo-lang-filesystem" }
+cairo-lang-semantic = { path = "third_party/cairo-lang-semantic" }

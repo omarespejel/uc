@@ -32,6 +32,8 @@ use cairo_lang_lowering::optimizations::config::Optimizations;
 #[cfg(feature = "native-compile")]
 use cairo_lang_lowering::utils::InliningStrategy;
 #[cfg(feature = "native-compile")]
+use cairo_lang_semantic::db::SemanticGroupEx;
+#[cfg(feature = "native-compile")]
 use cairo_lang_starknet::compile::compile_prepared_db as compile_starknet_prepared_db;
 #[cfg(feature = "native-compile")]
 use cairo_lang_starknet::contract::{find_contracts, module_contract, ContractDeclaration};
@@ -214,6 +216,8 @@ const DEFAULT_DAEMON_SHARED_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const DEFAULT_UC_DISABLE_SCARB_ARTIFACTS_FINGERPRINT: bool = true;
 const DEFAULT_UC_NATIVE_BUILD_MODE: &str = "auto";
 const DEFAULT_UC_NATIVE_DISALLOW_SCARB_FALLBACK: bool = false;
+#[cfg(feature = "native-compile")]
+const DEFAULT_UC_NATIVE_SKIP_UNUSED_IMPORT_DIAGNOSTICS: bool = true;
 const TOOLCHAIN_CHECK_CACHE_SCHEMA_VERSION: u32 = 1;
 const MAX_TOOLCHAIN_CHECK_CACHE_BYTES: u64 = 64 * 1024;
 /// Default Starknet CASM bytecode limit used by native compile.
@@ -714,6 +718,7 @@ struct NativeCompileSessionSignature {
     manifest_path: PathBuf,
     manifest_content_hash: String,
     context: NativeCompileContext,
+    skip_unused_import_diagnostics: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1677,6 +1682,14 @@ fn parse_env_bool(name: &str, default: bool) -> bool {
         }
         Err(_) => default,
     }
+}
+
+#[cfg(feature = "native-compile")]
+fn native_skip_unused_import_diagnostics() -> bool {
+    parse_env_bool(
+        "UC_NATIVE_SKIP_UNUSED_IMPORT_DIAGNOSTICS",
+        DEFAULT_UC_NATIVE_SKIP_UNUSED_IMPORT_DIAGNOSTICS,
+    )
 }
 
 #[cfg(feature = "native-compile")]
@@ -6677,6 +6690,7 @@ fn native_compile_session_signature(
         manifest_path: manifest_path.to_path_buf(),
         manifest_content_hash: context.manifest_content_hash.clone(),
         context: context.clone(),
+        skip_unused_import_diagnostics: native_skip_unused_import_diagnostics(),
     }
 }
 
@@ -6699,6 +6713,11 @@ fn native_compile_session_signature_hash(signature: &NativeCompileSessionSignatu
         b"1"
     } else {
         b"0"
+    });
+    hasher.update(if signature.skip_unused_import_diagnostics {
+        b"skip-unused-import-diagnostics:1"
+    } else {
+        b"skip-unused-import-diagnostics:0"
     });
 
     let mut external_dependencies = signature.context.external_non_starknet_dependencies.clone();
@@ -8219,7 +8238,10 @@ fn native_setup_project(db: &mut RootDatabase, path: &Path) -> Result<Vec<CrateI
 }
 
 #[cfg(feature = "native-compile")]
-fn native_seeded_root_database(corelib_src: &Path) -> Result<RootDatabase> {
+fn native_seeded_root_database(
+    corelib_src: &Path,
+    skip_unused_import_diagnostics: bool,
+) -> Result<RootDatabase> {
     let mut db = RootDatabase::builder()
         .with_optimizations(Optimizations::enabled_with_default_movable_functions(
             InliningStrategy::Default,
@@ -8227,9 +8249,11 @@ fn native_seeded_root_database(corelib_src: &Path) -> Result<RootDatabase> {
         .with_default_plugin_suite(starknet_plugin_suite())
         .build()
         .context("failed to initialize native cairo compiler database")?;
+    db.set_skip_unused_import_diagnostics(skip_unused_import_diagnostics);
     init_dev_corelib(&mut db, corelib_src.to_path_buf());
     tracing::debug!(
         corelib_src = %corelib_src.display(),
+        skip_unused_import_diagnostics,
         "native root database initialized"
     );
     Ok(db)
@@ -8249,11 +8273,14 @@ fn build_native_compile_session_state(
     ));
     let _heartbeat = NativeProgressHeartbeat::start("native session-state build");
     let db_start = Instant::now();
-    let mut db = native_seeded_root_database(&signature.context.corelib_src)?;
+    let mut db = native_seeded_root_database(
+        &signature.context.corelib_src,
+        signature.skip_unused_import_diagnostics,
+    )?;
     let db_init_ms = db_start.elapsed().as_secs_f64() * 1000.0;
     native_progress_log(format!(
-        "native session-state db init finished in {:.1}ms",
-        db_init_ms
+        "native session-state db init finished in {:.1}ms (skip_unused_import_diagnostics={})",
+        db_init_ms, signature.skip_unused_import_diagnostics
     ));
     native_progress_log(format!(
         "native session-state setup_project start ({})",

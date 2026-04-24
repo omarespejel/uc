@@ -1,4 +1,5 @@
 use super::*;
+use cairo_lang_semantic::db::SemanticGroup;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fs;
@@ -182,10 +183,14 @@ fn prepare_smoke_workspace(prefix: &str) -> PathBuf {
 
 fn create_mock_native_corelib(corelib_src: &Path) {
     fs::create_dir_all(corelib_src).expect("failed to create mock corelib src");
-    fs::write(corelib_src.join("lib.cairo"), "mod prelude;\nmod ops;\n")
-        .expect("failed to write mock corelib lib.cairo");
+    fs::write(
+        corelib_src.join("lib.cairo"),
+        "mod prelude;\nmod ops;\nmod integer;\n",
+    )
+    .expect("failed to write mock corelib lib.cairo");
     fs::write(corelib_src.join("prelude.cairo"), "").expect("failed to write mock prelude");
     fs::write(corelib_src.join("ops.cairo"), "").expect("failed to write mock ops");
+    fs::write(corelib_src.join("integer.cairo"), "").expect("failed to write mock integer");
 }
 
 fn write_mock_native_corelib_manifest(corelib_src: &Path, version: &str) {
@@ -1582,6 +1587,25 @@ fn native_disallow_scarb_fallback_parses_expected_values() {
     std::env::set_var("UC_NATIVE_DISALLOW_SCARB_FALLBACK", "0");
     assert!(!native_disallow_scarb_fallback());
     std::env::remove_var("UC_NATIVE_DISALLOW_SCARB_FALLBACK");
+}
+
+#[test]
+fn native_skip_unused_import_diagnostics_parses_expected_values() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::env::remove_var("UC_NATIVE_SKIP_UNUSED_IMPORT_DIAGNOSTICS");
+    assert!(native_skip_unused_import_diagnostics());
+
+    std::env::set_var("UC_NATIVE_SKIP_UNUSED_IMPORT_DIAGNOSTICS", "1");
+    assert!(native_skip_unused_import_diagnostics());
+
+    std::env::set_var("UC_NATIVE_SKIP_UNUSED_IMPORT_DIAGNOSTICS", "false");
+    assert!(!native_skip_unused_import_diagnostics());
+
+    std::env::set_var("UC_NATIVE_SKIP_UNUSED_IMPORT_DIAGNOSTICS", "invalid");
+    assert!(native_skip_unused_import_diagnostics());
+    std::env::remove_var("UC_NATIVE_SKIP_UNUSED_IMPORT_DIAGNOSTICS");
 }
 
 #[test]
@@ -5884,6 +5908,7 @@ fn native_test_compile_session_signature(
     NativeCompileSessionSignature {
         manifest_path: workspace_root.join("Scarb.toml"),
         manifest_content_hash: manifest_hash.to_string(),
+        skip_unused_import_diagnostics: true,
         context: NativeCompileContext {
             package_name: "demo".to_string(),
             crate_name: "demo".to_string(),
@@ -5908,6 +5933,21 @@ fn native_test_compile_session_signature(
             }],
         },
     }
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_compile_session_signature_hash_changes_when_unused_import_diagnostics_toggle_changes() {
+    let dir = unique_test_dir("uc-native-signature-unused-import-toggle");
+    let mut signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
+    let with_skip = native_compile_session_signature_hash(&signature);
+    signature.skip_unused_import_diagnostics = false;
+    let without_skip = native_compile_session_signature_hash(&signature);
+    assert_ne!(
+        with_skip, without_skip,
+        "native session signature hash must change when unused-import diagnostic mode changes"
+    );
+    fs::remove_dir_all(&dir).ok();
 }
 
 #[cfg(feature = "native-compile")]
@@ -6544,7 +6584,7 @@ fn native_seeded_root_database_returns_writable_db() {
     create_mock_native_corelib(&corelib_src);
 
     let mut db =
-        native_seeded_root_database(&corelib_src).expect("root database should initialize");
+        native_seeded_root_database(&corelib_src, true).expect("root database should initialize");
     let baseline_len = db.crate_configs().len();
     let demo_input = CrateInput::Real {
         name: "demo".into(),
@@ -6639,7 +6679,7 @@ fn native_seeded_root_database_supports_native_setup_project_end_to_end() {
     .expect("failed to write cairo_project.toml");
 
     let mut db =
-        native_seeded_root_database(&corelib_src).expect("root database should initialize");
+        native_seeded_root_database(&corelib_src, true).expect("root database should initialize");
     let baseline_len = db.crate_configs().len();
     let main_crate_inputs =
         native_setup_project(&mut db, &project_dir).expect("native seeded setup should work");
@@ -6660,6 +6700,31 @@ fn native_seeded_root_database_supports_native_setup_project_end_to_end() {
             "seeded native setup should populate crate config for {crate_id:?}"
         );
     }
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_seeded_root_database_propagates_skip_unused_import_diagnostics_flag() {
+    let dir = unique_test_dir("uc-native-skip-unused-import-flag");
+    let corelib_src = dir.join("toolchain/corelib/src");
+    fs::create_dir_all(&corelib_src).expect("failed to create mock corelib src");
+    create_mock_native_corelib(&corelib_src);
+
+    let db_with_skip =
+        native_seeded_root_database(&corelib_src, true).expect("root database should initialize");
+    assert!(
+        db_with_skip.skip_unused_import_diagnostics(),
+        "native seeded database should propagate skip-unused-import flag"
+    );
+
+    let db_without_skip =
+        native_seeded_root_database(&corelib_src, false).expect("root database should initialize");
+    assert!(
+        !db_without_skip.skip_unused_import_diagnostics(),
+        "native seeded database should preserve disabled skip-unused-import flag"
+    );
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -6697,7 +6762,7 @@ mod contract_b {
     .expect("failed to write cairo_project.toml");
 
     let mut db =
-        native_seeded_root_database(&corelib_src).expect("root database should initialize");
+        native_seeded_root_database(&corelib_src, true).expect("root database should initialize");
     let main_crate_inputs =
         native_setup_project(&mut db, &project_dir).expect("native setup should work");
     let crate_ids = CrateInput::into_crate_ids(&db, main_crate_inputs.iter().cloned());
@@ -6755,7 +6820,7 @@ fn native_resolve_contracts_from_output_plans_rejects_missing_modules() {
         .expect("failed to write source fixture");
 
     let mut db =
-        native_seeded_root_database(&corelib_src).expect("root database should initialize");
+        native_seeded_root_database(&corelib_src, true).expect("root database should initialize");
     let main_crate_inputs =
         native_setup_project(&mut db, &project_dir).expect("native setup should work");
     let crate_ids = CrateInput::into_crate_ids(&db, main_crate_inputs.iter().cloned());
