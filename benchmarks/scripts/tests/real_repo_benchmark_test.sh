@@ -59,6 +59,8 @@ fi
 if [[ "$1" == "build" ]]; then
   manifest=""
   report_path=""
+  seen_offline=0
+  seen_daemon_off=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --manifest-path)
@@ -69,11 +71,31 @@ if [[ "$1" == "build" ]]; then
         report_path="${2-}"
         shift 2
         ;;
+      --daemon-mode)
+        if [[ "${2-}" != "off" ]]; then
+          echo "expected uc --daemon-mode off, got: ${2-}" >&2
+          exit 22
+        fi
+        seen_daemon_off=1
+        shift 2
+        ;;
+      --offline)
+        seen_offline=1
+        shift
+        ;;
       *)
         shift
       ;;
     esac
   done
+  if [[ "$seen_offline" -ne 1 ]]; then
+    echo "missing uc --offline" >&2
+    exit 23
+  fi
+  if [[ "$seen_daemon_off" -ne 1 ]]; then
+    echo "missing uc --daemon-mode off" >&2
+    exit 24
+  fi
   printf 'build %s disallow=%s corelib=%s report=%s\n' "$manifest" "${UC_NATIVE_DISALLOW_SCARB_FALLBACK:-}" "${UC_NATIVE_CORELIB_SRC:-}" "$report_path" >> "$args_log"
   if [[ "$manifest" == *"unstable"* && "${UC_NATIVE_DISALLOW_SCARB_FALLBACK:-}" == "1" ]]; then
     state_dir="${MOCK_UC_STATE_DIR:-}"
@@ -155,6 +177,7 @@ set -euo pipefail
 args_log="${MOCK_SCARB_ARGS_LOG:?}"
 manifest=""
 subcommand=""
+seen_offline=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --manifest-path)
@@ -166,6 +189,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --offline)
+      seen_offline=1
       shift
       ;;
     *)
@@ -177,6 +201,10 @@ done
 if [[ -z "$subcommand" ]]; then
   echo "missing scarb subcommand" >&2
   exit 20
+fi
+if [[ "$seen_offline" -ne 1 ]]; then
+  echo "missing scarb --offline" >&2
+  exit 21
 fi
 if [[ -z "$manifest" && "$subcommand" == "fetch" ]]; then
   manifest="$PWD/Scarb.toml"
@@ -292,6 +320,32 @@ test_real_repo_benchmark_accepts_cases_file() {
     cat "$json_path" >&2
     return 1
   fi
+}
+
+test_real_repo_benchmark_rejects_malformed_cases_file_rows() {
+  local cases_file="$TEST_TMP_DIR/malformed-cases-file.tsv"
+  local stderr_path="$TEST_TMP_DIR/malformed-cases-file.err"
+  local -a rows=(
+    $'/tmp/Scarb.toml\ttag\t'
+    $'/tmp/Scarb.toml\ttag\textra'
+    $'/tmp/Scarb.toml'
+    $'\ttag'
+    $'/tmp/Scarb.toml\t'
+  )
+
+  local index
+  for index in "${!rows[@]}"; do
+    printf '%s\n' "${rows[$index]}" > "$cases_file"
+    if "$BENCH_SCRIPT" --cases-file "$cases_file" >"$TEST_TMP_DIR/malformed-cases-file-$index.out" 2>"$stderr_path"; then
+      echo "expected malformed cases-file row to be rejected: ${rows[$index]}" >&2
+      return 1
+    fi
+    if ! grep -q "Invalid cases file row 1" "$stderr_path"; then
+      echo "expected malformed cases-file row validation error for: ${rows[$index]}" >&2
+      cat "$stderr_path" >&2
+      return 1
+    fi
+  done
 }
 
 test_real_repo_benchmark_records_support_matrix_categories() {
@@ -577,6 +631,8 @@ run_test "real_repo_benchmark_rejects_zero_runs_from_environment" \
   test_real_repo_benchmark_rejects_zero_runs_from_environment
 run_test "real_repo_benchmark_accepts_cases_file" \
   test_real_repo_benchmark_accepts_cases_file
+run_test "real_repo_benchmark_rejects_malformed_cases_file_rows" \
+  test_real_repo_benchmark_rejects_malformed_cases_file_rows
 run_test "real_repo_benchmark_records_support_matrix_categories" \
   test_real_repo_benchmark_records_support_matrix_categories
 run_test "real_repo_benchmark_records_supported_build_failures" \

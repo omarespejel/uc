@@ -102,15 +102,23 @@ load_cases_file() {
   fi
 
   local line_no=0
+  local raw_line=""
   local manifest_path=""
   local tag=""
-  local extra=""
-  while IFS=$'\t' read -r manifest_path tag extra || [[ -n "$manifest_path$tag$extra" ]]; do
+  while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
     line_no=$((line_no + 1))
-    if [[ -z "$manifest_path$tag$extra" ]]; then
+    if [[ -z "$raw_line" ]]; then
       continue
     fi
-    if [[ -n "$extra" || -z "$manifest_path" || -z "$tag" ]]; then
+    local without_tabs="${raw_line//$'\t'/}"
+    local tab_count=$(( ${#raw_line} - ${#without_tabs} ))
+    if [[ "$tab_count" -ne 1 ]]; then
+      echo "Invalid cases file row $line_no in $cases_file; expected: <manifest-path><TAB><tag>" >&2
+      exit 2
+    fi
+    manifest_path="${raw_line%%$'\t'*}"
+    tag="${raw_line#*$'\t'}"
+    if [[ -z "$manifest_path" || -z "$tag" ]]; then
       echo "Invalid cases file row $line_no in $cases_file; expected: <manifest-path><TAB><tag>" >&2
       exit 2
     fi

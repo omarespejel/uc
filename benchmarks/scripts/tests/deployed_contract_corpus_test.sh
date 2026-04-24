@@ -64,6 +64,8 @@ fi
 if [[ "$1" == "build" ]]; then
   manifest=""
   report_path=""
+  seen_offline=0
+  seen_daemon_off=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --manifest-path)
@@ -74,11 +76,31 @@ if [[ "$1" == "build" ]]; then
         report_path="${2-}"
         shift 2
         ;;
+      --daemon-mode)
+        if [[ "${2-}" != "off" ]]; then
+          echo "expected uc --daemon-mode off, got: ${2-}" >&2
+          exit 22
+        fi
+        seen_daemon_off=1
+        shift 2
+        ;;
+      --offline)
+        seen_offline=1
+        shift
+        ;;
       *)
         shift
         ;;
     esac
   done
+  if [[ "$seen_offline" -ne 1 ]]; then
+    echo "missing uc --offline" >&2
+    exit 23
+  fi
+  if [[ "$seen_daemon_off" -ne 1 ]]; then
+    echo "missing uc --daemon-mode off" >&2
+    exit 24
+  fi
   printf 'build %s disallow=%s report=%s\n' "$manifest" "${UC_NATIVE_DISALLOW_SCARB_FALLBACK:-}" "$report_path" >> "$args_log"
   compile_backend="uc_native"
   diagnostics="[]"
