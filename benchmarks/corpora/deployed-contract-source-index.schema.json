@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/omarespejel/uc/benchmarks/corpora/deployed-contract-source-index.schema.json",
+  "title": "uc deployed contract source index",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "corpus_id",
+    "chain",
+    "selection",
+    "deduplication",
+    "license_policy",
+    "source_availability",
+    "items"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "corpus_id": { "type": "string", "minLength": 1 },
+    "chain": { "type": "string", "minLength": 1 },
+    "selection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "snapshot_id", "from_block", "to_block", "coverage"],
+      "properties": {
+        "source": { "type": "string", "minLength": 1 },
+        "snapshot_id": { "type": "string", "minLength": 1 },
+        "from_block": { "type": "integer", "minimum": 0 },
+        "to_block": { "type": "integer", "minimum": 0 },
+        "coverage": { "enum": ["sample", "complete_deployed_contracts"] },
+        "notes": { "type": "string" }
+      }
+    },
+    "deduplication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "input_count", "deduped_count"],
+      "properties": {
+        "key": { "enum": ["class_hash", "source_package", "none"] },
+        "input_count": { "type": "integer", "minimum": 1 },
+        "deduped_count": { "type": "integer", "minimum": 1 },
+        "rules": { "type": "string" }
+      }
+    },
+    "license_policy": { "type": "string", "minLength": 1 },
+    "source_availability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy"],
+      "properties": {
+        "policy": { "enum": ["local_manifest_paths", "verified_source_refs"] },
+        "notes": { "type": "string" }
+      }
+    },
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["tag", "contract_address", "class_hash", "source_ref", "manifest_path", "cairo_version"],
+        "properties": {
+          "tag": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+          "contract_address": { "type": "string", "minLength": 1 },
+          "class_hash": { "type": "string", "minLength": 1 },
+          "source_ref": { "type": "string", "minLength": 1 },
+          "manifest_path": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^/].*",
+            "description": "Path to Scarb.toml relative to this source-index file."
+          },
+          "cairo_version": { "type": "string", "minLength": 1 },
+          "scarb_version": { "type": "string" },
+          "license": { "type": "string" },
+          "notes": { "type": "string" }
+        }
+      }
+    }
+  }
+}

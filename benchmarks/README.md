@@ -98,6 +98,28 @@ If a native-eligible case fails during `scarb` or `uc` execution, the harness
 records that build failure in a separate section with exit code and log path
 instead of aborting the whole benchmark run.
 
+## Generate Deployed-Contract Corpus From Source Index
+
+```bash
+# Shape-only sample: validates source lock input and writes a generated corpus.
+./benchmarks/scripts/generate_deployed_contract_corpus.sh \
+  --source-index benchmarks/corpora/deployed-contract-source-index.example.json \
+  --out benchmarks/results/generated-deployed-contract-corpus.sample.json
+```
+
+The source index is the durable selection artifact for deployed-contract
+evidence. It records chain/snapshot/block selection, deduplication, license
+policy, source availability, and the local `Scarb.toml` chosen for each contract
+or deduped class. The generator enforces the constraints mirrored in
+`benchmarks/corpora/deployed-contract-source-index.schema.json`, resolves all
+relative manifest paths to absolute paths, and writes corpus JSON that conforms
+to `benchmarks/corpora/deployed-contract-corpus.schema.json` for the benchmark
+runner.
+
+Do not hand-author launch corpus JSON. Keep the source index as the reviewed
+input, generate the corpus from it, and commit or immutably archive the exact
+source index used for any public claim.
+
 ## Run Deployed-Contract Corpus Evidence
 
 ```bash

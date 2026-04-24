@@ -49,9 +49,13 @@ If `.diagnostics[].fallback_used` is true, classify the result as fallback-used 
 ## Deployed-Contract Corpus Evidence
 
 ```sh
+./benchmarks/scripts/generate_deployed_contract_corpus.sh \
+  --source-index /abs/path/to/pinned-deployed-contract-source-index.json \
+  --out /abs/path/to/generated-deployed-contract-corpus.json
+
 ./benchmarks/scripts/run_deployed_contract_corpus.sh \
   --uc-bin /abs/path/to/uc \
-  --corpus /abs/path/to/pinned-deployed-contract-corpus.json \
+  --corpus /abs/path/to/generated-deployed-contract-corpus.json \
   --results-dir benchmarks/results \
   --runs 5 \
   --cold-runs 5
@@ -68,6 +72,10 @@ Read:
 Only use `.claim_guard.compiled_all_claim_text` when the guard is true. If the
 guard is false, report `.claim_guard.reason` and keep the artifact as support
 matrix evidence, not launch copy.
+
+Treat the source index as the durable evidence input. Generated corpus JSON is a
+runner artifact and should be regenerated from the reviewed source index instead
+of edited by hand.
 
 ## Stop Conditions
 

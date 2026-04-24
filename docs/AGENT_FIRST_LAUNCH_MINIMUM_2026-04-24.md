@@ -25,8 +25,8 @@ This PR can credibly claim:
 - Manifest/lockfile-driven native lane selection.
 - Agent-grade diagnostics for native support and fallback classes.
 - Local-first support-matrix benchmark reporting.
-- A checked-in deployed-contract corpus schema and wrapper that emits guarded
-  support-matrix artifacts.
+- A checked-in deployed-contract source-index schema, generator, corpus schema,
+  and wrapper that emit guarded support-matrix artifacts.
 - Guardrails preventing unpublished local benchmark numbers from becoming launch copy.
 
 This PR should not claim:
@@ -35,8 +35,8 @@ This PR should not claim:
 - Flight-recorder/replay support.
 - SARIF export.
 - Deployed-contract universe coverage.
-- A real deployed-contract corpus artifact; the checked-in example is a sample
-  shape only and is not launch evidence.
+- A real deployed-contract source index or generated corpus artifact; the
+  checked-in examples are sample shapes only and are not launch evidence.
 - Uniform speedups across every Cairo repo.
 
 ## Benchmark Message We Want
@@ -50,7 +50,10 @@ Do not publish that sentence until the corpus exists and the artifact is durable
 Required evidence for that line:
 
 - A checked-in or immutable manifest of contract sources/classes conforming to
-  `benchmarks/corpora/deployed-contract-corpus.schema.json`.
+  `benchmarks/corpora/deployed-contract-source-index.schema.json`.
+- Generated corpus JSON produced by
+  `benchmarks/scripts/generate_deployed_contract_corpus.sh`; do not hand-author
+  the run corpus for launch evidence.
 - The chain, block range, or index snapshot used to select deployed contracts,
   recorded in `selection`.
 - Cairo/Scarb version extraction rules, recorded per `items[]` row.
