@@ -246,11 +246,23 @@ measurement_ok_json() {
     --arg stage "$stage" \
     --argjson sample_count "$sample_count" \
     --argjson stats "$stats_json" \
-    '{
+    'def ratio($num; $den):
+        if $den == null or $den == 0 then null else ($num / $den) end;
+      {
       status: "ok",
       stage: $stage,
       sample_count: $sample_count,
-      stats: $stats
+      stats: $stats,
+      stability: {
+        p95_over_p50: ratio($stats.p95_ms; $stats.p50_ms),
+        max_over_p50: ratio($stats.max_ms; $stats.p50_ms),
+        p95_over_p50_threshold: 1.20,
+        max_over_p50_threshold: 1.25,
+        unstable: (
+          (ratio($stats.p95_ms; $stats.p50_ms) // 0) >= 1.20
+          or (ratio($stats.max_ms; $stats.p50_ms) // 0) >= 1.25
+        )
+      }
     }'
 }
 
@@ -629,13 +641,51 @@ jq -s \
   --arg warm_settle_seconds "$WARM_SETTLE_SECONDS" \
   --argjson runs "$RUNS" \
   --argjson cold_runs "$COLD_RUNS" \
-  '{
+  'def unstable_lanes:
+      [
+        .[] as $case
+        | if $case.benchmark_status != "ok" then empty else
+            [
+              {tool: "scarb", lane: $case.benchmarks.scarb.build.cold},
+              {tool: "scarb", lane: $case.benchmarks.scarb.build.warm_noop},
+              {tool: "uc", lane: $case.benchmarks.uc.build.cold},
+              {tool: "uc", lane: $case.benchmarks.uc.build.warm_noop}
+            ][]
+            | select(.lane.status == "ok" and (.lane.stability.unstable // false))
+            | {
+                tag: $case.tag,
+                tool: .tool,
+                stage: .lane.stage,
+                p50_ms: .lane.stats.p50_ms,
+                p95_ms: .lane.stats.p95_ms,
+                max_ms: .lane.stats.max_ms,
+                p95_over_p50: .lane.stability.p95_over_p50,
+                max_over_p50: .lane.stability.max_over_p50
+              }
+          end
+      ];
+    {
     generated_at: $generated_at,
     uc_bin: $uc_bin,
     runs: $runs,
     cold_runs: $cold_runs,
     warm_settle_seconds: ($warm_settle_seconds | tonumber),
-    cases: .
+    cases: .,
+    summary: {
+      support_matrix: (
+        reduce .[] as $case (
+          {
+            native_supported: 0,
+            fallback_used: 0,
+            native_unsupported: 0,
+            build_failed: 0
+          };
+          .[$case.support_matrix.classification] += 1
+        )
+      ),
+      unstable_lanes: unstable_lanes,
+      unstable_lane_count: (unstable_lanes | length)
+    }
   }' "$TMP_DIR/cases.ndjson" > "$OUT_JSON"
 
 {
@@ -671,6 +721,15 @@ jq -s \
     | ($case.benchmarks.scarb.build.warm_noop.stats.p95_ms) as $scarb_warm
     | ($case.benchmarks.uc.build.warm_noop.stats.p95_ms) as $uc_warm
     | "| \($case.tag) | \($scarb_cold | r3) | \($uc_cold | r3) | \((if $uc_cold == 0 then null else $scarb_cold / $uc_cold end) | r3) | \($scarb_warm | r3) | \($uc_warm | r3) | \((if $uc_warm == 0 then null else $scarb_warm / $uc_warm end) | r3) |"
+  ' "$OUT_JSON"
+  echo
+  echo "## Stability Warnings"
+  echo "| Tag | Tool | Stage | p50 (ms) | p95 (ms) | max (ms) | p95/p50 | max/p50 |"
+  echo "|---|---|---|---:|---:|---:|---:|---:|"
+  jq -r '
+    def r3: ((. * 1000 | round) / 1000);
+    .summary.unstable_lanes[]
+    | "| \(.tag) | \(.tool) | \(.stage) | \(.p50_ms | r3) | \(.p95_ms | r3) | \(.max_ms | r3) | \(.p95_over_p50 | r3) | \(.max_over_p50 | r3) |"
   ' "$OUT_JSON"
   echo
   echo "## Native-Supported Benchmark Cases With Build Failures"

@@ -80,12 +80,31 @@ if [[ "$1" == "build" ]]; then
     compile_backend="uc_native"
     fallback_used="false"
     diagnostics='[]'
-    if [[ "$manifest" == *"fallback-used"* ]]; then
-      compile_backend="scarb_fallback"
-      fallback_used="true"
-      diagnostics='[{"code":"UCN2002","category":"native_fallback_local_native_error","severity":"warn","title":"Native local build downgraded to Scarb","what_happened":"native failed","why":"native failed","how_to_fix":["fix native"],"retryable":true,"fallback_used":true,"toolchain_expected":"2.16.0","toolchain_found":"2.16.0"}]'
+  if [[ "$manifest" == *"fallback-used"* ]]; then
+    compile_backend="scarb_fallback"
+    fallback_used="true"
+    diagnostics='[{"code":"UCN2002","category":"native_fallback_local_native_error","severity":"warn","title":"Native local build downgraded to Scarb","what_happened":"native failed","why":"native failed","how_to_fix":["fix native"],"retryable":true,"fallback_used":true,"toolchain_expected":"2.16.0","toolchain_found":"2.16.0"}]'
+  fi
+  if [[ "$manifest" == *"unstable-supported"* && "${UC_NATIVE_DISALLOW_SCARB_FALLBACK:-}" == "1" ]]; then
+    state_dir="${MOCK_UC_STATE_DIR:-}"
+    if [[ -n "$state_dir" ]]; then
+      mkdir -p "$state_dir"
+      count_file="$state_dir/unstable-supported.count"
+      count=0
+      if [[ -f "$count_file" ]]; then
+        count="$(cat "$count_file")"
+      fi
+      count=$((count + 1))
+      printf '%s' "$count" > "$count_file"
+      if [[ "$count" -eq 4 ]]; then
+        python3 - <<'PY'
+import time
+time.sleep(0.45)
+PY
+      fi
     fi
-    cat > "$report_path" <<REPORT
+  fi
+  cat > "$report_path" <<REPORT
 {
   "generated_at_epoch_ms": 1,
   "engine": "uc",
@@ -381,6 +400,50 @@ test_real_repo_benchmark_records_supported_build_failures() {
   assert_contains "$markdown_text" "| fails-build | scarb | build.cold | 17 |"
 }
 
+test_real_repo_benchmark_surfaces_stability_warnings() {
+  local cases_root="$TEST_TMP_DIR/stability-cases"
+  local mock_bin_dir="$TEST_TMP_DIR/stability-mock-bin"
+  local mock_uc="$mock_bin_dir/uc"
+  local mock_scarb="$mock_bin_dir/scarb"
+  local results_dir="$TEST_TMP_DIR/stability-results"
+  mkdir -p "$mock_bin_dir" "$results_dir"
+  write_mock_uc_bin "$mock_uc"
+  write_mock_scarb_bin "$mock_scarb"
+  write_manifest_case "$cases_root" "unstable-supported"
+
+  local stdout_text
+  stdout_text="$(
+    PATH="$mock_bin_dir:$PATH" \
+    MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/stability-uc.args" \
+    MOCK_UC_STATE_DIR="$TEST_TMP_DIR/stability-uc.state" \
+    MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/stability-scarb.args" \
+    "$BENCH_SCRIPT" \
+      --uc-bin "$mock_uc" \
+      --results-dir "$results_dir" \
+      --runs 4 \
+      --cold-runs 5 \
+      --warm-settle-seconds 0 \
+      --case "$cases_root/unstable-supported/Scarb.toml" unstable-supported
+  )"
+  local json_path
+  json_path="$(awk -F': ' '/Benchmark JSON:/ {print $2}' <<<"$stdout_text")"
+  local md_path
+  md_path="$(awk -F': ' '/Benchmark Markdown:/ {print $2}' <<<"$stdout_text")"
+
+  local unstable_count
+  unstable_count="$(jq -r '.summary.unstable_lane_count' "$json_path")"
+  if [[ "$unstable_count" -lt 1 ]]; then
+    echo "expected unstable lane warning to be recorded" >&2
+    cat "$json_path" >&2
+    return 1
+  fi
+
+  local markdown_text
+  markdown_text="$(cat "$md_path")"
+  assert_contains "$markdown_text" "## Stability Warnings"
+  assert_contains "$markdown_text" "| unstable-supported |"
+}
+
 run_test "real_repo_benchmark_rejects_missing_case_values" \
   test_real_repo_benchmark_rejects_missing_case_values
 run_test "real_repo_benchmark_rejects_zero_runs_from_environment" \
@@ -389,3 +452,5 @@ run_test "real_repo_benchmark_records_support_matrix_categories" \
   test_real_repo_benchmark_records_support_matrix_categories
 run_test "real_repo_benchmark_records_supported_build_failures" \
   test_real_repo_benchmark_records_supported_build_failures
+run_test "real_repo_benchmark_surfaces_stability_warnings" \
+  test_real_repo_benchmark_surfaces_stability_warnings

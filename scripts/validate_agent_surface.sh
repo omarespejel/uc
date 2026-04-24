@@ -16,7 +16,10 @@ required_files=(
   pr_compliance_checklist.yaml
   scripts/install_git_hooks.sh
   scripts/local_ci_gate.sh
+  scripts/build_native_toolchain_helper.sh
   scripts/tests/local_ci_gate_test.sh
+  scripts/tests/doctor_test.sh
+  scripts/tests/build_native_toolchain_helper_test.sh
   .githooks/pre-push
   .claude/skills/uc-pr-review-loop/SKILL.md
   .claude/skills/uc-native-debug/SKILL.md

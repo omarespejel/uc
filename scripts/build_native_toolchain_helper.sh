@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+LANE=""
+OUTPUT=""
+STAGING_DIR=""
+TARGET_DIR=""
+PREPARE_ONLY=0
+KEEP_STAGING=0
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  build_native_toolchain_helper.sh --lane <major.minor> [--output /abs/path/to/uc]
+    [--staging-dir /abs/path] [--target-dir /abs/path] [--prepare-only] [--keep-staging]
+
+Examples:
+  ./scripts/build_native_toolchain_helper.sh --lane 2.14
+  ./scripts/build_native_toolchain_helper.sh --lane 2.14 --output "$HOME/.uc/toolchain-helpers/uc-cairo214/bin/uc"
+USAGE
+}
+
+require_option_value() {
+  local flag="$1"
+  local value="${2-}"
+  if [[ -z "$value" || "$value" == -* ]]; then
+    echo "Missing value for $flag" >&2
+    usage >&2
+    exit 2
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --lane)
+      require_option_value "$1" "${2-}"
+      LANE="$2"
+      shift 2
+      ;;
+    --output)
+      require_option_value "$1" "${2-}"
+      OUTPUT="$2"
+      shift 2
+      ;;
+    --staging-dir)
+      require_option_value "$1" "${2-}"
+      STAGING_DIR="$2"
+      shift 2
+      ;;
+    --target-dir)
+      require_option_value "$1" "${2-}"
+      TARGET_DIR="$2"
+      shift 2
+      ;;
+    --prepare-only)
+      PREPARE_ONLY=1
+      shift
+      ;;
+    --keep-staging)
+      KEEP_STAGING=1
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -z "$LANE" ]]; then
+  echo "--lane is required" >&2
+  usage >&2
+  exit 2
+fi
+
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "cargo is required" >&2
+  exit 1
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "python3 is required" >&2
+  exit 1
+fi
+
+read_metadata_field() {
+  local field="$1"
+  python3 - "$ROOT/Cargo.toml" "$LANE" "$field" <<'PY'
+import sys, tomllib
+from pathlib import Path
+cargo_path = Path(sys.argv[1])
+lane = sys.argv[2]
+field = sys.argv[3]
+doc = tomllib.loads(cargo_path.read_text())
+entry = doc["workspace"]["metadata"]["uc-native-toolchain-helpers"][lane]
+print(entry[field])
+PY
+}
+
+CAIRO_VERSION="$(read_metadata_field cairo-version)"
+SALSA_VERSION="$(read_metadata_field salsa-version)"
+LOCKFILE_REL="$(read_metadata_field lockfile)"
+LOCKFILE_PATH="$ROOT/$LOCKFILE_REL"
+if [[ ! -f "$LOCKFILE_PATH" ]]; then
+  echo "Missing helper lockfile: $LOCKFILE_PATH" >&2
+  exit 1
+fi
+
+lane_digits="${LANE//./}"
+if [[ -z "$OUTPUT" ]]; then
+  OUTPUT="$HOME/.uc/toolchain-helpers/uc-cairo${lane_digits}-helper/bin/uc"
+fi
+if [[ -z "$STAGING_DIR" ]]; then
+  STAGING_DIR="$ROOT/.uc/toolchain-helper-builds/cairo-${LANE}-$(date +%Y%m%d-%H%M%S)-$$"
+fi
+if [[ -z "$TARGET_DIR" ]]; then
+  TARGET_DIR="$ROOT/.uc/toolchain-helper-targets/cairo-${LANE}"
+fi
+
+cleanup() {
+  if (( KEEP_STAGING == 0 )) && (( PREPARE_ONLY == 0 )) && [[ -d "$STAGING_DIR" ]]; then
+    rm -rf "$STAGING_DIR"
+  fi
+}
+trap cleanup EXIT
+
+if [[ -e "$STAGING_DIR" ]]; then
+  echo "staging dir already exists: $STAGING_DIR" >&2
+  exit 1
+fi
+mkdir -p "$STAGING_DIR"
+
+prepare_staging_tree() {
+  tar -C "$ROOT" \
+    --exclude='./.git' \
+    --exclude='./target' \
+    --exclude='./.uc' \
+    --exclude='./benchmarks/results' \
+    -cf - . | tar -C "$STAGING_DIR" -xf -
+}
+
+rewrite_workspace_manifest() {
+  python3 - "$STAGING_DIR/Cargo.toml" "$CAIRO_VERSION" "$SALSA_VERSION" <<'PY'
+import re, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+cairo_version = sys.argv[2]
+salsa_version = sys.argv[3]
+text = path.read_text()
+for dep in [
+    "cairo-lang-compiler",
+    "cairo-lang-defs",
+    "cairo-lang-filesystem",
+    "cairo-lang-lowering",
+    "cairo-lang-semantic",
+    "cairo-lang-starknet",
+    "cairo-lang-starknet-classes",
+]:
+    pattern = rf'^{re.escape(dep)}\s*=\s*".*"$'
+    replacement = f'{dep} = "={cairo_version}"'
+    text, count = re.subn(pattern, replacement, text, flags=re.MULTILINE)
+    if count != 1:
+        raise SystemExit(f"failed to rewrite {dep} in {path}")
+text, count = re.subn(r'^salsa\s*=\s*".*"$', f'salsa = "{salsa_version}"', text, flags=re.MULTILINE)
+if count != 1:
+    raise SystemExit(f"failed to rewrite salsa in {path}")
+text, count = re.subn(r'\n\[patch\.crates-io\]\n(?:.*\n)*?(?=\n\[|\Z)', '\n', text, flags=re.MULTILINE)
+if count != 1:
+    raise SystemExit(f"failed to drop [patch.crates-io] section in {path}")
+path.write_text(text)
+PY
+}
+
+prepare_staging_tree
+rewrite_workspace_manifest
+cp "$LOCKFILE_PATH" "$STAGING_DIR/Cargo.lock"
+
+if (( PREPARE_ONLY == 1 )); then
+  printf 'Prepared helper staging tree: %s\n' "$STAGING_DIR"
+  printf 'Lane: %s\n' "$LANE"
+  printf 'Output target: %s\n' "$OUTPUT"
+  printf 'Cargo target dir: %s\n' "$TARGET_DIR"
+  exit 0
+fi
+
+mkdir -p "$(dirname "$OUTPUT")"
+mkdir -p "$TARGET_DIR"
+(
+  cd "$STAGING_DIR"
+  CARGO_TARGET_DIR="$TARGET_DIR" cargo build --locked --release --features helper-cairo-214 --bin uc
+)
+cp "$TARGET_DIR/release/uc" "$OUTPUT"
+chmod +x "$OUTPUT"
+
+printf 'Built helper lane %s -> %s\n' "$LANE" "$OUTPUT"
+printf 'Export with: export UC_NATIVE_TOOLCHAIN_%s_BIN=%q\n' "${LANE//./_}" "$OUTPUT"

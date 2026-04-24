@@ -14,16 +14,23 @@ use cairo_lang_defs::ids::ModuleId;
 use cairo_lang_defs::ids::NamedLanguageElementId;
 #[cfg(feature = "native-compile")]
 use cairo_lang_defs::ids::TopLevelLanguageElementId;
-#[cfg(feature = "native-compile")]
+#[cfg(all(feature = "native-compile", not(feature = "helper-cairo-214")))]
 use cairo_lang_filesystem::db::{
     ensure_keyed_file_override_slots, files_group_input, init_dev_corelib, set_crate_configs_input,
     set_file_override_content_keyed, CrateConfigurationInput, FilesGroup,
+};
+#[cfg(all(feature = "native-compile", feature = "helper-cairo-214"))]
+use cairo_lang_filesystem::db::{
+    file_overrides, files_group_input, init_dev_corelib, set_crate_configs_input,
+    update_file_overrides_input_helper, CrateConfigurationInput, FilesGroup,
 };
 #[cfg(feature = "native-compile")]
 use cairo_lang_filesystem::detect::detect_corelib;
 #[cfg(feature = "native-compile")]
 use cairo_lang_filesystem::ids::{BlobLongId, CrateId, CrateInput, CrateLongId, Directory};
-#[cfg(feature = "native-compile")]
+#[cfg(all(feature = "native-compile", feature = "helper-cairo-214"))]
+use cairo_lang_filesystem::ids::{FileId, FileInput, FileLongId};
+#[cfg(all(feature = "native-compile", not(feature = "helper-cairo-214")))]
 use cairo_lang_filesystem::ids::{FileId, FileLongId};
 #[cfg(feature = "native-compile")]
 use cairo_lang_lowering::cache::generate_crate_cache;
@@ -31,9 +38,11 @@ use cairo_lang_lowering::cache::generate_crate_cache;
 use cairo_lang_lowering::optimizations::config::Optimizations;
 #[cfg(feature = "native-compile")]
 use cairo_lang_lowering::utils::InliningStrategy;
-#[cfg(feature = "native-compile")]
+#[cfg(all(feature = "native-compile", not(feature = "helper-cairo-214")))]
 use cairo_lang_semantic::db::SemanticGroupEx;
-#[cfg(feature = "native-compile")]
+#[cfg(all(feature = "native-compile", feature = "helper-cairo-214"))]
+use cairo_lang_starknet::compile::compile_prepared_db as compile_starknet_prepared_db;
+#[cfg(all(feature = "native-compile", not(feature = "helper-cairo-214")))]
 use cairo_lang_starknet::compile::{
     compile_prepared_db as compile_starknet_prepared_db,
     compile_prepared_db_without_diagnostics as compile_starknet_prepared_db_without_diagnostics,
@@ -51,6 +60,8 @@ use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use notify::event::{ModifyKind as NotifyModifyKind, RenameMode as NotifyRenameMode};
 #[cfg(feature = "native-compile")]
 use notify::{EventKind as NotifyEventKind, RecommendedWatcher, RecursiveMode, Watcher};
+#[cfg(all(feature = "native-compile", feature = "helper-cairo-214"))]
+use salsa::Setter;
 #[cfg(feature = "native-compile")]
 use scarb_stable_hash::short_hash;
 use serde::{Deserialize, Serialize};
@@ -2368,13 +2379,24 @@ impl NativeCompileSupportIssue {
                     native_toolchain_env_var_name_for_major_minor(requested.split('.').take(2).collect::<Vec<_>>().join(".").as_str());
                 vec![
                     format!("Use a uc binary built against Cairo {requested} for this project."),
+                    format!("Or run `./scripts/build_native_toolchain_helper.sh --lane {}` to build a compatible helper lane.", requested.split('.').take(2).collect::<Vec<_>>().join(".")),
                     format!("Or set `{helper_env}` to a compatible helper binary."),
                 ]
             }
-            Self::MissingToolchainHelper { helper_env, .. } => vec![format!(
-                "Set `{helper_env}` to the path of a uc binary built with the required cairo-lang lane."
-            )],
+            Self::MissingToolchainHelper {
+                helper_env,
+                requested,
+            } => vec![
+                format!(
+                    "Run `./scripts/build_native_toolchain_helper.sh --lane {}` to build the required helper lane.",
+                    requested.split('.').take(2).collect::<Vec<_>>().join(".")
+                ),
+                format!(
+                    "Set `{helper_env}` to the path of a uc binary built with the required cairo-lang lane."
+                ),
+            ],
             Self::InvalidToolchainHelper { helper_env, .. } => vec![
+                "Rebuild the helper with `./scripts/build_native_toolchain_helper.sh --lane <major.minor>` if the binary is stale or missing.".to_string(),
                 format!("Point `{helper_env}` at an executable uc binary for the required Cairo lane."),
             ],
         }
@@ -7831,16 +7853,81 @@ fn compile_native_casm_contract(
     contract_class: ContractClass,
     max_casm_bytecode_size: usize,
 ) -> Result<CasmContractClass> {
+    #[cfg(not(feature = "helper-cairo-214"))]
     let extracted_program = contract_class
         .extract_sierra_program(false)
         .context("failed to extract native Sierra program for CASM emission")?;
-    CasmContractClass::from_contract_class(
+    #[cfg(not(feature = "helper-cairo-214"))]
+    let casm = CasmContractClass::from_contract_class(
         contract_class,
         extracted_program,
         false,
         max_casm_bytecode_size,
-    )
-    .context("failed to compile native CASM contract class")
+    );
+    #[cfg(feature = "helper-cairo-214")]
+    let casm =
+        CasmContractClass::from_contract_class(contract_class, false, max_casm_bytecode_size);
+    casm.context("failed to compile native CASM contract class")
+}
+
+#[cfg(all(feature = "native-compile", feature = "helper-cairo-214"))]
+fn compile_starknet_prepared_db_without_diagnostics(
+    db: &RootDatabase,
+    contracts: &[&ContractDeclaration],
+    compiler_config: CompilerConfig<'_>,
+) -> Result<Vec<ContractClass>> {
+    compile_starknet_prepared_db(db, contracts, compiler_config)
+}
+
+#[cfg(all(feature = "native-compile", feature = "helper-cairo-214"))]
+fn ensure_keyed_file_override_slots(
+    _db: &mut RootDatabase,
+    _files: impl IntoIterator<Item = FileInput>,
+) -> usize {
+    0
+}
+
+#[cfg(all(feature = "native-compile", feature = "helper-cairo-214"))]
+fn set_file_override_content_keyed(
+    db: &mut RootDatabase,
+    file: FileInput,
+    content: Option<Arc<str>>,
+) -> bool {
+    let overrides = update_file_overrides_input_helper(db, file, content);
+    files_group_input(db)
+        .set_file_overrides(db)
+        .to(Some(overrides));
+    true
+}
+
+#[cfg(feature = "native-compile")]
+fn native_set_skip_unused_import_diagnostics(
+    db: &mut RootDatabase,
+    skip_unused_import_diagnostics: bool,
+) {
+    #[cfg(not(feature = "helper-cairo-214"))]
+    db.set_skip_unused_import_diagnostics(skip_unused_import_diagnostics);
+    #[cfg(feature = "helper-cairo-214")]
+    let _ = (db, skip_unused_import_diagnostics);
+}
+
+#[cfg(feature = "native-compile")]
+fn native_removed_override_slot_exists(
+    db: &RootDatabase,
+    _file_id: FileId,
+    #[cfg(not(feature = "helper-cairo-214"))] file: &cairo_lang_filesystem::ids::FileInput,
+) -> bool {
+    #[cfg(not(feature = "helper-cairo-214"))]
+    {
+        files_group_input(db)
+            .keyed_file_overrides(db)
+            .as_ref()
+            .is_some_and(|overrides| overrides.contains_key(file))
+    }
+    #[cfg(feature = "helper-cairo-214")]
+    {
+        file_overrides(db).contains_key(&_file_id)
+    }
 }
 
 #[cfg(feature = "native-compile")]
@@ -9161,7 +9248,10 @@ fn native_restore_crate_cache_into_db(
         updated = true;
     }
     if updated {
+        #[cfg(not(feature = "helper-cairo-214"))]
         set_crate_configs_input(db, crate_configs);
+        #[cfg(feature = "helper-cairo-214")]
+        set_crate_configs_input(db, Some(crate_configs));
     }
     stats
 }
@@ -9423,7 +9513,7 @@ fn native_seeded_root_database(
         .with_default_plugin_suite(starknet_plugin_suite())
         .build()
         .context("failed to initialize native cairo compiler database")?;
-    db.set_skip_unused_import_diagnostics(skip_unused_import_diagnostics);
+    native_set_skip_unused_import_diagnostics(&mut db, skip_unused_import_diagnostics);
     init_dev_corelib(&mut db, corelib_src.to_path_buf());
     tracing::debug!(
         corelib_src = %corelib_src.display(),
@@ -10456,10 +10546,12 @@ fn native_apply_file_keyed_session_updates(
         )?;
         let file_id = FileId::new(db, FileLongId::OnDisk(absolute_path));
         let file = db.file_input(file_id).clone();
-        let slot_exists = files_group_input(db)
-            .keyed_file_overrides(db)
-            .as_ref()
-            .is_some_and(|overrides| overrides.contains_key(&file));
+        let slot_exists = native_removed_override_slot_exists(
+            db,
+            file_id,
+            #[cfg(not(feature = "helper-cairo-214"))]
+            &file,
+        );
         if slot_exists {
             removed_updates.push((file, None));
         }

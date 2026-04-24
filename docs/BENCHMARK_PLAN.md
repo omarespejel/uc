@@ -41,6 +41,14 @@ Examples of native-ineligible reasons that should be reported explicitly:
 - legacy package editions (`2023_01`, `2023_10`, `2023_11`) without an exact `[package].cairo-version`
 - missing or invalid `UC_NATIVE_TOOLCHAIN_<major>_<minor>_BIN` helper lanes
 
+## Stability Rule
+Do not rely on aggregate medians alone.
+Real-repo benchmark reports must surface repo-level instability when a lane shows a materially noisy sample window, including outlier-heavy cases where:
+- `p95 / p50 >= 1.20`, or
+- `max / p50 >= 1.25`
+
+These warnings are not automatic failures, but they must be called out explicitly before drawing “faster/slower” conclusions from the aggregate summary.
+
 ## Comparator Rule
 Every build-path engine change must run dual-run comparison (`scarb-direct` vs `uc build`) and record:
 - artifact mismatch count,
@@ -58,6 +66,7 @@ Every build-path engine change must run dual-run comparison (`scarb-direct` vs `
 ./benchmarks/scripts/run_dual_run_comparator.sh
 
 # Real repo support-matrix and strict-native benchmark sweep
+./scripts/build_native_toolchain_helper.sh --lane 2.14
 UC_NATIVE_TOOLCHAIN_2_14_BIN=/abs/path/to/uc-cairo214-helper \
 ./benchmarks/scripts/run_real_repo_benchmarks.sh \
   --uc-bin /abs/path/to/uc \
