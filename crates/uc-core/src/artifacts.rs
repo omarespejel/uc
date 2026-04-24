@@ -34,6 +34,7 @@ const DEFAULT_SUFFIXES: [&str; 7] = [
 const MAX_ARTIFACT_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 const SIERRA_NORMALIZATION_SCHEMA_TAG: &str = "sierra-normalization-v3";
 const CONTRACT_CLASS_NORMALIZATION_SCHEMA_TAG: &str = "contract-class-normalization-v1";
+const STARKNET_ARTIFACTS_MANIFEST_SCHEMA_TAG: &str = "starknet-artifacts-manifest-normalization-v1";
 
 pub fn collect_artifact_digests(target_root: &Path) -> Result<Vec<ArtifactDigest>> {
     if !target_root.exists() {
@@ -68,6 +69,8 @@ pub fn collect_artifact_digests(target_root: &Path) -> Result<Vec<ArtifactDigest
             hash_file_with_limit(path)?
         } else if name.ends_with(".contract_class.json") {
             hash_contract_class_json_semantic(path)?
+        } else if name.ends_with(".starknet_artifacts.json") {
+            hash_starknet_artifacts_manifest_semantic(path)?
         } else {
             hash_file_with_limit(path)?
         };
@@ -198,6 +201,73 @@ fn hash_sierra_json_semantic(path: &Path) -> Result<(String, u64)> {
         .with_context(|| format!("failed to serialize normalized JSON {}", path.display()))?;
     let mut hasher = Hasher::new();
     hasher.update(SIERRA_NORMALIZATION_SCHEMA_TAG.as_bytes());
+    hasher.update(&canonical_bytes);
+    Ok((hasher.finalize().to_hex().to_string(), metadata.len()))
+}
+
+fn starknet_artifact_manifest_entry_sort_key(value: &Value) -> (String, String) {
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let canonical = serde_json::to_string(&canonicalize_json(value))
+        .expect("canonicalized Value should always serialize");
+    (id, canonical)
+}
+
+fn supported_starknet_artifacts_manifest_version(value: &Value) -> bool {
+    match value.get("version") {
+        None => true,
+        Some(Value::Number(number)) => number.as_u64() == Some(1),
+        Some(Value::String(text)) => text.trim() == "1",
+        _ => false,
+    }
+}
+
+fn normalize_starknet_artifacts_manifest(value: &mut Value) {
+    let Some(contracts) = value.get_mut("contracts").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for contract in contracts.iter_mut() {
+        let Some(artifacts) = contract.get_mut("artifacts").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        artifacts
+            .entry("casm".to_string())
+            .or_insert(serde_json::Value::Null);
+    }
+    contracts.sort_by_key(starknet_artifact_manifest_entry_sort_key);
+}
+
+fn hash_starknet_artifacts_manifest_semantic(path: &Path) -> Result<(String, u64)> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    if metadata.len() > MAX_ARTIFACT_SIZE_BYTES {
+        bail!(
+            "artifact {} exceeds size limit ({} bytes > {} bytes)",
+            path.display(),
+            metadata.len(),
+            MAX_ARTIFACT_SIZE_BYTES
+        );
+    }
+
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut value: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse JSON {}", path.display()))?;
+    if !supported_starknet_artifacts_manifest_version(&value) {
+        tracing::warn!(
+            path = %path.display(),
+            "unsupported starknet artifacts manifest schema; falling back to raw hash"
+        );
+        return hash_file_with_limit(path);
+    }
+    normalize_starknet_artifacts_manifest(&mut value);
+    let canonical = canonicalize_json(&value);
+    let canonical_bytes = serde_json::to_vec(&canonical)
+        .with_context(|| format!("failed to serialize normalized JSON {}", path.display()))?;
+    let mut hasher = Hasher::new();
+    hasher.update(STARKNET_ARTIFACTS_MANIFEST_SCHEMA_TAG.as_bytes());
     hasher.update(&canonical_bytes);
     Ok((hasher.finalize().to_hex().to_string(), metadata.len()))
 }
@@ -769,7 +839,8 @@ mod tests {
     use super::{
         canonicalize_json, collect_artifact_digests, compare_artifact_sets,
         hash_contract_class_json_semantic, hash_file_with_limit, hash_sierra_json_semantic,
-        normalize_sierra_json_ids, validate_supported_sierra_schema, ArtifactDigest,
+        hash_starknet_artifacts_manifest_semantic, normalize_sierra_json_ids,
+        validate_supported_sierra_schema, ArtifactDigest,
     };
     use serde_json::json;
     use std::fs;
@@ -878,6 +949,267 @@ mod tests {
         assert!(mismatches
             .iter()
             .any(|m| m.relative_path == "c.sierra" && m.baseline_hash.is_none()));
+    }
+
+    #[test]
+    fn starknet_artifacts_manifest_semantic_hash_ignores_whitespace_and_contract_order() {
+        let path_a = unique_test_path("starknet-artifacts-a");
+        let path_b = unique_test_path("starknet-artifacts-b");
+        let contract_a = json!({
+            "id": "pkg_a",
+            "package_name": "pkg",
+            "contract_name": "A",
+            "module_path": "pkg::a",
+            "artifacts": {"sierra": "a.contract_class.json", "casm": "a.compiled_contract_class.json"}
+        });
+        let contract_b = json!({
+            "id": "pkg_b",
+            "package_name": "pkg",
+            "contract_name": "B",
+            "module_path": "pkg::b",
+            "artifacts": {"sierra": "b.contract_class.json"}
+        });
+        let body_a = json!({"version": 1, "contracts": [contract_b.clone(), contract_a.clone()]});
+        let body_b = json!({"contracts": [contract_a, contract_b], "version": 1});
+        fs::write(
+            &path_a,
+            serde_json::to_string_pretty(&body_a).expect("encode manifest a"),
+        )
+        .expect("failed to write manifest a");
+        fs::write(
+            &path_b,
+            serde_json::to_vec(&body_b).expect("encode manifest b"),
+        )
+        .expect("failed to write manifest b");
+
+        let hash_a = hash_starknet_artifacts_manifest_semantic(&path_a)
+            .expect("failed to hash manifest a")
+            .0;
+        let hash_b = hash_starknet_artifacts_manifest_semantic(&path_b)
+            .expect("failed to hash manifest b")
+            .0;
+        assert_eq!(
+            hash_a, hash_b,
+            "semantic manifest hash should ignore JSON formatting and contract ordering"
+        );
+
+        let _ = fs::remove_file(&path_a);
+        let _ = fs::remove_file(&path_b);
+    }
+
+    #[test]
+    fn starknet_artifacts_manifest_semantic_hash_changes_on_artifact_reference_change() {
+        let path_a = unique_test_path("starknet-artifacts-semantic-a");
+        let path_b = unique_test_path("starknet-artifacts-semantic-b");
+        let body_a = json!({
+            "version": 1,
+            "contracts": [{
+                "id": "pkg_a",
+                "package_name": "pkg",
+                "contract_name": "A",
+                "module_path": "pkg::a",
+                "artifacts": {"sierra": "a.contract_class.json", "casm": "a.compiled_contract_class.json"}
+            }]
+        });
+        let body_b = json!({
+            "version": 1,
+            "contracts": [{
+                "id": "pkg_a",
+                "package_name": "pkg",
+                "contract_name": "A",
+                "module_path": "pkg::a",
+                "artifacts": {"sierra": "a.contract_class.json", "casm": "changed.compiled_contract_class.json"}
+            }]
+        });
+        fs::write(
+            &path_a,
+            serde_json::to_vec(&body_a).expect("encode semantic manifest a"),
+        )
+        .expect("failed to write semantic manifest a");
+        fs::write(
+            &path_b,
+            serde_json::to_vec(&body_b).expect("encode semantic manifest b"),
+        )
+        .expect("failed to write semantic manifest b");
+
+        let hash_a = hash_starknet_artifacts_manifest_semantic(&path_a)
+            .expect("failed to hash semantic manifest a")
+            .0;
+        let hash_b = hash_starknet_artifacts_manifest_semantic(&path_b)
+            .expect("failed to hash semantic manifest b")
+            .0;
+        assert_ne!(
+            hash_a, hash_b,
+            "semantic manifest hash must change when artifact references change"
+        );
+
+        let _ = fs::remove_file(&path_a);
+        let _ = fs::remove_file(&path_b);
+    }
+
+    #[test]
+    fn starknet_artifacts_manifest_semantic_hash_treats_missing_and_null_casm_equivalently() {
+        let path_a = unique_test_path("starknet-artifacts-null-casm-a");
+        let path_b = unique_test_path("starknet-artifacts-null-casm-b");
+        let body_a = json!({
+            "version": 1,
+            "contracts": [{
+                "id": "pkg_a",
+                "package_name": "pkg",
+                "contract_name": "A",
+                "module_path": "pkg::a",
+                "artifacts": {"sierra": "a.contract_class.json"}
+            }]
+        });
+        let body_b = json!({
+            "version": 1,
+            "contracts": [{
+                "id": "pkg_a",
+                "package_name": "pkg",
+                "contract_name": "A",
+                "module_path": "pkg::a",
+                "artifacts": {"sierra": "a.contract_class.json", "casm": null}
+            }]
+        });
+        fs::write(
+            &path_a,
+            serde_json::to_vec(&body_a).expect("encode missing-casm manifest"),
+        )
+        .expect("failed to write missing-casm manifest");
+        fs::write(
+            &path_b,
+            serde_json::to_vec(&body_b).expect("encode null-casm manifest"),
+        )
+        .expect("failed to write null-casm manifest");
+
+        let hash_a = hash_starknet_artifacts_manifest_semantic(&path_a)
+            .expect("failed to hash missing-casm manifest")
+            .0;
+        let hash_b = hash_starknet_artifacts_manifest_semantic(&path_b)
+            .expect("failed to hash null-casm manifest")
+            .0;
+        assert_eq!(
+            hash_a, hash_b,
+            "manifest semantic hash should treat missing and null casm identically"
+        );
+
+        let _ = fs::remove_file(&path_a);
+        let _ = fs::remove_file(&path_b);
+    }
+
+    #[test]
+    fn starknet_artifacts_manifest_semantic_hash_handles_empty_contracts() {
+        let path = unique_test_path("starknet-artifacts-empty");
+        let body = json!({"version": 1, "contracts": []});
+        fs::write(
+            &path,
+            serde_json::to_vec(&body).expect("encode empty manifest"),
+        )
+        .expect("failed to write empty manifest");
+
+        let result = hash_starknet_artifacts_manifest_semantic(&path);
+        assert!(
+            result.is_ok(),
+            "empty contracts array should hash successfully"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn starknet_artifacts_manifest_semantic_hash_handles_missing_contracts() {
+        let path = unique_test_path("starknet-artifacts-missing-contracts");
+        let body = json!({"version": 1});
+        fs::write(
+            &path,
+            serde_json::to_vec(&body).expect("encode manifest without contracts"),
+        )
+        .expect("failed to write manifest without contracts");
+
+        let result = hash_starknet_artifacts_manifest_semantic(&path);
+        assert!(
+            result.is_ok(),
+            "missing contracts field should hash successfully"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn starknet_artifacts_manifest_semantic_hash_sorts_entries_without_id_deterministically() {
+        let path_a = unique_test_path("starknet-artifacts-no-id-a");
+        let path_b = unique_test_path("starknet-artifacts-no-id-b");
+        let entry_a = json!({
+            "package_name": "pkg-a",
+            "contract_name": "A",
+            "module_path": "pkg::a",
+            "artifacts": {"sierra": "a.contract_class.json"}
+        });
+        let entry_b = json!({
+            "package_name": "pkg-b",
+            "contract_name": "B",
+            "module_path": "pkg::b",
+            "artifacts": {"sierra": "b.contract_class.json"}
+        });
+        let body_a = json!({"version": 1, "contracts": [entry_b.clone(), entry_a.clone()]});
+        let body_b = json!({"version": 1, "contracts": [entry_a, entry_b]});
+        fs::write(
+            &path_a,
+            serde_json::to_vec(&body_a).expect("encode no-id manifest a"),
+        )
+        .expect("failed to write no-id manifest a");
+        fs::write(
+            &path_b,
+            serde_json::to_vec(&body_b).expect("encode no-id manifest b"),
+        )
+        .expect("failed to write no-id manifest b");
+
+        let hash_a = hash_starknet_artifacts_manifest_semantic(&path_a)
+            .expect("failed to hash no-id manifest a")
+            .0;
+        let hash_b = hash_starknet_artifacts_manifest_semantic(&path_b)
+            .expect("failed to hash no-id manifest b")
+            .0;
+        assert_eq!(
+            hash_a, hash_b,
+            "entries without id should sort deterministically by content"
+        );
+
+        let _ = fs::remove_file(&path_a);
+        let _ = fs::remove_file(&path_b);
+    }
+
+    #[test]
+    fn starknet_artifacts_manifest_semantic_hash_falls_back_for_unsupported_version() {
+        let path = unique_test_path("starknet-artifacts-unsupported-version");
+        let body = json!({
+            "version": 2,
+            "contracts": [{
+                "id": "pkg_a",
+                "package_name": "pkg",
+                "contract_name": "A",
+                "module_path": "pkg::a",
+                "artifacts": {"sierra": "a.contract_class.json"}
+            }]
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&body).expect("encode unsupported manifest"),
+        )
+        .expect("failed to write unsupported manifest");
+
+        let semantic_hash = hash_starknet_artifacts_manifest_semantic(&path)
+            .expect("failed to hash unsupported manifest")
+            .0;
+        let raw_hash = hash_file_with_limit(&path)
+            .expect("failed to raw-hash unsupported manifest")
+            .0;
+        assert_eq!(
+            semantic_hash, raw_hash,
+            "unsupported manifest versions should use the raw hash path"
+        );
+
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

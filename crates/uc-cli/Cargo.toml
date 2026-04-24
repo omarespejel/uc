@@ -34,6 +34,7 @@ cairo-lang-starknet-classes = { workspace = true, optional = true }
 clap.workspace = true
 libc.workspace = true
 notify = { workspace = true, optional = true }
+postcard.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 scarb-stable-hash = { workspace = true, optional = true }

@@ -47,7 +47,7 @@ impl From<CrateIdentifier> for String {
 
 /// Same as `CrateConfiguration` but without interning the root directory.
 /// This is used to avoid the need to intern the file id inside salsa database inputs.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::Update)]
 pub struct CrateConfigurationInput {
     pub root: DirectoryInput,
     pub settings: CrateSettings,
@@ -228,6 +228,27 @@ pub struct ExperimentalFeaturesConfig {
 pub type ExtAsVirtual =
     Arc<dyn for<'a> Fn(&'a dyn Database, salsa::Id) -> &'a VirtualFile<'a> + Send + Sync>;
 
+fn should_log_uc_native_progress() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("UC_NATIVE_PROGRESS")
+                .ok()
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("1" | "true" | "yes" | "on")
+        )
+    })
+}
+
+fn log_uc_native_progress(message: impl AsRef<str>) {
+    if should_log_uc_native_progress() {
+        eprintln!("uc: {}", message.as_ref());
+    }
+}
+
 #[salsa::input]
 // TODO(eytan-starkware): Change this mechanism to hold input handles on the db struct outside
 // salsa mechanism, and invalidate manually.
@@ -349,9 +370,20 @@ pub fn set_crate_configs_input(
     db: &mut dyn Database,
     crate_configs: OrderedHashMap<CrateInput, CrateConfigurationInput>,
 ) {
+    let len = crate_configs.len();
+    if should_log_uc_native_progress() {
+        log_uc_native_progress(format!("set_crate_configs_input start (len={len})"));
+    }
+    let started = std::time::Instant::now();
     files_group_input(db)
         .set_crate_configs(db)
         .to(Some(crate_configs));
+    if should_log_uc_native_progress() {
+        log_uc_native_progress(format!(
+            "set_crate_configs_input finished (len={len}, elapsed_ms={:.1})",
+            started.elapsed().as_secs_f64() * 1000.0
+        ));
+    }
 }
 
 /// Ensures keyed override slots exist for the provided files.
@@ -456,19 +488,26 @@ pub fn file_overrides<'db>(db: &'db dyn Database) -> OrderedHashMap<FileId<'db>,
 pub fn crate_configs<'db>(
     db: &'db dyn Database,
 ) -> OrderedHashMap<CrateId<'db>, CrateConfiguration<'db>> {
-    let inp = files_group_input(db)
+    log_uc_native_progress("crate_configs query start");
+    let configs = files_group_input(db)
         .crate_configs(db)
         .as_ref()
         .cloned()
         .unwrap_or_default();
-    inp.iter()
+    let resolved = configs
+        .iter()
         .map(|(crate_input, config)| {
             (
                 crate_input.clone().into_crate_long_id(db).intern(db),
                 config.clone().into_crate_configuration(db),
             )
         })
-        .collect()
+        .collect::<OrderedHashMap<_, _>>();
+    log_uc_native_progress(format!(
+        "crate_configs query finished (resolved={})",
+        resolved.len()
+    ));
+    resolved
 }
 
 #[salsa::tracked(returns(ref))]
@@ -529,6 +568,11 @@ pub fn update_crate_configuration_input_helper(
     root: Option<CrateConfiguration<'_>>,
 ) -> OrderedHashMap<CrateInput, CrateConfigurationInput> {
     let crt = db.crate_input(crt);
+    if should_log_uc_native_progress() {
+        log_uc_native_progress(format!(
+            "update_crate_configuration_input_helper start ({crt:?})"
+        ));
+    }
     let db_ref: &dyn Database = db;
     let mut crate_configs = files_group_input(db_ref)
         .crate_configs(db_ref)
@@ -538,6 +582,12 @@ pub fn update_crate_configuration_input_helper(
         Some(root) => crate_configs.insert(crt.clone(), db.crate_configuration_input(root).clone()),
         None => crate_configs.swap_remove(crt),
     };
+    if should_log_uc_native_progress() {
+        log_uc_native_progress(format!(
+            "update_crate_configuration_input_helper finished ({crt:?}, len={})",
+            crate_configs.len()
+        ));
+    }
     crate_configs
 }
 

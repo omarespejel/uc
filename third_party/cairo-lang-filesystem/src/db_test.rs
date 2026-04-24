@@ -2,7 +2,9 @@ use cairo_lang_utils::Intern;
 
 use super::FilesGroup;
 use crate::cfg::{Cfg, CfgSet};
-use crate::db::{files_group_input, set_file_override_content_keyed, CrateConfiguration};
+use crate::db::{
+    files_group_input, set_file_override_content_keyed, CrateConfiguration,
+};
 use crate::flag::{Flag, FlagsGroup};
 use crate::ids::{CrateLongId, Directory, FlagId, FlagLongId, SmolStrId};
 use crate::test_utils::FilesDatabaseForTesting;

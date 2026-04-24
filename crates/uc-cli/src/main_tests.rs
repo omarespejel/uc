@@ -15,6 +15,15 @@ fn unique_test_dir(prefix: &str) -> PathBuf {
     dir
 }
 
+#[cfg(feature = "native-compile")]
+fn unique_platform_absolute_fixture_path(prefix: &str) -> String {
+    normalize_fingerprint_path(
+        &std::env::temp_dir()
+            .join(format!("{prefix}-{}", std::process::id()))
+            .join("src/lib.cairo"),
+    )
+}
+
 #[cfg(unix)]
 fn unique_unix_socket_path(prefix: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -68,6 +77,12 @@ impl ScopedEnvVar {
         std::env::set_var(key, value);
         Self { key, previous }
     }
+
+    fn unset_with_lock(_guard: &std::sync::MutexGuard<'_, ()>, key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::remove_var(key);
+        Self { key, previous }
+    }
 }
 
 impl Drop for ScopedEnvVar {
@@ -78,6 +93,51 @@ impl Drop for ScopedEnvVar {
             std::env::remove_var(self.key);
         }
     }
+}
+
+#[cfg(feature = "native-compile")]
+fn native_progress_hook_lock() -> &'static Mutex<()> {
+    static LOCK: TestOnceLock<Mutex<()>> = TestOnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[cfg(feature = "native-compile")]
+struct NativeProgressHookRestore {
+    previous: Option<NativeProgressTestHook>,
+    _integration_guard: std::sync::MutexGuard<'static, ()>,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(feature = "native-compile")]
+impl Drop for NativeProgressHookRestore {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        let _ = set_native_progress_test_hook(previous);
+    }
+}
+
+#[cfg(feature = "native-compile")]
+fn capture_native_progress_messages(
+    integration_guard: std::sync::MutexGuard<'static, ()>,
+) -> (Arc<Mutex<Vec<String>>>, NativeProgressHookRestore) {
+    let guard = native_progress_hook_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let messages = Arc::new(Mutex::new(Vec::new()));
+    let sink = messages.clone();
+    let previous = set_native_progress_test_hook(Some(Arc::new(move |message| {
+        sink.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(message);
+    })));
+    (
+        messages,
+        NativeProgressHookRestore {
+            previous,
+            _integration_guard: integration_guard,
+            _guard: guard,
+        },
+    )
 }
 
 fn scarb_available() -> bool {
@@ -403,7 +463,7 @@ fn daemon_build_request_payload_fields_override_hybrid_root_fields() {
 
 #[cfg(feature = "native-compile")]
 #[test]
-fn starknet_artifact_files_omits_casm_when_none() {
+fn starknet_artifact_files_serializes_null_casm_when_none() {
     let files = StarknetArtifactFiles {
         sierra: "demo.contract_class.json".to_string(),
         casm: None,
@@ -414,8 +474,8 @@ fn starknet_artifact_files_omits_casm_when_none() {
         Some("demo.contract_class.json")
     );
     assert!(
-        json.get("casm").is_none(),
-        "casm key should be omitted when not generated"
+        json.get("casm").is_some_and(serde_json::Value::is_null),
+        "casm key should be encoded as null to match scarb's manifest schema"
     );
 }
 
@@ -5851,28 +5911,62 @@ fn native_test_compile_session_signature(
 }
 
 #[cfg(feature = "native-compile")]
+fn write_native_tracked_source_fixtures(
+    workspace_root: &Path,
+    tracked_sources: &BTreeMap<String, NativeTrackedFileState>,
+) -> BTreeMap<String, NativeTrackedFileState> {
+    let mut materialized = BTreeMap::new();
+    for relative in tracked_sources.keys() {
+        let path = workspace_root.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("failed to create tracked source parent");
+        }
+        fs::write(
+            &path,
+            format!("// fixture for {relative}\nfn fixture() -> felt252 {{ 1 }}\n"),
+        )
+        .expect("failed to write tracked source fixture");
+        let metadata = fs::metadata(&path).expect("failed to stat tracked source fixture");
+        materialized.insert(
+            relative.clone(),
+            NativeTrackedFileState {
+                size_bytes: metadata.len(),
+                modified_unix_ms: metadata_modified_unix_ms(&metadata)
+                    .expect("tracked source fixture mtime"),
+            },
+        );
+    }
+    materialized
+}
+
+#[cfg(feature = "native-compile")]
 #[test]
 fn native_compile_session_image_round_trip_restores_tracked_sources_and_dependency_index() {
     let dir = unique_test_dir("uc-native-session-image-roundtrip");
     let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
-    let tracked_sources = BTreeMap::from([
-        (
-            "src/lib.cairo".to_string(),
-            NativeTrackedFileState {
-                size_bytes: 42,
-                modified_unix_ms: 101,
-            },
-        ),
-        (
-            "src/math.cairo".to_string(),
-            NativeTrackedFileState {
-                size_bytes: 12,
-                modified_unix_ms: 102,
-            },
-        ),
-    ]);
+    let tracked_sources = write_native_tracked_source_fixtures(
+        &dir,
+        &BTreeMap::from([
+            (
+                "src/lib.cairo".to_string(),
+                NativeTrackedFileState {
+                    size_bytes: 42,
+                    modified_unix_ms: 101,
+                },
+            ),
+            (
+                "src/math.cairo".to_string(),
+                NativeTrackedFileState {
+                    size_bytes: 12,
+                    modified_unix_ms: 102,
+                },
+            ),
+        ]),
+    );
     let tracked_source_bytes = native_tracked_sources_total_bytes(&tracked_sources)
         .expect("tracked source bytes should be computed");
+    let tracked_sources_content_hash =
+        native_tracked_sources_content_hash(&dir, &tracked_sources).expect("content hash");
     let dependencies = BTreeMap::from([(
         "demo::token".to_string(),
         BTreeSet::from(["src/lib.cairo".to_string(), "src/math.cairo".to_string()]),
@@ -5890,6 +5984,7 @@ fn native_compile_session_image_round_trip_restores_tracked_sources_and_dependen
         source_root_modified_unix_ms: 777,
         tracked_sources: tracked_sources.clone(),
         tracked_source_bytes,
+        tracked_sources_content_hash: tracked_sources_content_hash.clone(),
         contract_source_dependencies: dependencies.clone(),
         contract_output_plans: plans.clone(),
         journal_cursor_applied: 33,
@@ -5897,10 +5992,15 @@ fn native_compile_session_image_round_trip_restores_tracked_sources_and_dependen
     persist_native_compile_session_image_snapshot(&dir, &snapshot)
         .expect("native session image should persist");
 
-    let restored = try_native_compile_session_image_restore(&dir, &signature, 777)
-        .expect("matching signature/root mtime should restore session image");
+    let restored =
+        try_native_compile_session_image_restore(&dir, &signature, &tracked_sources_content_hash)
+            .expect("matching signature/content hash should restore session image");
     assert_eq!(restored.tracked_sources, tracked_sources);
     assert_eq!(restored.tracked_source_bytes, tracked_source_bytes);
+    assert_eq!(
+        restored.tracked_sources_content_hash,
+        tracked_sources_content_hash
+    );
     assert_eq!(restored.contract_source_dependencies, dependencies);
     assert_eq!(restored.contract_output_plans, plans);
     assert_eq!(restored.journal_cursor_applied, 33);
@@ -5910,23 +6010,117 @@ fn native_compile_session_image_round_trip_restores_tracked_sources_and_dependen
 
 #[cfg(feature = "native-compile")]
 #[test]
-fn native_compile_session_image_restore_rejects_signature_and_root_mtime_mismatches() {
-    let dir = unique_test_dir("uc-native-session-image-invalidations");
-    let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
+fn native_tracked_sources_content_hash_accepts_absolute_dependency_paths() {
+    let dir = unique_test_dir("uc-native-content-hash-absolute-deps");
+    let dep_root = unique_test_dir("uc-native-content-hash-absolute-deps-external");
+    let dep_file = dep_root.join("registry/pkg/src/lib.cairo");
+    fs::create_dir_all(dep_file.parent().expect("dep parent"))
+        .expect("failed to create dependency source dir");
+    fs::write(&dep_file, "fn dep() -> felt252 { 7 }\n").expect("failed to write dependency file");
+
     let tracked_sources = BTreeMap::from([(
-        "src/lib.cairo".to_string(),
+        normalize_fingerprint_path(&dep_file),
         NativeTrackedFileState {
-            size_bytes: 5,
-            modified_unix_ms: 11,
+            size_bytes: fs::metadata(&dep_file).expect("dep metadata").len(),
+            modified_unix_ms: metadata_modified_unix_ms(
+                &fs::metadata(&dep_file).expect("dep metadata"),
+            )
+            .expect("dep mtime"),
         },
     )]);
+
+    let hash = native_tracked_sources_content_hash(&dir, &tracked_sources)
+        .expect("absolute dependency paths should hash successfully");
+    assert!(
+        !hash.is_empty(),
+        "absolute dependency tracked-source hash should produce a digest"
+    );
+    thread::sleep(Duration::from_millis(20));
+    fs::write(&dep_file, "fn dep() -> felt252 { 8 }\n").expect("failed to mutate dependency file");
+    let updated_tracked_sources = BTreeMap::from([(
+        normalize_fingerprint_path(&dep_file),
+        NativeTrackedFileState {
+            size_bytes: fs::metadata(&dep_file).expect("dep metadata").len(),
+            modified_unix_ms: metadata_modified_unix_ms(
+                &fs::metadata(&dep_file).expect("dep metadata"),
+            )
+            .expect("dep mtime"),
+        },
+    )]);
+    let changed_hash = native_tracked_sources_content_hash(&dir, &updated_tracked_sources)
+        .expect("mutated absolute dependency should still hash successfully");
+    assert_ne!(
+        hash, changed_hash,
+        "absolute dependency content changes must invalidate the tracked-source digest"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+    fs::remove_dir_all(&dep_root).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_tracked_sources_content_hash_rejects_parent_dir_escape_paths() {
+    let dir = unique_test_dir("uc-native-tracked-hash-parent-escape");
+    let outside_name = format!(
+        "outside-{}.cairo",
+        dir.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("fixture")
+    );
+    let outside = dir
+        .parent()
+        .expect("test dir should have parent")
+        .join(&outside_name);
+    fs::write(&outside, "fn outside() {}\n").expect("failed to write outside fixture");
+    let tracked_sources = BTreeMap::from([(
+        format!("../{outside_name}"),
+        NativeTrackedFileState {
+            size_bytes: fs::metadata(&outside).expect("outside metadata").len(),
+            modified_unix_ms: metadata_modified_unix_ms(
+                &fs::metadata(&outside).expect("outside metadata"),
+            )
+            .expect("outside mtime"),
+        },
+    )]);
+
+    let err = native_tracked_sources_content_hash(&dir, &tracked_sources)
+        .expect_err("parent-dir escape must be rejected");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("invalid components"),
+        "unexpected error for parent-dir escape: {message}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+    fs::remove_file(&outside).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_compile_session_image_restore_rejects_signature_and_content_hash_mismatches() {
+    let dir = unique_test_dir("uc-native-session-image-invalidations");
+    let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
+    let tracked_sources = write_native_tracked_source_fixtures(
+        &dir,
+        &BTreeMap::from([(
+            "src/lib.cairo".to_string(),
+            NativeTrackedFileState {
+                size_bytes: 5,
+                modified_unix_ms: 11,
+            },
+        )]),
+    );
     let tracked_source_bytes = native_tracked_sources_total_bytes(&tracked_sources)
         .expect("tracked source bytes should be computed");
+    let tracked_sources_content_hash =
+        native_tracked_sources_content_hash(&dir, &tracked_sources).expect("content hash");
     let snapshot = NativeCompileSessionImageSnapshot {
         signature_hash: native_compile_session_signature_hash(&signature),
         source_root_modified_unix_ms: 999,
         tracked_sources,
         tracked_source_bytes,
+        tracked_sources_content_hash: tracked_sources_content_hash.clone(),
         contract_source_dependencies: BTreeMap::new(),
         contract_output_plans: Vec::new(),
         journal_cursor_applied: 0,
@@ -5936,12 +6130,99 @@ fn native_compile_session_image_restore_rejects_signature_and_root_mtime_mismatc
 
     let different_signature = native_test_compile_session_signature(&dir, "manifest-blake3:other");
     assert!(
-        try_native_compile_session_image_restore(&dir, &different_signature, 999).is_none(),
+        try_native_compile_session_image_restore(
+            &dir,
+            &different_signature,
+            &tracked_sources_content_hash
+        )
+        .is_none(),
         "signature mismatch must invalidate persisted session image"
     );
+    fs::write(dir.join("src/lib.cairo"), "fn changed() -> felt252 { 2 }\n")
+        .expect("failed to mutate tracked source");
+    let changed_metadata =
+        fs::metadata(dir.join("src/lib.cairo")).expect("failed to stat mutated tracked source");
+    let changed_hash = native_tracked_sources_content_hash(
+        &dir,
+        &BTreeMap::from([(
+            "src/lib.cairo".to_string(),
+            NativeTrackedFileState {
+                size_bytes: changed_metadata.len(),
+                modified_unix_ms: metadata_modified_unix_ms(&changed_metadata)
+                    .expect("changed source mtime"),
+            },
+        )]),
+    )
+    .expect("changed content hash");
     assert!(
-        try_native_compile_session_image_restore(&dir, &signature, 1_000).is_none(),
-        "source-root mtime mismatch must invalidate persisted session image"
+        try_native_compile_session_image_restore(&dir, &signature, &changed_hash).is_none(),
+        "content hash mismatch must invalidate persisted session image"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_compile_session_image_restore_normalizes_workspace_absolute_tracked_sources() {
+    let dir = unique_test_dir("uc-native-session-image-normalize-absolute");
+    let signature = native_test_compile_session_signature(&dir, "manifest-blake3:absolute");
+    let source_file = dir.join("src/lib.cairo");
+    fs::create_dir_all(source_file.parent().expect("source parent"))
+        .expect("failed to create source dir");
+    fs::write(&source_file, "fn lib() -> felt252 { 1 }\n").expect("failed to write source file");
+    let tracked_sources = BTreeMap::from([(
+        normalize_fingerprint_path(&source_file),
+        NativeTrackedFileState {
+            size_bytes: fs::metadata(&source_file).expect("source metadata").len(),
+            modified_unix_ms: metadata_modified_unix_ms(
+                &fs::metadata(&source_file).expect("source metadata"),
+            )
+            .expect("source mtime"),
+        },
+    )]);
+    let tracked_source_bytes = native_tracked_sources_total_bytes(&tracked_sources)
+        .expect("tracked source bytes should be computed");
+    let tracked_sources_content_hash =
+        native_tracked_sources_content_hash(&dir, &tracked_sources).expect("content hash");
+    let relative_tracked_sources = BTreeMap::from([(
+        "src/lib.cairo".to_string(),
+        tracked_sources
+            .values()
+            .next()
+            .cloned()
+            .expect("absolute tracked source state should exist"),
+    )]);
+    let relative_tracked_sources_content_hash =
+        native_tracked_sources_content_hash(&dir, &relative_tracked_sources)
+            .expect("relative content hash");
+    let snapshot = NativeCompileSessionImageSnapshot {
+        signature_hash: native_compile_session_signature_hash(&signature),
+        source_root_modified_unix_ms: 123,
+        tracked_sources,
+        tracked_source_bytes,
+        tracked_sources_content_hash: tracked_sources_content_hash.clone(),
+        contract_source_dependencies: BTreeMap::new(),
+        contract_output_plans: Vec::new(),
+        journal_cursor_applied: 0,
+    };
+    persist_native_compile_session_image_snapshot(&dir, &snapshot)
+        .expect("native session image should persist");
+
+    let restored = try_native_compile_session_image_restore(
+        &dir,
+        &signature,
+        &relative_tracked_sources_content_hash,
+    )
+    .expect("normalized tracked sources should restore");
+    assert!(
+        restored.tracked_sources.contains_key("src/lib.cairo"),
+        "workspace-relative key should replace persisted absolute source path"
+    );
+    assert_eq!(restored.tracked_sources.len(), 1);
+    assert_eq!(
+        restored.tracked_sources_content_hash, relative_tracked_sources_content_hash,
+        "restored session image should carry the caller-visible relative-key hash"
     );
 
     fs::remove_dir_all(&dir).ok();
@@ -5952,24 +6233,29 @@ fn native_compile_session_image_restore_rejects_signature_and_root_mtime_mismatc
 fn native_buildinfo_sidecar_round_trip_restores_tracked_sources_and_dependency_index() {
     let dir = unique_test_dir("uc-native-buildinfo-roundtrip");
     let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
-    let tracked_sources = BTreeMap::from([
-        (
-            "src/lib.cairo".to_string(),
-            NativeTrackedFileState {
-                size_bytes: 42,
-                modified_unix_ms: 101,
-            },
-        ),
-        (
-            "src/math.cairo".to_string(),
-            NativeTrackedFileState {
-                size_bytes: 12,
-                modified_unix_ms: 102,
-            },
-        ),
-    ]);
+    let tracked_sources = write_native_tracked_source_fixtures(
+        &dir,
+        &BTreeMap::from([
+            (
+                "src/lib.cairo".to_string(),
+                NativeTrackedFileState {
+                    size_bytes: 42,
+                    modified_unix_ms: 101,
+                },
+            ),
+            (
+                "src/math.cairo".to_string(),
+                NativeTrackedFileState {
+                    size_bytes: 12,
+                    modified_unix_ms: 102,
+                },
+            ),
+        ]),
+    );
     let tracked_source_bytes = native_tracked_sources_total_bytes(&tracked_sources)
         .expect("tracked source bytes should be computed");
+    let tracked_sources_content_hash =
+        native_tracked_sources_content_hash(&dir, &tracked_sources).expect("content hash");
     let dependencies = BTreeMap::from([(
         "demo::token".to_string(),
         BTreeSet::from(["src/lib.cairo".to_string(), "src/math.cairo".to_string()]),
@@ -5987,28 +6273,120 @@ fn native_buildinfo_sidecar_round_trip_restores_tracked_sources_and_dependency_i
         777,
         tracked_sources.clone(),
         tracked_source_bytes,
+        tracked_sources_content_hash.clone(),
         dependencies.clone(),
         plans.clone(),
         33,
     );
     persist_native_buildinfo_sidecar(&dir, &buildinfo).expect("native buildinfo should persist");
 
-    let restored = try_native_buildinfo_sidecar_restore(&dir, &signature, 777)
-        .expect("matching signature/root mtime should restore buildinfo sidecar");
+    let restored =
+        try_native_buildinfo_sidecar_restore(&dir, &signature, &tracked_sources_content_hash)
+            .expect("matching signature/content hash should restore buildinfo sidecar");
     assert_eq!(restored.tracked_sources, tracked_sources);
     assert_eq!(restored.tracked_source_bytes, tracked_source_bytes);
+    assert_eq!(
+        restored.tracked_sources_content_hash,
+        tracked_sources_content_hash
+    );
     assert_eq!(restored.contract_source_dependencies, dependencies);
     assert_eq!(restored.contract_output_plans, plans);
     assert_eq!(restored.journal_cursor_applied, 33);
 
     let different_signature = native_test_compile_session_signature(&dir, "manifest-blake3:other");
     assert!(
-        try_native_buildinfo_sidecar_restore(&dir, &different_signature, 777).is_none(),
+        try_native_buildinfo_sidecar_restore(
+            &dir,
+            &different_signature,
+            &tracked_sources_content_hash
+        )
+        .is_none(),
         "signature mismatch must invalidate persisted buildinfo sidecar"
     );
+    fs::write(dir.join("src/lib.cairo"), "fn changed() -> felt252 { 2 }\n")
+        .expect("failed to mutate tracked source");
+    let changed_metadata =
+        fs::metadata(dir.join("src/lib.cairo")).expect("failed to stat mutated tracked source");
+    let changed_hash = native_tracked_sources_content_hash(
+        &dir,
+        &BTreeMap::from([(
+            "src/lib.cairo".to_string(),
+            NativeTrackedFileState {
+                size_bytes: changed_metadata.len(),
+                modified_unix_ms: metadata_modified_unix_ms(&changed_metadata)
+                    .expect("changed source mtime"),
+            },
+        )]),
+    )
+    .expect("changed content hash");
     assert!(
-        try_native_buildinfo_sidecar_restore(&dir, &signature, 778).is_none(),
-        "source-root mtime mismatch must invalidate persisted buildinfo sidecar"
+        try_native_buildinfo_sidecar_restore(&dir, &signature, &changed_hash).is_none(),
+        "content hash mismatch must invalidate persisted buildinfo sidecar"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_buildinfo_sidecar_restore_normalizes_workspace_absolute_tracked_sources() {
+    let dir = unique_test_dir("uc-native-buildinfo-normalize-absolute");
+    let signature = native_test_compile_session_signature(&dir, "manifest-blake3:absolute");
+    let source_file = dir.join("src/lib.cairo");
+    fs::create_dir_all(source_file.parent().expect("source parent"))
+        .expect("failed to create source dir");
+    fs::write(&source_file, "fn lib() -> felt252 { 1 }\n").expect("failed to write source file");
+    let tracked_sources = BTreeMap::from([(
+        normalize_fingerprint_path(&source_file),
+        NativeTrackedFileState {
+            size_bytes: fs::metadata(&source_file).expect("source metadata").len(),
+            modified_unix_ms: metadata_modified_unix_ms(
+                &fs::metadata(&source_file).expect("source metadata"),
+            )
+            .expect("source mtime"),
+        },
+    )]);
+    let tracked_source_bytes = native_tracked_sources_total_bytes(&tracked_sources)
+        .expect("tracked source bytes should be computed");
+    let tracked_sources_content_hash =
+        native_tracked_sources_content_hash(&dir, &tracked_sources).expect("content hash");
+    let relative_tracked_sources = BTreeMap::from([(
+        "src/lib.cairo".to_string(),
+        tracked_sources
+            .values()
+            .next()
+            .cloned()
+            .expect("absolute tracked source state should exist"),
+    )]);
+    let relative_tracked_sources_content_hash =
+        native_tracked_sources_content_hash(&dir, &relative_tracked_sources)
+            .expect("relative content hash");
+    let buildinfo = native_buildinfo_file_from_snapshot(
+        native_compile_session_signature_hash(&signature),
+        123,
+        tracked_sources,
+        tracked_source_bytes,
+        tracked_sources_content_hash.clone(),
+        BTreeMap::new(),
+        Vec::new(),
+        0,
+    );
+    persist_native_buildinfo_sidecar(&dir, &buildinfo).expect("native buildinfo should persist");
+
+    let restored = try_native_buildinfo_sidecar_restore(
+        &dir,
+        &signature,
+        &relative_tracked_sources_content_hash,
+    )
+    .expect("normalized tracked sources should restore from buildinfo");
+    assert!(
+        restored.tracked_sources.contains_key("src/lib.cairo"),
+        "workspace-relative key should replace persisted absolute source path"
+    );
+    assert_eq!(restored.tracked_sources.len(), 1);
+    assert_eq!(
+        restored.tracked_sources_content_hash, relative_tracked_sources_content_hash,
+        "restored buildinfo should carry the caller-visible relative-key hash"
     );
 
     fs::remove_dir_all(&dir).ok();
@@ -6019,20 +6397,26 @@ fn native_buildinfo_sidecar_round_trip_restores_tracked_sources_and_dependency_i
 fn native_buildinfo_sidecar_journal_replay_seed_restores_when_pending_delta_exists() {
     let dir = unique_test_dir("uc-native-buildinfo-journal-replay-seed");
     let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
-    let tracked_sources = BTreeMap::from([(
-        "src/lib.cairo".to_string(),
-        NativeTrackedFileState {
-            size_bytes: 42,
-            modified_unix_ms: 101,
-        },
-    )]);
+    let tracked_sources = write_native_tracked_source_fixtures(
+        &dir,
+        &BTreeMap::from([(
+            "src/lib.cairo".to_string(),
+            NativeTrackedFileState {
+                size_bytes: 42,
+                modified_unix_ms: 101,
+            },
+        )]),
+    );
     let tracked_source_bytes = native_tracked_sources_total_bytes(&tracked_sources)
         .expect("tracked source bytes should be computed");
+    let tracked_sources_content_hash =
+        native_tracked_sources_content_hash(&dir, &tracked_sources).expect("content hash");
     let buildinfo = native_buildinfo_file_from_snapshot(
         native_compile_session_signature_hash(&signature),
         777,
         tracked_sources.clone(),
         tracked_source_bytes,
+        tracked_sources_content_hash.clone(),
         BTreeMap::new(),
         Vec::new(),
         10,
@@ -6051,14 +6435,19 @@ fn native_buildinfo_sidecar_journal_replay_seed_restores_when_pending_delta_exis
     .expect("native source journal should persist");
 
     let replay_seed =
-        try_native_buildinfo_sidecar_restore_with_journal_replay(&dir, &signature, 778)
+        try_native_buildinfo_sidecar_restore_with_journal_replay(&dir, &signature, "different")
             .expect("sidecar should be usable as journal replay seed");
     assert_eq!(replay_seed.tracked_sources, tracked_sources);
     assert_eq!(replay_seed.tracked_source_bytes, tracked_source_bytes);
     assert_eq!(replay_seed.journal_cursor_applied, 10);
     assert!(
-        try_native_buildinfo_sidecar_restore_with_journal_replay(&dir, &signature, 777).is_none(),
-        "matching source-root mtime should use strict restore path instead of replay seed"
+        try_native_buildinfo_sidecar_restore_with_journal_replay(
+            &dir,
+            &signature,
+            &tracked_sources_content_hash,
+        )
+        .is_none(),
+        "matching content hash should use strict restore path instead of replay seed"
     );
 
     fs::remove_dir_all(&dir).ok();
@@ -6069,20 +6458,26 @@ fn native_buildinfo_sidecar_journal_replay_seed_restores_when_pending_delta_exis
 fn native_buildinfo_sidecar_journal_replay_seed_rejects_ambiguous_cursor_state() {
     let dir = unique_test_dir("uc-native-buildinfo-journal-replay-ambiguous");
     let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
-    let tracked_sources = BTreeMap::from([(
-        "src/lib.cairo".to_string(),
-        NativeTrackedFileState {
-            size_bytes: 5,
-            modified_unix_ms: 11,
-        },
-    )]);
+    let tracked_sources = write_native_tracked_source_fixtures(
+        &dir,
+        &BTreeMap::from([(
+            "src/lib.cairo".to_string(),
+            NativeTrackedFileState {
+                size_bytes: 5,
+                modified_unix_ms: 11,
+            },
+        )]),
+    );
     let tracked_source_bytes = native_tracked_sources_total_bytes(&tracked_sources)
         .expect("tracked source bytes should be computed");
+    let tracked_sources_content_hash =
+        native_tracked_sources_content_hash(&dir, &tracked_sources).expect("content hash");
     let buildinfo = native_buildinfo_file_from_snapshot(
         native_compile_session_signature_hash(&signature),
         800,
         tracked_sources,
         tracked_source_bytes,
+        tracked_sources_content_hash,
         BTreeMap::new(),
         Vec::new(),
         9,
@@ -6101,7 +6496,8 @@ fn native_buildinfo_sidecar_journal_replay_seed_rejects_ambiguous_cursor_state()
     .expect("native source journal should persist");
 
     assert!(
-        try_native_buildinfo_sidecar_restore_with_journal_replay(&dir, &signature, 801).is_none(),
+        try_native_buildinfo_sidecar_restore_with_journal_replay(&dir, &signature, "different")
+            .is_none(),
         "seed cursor ahead of journal applied cursor must be rejected to avoid ambiguous replay"
     );
 
@@ -6137,6 +6533,247 @@ fn native_test_db_with_single_real_crate(
     );
     set_crate_configs_input(&mut db, crate_configs);
     (db, crate_input)
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_seeded_root_database_returns_writable_db() {
+    let dir = unique_test_dir("uc-native-root-db-writable");
+    let corelib_src = dir.join("toolchain/corelib/src");
+    fs::create_dir_all(&corelib_src).expect("failed to create mock corelib src");
+    create_mock_native_corelib(&corelib_src);
+
+    let mut db =
+        native_seeded_root_database(&corelib_src).expect("root database should initialize");
+    let baseline_len = db.crate_configs().len();
+    let demo_input = CrateInput::Real {
+        name: "demo".into(),
+        discriminator: Some("demo".into()),
+    };
+    let db_ref: &dyn salsa::Database = &db;
+    let mut crate_configs = files_group_input(db_ref)
+        .crate_configs(db_ref)
+        .clone()
+        .unwrap_or_default();
+    crate_configs.insert(
+        demo_input.clone(),
+        CrateConfigurationInput {
+            root: cairo_lang_filesystem::ids::DirectoryInput::Real(dir.join("src")),
+            settings: Default::default(),
+            cache_file: None,
+        },
+    );
+
+    set_crate_configs_input(&mut db, crate_configs);
+    assert_eq!(db.crate_configs().len(), baseline_len + 1);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_setup_project_matches_cairo_setup_project_results() {
+    let dir = unique_test_dir("uc-native-setup-project");
+    let project_dir = dir.join("project");
+    let dep_dir = dir.join("dep/src");
+    let corelib_src = dir.join("toolchain/corelib/src");
+    fs::create_dir_all(project_dir.join("src")).expect("failed to create main src");
+    fs::create_dir_all(&dep_dir).expect("failed to create dep src");
+    fs::create_dir_all(&corelib_src).expect("failed to create mock corelib src");
+    create_mock_native_corelib(&corelib_src);
+    fs::write(project_dir.join("src/lib.cairo"), "fn main() {}\n")
+        .expect("failed to write main crate source");
+    fs::write(dep_dir.join("lib.cairo"), "fn dep() {}\n").expect("failed to write dep source");
+    fs::write(
+        project_dir.join("cairo_project.toml"),
+        format!(
+            "[crate_roots]\nmain = \"src\"\ndep = \"{}\"\n",
+            toml_escape_basic_string(&dep_dir.display().to_string())
+        ),
+    )
+    .expect("failed to write cairo_project.toml");
+
+    let mut expected_db = RootDatabase::builder()
+        .build()
+        .expect("failed to build expected RootDatabase");
+    init_dev_corelib(&mut expected_db, corelib_src.clone());
+    let expected_inputs =
+        setup_project(&mut expected_db, &project_dir).expect("compiler setup_project should work");
+    let expected_configs = { expected_db.crate_configs().clone() };
+
+    let mut actual_db = RootDatabase::builder()
+        .build()
+        .expect("failed to build actual RootDatabase");
+    init_dev_corelib(&mut actual_db, corelib_src);
+    let actual_inputs =
+        native_setup_project(&mut actual_db, &project_dir).expect("native setup should work");
+    let actual_configs = { actual_db.crate_configs().clone() };
+
+    assert_eq!(actual_inputs, expected_inputs);
+    assert_eq!(actual_configs, expected_configs);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_seeded_root_database_supports_native_setup_project_end_to_end() {
+    let dir = unique_test_dir("uc-native-seeded-setup-project");
+    let project_dir = dir.join("project");
+    let dep_dir = dir.join("dep/src");
+    let corelib_src = dir.join("toolchain/corelib/src");
+    fs::create_dir_all(project_dir.join("src")).expect("failed to create main src");
+    fs::create_dir_all(&dep_dir).expect("failed to create dep src");
+    fs::create_dir_all(&corelib_src).expect("failed to create mock corelib src");
+    create_mock_native_corelib(&corelib_src);
+    fs::write(project_dir.join("src/lib.cairo"), "fn main() {}\n")
+        .expect("failed to write main crate source");
+    fs::write(dep_dir.join("lib.cairo"), "fn dep() {}\n").expect("failed to write dep source");
+    fs::write(
+        project_dir.join("cairo_project.toml"),
+        format!(
+            "[crate_roots]\nmain = \"src\"\ndep = \"{}\"\n",
+            toml_escape_basic_string(&dep_dir.display().to_string())
+        ),
+    )
+    .expect("failed to write cairo_project.toml");
+
+    let mut db =
+        native_seeded_root_database(&corelib_src).expect("root database should initialize");
+    let baseline_len = db.crate_configs().len();
+    let main_crate_inputs =
+        native_setup_project(&mut db, &project_dir).expect("native seeded setup should work");
+    let main_crate_ids = CrateInput::into_crate_ids(&db, main_crate_inputs.iter().cloned());
+
+    assert_eq!(
+        db.crate_configs().len(),
+        baseline_len + main_crate_inputs.len(),
+        "seeded native setup should add crate configs for every discovered project crate"
+    );
+    assert!(
+        !main_crate_inputs.is_empty(),
+        "fixture should expose at least one project crate"
+    );
+    for crate_id in &main_crate_ids {
+        assert!(
+            db.crate_configs().contains_key(crate_id),
+            "seeded native setup should populate crate config for {crate_id:?}"
+        );
+    }
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_resolve_contracts_from_output_plans_matches_find_contracts() {
+    let dir = unique_test_dir("uc-native-contract-discovery-fast-path");
+    let project_dir = dir.join("project");
+    let corelib_src = dir.join("toolchain/corelib/src");
+    fs::create_dir_all(project_dir.join("src")).expect("failed to create main src");
+    fs::create_dir_all(&corelib_src).expect("failed to create mock corelib src");
+    create_mock_native_corelib(&corelib_src);
+    fs::write(
+        project_dir.join("src/lib.cairo"),
+        r#"
+#[starknet::contract]
+mod contract_a {
+    #[storage]
+    struct Storage {}
+}
+
+#[starknet::contract]
+mod contract_b {
+    #[storage]
+    struct Storage {}
+}
+"#,
+    )
+    .expect("failed to write contract fixture");
+    fs::write(
+        project_dir.join("cairo_project.toml"),
+        "[crate_roots]\npkg = \"src\"\n",
+    )
+    .expect("failed to write cairo_project.toml");
+
+    let mut db =
+        native_seeded_root_database(&corelib_src).expect("root database should initialize");
+    let main_crate_inputs =
+        native_setup_project(&mut db, &project_dir).expect("native setup should work");
+    let crate_ids = CrateInput::into_crate_ids(&db, main_crate_inputs.iter().cloned());
+    let discovered = find_contracts(&db, &crate_ids);
+    assert_eq!(discovered.len(), 2, "fixture should expose two contracts");
+    let plans = discovered
+        .iter()
+        .map(|contract| {
+            let module_path = contract.submodule_id.full_path(&db);
+            NativeContractOutputPlan {
+                module_path: module_path.clone(),
+                artifact_id: format!("artifact::{module_path}"),
+                package_name: "pkg".to_string(),
+                contract_name: native_contract_name(&module_path).to_string(),
+                artifact_file: format!(
+                    "{}.contract_class.json",
+                    sanitize_artifact_component(&module_path)
+                ),
+                casm_file: None,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let resolved = native_resolve_contracts_from_output_plans(&db, &crate_ids, &plans)
+        .expect("persisted contract plans should resolve back into contract declarations");
+
+    let discovered_paths = discovered
+        .iter()
+        .map(|contract| contract.submodule_id.full_path(&db))
+        .collect::<Vec<_>>();
+    let resolved_paths = resolved
+        .iter()
+        .map(|contract| contract.submodule_id.full_path(&db))
+        .collect::<Vec<_>>();
+    assert_eq!(resolved_paths, discovered_paths);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_resolve_contracts_from_output_plans_rejects_missing_modules() {
+    let dir = unique_test_dir("uc-native-contract-discovery-missing");
+    let project_dir = dir.join("project");
+    let corelib_src = dir.join("toolchain/corelib/src");
+    fs::create_dir_all(project_dir.join("src")).expect("failed to create main src");
+    fs::create_dir_all(&corelib_src).expect("failed to create mock corelib src");
+    create_mock_native_corelib(&corelib_src);
+    fs::write(
+        project_dir.join("cairo_project.toml"),
+        "[crate_roots]\npkg = \"src\"\n",
+    )
+    .expect("failed to write cairo_project.toml");
+    fs::write(project_dir.join("src/lib.cairo"), "fn main() {}\n")
+        .expect("failed to write source fixture");
+
+    let mut db =
+        native_seeded_root_database(&corelib_src).expect("root database should initialize");
+    let main_crate_inputs =
+        native_setup_project(&mut db, &project_dir).expect("native setup should work");
+    let crate_ids = CrateInput::into_crate_ids(&db, main_crate_inputs.iter().cloned());
+    let plans = vec![NativeContractOutputPlan {
+        module_path: "pkg::missing_contract".to_string(),
+        artifact_id: "artifact::pkg::missing_contract".to_string(),
+        package_name: "pkg".to_string(),
+        contract_name: "missing_contract".to_string(),
+        artifact_file: "pkg_missing_contract.contract_class.json".to_string(),
+        casm_file: None,
+    }];
+
+    assert!(
+        native_resolve_contracts_from_output_plans(&db, &crate_ids, &plans).is_none(),
+        "stale persisted contract paths must fail closed and fall back to full discovery"
+    );
+
+    fs::remove_dir_all(&dir).ok();
 }
 
 #[cfg(feature = "native-compile")]
@@ -6578,6 +7215,135 @@ fn native_commit_source_journal_delta_keeps_newer_events_when_apply_cursor_is_st
 
 #[cfg(feature = "native-compile")]
 #[test]
+fn with_native_compile_session_recomputes_content_hash_after_daemon_journal_delta() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = unique_test_dir("uc-native-session-journal-hash-refresh");
+    let source_file = dir.join("src/lib.cairo");
+    fs::create_dir_all(source_file.parent().expect("source parent"))
+        .expect("failed to create source dir");
+    fs::write(&source_file, "fn value() -> felt252 { 1 }\n").expect("failed to write source");
+
+    let mut signature = native_test_compile_session_signature(&dir, "manifest-blake3:journal");
+    signature.context.main_source_root = dir.join("missing-src");
+    signature.context.path_dependency_roots.clear();
+
+    let tracked_sources = BTreeMap::from([(
+        "src/lib.cairo".to_string(),
+        NativeTrackedFileState {
+            size_bytes: fs::metadata(&source_file).expect("source metadata").len(),
+            modified_unix_ms: metadata_modified_unix_ms(
+                &fs::metadata(&source_file).expect("source metadata"),
+            )
+            .expect("source mtime"),
+        },
+    )]);
+    let tracked_source_bytes = native_tracked_sources_total_bytes(&tracked_sources)
+        .expect("tracked source bytes should be computed");
+    let tracked_sources_content_hash =
+        native_tracked_sources_content_hash(&dir, &tracked_sources).expect("content hash");
+    let session = NativeCompileSessionState {
+        signature: signature.clone(),
+        db: RootDatabase::builder()
+            .build()
+            .expect("failed to build test root database"),
+        main_crate_inputs: Vec::new(),
+        tracked_sources,
+        tracked_source_bytes,
+        tracked_sources_content_hash,
+        journal_cursor_applied: 0,
+        source_root_modified_unix_ms: 0,
+        contract_source_dependencies: BTreeMap::new(),
+        contract_output_plans: Vec::new(),
+    };
+    let estimated_bytes = native_compile_session_state_estimated_bytes(&session);
+    let cache_key = native_compile_session_cache_key(&dir);
+    {
+        let mut cache = native_compile_session_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.insert(
+            cache_key.clone(),
+            NativeCompileSessionCacheEntry {
+                session: Arc::new(Mutex::new(session)),
+                last_access_epoch_ms: epoch_ms_u64().unwrap_or_default(),
+                estimated_bytes,
+            },
+        );
+    }
+
+    thread::sleep(Duration::from_millis(20));
+    fs::write(&source_file, "fn value() -> felt252 { 2 }\n").expect("failed to mutate source");
+    persist_native_source_change_journal(
+        &dir,
+        &NativeSourceChangeJournal {
+            changed_files: BTreeSet::from(["src/lib.cairo".to_string()]),
+            removed_files: BTreeSet::new(),
+            overflowed: false,
+            cursor: 1,
+            applied_cursor: 0,
+        },
+    )
+    .expect("native source journal should persist");
+
+    with_native_compile_session(&dir, &signature, true, false, |_| Ok(()))
+        .expect("daemon journal refresh should succeed");
+
+    let updated_tracked_sources = BTreeMap::from([(
+        "src/lib.cairo".to_string(),
+        NativeTrackedFileState {
+            size_bytes: fs::metadata(&source_file).expect("source metadata").len(),
+            modified_unix_ms: metadata_modified_unix_ms(
+                &fs::metadata(&source_file).expect("source metadata"),
+            )
+            .expect("source mtime"),
+        },
+    )]);
+    let expected_tracked_source_bytes =
+        native_tracked_sources_total_bytes(&updated_tracked_sources)
+            .expect("tracked source bytes should be recomputed");
+    let expected_hash =
+        native_tracked_sources_content_hash(&dir, &updated_tracked_sources).expect("content hash");
+    let cached_session = {
+        let cache = native_compile_session_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = cache
+            .get(&cache_key)
+            .expect("daemon cache entry should remain populated after refresh");
+        entry.session.clone()
+    };
+    let cached_session = cached_session
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(
+        cached_session.tracked_sources, updated_tracked_sources,
+        "daemon cache should hold refreshed tracked sources after journal replay"
+    );
+    assert_eq!(
+        cached_session.tracked_source_bytes, expected_tracked_source_bytes,
+        "daemon cache should hold refreshed tracked-source bytes after journal replay"
+    );
+    assert_eq!(
+        cached_session.tracked_sources_content_hash, expected_hash,
+        "daemon cache should hold refreshed tracked-source content hash after journal replay"
+    );
+    assert!(
+        try_native_compile_session_image_restore(&dir, &signature, &expected_hash).is_some(),
+        "persisted session image should reuse the refreshed journal hash"
+    );
+    assert!(
+        try_native_buildinfo_sidecar_restore(&dir, &signature, &expected_hash).is_some(),
+        "persisted buildinfo should reuse the refreshed journal hash"
+    );
+
+    clear_native_compile_session(&dir);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
 fn native_source_roots_modified_unix_ms_tracks_nested_file_edits() {
     let workspace = unique_test_dir("uc-native-source-root-mtime-file-edit");
     let src_dir = workspace.join("src").join("nested");
@@ -6927,6 +7693,229 @@ fn native_impacted_contract_indices_stays_conservative_when_dependency_index_is_
 
 #[cfg(feature = "native-compile")]
 #[test]
+fn native_prune_contract_source_dependencies_for_output_plans_drops_stale_modules() {
+    let plans = vec![
+        NativeContractOutputPlan {
+            module_path: "pkg::contract_a".to_string(),
+            artifact_id: "a".to_string(),
+            package_name: "pkg".to_string(),
+            contract_name: "contract_a".to_string(),
+            artifact_file: "pkg_contract_a.contract_class.json".to_string(),
+            casm_file: None,
+        },
+        NativeContractOutputPlan {
+            module_path: "pkg::contract_b".to_string(),
+            artifact_id: "b".to_string(),
+            package_name: "pkg".to_string(),
+            contract_name: "contract_b".to_string(),
+            artifact_file: "pkg_contract_b.contract_class.json".to_string(),
+            casm_file: None,
+        },
+    ];
+    let mut dependencies = BTreeMap::from([
+        (
+            "pkg::contract_a".to_string(),
+            BTreeSet::from(["src/contract_a.cairo".to_string()]),
+        ),
+        (
+            "pkg::removed_contract".to_string(),
+            BTreeSet::from(["src/removed_contract.cairo".to_string()]),
+        ),
+    ]);
+
+    assert!(
+        native_prune_contract_source_dependencies_for_output_plans(&mut dependencies, &plans),
+        "removed contract dependency entries should be pruned when plans change"
+    );
+    assert_eq!(dependencies.len(), 1);
+    assert!(dependencies.contains_key("pkg::contract_a"));
+    assert!(!dependencies.contains_key("pkg::removed_contract"));
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_compile_batch_ranges_default_to_single_batch() {
+    assert_eq!(
+        native_compile_batch_ranges(0, 0),
+        Vec::<(usize, usize)>::new()
+    );
+    assert_eq!(native_compile_batch_ranges(3, 0), vec![(0, 3)]);
+    assert_eq!(native_compile_batch_ranges(3, 9), vec![(0, 3)]);
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_compile_batch_ranges_split_selected_contracts() {
+    assert_eq!(
+        native_compile_batch_ranges(5, 2),
+        vec![(0, 2), (2, 4), (4, 5)]
+    );
+    assert_eq!(
+        native_compile_batch_ranges(4, 1),
+        vec![(0, 1), (1, 2), (2, 3), (3, 4)]
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_run_contract_compile_batches_emits_progress_for_every_batch() {
+    let integration_guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (messages, _hook_restore) = capture_native_progress_messages(integration_guard);
+    let plans = (0..5)
+        .map(|index| NativeContractOutputPlan {
+            module_path: format!("demo::contract_{index}"),
+            artifact_id: format!("artifact-{index}"),
+            package_name: "demo".to_string(),
+            contract_name: format!("contract_{index}"),
+            artifact_file: format!("demo_contract_{index}.contract_class.json"),
+            casm_file: None,
+        })
+        .collect::<Vec<_>>();
+    let selected_indices = vec![0, 1, 2, 3, 4];
+
+    let (elapsed_ms, compiled) =
+        native_run_contract_compile_batches(&plans, &selected_indices, 2, |batch_indices| {
+            Ok(batch_indices
+                .iter()
+                .map(|index| format!("compiled-{index}"))
+                .collect::<Vec<_>>())
+        })
+        .expect("batched compile progress runner should succeed");
+
+    assert_eq!(
+        compiled,
+        vec![
+            "compiled-0".to_string(),
+            "compiled-1".to_string(),
+            "compiled-2".to_string(),
+            "compiled-3".to_string(),
+            "compiled-4".to_string(),
+        ],
+        "batched compile runner must preserve batch output order"
+    );
+    assert!(elapsed_ms >= 0.0);
+    let messages = messages
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    for expected in [
+        "native contract compile start",
+        "native contract compile batch 1/3 start",
+        "native contract compile batch 1/3 finished",
+        "native contract compile batch 2/3 start",
+        "native contract compile batch 2/3 finished",
+        "native contract compile batch 3/3 start",
+        "native contract compile batch 3/3 finished",
+        "native contract compile finished",
+    ] {
+        assert!(
+            messages.iter().any(|message| message.contains(expected)),
+            "missing progress message containing `{expected}` in {messages:?}"
+        );
+    }
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_run_contract_compile_batches_emits_in_flight_progress_before_batch_finish() {
+    let integration_guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (messages, _hook_restore) = capture_native_progress_messages(integration_guard);
+    let plans = (0..3)
+        .map(|index| NativeContractOutputPlan {
+            module_path: format!("demo::contract_{index}"),
+            artifact_id: format!("artifact-{index}"),
+            package_name: "demo".to_string(),
+            contract_name: format!("contract_{index}"),
+            artifact_file: format!("demo_contract_{index}.contract_class.json"),
+            casm_file: None,
+        })
+        .collect::<Vec<_>>();
+    let selected_indices = vec![0, 1, 2];
+
+    let (_elapsed_ms, compiled) =
+        native_run_contract_compile_batches(&plans, &selected_indices, 2, |batch_indices| {
+            native_progress_log(format!(
+                "native contract compile batch in-flight (batch={batch_indices:?})"
+            ));
+            thread::sleep(Duration::from_millis(10));
+            Ok(batch_indices
+                .iter()
+                .map(|index| format!("compiled-{index}"))
+                .collect::<Vec<_>>())
+        })
+        .expect("batched compile progress runner should succeed");
+
+    assert_eq!(
+        compiled,
+        vec![
+            "compiled-0".to_string(),
+            "compiled-1".to_string(),
+            "compiled-2".to_string(),
+        ],
+        "in-flight progress coverage must still preserve output order"
+    );
+    let messages = messages
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let batch_start = messages
+        .iter()
+        .position(|message| message.contains("native contract compile batch 1/2 start"))
+        .expect("batch start message should be emitted");
+    let in_flight = messages
+        .iter()
+        .position(|message| message.contains("native contract compile batch in-flight"))
+        .expect("in-flight progress message should be emitted");
+    let batch_finish = messages
+        .iter()
+        .position(|message| message.contains("native contract compile batch 1/2 finished"))
+        .expect("batch finish message should be emitted");
+    assert!(
+        batch_start < in_flight && in_flight < batch_finish,
+        "in-flight progress must appear after batch start and before batch finish: {messages:?}"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn load_native_progress_compile_batch_size_reads_documented_env_var() {
+    let guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _unset_legacy = ScopedEnvVar::unset_with_lock(&guard, "UC_NATIVE_COMPILE_BATCH_SIZE");
+    let _batch_size =
+        ScopedEnvVar::set_with_lock(&guard, "UC_NATIVE_PROGRESS_COMPILE_BATCH_SIZE", "7");
+
+    assert_eq!(
+        load_native_progress_compile_batch_size(),
+        7,
+        "documented native progress batch-size env var should be honored"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn load_native_progress_compile_batch_size_ignores_undocumented_legacy_env_var() {
+    let guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _unset_documented =
+        ScopedEnvVar::unset_with_lock(&guard, "UC_NATIVE_PROGRESS_COMPILE_BATCH_SIZE");
+    let _legacy = ScopedEnvVar::set_with_lock(&guard, "UC_NATIVE_COMPILE_BATCH_SIZE", "9");
+
+    assert_eq!(
+        load_native_progress_compile_batch_size(),
+        DEFAULT_NATIVE_PROGRESS_COMPILE_BATCH_SIZE,
+        "undocumented legacy batch-size env var must not change native progress batching"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
 fn native_changed_files_affect_tracked_contracts_skips_unrelated_changes_when_index_complete() {
     let plans = vec![
         NativeContractOutputPlan {
@@ -7023,6 +8012,78 @@ fn native_changed_files_affect_tracked_contracts_stays_conservative_when_index_i
             &dependencies
         ),
         "incomplete dependency indexes should keep conservative contract refresh behavior"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_changed_files_affect_tracked_contracts_stays_conservative_for_absolute_paths() {
+    let absolute_dependency = unique_platform_absolute_fixture_path("uc-native-external-dep");
+    let plans = vec![NativeContractOutputPlan {
+        module_path: "pkg::contract_a".to_string(),
+        artifact_id: "a".to_string(),
+        package_name: "pkg".to_string(),
+        contract_name: "contract_a".to_string(),
+        artifact_file: "pkg_contract_a.contract_class.json".to_string(),
+        casm_file: Some("pkg_contract_a.compiled_contract_class.json".to_string()),
+    }];
+    let dependencies = BTreeMap::from([(
+        "pkg::contract_a".to_string(),
+        BTreeSet::from(["src/contract_a.cairo".to_string()]),
+    )]);
+
+    assert!(
+        native_changed_files_affect_tracked_contracts(
+            &[absolute_dependency.clone()],
+            &[],
+            &plans,
+            &dependencies
+        ),
+        "absolute dependency paths must stay conservative to avoid noop false hits"
+    );
+    assert!(
+        native_changed_files_affect_tracked_contracts(
+            &[],
+            &[absolute_dependency],
+            &plans,
+            &dependencies
+        ),
+        "absolute removed dependency paths must stay conservative to avoid noop false hits"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_impacted_contract_indices_stays_conservative_for_absolute_paths() {
+    let absolute_dependency = unique_platform_absolute_fixture_path("uc-native-absolute-impact");
+    let module_paths = vec!["pkg::contract_a".to_string()];
+    let contract_source_paths = vec![Some("src/contract_a.cairo".to_string())];
+    let dependencies = BTreeMap::from([(
+        "pkg::contract_a".to_string(),
+        BTreeSet::from(["src/contract_a.cairo".to_string()]),
+    )]);
+
+    assert!(
+        native_impacted_contract_indices(
+            &module_paths,
+            &contract_source_paths,
+            &[absolute_dependency.clone()],
+            &[],
+            &dependencies,
+        )
+        .is_none(),
+        "absolute dependency paths must force conservative fallback to avoid stale artifact reuse"
+    );
+    assert!(
+        native_impacted_contract_indices(
+            &module_paths,
+            &contract_source_paths,
+            &[],
+            &[absolute_dependency],
+            &dependencies,
+        )
+        .is_none(),
+        "absolute removed dependency paths must force conservative fallback to avoid stale artifact reuse"
     );
 }
 
@@ -7137,6 +8198,40 @@ fn native_apply_file_keyed_session_updates_batches_changed_and_removed_files() {
     );
 
     fs::remove_dir_all(&workspace).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_filter_changed_files_to_contract_source_index_keeps_absolute_paths_conservative() {
+    let by_source = HashMap::from([("src/contract_a.cairo".to_string(), vec![0])]);
+    let changed_files = vec![unique_platform_absolute_fixture_path(
+        "uc-native-index-external-dep",
+    )];
+
+    let (scoped_changed, scoped_removed) =
+        native_filter_changed_files_to_contract_source_index(&changed_files, &[], &by_source, true);
+    assert_eq!(
+        scoped_changed, changed_files,
+        "absolute tracked-source edits should not be filtered into an apparently safe no-op set"
+    );
+    assert!(
+        scoped_removed.is_empty(),
+        "no removed files were provided for the conservative absolute-path case"
+    );
+
+    let removed_files = vec![unique_platform_absolute_fixture_path(
+        "uc-native-index-external-removed",
+    )];
+    let (scoped_changed, scoped_removed) =
+        native_filter_changed_files_to_contract_source_index(&[], &removed_files, &by_source, true);
+    assert!(
+        scoped_changed.is_empty(),
+        "no changed files were provided for the conservative removed-file case"
+    );
+    assert_eq!(
+        scoped_removed, removed_files,
+        "absolute removed tracked-source edits should not be filtered into an apparently safe no-op set"
+    );
 }
 
 #[cfg(feature = "native-compile")]
