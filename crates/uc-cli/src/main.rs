@@ -447,7 +447,6 @@ struct NativeDiagnostic {
     category: String,
     severity: NativeDiagnosticSeverity,
     title: String,
-    #[serde(default)]
     docs_url: String,
     what_happened: String,
     why: String,
@@ -455,7 +454,6 @@ struct NativeDiagnostic {
     how_to_fix: Vec<String>,
     #[serde(default)]
     next_commands: Vec<String>,
-    #[serde(default)]
     safe_automated_action: String,
     retryable: bool,
     fallback_used: bool,

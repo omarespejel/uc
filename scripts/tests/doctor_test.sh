@@ -188,6 +188,28 @@ test_doctor_skips_tomllib_probe_when_python3_missing() {
   fi
 }
 
+test_doctor_detects_non_executable_uc_native_toolchain_env() {
+  local fake_bin_dir="$TMP_DIR/non-executable-helper-bin"
+  local stdout_path="$TMP_DIR/non-executable-helper.out"
+  local helper_path="$TMP_DIR/non-executable-helper"
+  mkdir -p "$fake_bin_dir"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$helper_path"
+
+  link_required_host_tools "$fake_bin_dir"
+  write_required_tool_stubs "$fake_bin_dir"
+  write_version_stub "$fake_bin_dir/jq" "jq-1.7"
+  write_git_hooks_stub "$fake_bin_dir/git"
+
+  if PATH="$fake_bin_dir" \
+    UC_NATIVE_TOOLCHAIN_2_14_BIN="$helper_path" \
+    "$DOCTOR_SCRIPT" >"$stdout_path" 2>&1; then
+    echo "expected doctor to fail when helper env points to a non-executable file" >&2
+    return 1
+  fi
+  grep -q '\[missing\] UC_NATIVE_TOOLCHAIN_2_14_BIN points to a non-executable helper:' "$stdout_path"
+  grep -q "$helper_path" "$stdout_path"
+}
+
 test_doctor_manifest_probe_reports_invalid_json_without_aborting() {
   local cases_root="$TMP_DIR/malformed-json-cases"
   local mock_bin_dir="$TMP_DIR/malformed-json-bin"
@@ -217,5 +239,7 @@ run_test "doctor_manifest_probe_reports_missing_jq_without_aborting" \
   test_doctor_manifest_probe_reports_missing_jq_without_aborting
 run_test "doctor_skips_tomllib_probe_when_python3_missing" \
   test_doctor_skips_tomllib_probe_when_python3_missing
+run_test "doctor_detects_non_executable_uc_native_toolchain_env" \
+  test_doctor_detects_non_executable_uc_native_toolchain_env
 run_test "doctor_manifest_probe_reports_invalid_json_without_aborting" \
   test_doctor_manifest_probe_reports_invalid_json_without_aborting

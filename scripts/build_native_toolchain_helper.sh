@@ -172,12 +172,22 @@ mkdir -p "$STAGING_DIR"
 STAGING_CREATED=1
 
 prepare_staging_tree() {
-  tar -C "$ROOT" \
-    --exclude='./.git' \
-    --exclude='./target' \
-    --exclude='./.uc' \
-    --exclude='./benchmarks/results' \
-    -cf - . | tar -C "$STAGING_DIR" -xf -
+  local root_real staging_real stage_rel
+  local -a tar_args
+  root_real="$(cd "$ROOT" && pwd -P)"
+  staging_real="$(cd "$STAGING_DIR" && pwd -P)"
+  tar_args=(
+    -C "$ROOT"
+    --exclude='./.git'
+    --exclude='./target'
+    --exclude='./.uc'
+    --exclude='./benchmarks/results'
+  )
+  if [[ "$staging_real" == "$root_real/"* ]]; then
+    stage_rel="${staging_real#"$root_real"/}"
+    tar_args+=(--exclude="./$stage_rel")
+  fi
+  tar "${tar_args[@]}" -cf - . | tar -C "$STAGING_DIR" -xf -
 }
 
 rewrite_workspace_manifest() {

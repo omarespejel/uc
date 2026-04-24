@@ -75,6 +75,28 @@ test_prepare_only_accepts_workspace_manifest_without_patch_section() {
   fi
 }
 
+test_prepare_only_excludes_in_repo_staging_dir_from_archive() {
+  local stage_dir="$ROOT/.tmp-helper-inrepo-stage-$$"
+  local stdout_path="$TMP_DIR/inrepo-stage.out"
+  rm -rf "$stage_dir"
+
+  if ! "$HELPER_SCRIPT" --lane 2.14 --staging-dir "$stage_dir" --prepare-only >"$stdout_path"; then
+    rm -rf "$stage_dir"
+    return 1
+  fi
+
+  if ! grep -q "Prepared helper staging tree:" "$stdout_path"; then
+    rm -rf "$stage_dir"
+    return 1
+  fi
+  if [[ -e "$stage_dir/$(basename "$stage_dir")" ]]; then
+    echo "in-repo staging dir was copied into itself" >&2
+    rm -rf "$stage_dir"
+    return 1
+  fi
+  rm -rf "$stage_dir"
+}
+
 test_prepare_only_and_check_only_are_mutually_exclusive() {
   local stdout_path="$TMP_DIR/mutually-exclusive.out"
   if "$HELPER_SCRIPT" --lane 2.14 --prepare-only --check-only >"$stdout_path" 2>&1; then
@@ -120,6 +142,8 @@ run_test "prepare_only_rewrites_workspace_manifest_for_cairo214" \
   test_prepare_only_rewrites_workspace_manifest_for_cairo214
 run_test "prepare_only_accepts_workspace_manifest_without_patch_section" \
   test_prepare_only_accepts_workspace_manifest_without_patch_section
+run_test "prepare_only_excludes_in_repo_staging_dir_from_archive" \
+  test_prepare_only_excludes_in_repo_staging_dir_from_archive
 run_test "prepare_only_and_check_only_are_mutually_exclusive" \
   test_prepare_only_and_check_only_are_mutually_exclusive
 run_test "unsupported_lane_reports_actionable_error" \

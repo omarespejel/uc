@@ -79,7 +79,7 @@ if [[ "$1" == "build" ]]; then
     state_dir="${MOCK_UC_STATE_DIR:-}"
     if [[ -n "$state_dir" ]]; then
       mkdir -p "$state_dir"
-      case_tag="$(basename "$(dirname "$manifest")")"
+      case_tag="$(basename "$(dirname "$manifest")")-$(basename "$manifest")-$(printf '%s' "$manifest" | cksum)"
       case_tag="${case_tag//[^A-Za-z0-9_.-]/_}"
       count_file="$state_dir/${case_tag}.count"
       count=0
@@ -492,6 +492,42 @@ test_real_repo_benchmark_keeps_unstable_lanes_on_partial_failures() {
   fi
 }
 
+test_real_repo_benchmark_instability_state_is_manifest_specific() {
+  local cases_root_a="$TEST_TMP_DIR/stability-collision-a"
+  local cases_root_b="$TEST_TMP_DIR/stability-collision-b"
+  local mock_bin_dir="$TEST_TMP_DIR/stability-collision-mock-bin"
+  local mock_uc="$mock_bin_dir/uc"
+  local mock_scarb="$mock_bin_dir/scarb"
+  local results_dir="$TEST_TMP_DIR/stability-collision-results"
+  local state_dir="$TEST_TMP_DIR/stability-collision-state"
+  mkdir -p "$mock_bin_dir" "$results_dir" "$state_dir"
+  write_mock_uc_bin "$mock_uc"
+  write_mock_scarb_bin "$mock_scarb"
+  write_manifest_case "$cases_root_a" "unstable-same-name"
+  write_manifest_case "$cases_root_b" "unstable-same-name"
+
+  PATH="$mock_bin_dir:$PATH" \
+  MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/stability-collision-uc.args" \
+  MOCK_UC_STATE_DIR="$state_dir" \
+  MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/stability-collision-scarb.args" \
+  "$BENCH_SCRIPT" \
+    --uc-bin "$mock_uc" \
+    --results-dir "$results_dir" \
+    --runs 1 \
+    --cold-runs 1 \
+    --warm-settle-seconds 0 \
+    --case "$cases_root_a/unstable-same-name/Scarb.toml" unstable-a \
+    --case "$cases_root_b/unstable-same-name/Scarb.toml" unstable-b >/dev/null
+
+  local counter_count
+  counter_count="$(find "$state_dir" -name '*.count' -type f | wc -l | tr -d ' ')"
+  if [[ "$counter_count" != "4" ]]; then
+    echo "expected one instability counter per manifest, got $counter_count" >&2
+    find "$state_dir" -name '*.count' -type f -print >&2
+    return 1
+  fi
+}
+
 run_test "real_repo_benchmark_rejects_missing_case_values" \
   test_real_repo_benchmark_rejects_missing_case_values
 run_test "real_repo_benchmark_rejects_zero_runs_from_environment" \
@@ -504,3 +540,5 @@ run_test "real_repo_benchmark_surfaces_stability_warnings" \
   test_real_repo_benchmark_surfaces_stability_warnings
 run_test "real_repo_benchmark_keeps_unstable_lanes_on_partial_failures" \
   test_real_repo_benchmark_keeps_unstable_lanes_on_partial_failures
+run_test "real_repo_benchmark_instability_state_is_manifest_specific" \
+  test_real_repo_benchmark_instability_state_is_manifest_specific
