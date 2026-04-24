@@ -319,6 +319,37 @@ test_rejects_source_index_output_overwrite() {
   expect_generator_failure "$source_index_path" "Refusing to overwrite source index with generated corpus" "$source_index_path"
 }
 
+test_rejects_source_index_output_symlink_overwrite() {
+  local case_root="$TEST_TMP_DIR/overwrite-symlink/cases"
+  local index_dir="$TEST_TMP_DIR/overwrite-symlink/index"
+  local out_dir="$TEST_TMP_DIR/overwrite-symlink/out"
+  mkdir -p "$index_dir" "$out_dir"
+  write_manifest_case "$case_root" "a"
+  local item source_index_path out_path stderr_path exit_code
+  item="$(source_item_json a "../cases/a/Scarb.toml" "0x01" "2.14.0")"
+  source_index_path="$index_dir/source-index.json"
+  out_path="$out_dir/source-index-alias.json"
+  write_source_index_file "$source_index_path" sample class_hash "$item"
+  ln -s "$source_index_path" "$out_path"
+
+  stderr_path="$TEST_TMP_DIR/overwrite-symlink.err"
+  set +e
+  "$GENERATOR_SCRIPT" --source-index "$source_index_path" --out "$out_path" >"$TEST_TMP_DIR/overwrite-symlink.out" 2>"$stderr_path"
+  exit_code=$?
+  set -e
+  if [[ "$exit_code" -ne 2 ]]; then
+    echo "expected symlink overwrite to exit with code 2, got: $exit_code" >&2
+    cat "$TEST_TMP_DIR/overwrite-symlink.out" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+  if ! grep -Fq -- "Refusing to overwrite source index with generated corpus" "$stderr_path"; then
+    echo "expected symlink overwrite refusal" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+}
+
 test_rejects_output_directory() {
   local case_root="$TEST_TMP_DIR/out-dir/cases"
   local index_dir="$TEST_TMP_DIR/out-dir/index"
@@ -354,5 +385,7 @@ run_test "rejects_deduped_count_mismatch" \
   test_rejects_deduped_count_mismatch
 run_test "rejects_source_index_output_overwrite" \
   test_rejects_source_index_output_overwrite
+run_test "rejects_source_index_output_symlink_overwrite" \
+  test_rejects_source_index_output_symlink_overwrite
 run_test "rejects_output_directory" \
   test_rejects_output_directory

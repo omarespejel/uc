@@ -112,8 +112,9 @@ evidence. It records chain/snapshot/block selection, deduplication, license
 policy, source availability, and the local `Scarb.toml` chosen for each contract
 or deduped class. The generator enforces the constraints mirrored in
 `benchmarks/corpora/deployed-contract-source-index.schema.json`, resolves all
-relative manifest paths to absolute paths, and writes a strict
-`deployed-contract-corpus.schema.json` file for the benchmark runner.
+relative manifest paths to absolute paths, and writes corpus JSON that conforms
+to `benchmarks/corpora/deployed-contract-corpus.schema.json` for the benchmark
+runner.
 
 Do not hand-author launch corpus JSON. Keep the source index as the reviewed
 input, generate the corpus from it, and commit or immutably archive the exact

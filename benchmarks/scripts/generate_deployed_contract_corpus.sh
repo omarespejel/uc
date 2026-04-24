@@ -71,7 +71,7 @@ fi
 SOURCE_INDEX_ABS="$(cd "$(dirname "$SOURCE_INDEX_PATH")" && pwd -P)/$(basename "$SOURCE_INDEX_PATH")"
 mkdir -p "$(dirname "$OUT_PATH")"
 OUT_ABS="$(cd "$(dirname "$OUT_PATH")" && pwd -P)/$(basename "$OUT_PATH")"
-if [[ "$SOURCE_INDEX_ABS" == "$OUT_ABS" ]]; then
+if [[ "$SOURCE_INDEX_ABS" == "$OUT_ABS" ]] || [[ -e "$OUT_ABS" && "$SOURCE_INDEX_ABS" -ef "$OUT_ABS" ]]; then
   echo "Refusing to overwrite source index with generated corpus: $SOURCE_INDEX_ABS" >&2
   exit 2
 fi
