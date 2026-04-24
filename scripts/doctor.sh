@@ -179,7 +179,8 @@ fi
 if command -v scarb >/dev/null 2>&1; then
   printf 'scarb: %s\n' "$(scarb --version | head -n 1)"
 fi
-if command -v python3 >/dev/null 2>&1; then
+python3_bin="$(command -v python3 || true)"
+if [[ -n "$python3_bin" ]]; then
   if python3 - <<'PY' >/dev/null 2>&1
 import sys, tomllib
 if sys.version_info < (3, 11):
@@ -191,6 +192,8 @@ PY
     printf '[missing] python3 >= 3.11 with tomllib is required for native helper builds\n' >&2
     failures=$((failures + 1))
   fi
+else
+  printf '[skip] python3 tomllib support check skipped because python3 is unavailable\n'
 fi
 if [[ -n "${UC_NATIVE_CORELIB_SRC:-}" ]]; then
   if [[ -d "${UC_NATIVE_CORELIB_SRC}" ]]; then

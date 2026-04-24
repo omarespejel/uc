@@ -106,6 +106,35 @@ link_required_host_tools() {
   done
 }
 
+write_version_stub() {
+  local path="$1"
+  local body="$2"
+  cat > "$path" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "$body"
+STUB
+  chmod +x "$path"
+}
+
+write_git_hooks_stub() {
+  local path="$1"
+  cat > "$path" <<'GITMOCK'
+#!/usr/bin/env bash
+if [[ "$1" == "config" && "$2" == "--get" && "$3" == "core.hooksPath" ]]; then
+  printf '.githooks\n'
+fi
+GITMOCK
+  chmod +x "$path"
+}
+
+write_required_tool_stubs() {
+  local fake_bin_dir="$1"
+  write_version_stub "$fake_bin_dir/cargo" "cargo 1.88.0"
+  write_version_stub "$fake_bin_dir/rustc" "rustc 1.88.0"
+  write_version_stub "$fake_bin_dir/scarb" "scarb 2.16.0"
+  write_version_stub "$fake_bin_dir/rg" "ripgrep 14.1.1"
+}
+
 test_doctor_manifest_probe_reports_missing_jq_without_aborting() {
   local cases_root="$TMP_DIR/jq-cases"
   local fake_bin_dir="$TMP_DIR/no-jq-bin"
@@ -116,20 +145,8 @@ test_doctor_manifest_probe_reports_missing_jq_without_aborting() {
   write_mock_uc_bin "$mock_uc"
 
   link_required_host_tools "$fake_bin_dir"
-  for cmd in cargo rustc scarb rg; do
-    cat > "$fake_bin_dir/$cmd" <<'MOCKCMD'
-#!/usr/bin/env bash
-printf '%s fake\n' "$(basename "$0")"
-MOCKCMD
-    chmod +x "$fake_bin_dir/$cmd"
-  done
-  cat > "$fake_bin_dir/git" <<'GITMOCK'
-#!/usr/bin/env bash
-if [[ "$1" == "config" && "$2" == "--get" && "$3" == "core.hooksPath" ]]; then
-  printf '.githooks\n'
-fi
-GITMOCK
-  chmod +x "$fake_bin_dir/git"
+  write_required_tool_stubs "$fake_bin_dir"
+  write_git_hooks_stub "$fake_bin_dir/git"
 
   if PATH="$fake_bin_dir" "$DOCTOR_SCRIPT" \
     --uc-bin "$mock_uc" \
@@ -140,6 +157,35 @@ GITMOCK
   grep -q '\[missing\] jq' "$stdout_path"
   grep -q '\[missing\] jq is required for manifest probe:' "$stdout_path"
   grep -q 'doctor failed:' "$stdout_path"
+}
+
+test_doctor_skips_tomllib_probe_when_python3_missing() {
+  local fake_bin_dir="$TMP_DIR/no-python-bin"
+  local stdout_path="$TMP_DIR/no-python.out"
+  mkdir -p "$fake_bin_dir"
+  for cmd in bash env head sort; do
+    local resolved
+    resolved="$(command -v "$cmd" || true)"
+    if [[ -z "$resolved" ]]; then
+      echo "required host command not found for test sandbox: $cmd" >&2
+      return 1
+    fi
+    ln -s "$resolved" "$fake_bin_dir/$cmd"
+  done
+  write_required_tool_stubs "$fake_bin_dir"
+  write_version_stub "$fake_bin_dir/jq" "jq-1.7"
+  write_git_hooks_stub "$fake_bin_dir/git"
+
+  if PATH="$fake_bin_dir" "$DOCTOR_SCRIPT" >"$stdout_path" 2>&1; then
+    echo "expected doctor to fail when python3 is unavailable" >&2
+    return 1
+  fi
+  grep -q '\[missing\] python3' "$stdout_path"
+  grep -q '\[skip\] python3 tomllib support check skipped because python3 is unavailable' "$stdout_path"
+  if grep -q 'python3 >= 3.11 with tomllib is required' "$stdout_path"; then
+    echo "tomllib version check should not run when python3 is unavailable" >&2
+    return 1
+  fi
 }
 
 test_doctor_manifest_probe_reports_invalid_json_without_aborting() {
@@ -169,5 +215,7 @@ run_test "doctor_requires_python_tomllib" \
   test_doctor_requires_python_tomllib
 run_test "doctor_manifest_probe_reports_missing_jq_without_aborting" \
   test_doctor_manifest_probe_reports_missing_jq_without_aborting
+run_test "doctor_skips_tomllib_probe_when_python3_missing" \
+  test_doctor_skips_tomllib_probe_when_python3_missing
 run_test "doctor_manifest_probe_reports_invalid_json_without_aborting" \
   test_doctor_manifest_probe_reports_invalid_json_without_aborting
