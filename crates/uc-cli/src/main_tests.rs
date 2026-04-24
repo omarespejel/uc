@@ -6027,6 +6027,7 @@ fn native_compile_session_image_round_trip_restores_tracked_sources_and_dependen
         tracked_sources_content_hash: tracked_sources_content_hash.clone(),
         contract_source_dependencies: dependencies.clone(),
         contract_output_plans: plans.clone(),
+        contract_output_plans_verified: true,
         journal_cursor_applied: 33,
     };
     persist_native_compile_session_image_snapshot(&dir, &snapshot)
@@ -6043,6 +6044,7 @@ fn native_compile_session_image_round_trip_restores_tracked_sources_and_dependen
     );
     assert_eq!(restored.contract_source_dependencies, dependencies);
     assert_eq!(restored.contract_output_plans, plans);
+    assert!(restored.contract_output_plans_verified);
     assert_eq!(restored.journal_cursor_applied, 33);
 
     fs::remove_dir_all(&dir).ok();
@@ -6163,6 +6165,7 @@ fn native_compile_session_image_restore_rejects_signature_and_content_hash_misma
         tracked_sources_content_hash: tracked_sources_content_hash.clone(),
         contract_source_dependencies: BTreeMap::new(),
         contract_output_plans: Vec::new(),
+        contract_output_plans_verified: false,
         journal_cursor_applied: 0,
     };
     persist_native_compile_session_image_snapshot(&dir, &snapshot)
@@ -6244,6 +6247,7 @@ fn native_compile_session_image_restore_normalizes_workspace_absolute_tracked_so
         tracked_sources_content_hash: tracked_sources_content_hash.clone(),
         contract_source_dependencies: BTreeMap::new(),
         contract_output_plans: Vec::new(),
+        contract_output_plans_verified: false,
         journal_cursor_applied: 0,
     };
     persist_native_compile_session_image_snapshot(&dir, &snapshot)
@@ -6357,6 +6361,7 @@ mod AtomicLock {
         tracked_sources_content_hash: tracked_sources_content_hash.clone(),
         contract_source_dependencies: BTreeMap::new(),
         contract_output_plans: Vec::new(),
+        contract_output_plans_verified: false,
         journal_cursor_applied: 0,
     };
     persist_native_compile_session_image_snapshot(&dir, &stale_snapshot)
@@ -6382,8 +6387,94 @@ mod AtomicLock {
         restored.contract_output_plans[0].module_path,
         "demo::AtomicLock".to_string()
     );
+    assert!(
+        !restored.contract_output_plans_verified,
+        "bootstrap-only rewritten images must remain unverified until a real compile succeeds"
+    );
 
     fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_contract_fast_path_requires_verified_unchanged_plans() {
+    let plans = vec![NativeContractOutputPlan {
+        module_path: "demo::token".to_string(),
+        artifact_id: "id-token".to_string(),
+        package_name: "demo".to_string(),
+        contract_name: "token".to_string(),
+        artifact_file: "demo_token.contract_class.json".to_string(),
+        casm_file: Some("demo_token.compiled_contract_class.json".to_string()),
+    }];
+    assert!(native_should_skip_global_contract_diagnostics(
+        &[],
+        &[],
+        &plans,
+        true
+    ));
+    assert!(!native_should_skip_global_contract_diagnostics(
+        &["src/lib.cairo".to_string()],
+        &[],
+        &plans,
+        true
+    ));
+    assert!(!native_should_skip_global_contract_diagnostics(
+        &[],
+        &[],
+        &plans,
+        false
+    ));
+    assert!(!native_should_skip_global_contract_diagnostics(
+        &[],
+        &[],
+        &[],
+        true
+    ));
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_session_and_buildinfo_missing_verified_field_default_false() {
+    let image_bytes = serde_json::to_vec(&serde_json::json!({
+        "schema_version": NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION,
+        "signature_hash": "sig",
+        "source_root_modified_unix_ms": 1u64,
+        "tracked_sources": {},
+        "tracked_source_bytes": 0u64,
+        "tracked_sources_content_hash": "hash",
+        "contract_source_dependencies": {},
+        "contract_output_plans": [],
+        "journal_cursor_applied": 0u64,
+        "generated_at_epoch_ms": 0u64
+    }))
+    .expect("legacy image json");
+    let image: NativeCompileSessionImageFile =
+        serde_json::from_slice(&image_bytes).expect("deserialize legacy image");
+    assert!(
+        !image.contract_output_plans_verified,
+        "legacy session image files must default the verified bit to false"
+    );
+
+    let buildinfo_bytes = serde_json::to_vec(&serde_json::json!({
+        "schema_version": NATIVE_BUILDINFO_SCHEMA_VERSION,
+        "signature_hash": "sig",
+        "source_root_modified_unix_ms": 1u64,
+        "tracked_sources": {},
+        "tracked_source_bytes": 0u64,
+        "tracked_sources_signature": "sig",
+        "tracked_sources_content_hash": "hash",
+        "contract_source_dependencies": {},
+        "contract_output_plans": [],
+        "journal_cursor_applied": 0u64,
+        "generated_at_epoch_ms": 0u64
+    }))
+    .expect("legacy buildinfo json");
+    let buildinfo: NativeBuildInfoFile =
+        serde_json::from_slice(&buildinfo_bytes).expect("deserialize legacy buildinfo");
+    assert!(
+        !buildinfo.contract_output_plans_verified,
+        "legacy buildinfo files must default the verified bit to false"
+    );
 }
 
 #[cfg(feature = "native-compile")]
@@ -6434,6 +6525,7 @@ fn native_buildinfo_sidecar_round_trip_restores_tracked_sources_and_dependency_i
         tracked_sources_content_hash.clone(),
         dependencies.clone(),
         plans.clone(),
+        true,
         33,
     );
     persist_native_buildinfo_sidecar(&dir, &buildinfo).expect("native buildinfo should persist");
@@ -6449,6 +6541,7 @@ fn native_buildinfo_sidecar_round_trip_restores_tracked_sources_and_dependency_i
     );
     assert_eq!(restored.contract_source_dependencies, dependencies);
     assert_eq!(restored.contract_output_plans, plans);
+    assert!(restored.contract_output_plans_verified);
     assert_eq!(restored.journal_cursor_applied, 33);
 
     let different_signature = native_test_compile_session_signature(&dir, "manifest-blake3:other");
@@ -6527,6 +6620,7 @@ fn native_buildinfo_sidecar_restore_normalizes_workspace_absolute_tracked_source
         tracked_sources_content_hash.clone(),
         BTreeMap::new(),
         Vec::new(),
+        false,
         0,
     );
     persist_native_buildinfo_sidecar(&dir, &buildinfo).expect("native buildinfo should persist");
@@ -6577,6 +6671,7 @@ fn native_buildinfo_sidecar_journal_replay_seed_restores_when_pending_delta_exis
         tracked_sources_content_hash.clone(),
         BTreeMap::new(),
         Vec::new(),
+        false,
         10,
     );
     persist_native_buildinfo_sidecar(&dir, &buildinfo).expect("native buildinfo should persist");
@@ -6638,6 +6733,7 @@ fn native_buildinfo_sidecar_journal_replay_seed_rejects_ambiguous_cursor_state()
         tracked_sources_content_hash,
         BTreeMap::new(),
         Vec::new(),
+        false,
         9,
     );
     persist_native_buildinfo_sidecar(&dir, &buildinfo).expect("native buildinfo should persist");
@@ -7647,6 +7743,7 @@ fn with_native_compile_session_recomputes_content_hash_after_daemon_journal_delt
         source_root_modified_unix_ms: 0,
         contract_source_dependencies: BTreeMap::new(),
         contract_output_plans: Vec::new(),
+        contract_output_plans_verified: false,
     };
     let estimated_bytes = native_compile_session_state_estimated_bytes(&session);
     let cache_key = native_compile_session_cache_key(&dir);

@@ -630,8 +630,6 @@ dependencies = [
 [[package]]
 name = "cairo-lang-starknet"
 version = "2.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e78d155d90e4eb6d8526553644fc0ee7f790ab4793fa8823baa10dda1bd89ac2"
 dependencies = [
  "anyhow",
  "cairo-lang-compiler",

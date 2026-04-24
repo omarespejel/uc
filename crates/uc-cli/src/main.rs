@@ -34,7 +34,10 @@ use cairo_lang_lowering::utils::InliningStrategy;
 #[cfg(feature = "native-compile")]
 use cairo_lang_semantic::db::SemanticGroupEx;
 #[cfg(feature = "native-compile")]
-use cairo_lang_starknet::compile::compile_prepared_db as compile_starknet_prepared_db;
+use cairo_lang_starknet::compile::{
+    compile_prepared_db as compile_starknet_prepared_db,
+    compile_prepared_db_without_diagnostics as compile_starknet_prepared_db_without_diagnostics,
+};
 #[cfg(feature = "native-compile")]
 use cairo_lang_starknet::contract::{find_contracts, module_contract, ContractDeclaration};
 #[cfg(feature = "native-compile")]
@@ -929,6 +932,7 @@ struct NativeCompileSessionState {
     source_root_modified_unix_ms: u64,
     contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
     contract_output_plans: Vec<NativeContractOutputPlan>,
+    contract_output_plans_verified: bool,
 }
 
 #[cfg(feature = "native-compile")]
@@ -940,6 +944,7 @@ struct NativeCompileSessionSnapshot {
     journal_fallback_full_scan: bool,
     contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
     contract_output_plans: Vec<NativeContractOutputPlan>,
+    contract_output_plans_verified: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -955,6 +960,8 @@ struct NativeCompileSessionImageFile {
     contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
     contract_output_plans: Vec<NativeContractOutputPlan>,
     #[serde(default)]
+    contract_output_plans_verified: bool,
+    #[serde(default)]
     journal_cursor_applied: u64,
     generated_at_epoch_ms: u64,
 }
@@ -969,6 +976,7 @@ struct NativeCompileSessionImageSnapshot {
     tracked_sources_content_hash: String,
     contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
     contract_output_plans: Vec<NativeContractOutputPlan>,
+    contract_output_plans_verified: bool,
     journal_cursor_applied: u64,
 }
 
@@ -1005,6 +1013,8 @@ struct NativeBuildInfoFile {
     #[serde(default)]
     contract_output_plans: Vec<NativeContractOutputPlan>,
     #[serde(default)]
+    contract_output_plans_verified: bool,
+    #[serde(default)]
     journal_cursor_applied: u64,
     generated_at_epoch_ms: u64,
 }
@@ -1017,6 +1027,7 @@ struct NativeBuildInfoSnapshot {
     tracked_sources_content_hash: String,
     contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
     contract_output_plans: Vec<NativeContractOutputPlan>,
+    contract_output_plans_verified: bool,
     journal_cursor_applied: u64,
 }
 
@@ -6265,8 +6276,12 @@ fn native_update_compile_session_post_build_state(
     signature: &NativeCompileSessionSignature,
     dependency_updates: &[(String, BTreeSet<String>)],
     contract_output_plans: Option<&[NativeContractOutputPlan]>,
+    contract_output_plans_verified: Option<bool>,
 ) {
-    if dependency_updates.is_empty() && contract_output_plans.is_none() {
+    if dependency_updates.is_empty()
+        && contract_output_plans.is_none()
+        && contract_output_plans_verified.is_none()
+    {
         return;
     }
     let session_handle = match native_compile_session_handle(workspace_root, signature) {
@@ -6316,6 +6331,12 @@ fn native_update_compile_session_post_build_state(
                     contract_output_plans,
                 );
                 session.contract_output_plans = contract_output_plans.to_vec();
+                state_changed = true;
+            }
+        }
+        if let Some(contract_output_plans_verified) = contract_output_plans_verified {
+            if session.contract_output_plans_verified != contract_output_plans_verified {
+                session.contract_output_plans_verified = contract_output_plans_verified;
                 state_changed = true;
             }
         }
@@ -7150,6 +7171,7 @@ fn native_compile_session_image_snapshot_from_state(
         tracked_sources_content_hash: session.tracked_sources_content_hash.clone(),
         contract_source_dependencies: session.contract_source_dependencies.clone(),
         contract_output_plans: session.contract_output_plans.clone(),
+        contract_output_plans_verified: session.contract_output_plans_verified,
         journal_cursor_applied: session.journal_cursor_applied,
     }
 }
@@ -7173,6 +7195,7 @@ fn persist_native_compile_session_image_snapshot(
         tracked_sources_content_hash: snapshot.tracked_sources_content_hash.clone(),
         contract_source_dependencies: snapshot.contract_source_dependencies.clone(),
         contract_output_plans: snapshot.contract_output_plans.clone(),
+        contract_output_plans_verified: snapshot.contract_output_plans_verified,
         journal_cursor_applied: snapshot.journal_cursor_applied,
         generated_at_epoch_ms: epoch_ms_u64().unwrap_or_default(),
     };
@@ -7361,6 +7384,7 @@ fn try_native_compile_session_image_restore(
             tracked_sources_content_hash: computed_content_hash,
             contract_source_dependencies: decoded.contract_source_dependencies,
             contract_output_plans: decoded.contract_output_plans,
+            contract_output_plans_verified: decoded.contract_output_plans_verified,
             journal_cursor_applied: decoded.journal_cursor_applied,
         });
     }
@@ -7612,6 +7636,7 @@ fn native_buildinfo_file_from_snapshot(
     tracked_sources_content_hash: String,
     contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
     contract_output_plans: Vec<NativeContractOutputPlan>,
+    contract_output_plans_verified: bool,
     journal_cursor_applied: u64,
 ) -> NativeBuildInfoFile {
     let tracked_sources_signature = native_tracked_sources_signature(&tracked_sources);
@@ -7625,6 +7650,7 @@ fn native_buildinfo_file_from_snapshot(
         tracked_sources_content_hash,
         contract_source_dependencies,
         contract_output_plans,
+        contract_output_plans_verified,
         journal_cursor_applied,
         generated_at_epoch_ms: epoch_ms_u64().unwrap_or_default(),
     }
@@ -7643,6 +7669,7 @@ fn native_buildinfo_file_from_state(
         session.tracked_sources_content_hash.clone(),
         session.contract_source_dependencies.clone(),
         session.contract_output_plans.clone(),
+        session.contract_output_plans_verified,
         journal_cursor_applied,
     )
 }
@@ -7848,6 +7875,7 @@ fn load_native_buildinfo_sidecar_snapshot(
                 tracked_sources_content_hash,
                 contract_source_dependencies: decoded.contract_source_dependencies,
                 contract_output_plans: decoded.contract_output_plans,
+                contract_output_plans_verified: decoded.contract_output_plans_verified,
                 journal_cursor_applied: decoded.journal_cursor_applied,
             },
             decoded.source_root_modified_unix_ms,
@@ -8530,6 +8558,7 @@ fn build_native_compile_session_state(
         tracked_sources_content_hash,
         mut contract_source_dependencies,
         mut contract_output_plans,
+        mut contract_output_plans_verified,
         session_image_hit,
         buildinfo_hit,
         buildinfo_replay_hit,
@@ -8541,6 +8570,7 @@ fn build_native_compile_session_state(
             image.tracked_sources_content_hash,
             image.contract_source_dependencies,
             image.contract_output_plans,
+            image.contract_output_plans_verified,
             true,
             false,
             false,
@@ -8553,6 +8583,7 @@ fn build_native_compile_session_state(
             buildinfo.tracked_sources_content_hash,
             buildinfo.contract_source_dependencies,
             buildinfo.contract_output_plans,
+            buildinfo.contract_output_plans_verified,
             false,
             true,
             false,
@@ -8565,6 +8596,7 @@ fn build_native_compile_session_state(
             buildinfo.tracked_sources_content_hash,
             buildinfo.contract_source_dependencies,
             buildinfo.contract_output_plans,
+            buildinfo.contract_output_plans_verified,
             false,
             false,
             true,
@@ -8600,6 +8632,7 @@ fn build_native_compile_session_state(
             false,
             false,
             false,
+            false,
             native_current_source_journal_cursor(workspace_root),
         )
     };
@@ -8627,6 +8660,7 @@ fn build_native_compile_session_state(
                 ));
                 contract_source_dependencies = bootstrapped_dependencies;
                 contract_output_plans = bootstrapped_plans;
+                contract_output_plans_verified = false;
                 bootstrapped_contract_metadata = true;
             }
             Ok(None) => {}
@@ -8694,6 +8728,7 @@ fn build_native_compile_session_state(
         source_root_modified_unix_ms,
         contract_source_dependencies,
         contract_output_plans,
+        contract_output_plans_verified,
     };
     if bootstrapped_contract_metadata || !session_image_hit {
         let snapshot = native_compile_session_image_snapshot_from_state(&state);
@@ -9819,6 +9854,7 @@ fn with_native_compile_session<T>(
                     ));
                     session.contract_source_dependencies = bootstrapped_dependencies;
                     session.contract_output_plans = bootstrapped_plans;
+                    session.contract_output_plans_verified = false;
                     state_mutated = true;
                 }
                 Ok(None) => {}
@@ -9841,6 +9877,7 @@ fn with_native_compile_session<T>(
                 journal_fallback_full_scan,
                 contract_source_dependencies: session.contract_source_dependencies.clone(),
                 contract_output_plans: session.contract_output_plans.clone(),
+                contract_output_plans_verified: session.contract_output_plans_verified,
             },
             state_mutated.then(|| native_compile_session_image_snapshot_from_state(&session)),
             state_mutated.then(|| {
@@ -9992,6 +10029,19 @@ fn native_compiler_config<'a>(
     compiler_config.replace_ids = profile != "release";
     compiler_config.add_statements_code_locations = capture_statement_locations;
     compiler_config
+}
+
+#[cfg(feature = "native-compile")]
+fn native_should_skip_global_contract_diagnostics(
+    changed_files: &[String],
+    removed_files: &[String],
+    contract_output_plans: &[NativeContractOutputPlan],
+    contract_output_plans_verified: bool,
+) -> bool {
+    changed_files.is_empty()
+        && removed_files.is_empty()
+        && !contract_output_plans.is_empty()
+        && contract_output_plans_verified
 }
 
 #[cfg(feature = "native-compile")]
@@ -10318,6 +10368,7 @@ fn run_native_build_inner(
                     &signature,
                     &[],
                     Some(&all_plans),
+                    None,
                 );
             }
 
@@ -10363,6 +10414,18 @@ fn run_native_build_inner(
             let (frontend_compile_ms, contract_classes) = if selected_indices.is_empty() {
                 (0.0, Vec::new())
             } else {
+                let skip_global_contract_diagnostics =
+                    native_should_skip_global_contract_diagnostics(
+                        &session.changed_files,
+                        &session.removed_files,
+                        &session.contract_output_plans,
+                        session.contract_output_plans_verified,
+                    );
+                if skip_global_contract_diagnostics {
+                    native_progress_log(
+                        "native contract compile using verified no-diagnostics fast path",
+                    );
+                }
                 native_run_contract_compile_batches(
                     &all_plans,
                     &selected_indices,
@@ -10372,15 +10435,24 @@ fn run_native_build_inner(
                             .iter()
                             .map(|index| &contracts[*index])
                             .collect();
-                        compile_starknet_prepared_db(
-                            &session.db,
-                            &contract_refs,
-                            native_compiler_config(
-                                &session.main_crate_inputs,
-                                profile,
-                                capture_statement_locations,
-                            ),
-                        )
+                        let compiler_config = native_compiler_config(
+                            &session.main_crate_inputs,
+                            profile,
+                            capture_statement_locations,
+                        );
+                        if skip_global_contract_diagnostics {
+                            compile_starknet_prepared_db_without_diagnostics(
+                                &session.db,
+                                &contract_refs,
+                                compiler_config,
+                            )
+                        } else {
+                            compile_starknet_prepared_db(
+                                &session.db,
+                                &contract_refs,
+                                compiler_config,
+                            )
+                        }
                         .map_err(|err| {
                             mark_native_fallback_eligible_for_external_dependencies(
                                 err.context("native starknet compile failed"),
@@ -10531,6 +10603,7 @@ fn run_native_build_inner(
         &signature,
         &dependency_updates,
         contract_output_plans.as_deref(),
+        contract_output_plans.as_ref().map(|_| true),
     );
     native_persist_crate_cache_after_build_best_effort(
         workspace_root,
