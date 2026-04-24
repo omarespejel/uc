@@ -13,6 +13,75 @@ const DEFAULT_UC_NATIVE_FALLBACK_HINT_RETRY_SECS: u64 = 30 * 60;
 const DAEMON_LOCAL_PROBE_HINT_MAX_ENTRIES_PER_DIR: usize = 256;
 const DAEMON_LOCAL_PROBE_HINT_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 
+fn native_fallback_diagnostic(
+    code: &str,
+    category: &str,
+    title: &str,
+    reason: String,
+    toolchain: Option<&NativeToolchainReport>,
+) -> NativeDiagnostic {
+    NativeDiagnostic {
+        code: code.to_string(),
+        category: category.to_string(),
+        severity: NativeDiagnosticSeverity::Warn,
+        title: title.to_string(),
+        what_happened: reason.clone(),
+        why: reason,
+        how_to_fix: vec![
+            "Review the selected native toolchain lane and the fallback reason.".to_string(),
+            "If native is required, rerun with UC_NATIVE_DISALLOW_SCARB_FALLBACK=1 after fixing the mismatch.".to_string(),
+        ],
+        retryable: true,
+        fallback_used: true,
+        toolchain_expected: toolchain
+            .and_then(|entry| entry.requested_version.clone().or(entry.requested_major_minor.clone())),
+        toolchain_found: toolchain.and_then(|entry| entry.compiler_version.clone()),
+    }
+}
+
+fn diagnostics_used_native_fallback(diagnostics: &[NativeDiagnostic]) -> bool {
+    diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.fallback_used)
+}
+
+fn build_report_compile_backend_label(
+    engine: EngineArg,
+    compile_backend: BuildCompileBackend,
+    used_external_helper: bool,
+    diagnostics: &[NativeDiagnostic],
+) -> &'static str {
+    match (engine, compile_backend, used_external_helper) {
+        (EngineArg::Scarb, BuildCompileBackend::Scarb, _) => "scarb",
+        (EngineArg::Uc, BuildCompileBackend::Native, true) => "uc_native_external_helper",
+        (EngineArg::Uc, BuildCompileBackend::Native, false) => "uc_native",
+        (EngineArg::Uc, BuildCompileBackend::Scarb, _) => {
+            if diagnostics_used_native_fallback(diagnostics) {
+                "scarb_fallback"
+            } else {
+                "uc_scarb"
+            }
+        }
+        (EngineArg::Scarb, BuildCompileBackend::Native, _) => "native",
+    }
+}
+
+fn helper_build_report_temp_path(workspace_root: &Path) -> Result<PathBuf> {
+    let path = workspace_root.join(".uc").join("reports").join(format!(
+        "helper-build-{}-{}.json",
+        std::process::id(),
+        epoch_ms_u64().unwrap_or_default()
+    ));
+    ensure_path_within_root(workspace_root, &path, "helper build report path")?;
+    Ok(path)
+}
+
+fn load_build_report(path: &Path) -> Result<BuildReport> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse build report {}", path.display()))
+}
+
 fn daemon_probe_hint_root_dir(workspace_root: &Path) -> Result<PathBuf> {
     let hint_dir = workspace_root.join(".uc/cache/probe-hints");
     ensure_path_within_root(
@@ -765,8 +834,9 @@ fn maybe_autostart_daemon_for_build(
 
 pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
     let common = args.common;
+    let emit_json = args.json;
     let report_path = args.report_path;
-    let write_report = report_path.is_some();
+    let write_report = report_path.is_some() || emit_json;
     let engine = args.engine;
     let daemon_mode = args.daemon_mode;
     let manifest_path = resolve_manifest_path(&common.manifest_path)?;
@@ -776,6 +846,13 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
     let mut session_key = String::new();
     let mut daemon_used = false;
     let mut phase_telemetry: Option<BuildPhaseTelemetry> = None;
+    let mut native_toolchain: Option<NativeToolchainReport> = None;
+    let mut actual_compile_backend = match engine {
+        EngineArg::Scarb => Some(BuildCompileBackend::Scarb),
+        EngineArg::Uc => None,
+    };
+    let mut used_external_helper = false;
+    let diagnostics = std::cell::RefCell::new(Vec::<NativeDiagnostic>::new());
     let (run, cache_hit, fingerprint) = match engine {
         EngineArg::Scarb => {
             validate_scarb_toolchain()?;
@@ -788,9 +865,66 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             };
             (run, false, fingerprint)
         }
-        EngineArg::Uc => {
+        EngineArg::Uc => 'uc: {
+            let (toolchain_requirement, toolchain_selection) =
+                select_native_toolchain_from_manifest_path(&manifest_path)?;
+            native_toolchain = Some(match &toolchain_selection {
+                Ok(selection) => selection.toolchain.clone(),
+                Err(issue) => native_toolchain_report_for_issue(&toolchain_requirement, issue),
+            });
             let configured_native_mode = native_build_mode();
             let disallow_native_fallback = native_disallow_scarb_fallback();
+            if configured_native_mode != NativeBuildMode::Off {
+                if let Ok(selection) = &toolchain_selection {
+                    if let Some(helper_path) = selection.helper_path.as_ref() {
+                        used_external_helper = true;
+                        actual_compile_backend = Some(BuildCompileBackend::Native);
+                        let helper_display = helper_path.display().to_string();
+                        let helper_report_path = if write_report {
+                            Some(helper_build_report_temp_path(&workspace_root)?)
+                        } else {
+                            None
+                        };
+                        let (command, command_vec) = build_uc_build_command(
+                            helper_path,
+                            &common,
+                            &manifest_path,
+                            EngineArg::Uc,
+                            daemon_mode,
+                            helper_report_path.as_deref(),
+                            Some(&helper_display),
+                        );
+                        let run = run_command(command, command_vec, write_report)?;
+                        if !emit_json {
+                            replay_output(&run.stdout, &run.stderr)?;
+                        }
+                        let mut cache_hit = false;
+                        let mut fingerprint = String::new();
+                        if let Some(path) = helper_report_path.as_ref() {
+                            if path.exists() {
+                                let helper_report = load_build_report(path)?;
+                                daemon_used = helper_report.daemon_used;
+                                session_key = helper_report.session_key;
+                                phase_telemetry = helper_report.phase_telemetry;
+                                cache_hit = helper_report.cache_hit;
+                                fingerprint = helper_report.fingerprint;
+                                if helper_report.native_toolchain.is_some() {
+                                    native_toolchain = helper_report.native_toolchain;
+                                }
+                                diagnostics.borrow_mut().extend(helper_report.diagnostics);
+                            }
+                            let _ = fs::remove_file(path);
+                        }
+                        if !write_report {
+                            if run.exit_code != 0 {
+                                bail!("build failed with exit code {}", run.exit_code);
+                            }
+                            return Ok(());
+                        }
+                        break 'uc (run, cache_hit, fingerprint);
+                    }
+                }
+            }
             let native_auto_preflight_error = if configured_native_mode == NativeBuildMode::Auto {
                 if should_skip_local_native_auto_preflight(daemon_mode) {
                     tracing::debug!(
@@ -862,6 +996,13 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                     );
                 }
                 record_native_fallback(NativeFallbackReason::PreflightIneligible);
+                diagnostics.borrow_mut().push(native_fallback_diagnostic(
+                    "UCN2001",
+                    "native_fallback_preflight_ineligible",
+                    "Native preflight downgraded to Scarb",
+                    reason.to_string(),
+                    native_toolchain.as_ref(),
+                ));
                 tracing::debug!(
                     manifest_path = %manifest_path.display(),
                     reason,
@@ -898,8 +1039,8 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             compiler_version,
                             compile_backend: backend,
                             options: BuildRunOptions {
-                                capture_output: false,
-                                inherit_output_when_uncaptured: true,
+                                capture_output: write_report,
+                                inherit_output_when_uncaptured: !write_report,
                                 async_cache_persist: false,
                                 use_daemon_shared_cache: false,
                             },
@@ -914,6 +1055,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                 String,
                 String,
                 BuildPhaseTelemetry,
+                BuildCompileBackend,
             )> {
                 match mode {
                     NativeBuildMode::Off => {
@@ -930,7 +1072,14 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             &compiler_version,
                             BuildCompileBackend::Scarb,
                         )?;
-                        Ok((run, cache_hit, fingerprint, local_session_key, telemetry))
+                        Ok((
+                            run,
+                            cache_hit,
+                            fingerprint,
+                            local_session_key,
+                            telemetry,
+                            BuildCompileBackend::Scarb,
+                        ))
                     }
                     NativeBuildMode::Auto => {
                         let native_compiler_version = native_compiler_version_line();
@@ -961,6 +1110,15 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                 );
                             }
                             record_native_fallback(NativeFallbackReason::DaemonBackendDowngrade);
+                            diagnostics.borrow_mut().push(native_fallback_diagnostic(
+                                "UCN2003",
+                                "native_fallback_daemon_backend_downgrade",
+                                "Native daemon hint downgraded to Scarb",
+                                format!(
+                                    "daemon cache already recorded a scarb fallback session key for native session {native_session_key}"
+                                ),
+                                native_toolchain.as_ref(),
+                            ));
                             let (compiler_version, local_session_key) =
                                 build_scarb_fallback_context()?;
                             let (run, cache_hit, fingerprint, telemetry) = run_local_with_backend(
@@ -983,7 +1141,14 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                 &workspace_root,
                                 &native_session_key,
                             );
-                            return Ok((run, cache_hit, fingerprint, local_session_key, telemetry));
+                            return Ok((
+                                run,
+                                cache_hit,
+                                fingerprint,
+                                local_session_key,
+                                telemetry,
+                                BuildCompileBackend::Scarb,
+                            ));
                         }
                         match run_local_with_backend(
                             &native_session_key,
@@ -1003,7 +1168,14 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                     &workspace_root,
                                     &native_session_key,
                                 );
-                                Ok((run, cache_hit, fingerprint, native_session_key, telemetry))
+                                Ok((
+                                    run,
+                                    cache_hit,
+                                    fingerprint,
+                                    native_session_key,
+                                    telemetry,
+                                    BuildCompileBackend::Native,
+                                ))
                             }
                             Err(native_err) => {
                                 if !native_error_allows_scarb_fallback(&native_err) {
@@ -1015,6 +1187,13 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                     );
                                 }
                                 record_native_fallback(NativeFallbackReason::LocalNativeError);
+                                diagnostics.borrow_mut().push(native_fallback_diagnostic(
+                                    "UCN2002",
+                                    "native_fallback_local_native_error",
+                                    "Native local build downgraded to Scarb",
+                                    format!("{}", native_err.root_cause()),
+                                    native_toolchain.as_ref(),
+                                ));
                                 eprintln!(
                                     "uc: native compile unavailable ({}), falling back to scarb backend",
                                     native_err.root_cause()
@@ -1040,7 +1219,14 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                     &workspace_root,
                                     &native_session_key,
                                 );
-                                Ok((run, cache_hit, fingerprint, local_session_key, telemetry))
+                                Ok((
+                                    run,
+                                    cache_hit,
+                                    fingerprint,
+                                    local_session_key,
+                                    telemetry,
+                                    BuildCompileBackend::Scarb,
+                                ))
                             }
                         }
                     }
@@ -1059,7 +1245,14 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             BuildCompileBackend::Native,
                         )
                         .context("native compile mode is require but native backend failed")?;
-                        Ok((run, cache_hit, fingerprint, native_session_key, telemetry))
+                        Ok((
+                            run,
+                            cache_hit,
+                            fingerprint,
+                            native_session_key,
+                            telemetry,
+                            BuildCompileBackend::Native,
+                        ))
                     }
                 }
             };
@@ -1123,6 +1316,13 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                 NativeAutoPreflightHintState::Supported
                                 | NativeAutoPreflightHintState::Unknown => "unknown reason",
                             };
+                            diagnostics.borrow_mut().push(native_fallback_diagnostic(
+                                "UCN2003",
+                                "native_fallback_daemon_backend_downgrade",
+                                "Daemon backend downgraded to Scarb",
+                                reason.to_string(),
+                                native_toolchain.as_ref(),
+                            ));
                             tracing::debug!(
                                 session_key = %local_session_key,
                                 reason,
@@ -1141,9 +1341,16 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                 };
             let try_daemon_local_probe = |primary_session_key: &str,
                                           primary_compiler_version: &str,
+                                          primary_backend: BuildCompileBackend,
                                           include_scarb_fallback_probe: bool|
              -> Result<
-                Option<(CommandRun, String, BuildPhaseTelemetry, String)>,
+                Option<(
+                    CommandRun,
+                    String,
+                    BuildPhaseTelemetry,
+                    String,
+                    BuildCompileBackend,
+                )>,
             > {
                 let mut scarb_probe_context: Option<(String, String)> = None;
                 let mut resolve_scarb_probe_context = || -> Result<(String, String)> {
@@ -1188,7 +1395,13 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                 &scarb_session_key,
                                 &scarb_compiler_version,
                             )? {
-                                return Ok(Some((run, fingerprint, telemetry, scarb_session_key)));
+                                return Ok(Some((
+                                    run,
+                                    fingerprint,
+                                    telemetry,
+                                    scarb_session_key,
+                                    BuildCompileBackend::Scarb,
+                                )));
                             }
                         }
                     }
@@ -1217,6 +1430,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                         fingerprint,
                         telemetry,
                         primary_session_key.to_string(),
+                        primary_backend,
                     )));
                 }
                 if include_scarb_fallback_probe
@@ -1247,7 +1461,13 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                 &workspace_root,
                                 primary_session_key,
                             );
-                            return Ok(Some((run, fingerprint, telemetry, scarb_session_key)));
+                            return Ok(Some((
+                                run,
+                                fingerprint,
+                                telemetry,
+                                scarb_session_key,
+                                BuildCompileBackend::Scarb,
+                            )));
                         }
                     }
                 }
@@ -1256,8 +1476,9 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
 
             match daemon_mode {
                 DaemonModeArg::Off => {
-                    let (run, cache_hit, fingerprint, local_session_key, telemetry) =
+                    let (run, cache_hit, fingerprint, local_session_key, telemetry, backend) =
                         run_local_for_native_mode(native_mode)?;
+                    actual_compile_backend = Some(backend);
                     session_key = local_session_key;
                     phase_telemetry = Some(telemetry);
                     (run, cache_hit, fingerprint)
@@ -1272,8 +1493,9 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                         DaemonModeArg::Auto,
                         daemon_socket_available,
                     ) {
-                        let (run, cache_hit, fingerprint, fallback_session_key, telemetry) =
+                        let (run, cache_hit, fingerprint, fallback_session_key, telemetry, backend) =
                             run_local_for_native_mode(native_mode)?;
+                        actual_compile_backend = Some(backend);
                         session_key = fallback_session_key;
                         phase_telemetry = Some(telemetry);
                         (run, cache_hit, fingerprint)
@@ -1284,13 +1506,15 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             compiler_version,
                             local_session_key,
                         ) = resolve_daemon_backend_context()?;
-                        if let Some((run, fingerprint, telemetry, hit_session_key)) =
+                        if let Some((run, fingerprint, telemetry, hit_session_key, backend)) =
                             try_daemon_local_probe(
                                 &local_session_key,
                                 &compiler_version,
+                                daemon_compile_backend,
                                 daemon_native_fallback_to_scarb,
                             )?
                         {
+                            actual_compile_backend = Some(backend);
                             session_key = hit_session_key;
                             phase_telemetry = Some(telemetry);
                             (run, true, fingerprint)
@@ -1335,12 +1559,21 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                 }
                             }
                             daemon_used = true;
+                            actual_compile_backend =
+                                Some(response.compile_backend.into_compile_backend());
                             session_key = response.session_key;
                             phase_telemetry = Some(response.telemetry);
                             (response.run, response.cache_hit, response.fingerprint)
                         } else {
-                            let (run, cache_hit, fingerprint, fallback_session_key, telemetry) =
-                                run_local_for_native_mode(native_mode)?;
+                            let (
+                                run,
+                                cache_hit,
+                                fingerprint,
+                                fallback_session_key,
+                                telemetry,
+                                backend,
+                            ) = run_local_for_native_mode(native_mode)?;
+                            actual_compile_backend = Some(backend);
                             session_key = fallback_session_key;
                             phase_telemetry = Some(telemetry);
                             (run, cache_hit, fingerprint)
@@ -1394,16 +1627,20 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             }
                         }
                         daemon_used = true;
+                        actual_compile_backend =
+                            Some(response.compile_backend.into_compile_backend());
                         session_key = response.session_key;
                         phase_telemetry = Some(response.telemetry);
                         (response.run, response.cache_hit, response.fingerprint)
-                    } else if let Some((run, fingerprint, telemetry, hit_session_key)) =
+                    } else if let Some((run, fingerprint, telemetry, hit_session_key, backend)) =
                         try_daemon_local_probe(
                             &local_session_key,
                             &compiler_version,
+                            daemon_compile_backend,
                             daemon_native_fallback_to_scarb,
                         )?
                     {
+                        actual_compile_backend = Some(backend);
                         session_key = hit_session_key;
                         phase_telemetry = Some(telemetry);
                         (run, true, fingerprint)
@@ -1414,7 +1651,9 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             }
         }
     };
-    replay_output(&run.stdout, &run.stderr)?;
+    if !emit_json {
+        replay_output(&run.stdout, &run.stderr)?;
+    }
     if should_log_phase_telemetry() {
         if let Some(telemetry) = phase_telemetry.as_ref() {
             eprintln!(
@@ -1441,8 +1680,18 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         session_key = "n/a".to_string();
     }
 
-    if let Some(path) = report_path {
+    if write_report {
         let artifacts = collect_profile_artifacts(&workspace_root, &profile)?;
+        let report_diagnostics = diagnostics.into_inner();
+        let compile_backend = actual_compile_backend.map(|backend| {
+            build_report_compile_backend_label(
+                engine,
+                backend,
+                used_external_helper,
+                &report_diagnostics,
+            )
+            .to_string()
+        });
         let report = BuildReport {
             generated_at_epoch_ms: epoch_ms()?,
             engine: engine.as_str().to_string(),
@@ -1458,8 +1707,19 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             fingerprint,
             artifact_count: artifacts.len(),
             phase_telemetry,
+            compile_backend,
+            native_toolchain,
+            diagnostics: report_diagnostics,
         };
-        write_json_report(&path, &report)?;
+        if let Some(path) = report_path.as_ref() {
+            write_json_report(path, &report)?;
+        }
+        if emit_json {
+            println!(
+                "{}",
+                serde_json::to_string(&report).context("failed to serialize build report")?
+            );
+        }
     }
 
     if run.exit_code != 0 {
@@ -1510,6 +1770,73 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    #[test]
+    fn build_report_compile_backend_labels_supported_backends() {
+        assert_eq!(
+            build_report_compile_backend_label(
+                EngineArg::Scarb,
+                BuildCompileBackend::Scarb,
+                false,
+                &[],
+            ),
+            "scarb"
+        );
+        assert_eq!(
+            build_report_compile_backend_label(
+                EngineArg::Uc,
+                BuildCompileBackend::Native,
+                false,
+                &[],
+            ),
+            "uc_native"
+        );
+        assert_eq!(
+            build_report_compile_backend_label(
+                EngineArg::Uc,
+                BuildCompileBackend::Native,
+                true,
+                &[],
+            ),
+            "uc_native_external_helper"
+        );
+        assert_eq!(
+            build_report_compile_backend_label(
+                EngineArg::Uc,
+                BuildCompileBackend::Scarb,
+                false,
+                &[],
+            ),
+            "uc_scarb"
+        );
+    }
+
+    #[test]
+    fn build_report_compile_backend_labels_scarb_fallbacks() {
+        let diagnostics = vec![NativeDiagnostic {
+            code: "UCN2002".to_string(),
+            category: "native_fallback_local_native_error".to_string(),
+            severity: NativeDiagnosticSeverity::Warn,
+            title: "Native local build downgraded to Scarb".to_string(),
+            what_happened: "native failed".to_string(),
+            why: "native failed".to_string(),
+            how_to_fix: vec!["fix native".to_string()],
+            retryable: true,
+            fallback_used: true,
+            toolchain_expected: Some("2.14.0".to_string()),
+            toolchain_found: Some("2.16.0".to_string()),
+        }];
+        assert_eq!(
+            build_report_compile_backend_label(
+                EngineArg::Uc,
+                BuildCompileBackend::Scarb,
+                false,
+                &diagnostics,
+            ),
+            "scarb_fallback"
+        );
+        assert!(diagnostics_used_native_fallback(&diagnostics));
     }
 
     #[test]

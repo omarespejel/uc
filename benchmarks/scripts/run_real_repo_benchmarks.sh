@@ -289,6 +289,114 @@ probe_native_support() {
   "$UC_BIN" support native --manifest-path "$manifest_path" --format json
 }
 
+classify_support_matrix_case() {
+  local manifest_path="$1"
+  local tag="$2"
+  local support_json="$3"
+  if [[ "$(jq -r '.supported' <<<"$support_json")" != "true" ]]; then
+    jq -n \
+      --argjson native_support "$support_json" \
+      '{
+        classification: "native_unsupported",
+        compile_backend: null,
+        fallback_used: false,
+        exit_code: 0,
+        elapsed_ms: null,
+        log_path: null,
+        report_path: null,
+        build_report: null,
+        reason: ($native_support.reason // "native support probe reported unsupported")
+      }'
+    return 0
+  fi
+
+  local source_dir
+  source_dir="$(cd "$(dirname "$manifest_path")" && pwd -P)"
+  local classify_dir="$TMP_DIR/${tag}-uc-auto-classify"
+  local log_path="$RESULTS_DIR/real-repo-${tag}-uc-auto-build.log"
+  local report_path="$RESULTS_DIR/real-repo-${tag}-uc-auto-build-report.json"
+  rm -rf "$classify_dir"
+  mkdir -p "$classify_dir"
+  cp -PR "$source_dir/." "$classify_dir"
+  reset_workload_outputs "$classify_dir"
+  prefetch_manifest_dependencies "$manifest_path"
+
+  local -a uc_auto_cmd=(env "UC_NATIVE_BUILD=auto")
+  if [[ -n "${UC_NATIVE_CORELIB_SRC:-}" ]]; then
+    uc_auto_cmd+=("UC_NATIVE_CORELIB_SRC=$UC_NATIVE_CORELIB_SRC")
+  fi
+  uc_auto_cmd+=(
+    "$UC_BIN"
+    build
+    --engine
+    uc
+    --daemon-mode
+    off
+    --offline
+    --report-path
+    "$report_path"
+    --manifest-path
+    "$classify_dir/Scarb.toml"
+  )
+
+  local elapsed_ms=""
+  local exit_code=0
+  elapsed_ms="$(measure_command_ms "$classify_dir" "$log_path" "${uc_auto_cmd[@]}")" || exit_code=$?
+  local build_report_json="null"
+  if [[ -f "$report_path" ]]; then
+    build_report_json="$(cat "$report_path")"
+  fi
+  rm -rf "$classify_dir"
+
+  jq -n \
+    --argjson native_support "$support_json" \
+    --argjson build_report "$build_report_json" \
+    --argjson exit_code "$exit_code" \
+    --arg elapsed_ms "$elapsed_ms" \
+    --arg log_path "$log_path" \
+    --arg report_path "$report_path" \
+    '
+      def fallback_used:
+        (($build_report.diagnostics // []) | any(.fallback_used == true));
+      def compile_backend:
+        ($build_report.compile_backend // null);
+      def classification:
+        if $native_support.supported != true then
+          "native_unsupported"
+        elif $exit_code != 0 then
+          "build_failed"
+        elif compile_backend == "uc_native" or compile_backend == "uc_native_external_helper" then
+          "native_supported"
+        elif compile_backend == "scarb_fallback" or compile_backend == "uc_scarb" or fallback_used then
+          "fallback_used"
+        else
+          "build_failed"
+        end;
+      {
+        classification: classification,
+        compile_backend: compile_backend,
+        fallback_used: fallback_used,
+        exit_code: $exit_code,
+        elapsed_ms: (if $elapsed_ms == "" then null else ($elapsed_ms | tonumber) end),
+        log_path: $log_path,
+        report_path: (if $build_report == null then null else $report_path end),
+        build_report: $build_report,
+        reason: (
+          if classification == "native_unsupported" then
+            ($native_support.reason // "native support probe reported unsupported")
+          elif classification == "fallback_used" then
+            ((($build_report.diagnostics // []) | map(select(.fallback_used == true) | .why) | first)
+              // "uc auto build fell back to the scarb backend")
+          elif classification == "build_failed" then
+            ((($build_report.diagnostics // []) | map(.why) | first)
+              // "uc auto build failed before backend classification completed")
+          else
+            null
+          end
+        )
+      }'
+}
+
 reset_workload_outputs() {
   local cwd="$1"
   rm -rf "$cwd/target" "$cwd/.uc" "$cwd/.scarb"
@@ -351,15 +459,18 @@ run_cold_stats() {
     local exit_code=0
     measure_command_ms "$run_dir" "$log_path" "${command[@]}" >> "$samples_file" || exit_code=$?
     if [[ "$exit_code" -ne 0 ]]; then
+      rm -rf "$baseline_dir" "$run_root"
       measurement_failure_json "$stage" "$exit_code" "$log_path"
       return 0
     fi
   done
   local stats_json
   if ! stats_json="$(stats_json_from_samples "$samples_file")"; then
+    rm -rf "$baseline_dir" "$run_root"
     measurement_failure_json "$stage" "-1" "$samples_file"
     return 0
   fi
+  rm -rf "$baseline_dir" "$run_root"
   measurement_ok_json "$stage" "$sample_count" "$stats_json"
 }
 
@@ -387,6 +498,7 @@ run_warm_noop_stats() {
   local exit_code=0
   measure_command_ms "$warm_dir" "$warm_prime_log" "${command[@]}" >/dev/null || exit_code=$?
   if [[ "$exit_code" -ne 0 ]]; then
+    rm -rf "$warm_dir"
     measurement_failure_json "$stage.prime" "$exit_code" "$warm_prime_log"
     return 0
   fi
@@ -396,15 +508,18 @@ run_warm_noop_stats() {
     local exit_code=0
     measure_command_ms "$warm_dir" "$log_path" "${command[@]}" >> "$samples_file" || exit_code=$?
     if [[ "$exit_code" -ne 0 ]]; then
+      rm -rf "$warm_dir"
       measurement_failure_json "$stage" "$exit_code" "$log_path"
       return 0
     fi
   done
   local stats_json
   if ! stats_json="$(stats_json_from_samples "$samples_file")"; then
+    rm -rf "$warm_dir"
     measurement_failure_json "$stage" "-1" "$samples_file"
     return 0
   fi
+  rm -rf "$warm_dir"
   measurement_ok_json "$stage" "$sample_count" "$stats_json"
 }
 
@@ -412,6 +527,7 @@ benchmark_supported_case() {
   local manifest_path="$1"
   local tag="$2"
   local support_json="$3"
+  local support_matrix_json="$4"
   local source_dir
   source_dir="$(cd "$(dirname "$manifest_path")" && pwd -P)"
   prefetch_manifest_dependencies "$manifest_path"
@@ -436,6 +552,7 @@ benchmark_supported_case() {
     --arg tag "$tag" \
     --arg manifest_path "$manifest_path" \
     --argjson native_support "$support_json" \
+    --argjson support_matrix "$support_matrix_json" \
     --argjson scarb_cold "$scarb_cold_json" \
     --argjson scarb_warm "$scarb_warm_json" \
     --argjson uc_cold "$uc_cold_json" \
@@ -444,6 +561,7 @@ benchmark_supported_case() {
       tag: $tag,
       manifest_path: $manifest_path,
       native_support: $native_support,
+      support_matrix: $support_matrix,
       benchmark_status: (
         if [
           $scarb_cold.status,
@@ -469,18 +587,22 @@ benchmark_supported_case() {
     }'
 }
 
-record_ineligible_case() {
+record_non_benchmarked_case() {
   local manifest_path="$1"
   local tag="$2"
   local support_json="$3"
+  local support_matrix_json="$4"
   jq -n \
     --arg tag "$tag" \
     --arg manifest_path "$manifest_path" \
     --argjson native_support "$support_json" \
+    --argjson support_matrix "$support_matrix_json" \
     '{
       tag: $tag,
       manifest_path: $manifest_path,
       native_support: $native_support,
+      support_matrix: $support_matrix,
+      benchmark_status: "skipped",
       benchmarks: null
     }'
 }
@@ -489,10 +611,11 @@ for idx in "${!CASE_MANIFESTS[@]}"; do
   manifest_path="$(cd "$(dirname "${CASE_MANIFESTS[$idx]}")" && pwd -P)/$(basename "${CASE_MANIFESTS[$idx]}")"
   tag="${CASE_TAGS[$idx]}"
   support_json="$(probe_native_support "$manifest_path")"
-  if [[ "$(jq -r '.supported' <<<"$support_json")" == "true" ]]; then
-    benchmark_supported_case "$manifest_path" "$tag" "$support_json" >> "$TMP_DIR/cases.ndjson"
+  support_matrix_json="$(classify_support_matrix_case "$manifest_path" "$tag" "$support_json")"
+  if [[ "$(jq -r '.classification' <<<"$support_matrix_json")" == "native_supported" ]]; then
+    benchmark_supported_case "$manifest_path" "$tag" "$support_json" "$support_matrix_json" >> "$TMP_DIR/cases.ndjson"
   else
-    record_ineligible_case "$manifest_path" "$tag" "$support_json" >> "$TMP_DIR/cases.ndjson"
+    record_non_benchmarked_case "$manifest_path" "$tag" "$support_json" "$support_matrix_json" >> "$TMP_DIR/cases.ndjson"
   fi
 done
 
@@ -524,13 +647,24 @@ jq -s \
   echo "- Cold runs: $COLD_RUNS"
   echo "- Warm settle seconds: $WARM_SETTLE_SECONDS"
   echo
-  echo "## Native-Eligible Cases"
+  echo "## Support Matrix"
+  echo "| Tag | Classification | Compile Backend | Requested | Found | Fallback Used | Reason |"
+  echo "|---|---|---|---|---|---|---|"
+  jq -r '
+    .cases[]
+    | .support_matrix as $matrix
+    | .native_support as $support
+    | ($matrix.build_report.native_toolchain // $support.toolchain // null) as $toolchain
+    | "| \(.tag) | \($matrix.classification) | \($matrix.compile_backend // "<none>") | \($toolchain.requested_version // $toolchain.requested_major_minor // $support.package_cairo_version // "<none>") | \($toolchain.compiler_version // "<none>") | \($matrix.fallback_used) | \($matrix.reason // "<none>") |"
+  ' "$OUT_JSON"
+  echo
+  echo "## Native-Supported Benchmark Cases"
   echo "| Tag | Cold Scarb p95 (ms) | Cold UC p95 (ms) | Cold Speedup (x) | Warm Scarb p95 (ms) | Warm UC p95 (ms) | Warm Speedup (x) |"
   echo "|---|---:|---:|---:|---:|---:|---:|"
   jq -r '
     def r3: ((. * 1000 | round) / 1000);
     .cases[]
-    | select(.native_support.supported == true and .benchmark_status == "ok")
+    | select(.support_matrix.classification == "native_supported" and .benchmark_status == "ok")
     | . as $case
     | ($case.benchmarks.scarb.build.cold.stats.p95_ms) as $scarb_cold
     | ($case.benchmarks.uc.build.cold.stats.p95_ms) as $uc_cold
@@ -539,12 +673,12 @@ jq -s \
     | "| \($case.tag) | \($scarb_cold | r3) | \($uc_cold | r3) | \((if $uc_cold == 0 then null else $scarb_cold / $uc_cold end) | r3) | \($scarb_warm | r3) | \($uc_warm | r3) | \((if $uc_warm == 0 then null else $scarb_warm / $uc_warm end) | r3) |"
   ' "$OUT_JSON"
   echo
-  echo "## Native-Eligible Cases With Build Failures"
+  echo "## Native-Supported Benchmark Cases With Build Failures"
   echo "| Tag | Tool | Stage | Exit Code | Log Path |"
   echo "|---|---|---|---:|---|"
   jq -r '
     .cases[]
-    | select(.native_support.supported == true and .benchmark_status != "ok")
+    | select(.support_matrix.classification == "native_supported" and .benchmark_status != "ok")
     | . as $case
     | [
         {tool: "scarb", lane: $case.benchmarks.scarb.build.cold},
@@ -556,13 +690,33 @@ jq -s \
     | "| \($case.tag) | \(.tool) | \(.lane.stage) | \(.lane.exit_code) | \(.lane.log_path) |"
   ' "$OUT_JSON"
   echo
-  echo "## Native-Ineligible Cases"
-  echo "| Tag | Package Cairo Version | Reason |"
+  echo "## Fallback-Used Cases"
+  echo "| Tag | Compile Backend | Requested | Found | Reason |"
+  echo "|---|---|---|---|---|"
+  jq -r '
+    .cases[]
+    | select(.support_matrix.classification == "fallback_used")
+    | .support_matrix as $matrix
+    | (.support_matrix.build_report.native_toolchain // .native_support.toolchain // null) as $toolchain
+    | "| \(.tag) | \($matrix.compile_backend // "<none>") | \($toolchain.requested_version // $toolchain.requested_major_minor // .native_support.package_cairo_version // "<none>") | \($toolchain.compiler_version // "<none>") | \($matrix.reason // "unknown reason") |"
+  ' "$OUT_JSON"
+  echo
+  echo "## Native-Unsupported Cases"
+  echo "| Tag | Requested | Reason |"
   echo "|---|---|---|"
   jq -r '
     .cases[]
-    | select(.native_support.supported != true)
-    | "| \(.tag) | \(.native_support.package_cairo_version // "<none>") | \(.native_support.reason // "unknown reason") |"
+    | select(.support_matrix.classification == "native_unsupported")
+    | "| \(.tag) | \(.native_support.package_cairo_version // .native_support.toolchain.requested_version // .native_support.toolchain.requested_major_minor // "<none>") | \(.support_matrix.reason // .native_support.reason // "unknown reason") |"
+  ' "$OUT_JSON"
+  echo
+  echo "## Auto-Build Classification Failures"
+  echo "| Tag | Exit Code | Log Path | Reason |"
+  echo "|---|---:|---|---|"
+  jq -r '
+    .cases[]
+    | select(.support_matrix.classification == "build_failed")
+    | "| \(.tag) | \(.support_matrix.exit_code) | \(.support_matrix.log_path // "<none>") | \(.support_matrix.reason // "unknown reason") |"
   ' "$OUT_JSON"
 } > "$OUT_MD"
 

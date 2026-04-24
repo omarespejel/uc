@@ -96,6 +96,53 @@ impl Drop for ScopedEnvVar {
     }
 }
 
+struct ScopedDynamicEnvVar {
+    key: String,
+    previous: Option<OsString>,
+}
+
+impl ScopedDynamicEnvVar {
+    fn set_with_lock(
+        _guard: &std::sync::MutexGuard<'_, ()>,
+        key: impl Into<String>,
+        value: impl AsRef<std::ffi::OsStr>,
+    ) -> Self {
+        let key = key.into();
+        let previous = std::env::var_os(&key);
+        std::env::set_var(&key, value);
+        Self { key, previous }
+    }
+
+    fn unset_with_lock(_guard: &std::sync::MutexGuard<'_, ()>, key: impl Into<String>) -> Self {
+        let key = key.into();
+        let previous = std::env::var_os(&key);
+        std::env::remove_var(&key);
+        Self { key, previous }
+    }
+}
+
+impl Drop for ScopedDynamicEnvVar {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.as_ref() {
+            std::env::set_var(&self.key, previous);
+        } else {
+            std::env::remove_var(&self.key);
+        }
+    }
+}
+
+#[cfg(all(feature = "native-compile", unix))]
+fn write_fake_uc_support_helper(path: &Path, report: &NativeSupportReport) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let payload = serde_json::to_string(report).expect("serialize fake helper report");
+    let script = format!("#!/usr/bin/env bash\nprintf '%s\\n' '{}'\n", payload);
+    fs::write(path, script).expect("write fake helper script");
+    let mut perms = fs::metadata(path).expect("stat fake helper").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).expect("chmod fake helper");
+}
+
 #[cfg(feature = "native-compile")]
 fn native_progress_hook_lock() -> &'static Mutex<()> {
     static LOCK: TestOnceLock<Mutex<()>> = TestOnceLock::new();
@@ -251,6 +298,27 @@ fn build_cli_defaults_daemon_mode_to_auto() {
         panic!("expected build command");
     };
     assert_eq!(args.daemon_mode as u8, DaemonModeArg::Auto as u8);
+}
+
+#[test]
+fn build_cli_accepts_json_flag() {
+    let cli = Cli::try_parse_from(["uc", "build", "--json"]).expect("build args should parse");
+    let Commands::Build(args) = cli.command else {
+        panic!("expected build command");
+    };
+    assert!(args.json);
+}
+
+#[test]
+fn support_native_cli_accepts_json_alias_flag() {
+    let cli = Cli::try_parse_from(["uc", "support", "native", "--json"])
+        .expect("support native args should parse");
+    let Commands::Support(args) = cli.command else {
+        panic!("expected support command");
+    };
+    let SupportCommand::Native(args) = args.command;
+    assert!(args.json);
+    assert_eq!(args.format as u8, SupportFormatArg::Text as u8);
 }
 
 #[test]
@@ -1875,7 +1943,7 @@ edition = "2023_01"
             .reason
             .as_deref()
             .unwrap_or_default()
-            .contains("requires an exact [package].cairo-version for legacy edition 2023_01"),
+            .contains("could not resolve an exact Cairo toolchain for legacy edition 2023_01"),
         "report should explain why legacy floating manifests are unsupported"
     );
 }
@@ -1928,16 +1996,261 @@ cairo-version = "{compiler_major}.{}.0"
     assert!(!unsupported_report.supported);
     assert_eq!(
         unsupported_report.issue_kind.as_deref(),
-        Some("compiler_version_mismatch")
+        Some("missing_toolchain_helper")
     );
     assert!(
         unsupported_report
             .reason
             .as_deref()
             .unwrap_or_default()
-            .contains("requires the same cairo major.minor"),
-        "unsupported report should explain the version mismatch"
+            .contains("UC_NATIVE_TOOLCHAIN"),
+        "unsupported report should explain the missing helper lane"
     );
+}
+
+#[cfg(all(feature = "native-compile", unix))]
+#[test]
+fn select_native_toolchain_from_manifest_path_uses_lockfile_lane_helper() {
+    let _guard = integration_env_lock().lock().unwrap();
+    let current = parse_cairo_version_major_minor(native_cairo_lang_compiler_version())
+        .expect("compiler version should parse");
+    let requested = if current == (2, 14) { (2, 16) } else { (2, 14) };
+    let requested_major_minor = format_cairo_version_major_minor(requested);
+    let requested_version = format!("{requested_major_minor}.0");
+    let helper_env = native_toolchain_env_var_name_for_major_minor(&requested_major_minor);
+
+    let dir = unique_test_dir("uc-native-toolchain-lockfile-helper");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let manifest_path = dir.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2023_01"
+
+[dependencies]
+starknet = ">=2.11.2"
+"#,
+    )
+    .expect("write manifest");
+    fs::write(
+        dir.join("Scarb.lock"),
+        format!(
+            r#"version = 1
+
+[[package]]
+name = "demo"
+version = "0.1.0"
+
+[[package]]
+name = "starknet"
+version = "{requested_version}"
+"#
+        ),
+    )
+    .expect("write lockfile");
+
+    let helper_path = dir.join("uc-helper.sh");
+    write_fake_uc_support_helper(
+        &helper_path,
+        &NativeSupportReport {
+            manifest_path: manifest_path.display().to_string(),
+            status: NativeSupportStatus::Supported,
+            supported: true,
+            reason: None,
+            compiler_version: Some(requested_version.clone()),
+            package_cairo_version: None,
+            issue_kind: None,
+            toolchain: None,
+            diagnostics: Vec::new(),
+        },
+    );
+    let _helper = ScopedDynamicEnvVar::set_with_lock(&_guard, helper_env.clone(), &helper_path);
+
+    let (requirement, selection) =
+        select_native_toolchain_from_manifest_path(&manifest_path).expect("selection should work");
+    assert_eq!(
+        requirement.request_source,
+        Some(NativeToolchainRequestSource::LockfileDependencyVersion)
+    );
+    let selection = selection.expect("helper lane should be selected");
+    assert_eq!(
+        selection.toolchain.source,
+        NativeToolchainSource::ExternalHelper
+    );
+    assert_eq!(
+        selection.toolchain.requested_major_minor.as_deref(),
+        Some(requested_major_minor.as_str())
+    );
+    assert_eq!(
+        selection.helper_path.as_deref(),
+        Some(helper_path.as_path())
+    );
+}
+
+#[cfg(all(feature = "native-compile", unix))]
+#[test]
+fn native_support_report_from_manifest_path_uses_external_helper_toolchain_fields() {
+    let _guard = integration_env_lock().lock().unwrap();
+    let current = parse_cairo_version_major_minor(native_cairo_lang_compiler_version())
+        .expect("compiler version should parse");
+    let requested = if current == (2, 14) { (2, 16) } else { (2, 14) };
+    let requested_major_minor = format_cairo_version_major_minor(requested);
+    let requested_version = format!("{requested_major_minor}.0");
+    let helper_env = native_toolchain_env_var_name_for_major_minor(&requested_major_minor);
+
+    let dir = unique_test_dir("uc-native-support-helper-report");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let manifest_path = dir.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+cairo-version = "{requested_version}"
+"#
+        ),
+    )
+    .expect("write manifest");
+
+    let helper_path = dir.join("uc-helper.sh");
+    write_fake_uc_support_helper(
+        &helper_path,
+        &NativeSupportReport {
+            manifest_path: manifest_path.display().to_string(),
+            status: NativeSupportStatus::Supported,
+            supported: true,
+            reason: None,
+            compiler_version: Some(requested_version.clone()),
+            package_cairo_version: Some(requested_version.clone()),
+            issue_kind: None,
+            toolchain: Some(NativeToolchainReport {
+                edition: "2024_07".to_string(),
+                requested_version: Some(requested_version.clone()),
+                requested_major_minor: Some(requested_major_minor.clone()),
+                request_source: Some(NativeToolchainRequestSource::PackageCairoVersion),
+                source: NativeToolchainSource::Builtin,
+                binary_path: None,
+                compiler_version: Some(requested_version.clone()),
+            }),
+            diagnostics: Vec::new(),
+        },
+    );
+    let _helper = ScopedDynamicEnvVar::set_with_lock(&_guard, helper_env.clone(), &helper_path);
+
+    let report = native_support_report_from_manifest_path(&manifest_path)
+        .expect("helper-backed report should be returned");
+    assert_eq!(report.status, NativeSupportStatus::Supported);
+    assert!(report.supported);
+    let toolchain = report.toolchain.expect("toolchain should be populated");
+    assert_eq!(toolchain.source, NativeToolchainSource::ExternalHelper);
+    assert_eq!(
+        toolchain.binary_path.as_deref(),
+        Some(helper_path.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        toolchain.compiler_version.as_deref(),
+        Some(requested_version.as_str())
+    );
+    assert!(report.diagnostics.is_empty());
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_support_report_from_manifest_path_reports_missing_toolchain_helper_diagnostic() {
+    let _guard = integration_env_lock().lock().unwrap();
+    let current = parse_cairo_version_major_minor(native_cairo_lang_compiler_version())
+        .expect("compiler version should parse");
+    let requested = if current == (2, 14) { (2, 16) } else { (2, 14) };
+    let requested_major_minor = format_cairo_version_major_minor(requested);
+    let requested_version = format!("{requested_major_minor}.0");
+    let helper_env = native_toolchain_env_var_name_for_major_minor(&requested_major_minor);
+    let _helper = ScopedDynamicEnvVar::unset_with_lock(&_guard, helper_env.clone());
+
+    let dir = unique_test_dir("uc-native-support-missing-helper");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let manifest_path = dir.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+cairo-version = "{requested_version}"
+"#
+        ),
+    )
+    .expect("write manifest");
+
+    let report = native_support_report_from_manifest_path(&manifest_path)
+        .expect("missing helper should still return a report");
+    assert_eq!(report.status, NativeSupportStatus::Unsupported);
+    assert_eq!(
+        report.issue_kind.as_deref(),
+        Some("missing_toolchain_helper")
+    );
+    let diagnostic = report
+        .diagnostics
+        .first()
+        .expect("missing helper diagnostic should be present");
+    assert_eq!(diagnostic.code, "UCN1004");
+    assert_eq!(diagnostic.category, "toolchain_lane_unavailable");
+    assert_eq!(
+        report
+            .toolchain
+            .as_ref()
+            .map(|toolchain| toolchain.source.clone()),
+        Some(NativeToolchainSource::ExternalHelper)
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn ensure_native_manifest_cairo_version_supported_at_path_accepts_lockfile_resolved_version() {
+    let current = parse_cairo_version_major_minor(native_cairo_lang_compiler_version())
+        .expect("compiler version should parse");
+    let current_version = format!("{}.{}.0", current.0, current.1);
+    let dir = unique_test_dir("uc-native-lockfile-resolved-support");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let manifest_path = dir.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2023_01"
+
+[dependencies]
+starknet = ">=2.11.2"
+"#,
+    )
+    .expect("write manifest");
+    fs::write(
+        dir.join("Scarb.lock"),
+        format!(
+            r#"version = 1
+
+[[package]]
+name = "demo"
+version = "0.1.0"
+
+[[package]]
+name = "starknet"
+version = "{current_version}"
+"#
+        ),
+    )
+    .expect("write lockfile");
+    let manifest: TomlValue =
+        toml::from_str(&fs::read_to_string(&manifest_path).expect("read manifest"))
+            .expect("parse manifest");
+
+    ensure_native_manifest_cairo_version_supported_at_path(&manifest_path, &manifest)
+        .expect("lockfile-resolved exact version should be accepted");
 }
 
 #[test]
@@ -5006,8 +5319,9 @@ dojo = "1.2.3"
         surface
             .crate_dependency_configs
             .iter()
-            .any(|config| config.crate_name == "demo" && config.dependencies.is_empty()),
-        "root crate dependency config should be present even without local path dependencies"
+            .any(|config| config.crate_name == "demo"
+                && config.dependencies == vec!["demo".to_string()]),
+        "root crate dependency config should include the crate self-edge for legacy self imports"
     );
 }
 
@@ -5079,9 +5393,13 @@ alexandria = "0.9.0"
         surface.crate_dependency_configs.iter().any(|config| {
             config.crate_name == "demo"
                 && config.dependencies
-                    == vec!["local_dep".to_string(), "shared_dep".to_string()]
+                    == vec![
+                        "demo".to_string(),
+                        "local_dep".to_string(),
+                        "shared_dep".to_string(),
+                    ]
         }),
-        "root crate should track direct local path dependencies for cairo_project dependency wiring"
+        "root crate should track direct local path dependencies and its self-edge for cairo_project dependency wiring"
     );
     fs::remove_dir_all(&dir).ok();
 }
@@ -5138,9 +5456,10 @@ shared-dep = { workspace = true }
     );
     assert!(
         surface.crate_dependency_configs.iter().any(|config| {
-            config.crate_name == "demo" && config.dependencies == vec!["shared_dep".to_string()]
+            config.crate_name == "demo"
+                && config.dependencies == vec!["demo".to_string(), "shared_dep".to_string()]
         }),
-        "root crate should wire workspace path dependency as a local Cairo dependency"
+        "root crate should wire workspace path dependencies and its self-edge as local Cairo dependencies"
     );
     fs::remove_dir_all(&dir).ok();
 }
@@ -5464,6 +5783,12 @@ edition = "2024_07"
     assert!(
         cairo_project.contains("[config.global]\nedition = \"2024_07\""),
         "manifest edition should be propagated into cairo_project.toml: {cairo_project}"
+    );
+    assert!(
+        cairo_project.contains(
+            "[config.override.demo_native.dependencies]\ndemo_native = { discriminator = \"demo_native\" }"
+        ),
+        "native cairo_project should include the root crate self-dependency for crate-name imports: {cairo_project}"
     );
     assert!(
         !context.workspace_mode_supported,
@@ -10326,6 +10651,49 @@ fn resolve_native_corelib_src_skips_version_mismatched_home_candidate() {
         std::env::set_var("HOME", value);
     } else {
         std::env::remove_var("HOME");
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn resolve_native_corelib_src_uses_versioned_scarb_cache_candidate() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = unique_test_dir("uc-native-corelib-scarb-cache");
+    let workspace_root = dir.join("workspace");
+    fs::create_dir_all(&workspace_root).expect("failed to create workspace root");
+
+    let home = dir.join("home");
+    let scarb_corelib = home
+        .join("Library/Caches/com.swmansion.scarb/registry/std")
+        .join(format!("v{}", native_cairo_lang_compiler_version()))
+        .join("core/src");
+    create_mock_native_corelib(&scarb_corelib);
+
+    let original_home = std::env::var_os("HOME");
+    let original_xdg_cache_home = std::env::var_os("XDG_CACHE_HOME");
+    std::env::set_var("HOME", &home);
+    std::env::remove_var("XDG_CACHE_HOME");
+    std::env::remove_var("UC_NATIVE_CORELIB_SRC");
+
+    let resolved = resolve_native_corelib_src(&workspace_root).expect("resolve should succeed");
+    assert_eq!(
+        resolved,
+        scarb_corelib
+            .canonicalize()
+            .expect("failed to canonicalize scarb cache corelib")
+    );
+
+    if let Some(value) = original_home {
+        std::env::set_var("HOME", value);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    if let Some(value) = original_xdg_cache_home {
+        std::env::set_var("XDG_CACHE_HOME", value);
+    } else {
+        std::env::remove_var("XDG_CACHE_HOME");
     }
     fs::remove_dir_all(&dir).ok();
 }

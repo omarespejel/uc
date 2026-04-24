@@ -4,12 +4,17 @@
 
 1. `uc build`
 - Executes build path with selectable engines.
-- Supports: `--manifest-path`, `--package`, `--workspace`, `--features`, `--offline`, `--release`, `--profile`, `--daemon-mode`.
+- Supports: `--manifest-path`, `--package`, `--workspace`, `--features`, `--offline`, `--release`, `--profile`, `--daemon-mode`, `--json`.
 - Engines:
-  - `--engine uc` (default): deterministic fingerprint + local artifact cache restore fast-path.
-    - daemon policy via `--daemon-mode off|auto|require` (default: `off`).
+  - `--engine uc` (default): deterministic fingerprint + native compile/cache path with Scarb fallback only when allowed.
+    - daemon policy via `--daemon-mode off|auto|require` (default: `auto`).
   - `--engine scarb`: direct Scarb execution path.
-- Optional `--report-path` writes execution report JSON.
+- `--json` emits the same execution report JSON on stdout and suppresses normal build log replay so the payload stays machine-readable.
+- Optional `--report-path` writes the execution report JSON to disk; it can be combined with `--json`.
+- Build report JSON now includes:
+  - `compile_backend`: `scarb`, `uc_scarb`, `scarb_fallback`, `uc_native`, or `uc_native_external_helper`
+  - `native_toolchain`: requested lane, selected source, resolved compiler version, and helper binary path when applicable
+  - `diagnostics`: stable machine-readable diagnostic entries with `code`, `category`, `what_happened`, `why`, `how_to_fix`, `retryable`, `fallback_used`, `toolchain_expected`, and `toolchain_found`
 
 2. `uc metadata`
 - Executes metadata resolution path.
@@ -30,8 +35,13 @@
 
 6. `uc support native`
 - Probes whether a manifest is eligible for native compile in the current `uc` binary.
-- Supports: `--manifest-path`, `--format text|json`.
+- Supports: `--manifest-path`, `--format text|json`, `--json`.
 - Returns a structured reason for ineligible manifests so scripts and local benchmark harnesses can classify cases before measuring them.
+- Native support JSON includes selected toolchain lane and stable diagnostics for:
+  - exact `cairo-version` mismatches
+  - unsupported manifest constraints
+  - missing or invalid external helper lanes
+  - unparseable compiler versions
 
 7. `uc migrate`
 - Analyzes `Scarb.toml` and emits a migration readiness report.
@@ -43,8 +53,12 @@
 - `stop`: requests graceful shutdown.
 
 ## Current Engine Note
-`uc` engine currently uses Scarb execution for cache misses and deterministic local cache restore for hits. This is a bootstrap native path to capture warm speedups while keeping parity gates.
+`uc` now selects native toolchain lanes before compile starts:
+- builtin lane for the compiler version baked into the active binary
+- external helper lane via `UC_NATIVE_TOOLCHAIN_<major>_<minor>_BIN` for older Cairo majors/minors such as `2.14`
+
+Native auto mode still falls back to Scarb only when the failure class is explicitly marked fallback-eligible. The fallback path is now surfaced in build reports and benchmark support-matrix output instead of being inferred from logs.
 
 ## Next Expansion
-- Add native `uc` compile engine implementation behind the existing command interface.
-- Keep `compare-build` as mandatory gate while native path matures.
+- Add more native toolchain helper lanes beyond Cairo `2.14`.
+- Keep `compare-build` as mandatory gate while deeper frontend-compile optimizations mature.

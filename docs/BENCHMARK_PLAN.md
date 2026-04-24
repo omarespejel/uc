@@ -21,19 +21,25 @@ Measure and prove that `uc` outperforms Scarb on real workflows while maintainin
 - Markdown summary per run under `benchmarks/results/`.
 - Reviewed baseline snapshots under `benchmarks/baselines/`.
 
+## Execution Policy
+- Benchmarks are local-first. Reproduction must work from checked-in scripts plus pinned manifest paths; do not require GitHub Actions or hosted CI to verify the numbers.
+- Before comparing before/after performance claims, rerun both sides in the same binary/toolchain window on the same machine.
+
 ## Baseline Rule
 Before changing `uc` engine behavior, rerun baseline against current Scarb and snapshot results.
 
 ## Eligibility Rule
 Do not mix native-ineligible manifests into `uc` vs Scarb speedup claims.
 Benchmark reports must separate:
-- native-eligible workloads that were actually measured against `uc` native build
-- native-eligible workloads that failed during timed execution, with exit code and log path
-- native-ineligible workloads that were skipped, along with the exact reason
+- `native_supported`: auto-build stayed on native and strict native benchmarks were executed
+- `fallback_used`: auto-build downgraded to Scarb, along with the structured fallback reason
+- `native_unsupported`: native support probe rejected the repo before timed execution
+- `build_failed`: auto-build failed before backend classification completed
 
 Examples of native-ineligible reasons that should be reported explicitly:
 - exact `cairo-version` mismatch against the native compiler
 - legacy package editions (`2023_01`, `2023_10`, `2023_11`) without an exact `[package].cairo-version`
+- missing or invalid `UC_NATIVE_TOOLCHAIN_<major>_<minor>_BIN` helper lanes
 
 ## Comparator Rule
 Every build-path engine change must run dual-run comparison (`scarb-direct` vs `uc build`) and record:
@@ -50,4 +56,10 @@ Every build-path engine change must run dual-run comparison (`scarb-direct` vs `
 ./benchmarks/scripts/run_local_benchmarks.sh --matrix research --tool scarb
 ./benchmarks/scripts/run_local_benchmarks.sh --matrix research --tool uc
 ./benchmarks/scripts/run_dual_run_comparator.sh
+
+# Real repo support-matrix and strict-native benchmark sweep
+UC_NATIVE_TOOLCHAIN_2_14_BIN=/abs/path/to/uc-cairo214-helper \
+./benchmarks/scripts/run_real_repo_benchmarks.sh \
+  --uc-bin /abs/path/to/uc \
+  --case /abs/path/to/repo/Scarb.toml repo-tag
 ```
