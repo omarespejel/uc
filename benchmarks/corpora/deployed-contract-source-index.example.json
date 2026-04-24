@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "corpus_id": "starknet-mainnet-deployed-source-sample-2026-04-24",
+  "chain": "starknet-mainnet",
+  "selection": {
+    "source": "example fixture; not launch evidence",
+    "snapshot_id": "sample-fixture-only",
+    "from_block": 0,
+    "to_block": 0,
+    "coverage": "sample",
+    "notes": "This demonstrates the source-index shape. Do not use it for launch claims."
+  },
+  "deduplication": {
+    "key": "class_hash",
+    "input_count": 1,
+    "deduped_count": 1,
+    "rules": "Sample contains one local fixture class hash."
+  },
+  "license_policy": "Sample fixture is repository-local test code and not a deployed-contract source license review.",
+  "source_availability": {
+    "policy": "local_manifest_paths",
+    "notes": "Every item must point at a local Scarb.toml before corpus generation."
+  },
+  "items": [
+    {
+      "tag": "sample_scarb_smoke",
+      "contract_address": "0x0",
+      "class_hash": "0xsample",
+      "source_ref": "benchmarks/fixtures/scarb_smoke in this repository",
+      "manifest_path": "../fixtures/scarb_smoke/Scarb.toml",
+      "cairo_version": "2.14.0",
+      "scarb_version": "2.14.0",
+      "license": "repository fixture",
+      "notes": "Shape-only source-index sample."
+    }
+  ]
+}
