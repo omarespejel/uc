@@ -6433,6 +6433,13 @@ fn native_impacted_contract_indices_from_source_index(
     removed_files: &[String],
     dependency_index_complete: bool,
 ) -> Option<Vec<usize>> {
+    if changed_files
+        .iter()
+        .chain(removed_files.iter())
+        .any(|source| Path::new(source).is_absolute())
+    {
+        return None;
+    }
     let (impacted, unmatched_sources) = native_collect_impacted_contract_indices_from_source_index(
         by_source,
         changed_files,
@@ -6461,6 +6468,13 @@ fn native_impacted_contract_indices(
 ) -> Option<Vec<usize>> {
     if changed_files.is_empty() && removed_files.is_empty() {
         return Some(Vec::new());
+    }
+    if changed_files
+        .iter()
+        .chain(removed_files.iter())
+        .any(|source| Path::new(source).is_absolute())
+    {
+        return None;
     }
     let (by_source, dependency_index_complete) =
         native_contract_source_index_for_module_paths(module_paths, contract_source_dependencies);

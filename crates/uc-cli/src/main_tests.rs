@@ -6577,6 +6577,55 @@ fn native_setup_project_matches_cairo_setup_project_results() {
 
 #[cfg(feature = "native-compile")]
 #[test]
+fn native_seeded_root_database_supports_native_setup_project_end_to_end() {
+    let dir = unique_test_dir("uc-native-seeded-setup-project");
+    let project_dir = dir.join("project");
+    let dep_dir = dir.join("dep/src");
+    let corelib_src = dir.join("toolchain/corelib/src");
+    fs::create_dir_all(project_dir.join("src")).expect("failed to create main src");
+    fs::create_dir_all(&dep_dir).expect("failed to create dep src");
+    fs::create_dir_all(&corelib_src).expect("failed to create mock corelib src");
+    create_mock_native_corelib(&corelib_src);
+    fs::write(project_dir.join("src/lib.cairo"), "fn main() {}\n")
+        .expect("failed to write main crate source");
+    fs::write(dep_dir.join("lib.cairo"), "fn dep() {}\n").expect("failed to write dep source");
+    fs::write(
+        project_dir.join("cairo_project.toml"),
+        format!(
+            "[crate_roots]\nmain = \"src\"\ndep = \"{}\"\n",
+            toml_escape_basic_string(&dep_dir.display().to_string())
+        ),
+    )
+    .expect("failed to write cairo_project.toml");
+
+    let mut db =
+        native_seeded_root_database(&corelib_src).expect("root database should initialize");
+    let baseline_len = db.crate_configs().len();
+    let main_crate_inputs =
+        native_setup_project(&mut db, &project_dir).expect("native seeded setup should work");
+    let main_crate_ids = CrateInput::into_crate_ids(&db, main_crate_inputs.iter().cloned());
+
+    assert_eq!(
+        db.crate_configs().len(),
+        baseline_len + main_crate_inputs.len(),
+        "seeded native setup should add crate configs for every discovered project crate"
+    );
+    assert!(
+        !main_crate_inputs.is_empty(),
+        "fixture should expose at least one project crate"
+    );
+    for crate_id in &main_crate_ids {
+        assert!(
+            db.crate_configs().contains_key(crate_id),
+            "seeded native setup should populate crate config for {crate_id:?}"
+        );
+    }
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
 fn native_resolve_contracts_from_output_plans_matches_find_contracts() {
     let dir = unique_test_dir("uc-native-contract-discovery-fast-path");
     let project_dir = dir.join("project");
@@ -7851,6 +7900,30 @@ fn native_changed_files_affect_tracked_contracts_stays_conservative_for_absolute
             &dependencies
         ),
         "absolute dependency paths must stay conservative to avoid noop false hits"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_impacted_contract_indices_stays_conservative_for_absolute_paths() {
+    let absolute_dependency = unique_platform_absolute_fixture_path("uc-native-absolute-impact");
+    let module_paths = vec!["pkg::contract_a".to_string()];
+    let contract_source_paths = vec![Some("src/contract_a.cairo".to_string())];
+    let dependencies = BTreeMap::from([(
+        "pkg::contract_a".to_string(),
+        BTreeSet::from(["src/contract_a.cairo".to_string()]),
+    )]);
+
+    assert!(
+        native_impacted_contract_indices(
+            &module_paths,
+            &contract_source_paths,
+            &[absolute_dependency],
+            &[],
+            &dependencies,
+        )
+        .is_none(),
+        "absolute dependency paths must force conservative fallback to avoid stale artifact reuse"
     );
 }
 

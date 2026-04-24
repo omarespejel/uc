@@ -145,7 +145,10 @@ prefetch_manifest_dependencies() {
   manifest_dir="$(cd "$(dirname "$manifest_path")" && pwd -P)"
   (
     cd "$manifest_dir"
-    scarb fetch >/dev/null
+    if ! scarb fetch >/dev/null; then
+      echo "scarb fetch failed for manifest_path=$manifest_path manifest_dir=$manifest_dir" >&2
+      exit 1
+    fi
   )
   PREFETCHED_MANIFESTS["$manifest_path"]=1
 }

@@ -87,6 +87,18 @@ EOF
   chmod +x "$path"
 }
 
+write_failing_mock_scarb_bin() {
+  local path="$1"
+  cat > "$path" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "mock scarb fetch failure" >&2
+exit 23
+EOF
+  chmod +x "$path"
+}
+
 write_mock_sleeping_uc_bin() {
   local path="$1"
   cat > "$path" <<'EOF'
@@ -321,6 +333,41 @@ test_native_real_repo_smoke_passes_offline_to_uc() {
   assert_contains "$(cat "$TEST_TMP_DIR/native-real-offline.scarb.args")" "cmd=fetch"
 }
 
+test_native_real_repo_smoke_reports_prefetch_failure_context() {
+  local mock_uc="$TEST_TMP_DIR/mock-uc-prefetch"
+  local mock_bin_dir="$TEST_TMP_DIR/mock-bin-prefetch"
+  local fake_manifest_dir="$TEST_TMP_DIR/fake-prefetch"
+  local stderr_path="$TEST_TMP_DIR/native-real-prefetch.err"
+  mkdir -p "$mock_bin_dir"
+  mkdir -p "$fake_manifest_dir"
+  : > "$fake_manifest_dir/Scarb.toml"
+  write_failing_mock_scarb_bin "$mock_bin_dir/scarb"
+  write_mock_uc_bin "$mock_uc"
+
+  if PATH="$mock_bin_dir:$PATH" \
+    MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/native-real-prefetch.args" \
+    "$NATIVE_REAL_REPO_SMOKE_SCRIPT" \
+      --uc-bin "$mock_uc" \
+      --results-dir "$TEST_TMP_DIR/results-prefetch" \
+      --backend-case "$fake_manifest_dir/Scarb.toml" prefetch-case uc-native \
+      >"$TEST_TMP_DIR/native-real-prefetch.out" 2>"$stderr_path"; then
+    echo "expected native real repo smoke script to fail on scarb fetch" >&2
+    return 1
+  fi
+
+  if ! grep -q "mock scarb fetch failure" "$stderr_path"; then
+    echo "expected scarb fetch stderr to be preserved" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+
+  if ! grep -q "manifest_path=$fake_manifest_dir/Scarb.toml" "$stderr_path"; then
+    echo "expected manifest path context in scarb fetch failure" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+}
+
 test_native_real_repo_smoke_times_out_with_diagnostic() {
   local mock_uc="$TEST_TMP_DIR/mock-uc-timeout"
   local mock_bin_dir="$TEST_TMP_DIR/mock-bin-timeout"
@@ -372,4 +419,5 @@ run_test "native real repo smoke requires cases" test_native_real_repo_smoke_req
 run_test "native real repo smoke rejects duplicate tags" test_native_real_repo_smoke_rejects_duplicate_tags
 run_test "native real repo smoke rejects invalid tags" test_native_real_repo_smoke_rejects_invalid_tags
 run_test "native real repo smoke passes offline to uc" test_native_real_repo_smoke_passes_offline_to_uc
+run_test "native real repo smoke reports prefetch failure context" test_native_real_repo_smoke_reports_prefetch_failure_context
 run_test "native real repo smoke times out with diagnostic" test_native_real_repo_smoke_times_out_with_diagnostic
