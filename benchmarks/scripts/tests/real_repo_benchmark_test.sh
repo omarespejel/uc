@@ -251,6 +251,49 @@ test_real_repo_benchmark_rejects_zero_runs_from_environment() {
   fi
 }
 
+test_real_repo_benchmark_accepts_cases_file() {
+  local cases_root="$TEST_TMP_DIR/cases-file-cases"
+  local mock_bin_dir="$TEST_TMP_DIR/cases-file-mock-bin"
+  local mock_uc="$mock_bin_dir/uc"
+  local mock_scarb="$mock_bin_dir/scarb"
+  local results_dir="$TEST_TMP_DIR/cases-file-results"
+  local cases_file="$TEST_TMP_DIR/cases-file.tsv"
+  mkdir -p "$mock_bin_dir" "$results_dir"
+  write_mock_uc_bin "$mock_uc"
+  write_mock_scarb_bin "$mock_scarb"
+  write_manifest_case "$cases_root" "supported"
+  write_manifest_case "$cases_root" "unsupported"
+  printf '%s\t%s\n' "$cases_root/supported/Scarb.toml" supported > "$cases_file"
+  printf '%s\t%s\n' "$cases_root/unsupported/Scarb.toml" unsupported >> "$cases_file"
+
+  local stdout_text
+  stdout_text="$(
+    PATH="$mock_bin_dir:$PATH" \
+    MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/cases-file-uc.args" \
+    MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/cases-file-scarb.args" \
+    "$BENCH_SCRIPT" \
+      --uc-bin "$mock_uc" \
+      --results-dir "$results_dir" \
+      --runs 1 \
+      --cold-runs 1 \
+      --warm-settle-seconds 0 \
+      --cases-file "$cases_file"
+  )"
+
+  local json_path
+  json_path="$(awk -F': ' '/Benchmark JSON:/ {print $2}' <<<"$stdout_text")"
+  [[ -f "$json_path" ]] || { echo "missing json report: $json_path" >&2; return 1; }
+
+  local supported_count unsupported_count
+  supported_count="$(jq -r '.summary.support_matrix.native_supported' "$json_path")"
+  unsupported_count="$(jq -r '.summary.support_matrix.native_unsupported' "$json_path")"
+  if [[ "$supported_count" != "1" || "$unsupported_count" != "1" ]]; then
+    echo "expected cases file to populate support matrix" >&2
+    cat "$json_path" >&2
+    return 1
+  fi
+}
+
 test_real_repo_benchmark_records_support_matrix_categories() {
   local cases_root="$TEST_TMP_DIR/cases"
   local mock_bin_dir="$TEST_TMP_DIR/mock-bin"
@@ -532,6 +575,8 @@ run_test "real_repo_benchmark_rejects_missing_case_values" \
   test_real_repo_benchmark_rejects_missing_case_values
 run_test "real_repo_benchmark_rejects_zero_runs_from_environment" \
   test_real_repo_benchmark_rejects_zero_runs_from_environment
+run_test "real_repo_benchmark_accepts_cases_file" \
+  test_real_repo_benchmark_accepts_cases_file
 run_test "real_repo_benchmark_records_support_matrix_categories" \
   test_real_repo_benchmark_records_support_matrix_categories
 run_test "real_repo_benchmark_records_supported_build_failures" \

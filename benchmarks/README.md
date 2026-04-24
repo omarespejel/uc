@@ -79,6 +79,15 @@ Keep CI gate logic in scripts instead of workflow heredocs so it stays testable 
   --cold-runs 5 \
   --case /abs/path/to/repo-a/Scarb.toml repo-a \
   --case /abs/path/to/repo-b/Scarb.toml repo-b
+
+# For larger case sets, avoid argv fanout and use a tab-separated cases file:
+#   /abs/path/to/repo-a/Scarb.toml<TAB>repo-a
+./benchmarks/scripts/run_real_repo_benchmarks.sh \
+  --uc-bin ./target/release/uc \
+  --results-dir benchmarks/results \
+  --runs 5 \
+  --cold-runs 5 \
+  --cases-file /abs/path/to/manifest-tag-cases.tsv
 ```
 
 This local-only harness uses `uc support native --format json` to classify each

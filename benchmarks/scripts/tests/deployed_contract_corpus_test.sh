@@ -24,6 +24,11 @@ run_test() {
   "$@"
 }
 
+extract_labeled_path() {
+  local label="$1"
+  awk -v prefix="$label: " 'index($0, prefix) == 1 {sub(prefix, ""); print}' | tail -n 1
+}
+
 write_mock_uc_bin() {
   local path="$1"
   cat > "$path" <<'MOCK'
@@ -248,19 +253,32 @@ test_plan_only_normalizes_sample_corpus() {
   write_corpus_file "$corpus_dir/corpus.json" sample class_hash "$item"
 
   local stdout_text
-  stdout_text="$($CORPUS_SCRIPT --corpus "$corpus_dir/corpus.json" --results-dir "$results_dir" --plan-only)"
+  stdout_text="$(
+    "$CORPUS_SCRIPT" \
+      --corpus "$corpus_dir/corpus.json" \
+      --results-dir "$results_dir" \
+      --runs 3 \
+      --cold-runs 2 \
+      --timeout-secs 9 \
+      --warm-settle-seconds 0.5 \
+      --plan-only
+  )"
   assert_contains "$stdout_text" "Corpus plan JSON:"
 
   local json_path
-  json_path="$(awk -F': ' '/Corpus plan JSON:/ {print $2}' <<<"$stdout_text")"
+  json_path="$(extract_labeled_path "Corpus plan JSON" <<<"$stdout_text")"
   [[ -f "$json_path" ]] || { echo "missing plan json: $json_path" >&2; return 1; }
 
-  local plan_only item_count coverage manifest_path
+  local plan_only item_count coverage manifest_path runs cold_runs timeout_secs warm_settle_seconds
   plan_only="$(jq -r '.plan_only' "$json_path")"
   item_count="$(jq -r '.corpus.summary.item_count' "$json_path")"
   coverage="$(jq -r '.corpus.selection.coverage' "$json_path")"
   manifest_path="$(jq -r '.corpus.items[0].manifest_path' "$json_path")"
-  if [[ "$plan_only" != "true" || "$item_count" != "1" || "$coverage" != "sample" || "$manifest_path" != /* ]]; then
+  runs="$(jq -r '.run_config.runs' "$json_path")"
+  cold_runs="$(jq -r '.run_config.cold_runs' "$json_path")"
+  timeout_secs="$(jq -r '.run_config.timeout_secs' "$json_path")"
+  warm_settle_seconds="$(jq -r '.run_config.warm_settle_seconds' "$json_path")"
+  if [[ "$plan_only" != "true" || "$item_count" != "1" || "$coverage" != "sample" || "$manifest_path" != /* || "$runs" != "3" || "$cold_runs" != "2" || "$timeout_secs" != "9" || "$warm_settle_seconds" != "0.5" ]]; then
     echo "unexpected plan-only corpus artifact" >&2
     cat "$json_path" >&2
     return 1
@@ -339,11 +357,35 @@ test_rejects_unknown_top_level_keys() {
   fi
 }
 
+test_rejects_boolean_integer_fields() {
+  local case_root="$TEST_TMP_DIR/bool-int/cases"
+  local corpus_dir="$TEST_TMP_DIR/bool-int/corpora"
+  local results_dir="$TEST_TMP_DIR/bool-int/results"
+  mkdir -p "$corpus_dir" "$results_dir"
+  write_manifest_case "$case_root" "a"
+  local item
+  item="$(item_json a "../cases/a/Scarb.toml" "0x01" "2.14.0")"
+  write_corpus_file "$corpus_dir/corpus.json" sample class_hash "$item"
+  jq '.selection.from_block = true' "$corpus_dir/corpus.json" > "$corpus_dir/corpus.tmp"
+  mv "$corpus_dir/corpus.tmp" "$corpus_dir/corpus.json"
+
+  local stderr_path="$TEST_TMP_DIR/bool-int.err"
+  if "$CORPUS_SCRIPT" --corpus "$corpus_dir/corpus.json" --results-dir "$results_dir" --plan-only >"$TEST_TMP_DIR/bool-int.out" 2>"$stderr_path"; then
+    echo "expected boolean integer fields to be rejected" >&2
+    return 1
+  fi
+  if ! grep -q "corpus.selection.from_block must be a non-negative integer" "$stderr_path"; then
+    echo "expected boolean integer validation error" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+}
+
 run_corpus_benchmark() {
   local coverage="$1"
   local corpus_dir="$TEST_TMP_DIR/run-$coverage/corpora"
   local case_root="$TEST_TMP_DIR/run-$coverage/cases"
-  local results_dir="$TEST_TMP_DIR/run-$coverage/results"
+  local results_dir="$TEST_TMP_DIR/run-$coverage/results: dir"
   local mock_bin_dir="$TEST_TMP_DIR/run-$coverage/mock-bin"
   mkdir -p "$corpus_dir" "$case_root" "$results_dir" "$mock_bin_dir"
   write_manifest_case "$case_root" "cairo214"
@@ -399,7 +441,7 @@ test_complete_corpus_with_fallback_blocks_compiled_all_claim() {
   )"
 
   local json_path safe reason fallback_used claim
-  json_path="$(awk -F': ' '/Corpus Benchmark JSON:/ {print $2}' <<<"$stdout_text")"
+  json_path="$(extract_labeled_path "Corpus Benchmark JSON" <<<"$stdout_text")"
   [[ -f "$json_path" ]] || { echo "missing corpus benchmark json: $json_path" >&2; return 1; }
   safe="$(jq -r '.claim_guard.safe_to_say_compiled_all_deployed_contracts_in_corpus' "$json_path")"
   reason="$(jq -r '.claim_guard.reason' "$json_path")"
@@ -443,7 +485,7 @@ test_complete_corpus_with_unsupported_blocks_compiled_all_claim() {
   )"
 
   local json_path safe reason native_unsupported claim
-  json_path="$(awk -F': ' '/Corpus Benchmark JSON:/ {print $2}' <<<"$stdout_text")"
+  json_path="$(extract_labeled_path "Corpus Benchmark JSON" <<<"$stdout_text")"
   [[ -f "$json_path" ]] || { echo "missing corpus benchmark json: $json_path" >&2; return 1; }
   safe="$(jq -r '.claim_guard.safe_to_say_compiled_all_deployed_contracts_in_corpus' "$json_path")"
   reason="$(jq -r '.claim_guard.reason' "$json_path")"
@@ -463,7 +505,7 @@ test_sample_corpus_blocks_compiled_all_claim() {
   assert_contains "$stdout_text" "Corpus Benchmark Markdown:"
 
   local json_path
-  json_path="$(awk -F': ' '/Corpus Benchmark JSON:/ {print $2}' <<<"$stdout_text")"
+  json_path="$(extract_labeled_path "Corpus Benchmark JSON" <<<"$stdout_text")"
   [[ -f "$json_path" ]] || { echo "missing corpus benchmark json: $json_path" >&2; return 1; }
 
   local safe reason native_supported claim
@@ -482,8 +524,8 @@ test_complete_supported_corpus_emits_bounded_claim() {
   local stdout_text
   stdout_text="$(run_corpus_benchmark complete_deployed_contracts)"
   local json_path md_path
-  json_path="$(awk -F': ' '/Corpus Benchmark JSON:/ {print $2}' <<<"$stdout_text")"
-  md_path="$(awk -F': ' '/Corpus Benchmark Markdown:/ {print $2}' <<<"$stdout_text")"
+  json_path="$(extract_labeled_path "Corpus Benchmark JSON" <<<"$stdout_text")"
+  md_path="$(extract_labeled_path "Corpus Benchmark Markdown" <<<"$stdout_text")"
   [[ -f "$json_path" ]] || { echo "missing corpus benchmark json: $json_path" >&2; return 1; }
   [[ -f "$md_path" ]] || { echo "missing corpus benchmark markdown: $md_path" >&2; return 1; }
 
@@ -509,6 +551,8 @@ run_test "rejects_duplicate_class_hash_when_class_deduped" \
   test_rejects_duplicate_class_hash_when_class_deduped
 run_test "rejects_unknown_top_level_keys" \
   test_rejects_unknown_top_level_keys
+run_test "rejects_boolean_integer_fields" \
+  test_rejects_boolean_integer_fields
 run_test "sample_corpus_blocks_compiled_all_claim" \
   test_sample_corpus_blocks_compiled_all_claim
 run_test "complete_corpus_with_fallback_blocks_compiled_all_claim" \

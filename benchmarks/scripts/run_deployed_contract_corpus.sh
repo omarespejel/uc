@@ -187,7 +187,7 @@ def require_str(obj, key, ctx):
 
 def require_int(obj, key, ctx):
     value = obj.get(key)
-    if not isinstance(value, int) or value < 0:
+    if type(value) is not int or value < 0:
         fail(f"{ctx}.{key} must be a non-negative integer")
     return value
 
@@ -313,6 +313,12 @@ if (( PLAN_ONLY == 1 )); then
   jq -n \
     --arg generated_at "$GENERATED_AT" \
     --arg corpus_path "$CORPUS_ABS" \
+    --arg uc_bin "$UC_BIN" \
+    --arg results_dir "$RESULTS_DIR" \
+    --argjson runs "$RUNS" \
+    --argjson cold_runs "$COLD_RUNS" \
+    --argjson timeout_secs "$CASE_TIMEOUT_SECS" \
+    --argjson warm_settle_seconds "$WARM_SETTLE_SECONDS" \
     --slurpfile corpus "$NORMALIZED_CORPUS" \
     '{
       schema_version: 1,
@@ -320,16 +326,19 @@ if (( PLAN_ONLY == 1 )); then
       corpus_path: $corpus_path,
       plan_only: true,
       corpus: $corpus[0],
-      benchmark_command_shape: "run_real_repo_benchmarks.sh --case <manifest_path> <tag> ..."
+      benchmark_command_shape: "run_real_repo_benchmarks.sh --cases-file <manifest-tag-tsv>",
+      run_config: {
+        uc_bin: $uc_bin,
+        results_dir: $results_dir,
+        runs: $runs,
+        cold_runs: $cold_runs,
+        timeout_secs: $timeout_secs,
+        warm_settle_seconds: $warm_settle_seconds
+      }
     }' > "$PLAN_JSON"
   echo "Corpus plan JSON: $PLAN_JSON"
   exit 0
 fi
-
-case_args=()
-while IFS=$'\t' read -r manifest tag; do
-  case_args+=(--case "$manifest" "$tag")
-done < "$CASES_TSV"
 
 bench_stdout="$TMP_DIR/real-repo-benchmark.stdout"
 "$REAL_REPO_SCRIPT" \
@@ -339,10 +348,10 @@ bench_stdout="$TMP_DIR/real-repo-benchmark.stdout"
   --cold-runs "$COLD_RUNS" \
   --timeout-secs "$CASE_TIMEOUT_SECS" \
   --warm-settle-seconds "$WARM_SETTLE_SECONDS" \
-  "${case_args[@]}" | tee "$bench_stdout"
+  --cases-file "$CASES_TSV" | tee "$bench_stdout"
 
-REAL_JSON="$(awk -F': ' '/Benchmark JSON:/ {print $2}' "$bench_stdout" | tail -n 1)"
-REAL_MD="$(awk -F': ' '/Benchmark Markdown:/ {print $2}' "$bench_stdout" | tail -n 1)"
+REAL_JSON="$(awk '/^Benchmark JSON: / {sub(/^Benchmark JSON: /, ""); print}' "$bench_stdout" | tail -n 1)"
+REAL_MD="$(awk '/^Benchmark Markdown: / {sub(/^Benchmark Markdown: /, ""); print}' "$bench_stdout" | tail -n 1)"
 if [[ -z "$REAL_JSON" || ! -f "$REAL_JSON" ]]; then
   echo "real-repo benchmark did not produce a JSON artifact" >&2
   exit 1
