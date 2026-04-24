@@ -6270,6 +6270,124 @@ fn native_compile_session_image_restore_normalizes_workspace_absolute_tracked_so
 
 #[cfg(feature = "native-compile")]
 #[test]
+fn native_build_session_state_rewrites_stale_image_with_bootstrapped_contract_plans() {
+    let dir = unique_test_dir("uc-native-session-image-bootstrap-rewrite");
+    let mut signature =
+        native_test_compile_session_signature(&dir, "manifest-blake3:bootstrap-rewrite");
+    signature.context.external_non_starknet_dependencies = Vec::new();
+    signature.context.path_dependency_roots = Vec::new();
+    signature.context.crate_dependency_configs = vec![NativeCrateDependencyConfig {
+        crate_name: "demo".to_string(),
+        cairo_edition: Some("2024_07".to_string()),
+        dependencies: vec!["starknet".to_string()],
+    }];
+
+    let source_root = signature.context.main_source_root.clone();
+    fs::create_dir_all(&source_root).expect("failed to create source root");
+    fs::create_dir_all(&signature.context.corelib_src).expect("failed to create mock corelib src");
+    fs::create_dir_all(&signature.context.cairo_project_dir)
+        .expect("failed to create cairo project dir");
+    create_mock_native_corelib(&signature.context.corelib_src);
+    fs::write(
+        source_root.join("lib.cairo"),
+        r#"
+#[starknet::contract]
+mod AtomicLock {
+    #[storage]
+    struct Storage {}
+}
+"#,
+    )
+    .expect("failed to write contract source");
+    fs::write(
+        signature
+            .context
+            .cairo_project_dir
+            .join("cairo_project.toml"),
+        format!(
+            "[crate_roots]\ndemo = \"{}\"\n",
+            toml_escape_basic_string(&source_root.display().to_string())
+        ),
+    )
+    .expect("failed to write cairo_project.toml");
+
+    let tracked_sources = BTreeMap::from([(
+        "src/lib.cairo".to_string(),
+        NativeTrackedFileState {
+            size_bytes: 1,
+            modified_unix_ms: 1,
+        },
+    )]);
+    let _materialized_tracked_sources =
+        write_native_tracked_source_fixtures(&dir, &tracked_sources);
+    fs::write(
+        dir.join("src/lib.cairo"),
+        r#"
+#[starknet::contract]
+mod AtomicLock {
+    #[storage]
+    struct Storage {}
+}
+"#,
+    )
+    .expect("failed to rewrite contract source after fixture materialization");
+    let source_metadata =
+        fs::metadata(dir.join("src/lib.cairo")).expect("failed to stat contract source");
+    let tracked_sources = BTreeMap::from([(
+        "src/lib.cairo".to_string(),
+        NativeTrackedFileState {
+            size_bytes: source_metadata.len(),
+            modified_unix_ms: metadata_modified_unix_ms(&source_metadata)
+                .expect("contract source mtime"),
+        },
+    )]);
+    let tracked_source_bytes = native_tracked_sources_total_bytes(&tracked_sources)
+        .expect("tracked source bytes should be computed");
+    let tracked_sources_content_hash =
+        native_tracked_sources_content_hash(&dir, &tracked_sources).expect("content hash");
+    let stale_snapshot = NativeCompileSessionImageSnapshot {
+        signature_hash: native_compile_session_signature_hash(&signature),
+        source_root_modified_unix_ms: native_source_roots_modified_unix_ms(
+            &dir,
+            &[signature.context.main_source_root.clone()],
+        )
+        .expect("source root mtime"),
+        tracked_sources: tracked_sources.clone(),
+        tracked_source_bytes,
+        tracked_sources_content_hash: tracked_sources_content_hash.clone(),
+        contract_source_dependencies: BTreeMap::new(),
+        contract_output_plans: Vec::new(),
+        journal_cursor_applied: 0,
+    };
+    persist_native_compile_session_image_snapshot(&dir, &stale_snapshot)
+        .expect("stale image should persist");
+
+    let state = build_native_compile_session_state(&dir, signature.clone())
+        .expect("session state build should succeed with stale image");
+    assert_eq!(
+        state.contract_output_plans.len(),
+        1,
+        "bootstrap should seed contract plans into the rebuilt session state"
+    );
+
+    let restored =
+        try_native_compile_session_image_restore(&dir, &signature, &tracked_sources_content_hash)
+            .expect("session image should be rewritten with bootstrapped contract plans");
+    assert_eq!(
+        restored.contract_output_plans.len(),
+        1,
+        "rewritten image should retain the bootstrapped contract plan"
+    );
+    assert_eq!(
+        restored.contract_output_plans[0].module_path,
+        "demo::AtomicLock".to_string()
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
 fn native_buildinfo_sidecar_round_trip_restores_tracked_sources_and_dependency_index() {
     let dir = unique_test_dir("uc-native-buildinfo-roundtrip");
     let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
@@ -6724,6 +6842,214 @@ fn native_seeded_root_database_propagates_skip_unused_import_diagnostics_flag() 
     assert!(
         !db_without_skip.skip_unused_import_diagnostics(),
         "native seeded database should preserve disabled skip-unused-import flag"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_extract_starknet_contract_module_names_parses_supported_forms() {
+    let source = r#"
+#[starknet::contract]
+pub mod InlineRoot {
+}
+
+#[starknet::contract(account)] pub(crate) mod AccountContract {
+}
+
+#[starknet::contract]
+#[cfg(test)]
+mod WithExtraAttribute {
+}
+
+mod PlainModule {
+}
+"#;
+
+    assert_eq!(
+        native_extract_starknet_contract_module_names(source),
+        vec![
+            "InlineRoot".to_string(),
+            "AccountContract".to_string(),
+            "WithExtraAttribute".to_string(),
+        ]
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_bootstrap_contract_metadata_from_sources_discovers_root_and_nested_modules() {
+    let dir = unique_test_dir("uc-native-contract-bootstrap-metadata");
+    let src_dir = dir.join("src");
+    fs::create_dir_all(src_dir.join("locks")).expect("failed to create nested source dir");
+    fs::write(
+        src_dir.join("lib.cairo"),
+        r#"
+#[starknet::contract]
+pub mod RootContract {
+}
+"#,
+    )
+    .expect("failed to write root contract source");
+    fs::write(
+        src_dir.join("locks/mod.cairo"),
+        r#"
+#[starknet::contract]
+mod AtomicLock {
+}
+"#,
+    )
+    .expect("failed to write nested contract source");
+    fs::write(src_dir.join("helpers.cairo"), "fn helper() {}\n")
+        .expect("failed to write helper source");
+
+    let context = NativeCompileContext {
+        package_name: "demo_pkg".to_string(),
+        crate_name: "demo_pkg".to_string(),
+        main_source_root: src_dir.clone(),
+        workspace_mode_supported: false,
+        cairo_project_dir: dir.join(".uc/native-project"),
+        corelib_src: dir.join("toolchain/corelib/src"),
+        starknet_target: NativeStarknetTargetProps {
+            sierra: true,
+            casm: true,
+        },
+        manifest_content_hash: "manifest-blake3:demo".to_string(),
+        external_non_starknet_dependencies: Vec::new(),
+        path_dependency_roots: Vec::new(),
+        crate_dependency_configs: Vec::new(),
+    };
+    let tracked_sources = BTreeMap::from([
+        (
+            "src/lib.cairo".to_string(),
+            NativeTrackedFileState {
+                size_bytes: 1,
+                modified_unix_ms: 1,
+            },
+        ),
+        (
+            "src/locks/mod.cairo".to_string(),
+            NativeTrackedFileState {
+                size_bytes: 1,
+                modified_unix_ms: 1,
+            },
+        ),
+        (
+            "src/helpers.cairo".to_string(),
+            NativeTrackedFileState {
+                size_bytes: 1,
+                modified_unix_ms: 1,
+            },
+        ),
+    ]);
+
+    let (dependencies, plans) =
+        native_bootstrap_contract_metadata_from_sources(&dir, &context, &tracked_sources)
+            .expect("bootstrap should succeed")
+            .expect("fixture should yield contract plans");
+
+    let module_paths = plans
+        .iter()
+        .map(|plan| plan.module_path.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        module_paths,
+        vec![
+            "demo_pkg::RootContract".to_string(),
+            "demo_pkg::locks::AtomicLock".to_string(),
+        ]
+    );
+    assert_eq!(
+        dependencies.get("demo_pkg::RootContract"),
+        Some(&BTreeSet::from(["src/lib.cairo".to_string()])),
+        "root contract bootstrap should seed its defining source path"
+    );
+    assert_eq!(
+        dependencies.get("demo_pkg::locks::AtomicLock"),
+        Some(&BTreeSet::from(["src/locks/mod.cairo".to_string()])),
+        "nested contract bootstrap should seed its defining source path"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_bootstrap_contract_metadata_resolves_root_contracts_without_full_discovery() {
+    let dir = unique_test_dir("uc-native-contract-bootstrap-resolve");
+    let project_dir = dir.join("project");
+    let corelib_src = dir.join("toolchain/corelib/src");
+    fs::create_dir_all(project_dir.join("src")).expect("failed to create main src");
+    fs::create_dir_all(&corelib_src).expect("failed to create mock corelib src");
+    create_mock_native_corelib(&corelib_src);
+    fs::write(
+        project_dir.join("src/lib.cairo"),
+        r#"
+#[starknet::contract]
+mod contract_a {
+    #[storage]
+    struct Storage {}
+}
+
+#[starknet::contract]
+mod contract_b {
+    #[storage]
+    struct Storage {}
+}
+"#,
+    )
+    .expect("failed to write contract fixture");
+    fs::write(
+        project_dir.join("cairo_project.toml"),
+        "[crate_roots]\npkg = \"src\"\n",
+    )
+    .expect("failed to write cairo_project.toml");
+
+    let context = NativeCompileContext {
+        package_name: "pkg".to_string(),
+        crate_name: "pkg".to_string(),
+        main_source_root: project_dir.join("src"),
+        workspace_mode_supported: false,
+        cairo_project_dir: project_dir.clone(),
+        corelib_src: corelib_src.clone(),
+        starknet_target: NativeStarknetTargetProps {
+            sierra: true,
+            casm: true,
+        },
+        manifest_content_hash: "manifest-blake3:pkg".to_string(),
+        external_non_starknet_dependencies: Vec::new(),
+        path_dependency_roots: Vec::new(),
+        crate_dependency_configs: Vec::new(),
+    };
+    let tracked_sources = BTreeMap::from([(
+        "src/lib.cairo".to_string(),
+        NativeTrackedFileState {
+            size_bytes: 1,
+            modified_unix_ms: 1,
+        },
+    )]);
+
+    let (_dependencies, plans) =
+        native_bootstrap_contract_metadata_from_sources(&project_dir, &context, &tracked_sources)
+            .expect("bootstrap should succeed")
+            .expect("fixture should bootstrap plans");
+
+    let mut db =
+        native_seeded_root_database(&corelib_src, true).expect("root database should initialize");
+    let main_crate_inputs =
+        native_setup_project(&mut db, &project_dir).expect("native setup should work");
+    let crate_ids = CrateInput::into_crate_ids(&db, main_crate_inputs.iter().cloned());
+    let resolved = native_resolve_contracts_from_output_plans(&db, &crate_ids, &plans)
+        .expect("bootstrapped plans should resolve through the contract fast path");
+
+    let resolved_paths = resolved
+        .iter()
+        .map(|contract| contract.submodule_id.full_path(&db))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        resolved_paths,
+        vec!["pkg::contract_a".to_string(), "pkg::contract_b".to_string()]
     );
 
     fs::remove_dir_all(&dir).ok();

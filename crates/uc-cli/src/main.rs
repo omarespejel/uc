@@ -5975,6 +5975,180 @@ fn native_contract_source_relative_path(
 }
 
 #[cfg(feature = "native-compile")]
+fn native_contract_output_plans_from_module_paths(
+    root_package_name: &str,
+    module_paths: &[String],
+    casm_enabled: bool,
+) -> Vec<NativeContractOutputPlan> {
+    let contract_stems = native_contract_file_stems(module_paths);
+    module_paths
+        .iter()
+        .zip(contract_stems.iter())
+        .map(|(module_path, contract_stem)| {
+            let contract_package_name = native_contract_package_name(module_path).to_string();
+            let contract_name = native_contract_name(module_path).to_string();
+            let artifact_id = native_starknet_artifact_id(&contract_package_name, module_path);
+            let file_stem = format!(
+                "{}_{}",
+                root_package_name,
+                sanitize_artifact_component(contract_stem)
+            );
+            let artifact_file = format!("{file_stem}.contract_class.json");
+            let casm_file =
+                casm_enabled.then(|| format!("{file_stem}.compiled_contract_class.json"));
+            NativeContractOutputPlan {
+                module_path: module_path.clone(),
+                artifact_id,
+                package_name: contract_package_name,
+                contract_name,
+                artifact_file,
+                casm_file,
+            }
+        })
+        .collect()
+}
+
+#[cfg(feature = "native-compile")]
+fn native_contract_bootstrap_module_segments(
+    relative_to_source_root: &Path,
+) -> Option<Vec<String>> {
+    let is_cairo = relative_to_source_root
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("cairo"));
+    if !is_cairo {
+        return None;
+    }
+    let mut segments = relative_to_source_root
+        .parent()
+        .into_iter()
+        .flat_map(|parent| parent.components())
+        .map(|component| component.as_os_str().to_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()?;
+    let stem = relative_to_source_root.file_stem()?.to_str()?;
+    match stem {
+        "lib" | "main" | "mod" => {}
+        _ => segments.push(stem.to_string()),
+    }
+    Some(segments)
+}
+
+#[cfg(feature = "native-compile")]
+fn native_parse_starknet_contract_module_decl(line: &str) -> Option<String> {
+    let mut trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("pub") {
+        trimmed = rest.trim_start();
+        if let Some(rest) = trimmed.strip_prefix('(') {
+            let close_paren = rest.find(')')?;
+            trimmed = rest[close_paren + 1..].trim_start();
+        }
+    }
+    let rest = trimmed.strip_prefix("mod ")?;
+    let identifier_len = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .count();
+    if identifier_len == 0 || rest.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    Some(rest[..identifier_len].to_string())
+}
+
+#[cfg(feature = "native-compile")]
+fn native_extract_starknet_contract_module_names(source: &str) -> Vec<String> {
+    let mut discovered = Vec::new();
+    let mut pending_contract_attr = false;
+    for raw_line in source.lines() {
+        let line = raw_line
+            .split_once("//")
+            .map(|(head, _)| head)
+            .unwrap_or(raw_line)
+            .trim();
+        if line.is_empty() {
+            continue;
+        }
+        if pending_contract_attr {
+            if let Some(module_name) = native_parse_starknet_contract_module_decl(line) {
+                discovered.push(module_name);
+                pending_contract_attr = false;
+                continue;
+            }
+            if line.starts_with("#[") {
+                continue;
+            }
+            pending_contract_attr = false;
+        }
+        let Some(attr_start) = line.find("#[starknet::contract") else {
+            continue;
+        };
+        let attr_suffix = &line[attr_start..];
+        if let Some(attr_end) = attr_suffix.find(']') {
+            let remainder = &attr_suffix[attr_end + 1..];
+            if let Some(module_name) = native_parse_starknet_contract_module_decl(remainder) {
+                discovered.push(module_name);
+                pending_contract_attr = false;
+                continue;
+            }
+        }
+        pending_contract_attr = true;
+    }
+    discovered
+}
+
+#[cfg(feature = "native-compile")]
+fn native_bootstrap_contract_metadata_from_sources(
+    workspace_root: &Path,
+    context: &NativeCompileContext,
+    tracked_sources: &BTreeMap<String, NativeTrackedFileState>,
+) -> Result<
+    Option<(
+        BTreeMap<String, BTreeSet<String>>,
+        Vec<NativeContractOutputPlan>,
+    )>,
+> {
+    let mut module_paths = BTreeSet::new();
+    let mut contract_source_dependencies = BTreeMap::new();
+    for source_path in tracked_sources.keys() {
+        let absolute_path = workspace_root.join(source_path);
+        if !absolute_path.starts_with(&context.main_source_root) {
+            continue;
+        }
+        let relative_to_source_root = match absolute_path.strip_prefix(&context.main_source_root) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        let Some(module_segments) =
+            native_contract_bootstrap_module_segments(relative_to_source_root)
+        else {
+            continue;
+        };
+        let source = fs::read_to_string(&absolute_path)
+            .with_context(|| format!("failed to read {}", absolute_path.display()))?;
+        for module_name in native_extract_starknet_contract_module_names(&source) {
+            let mut path_segments = Vec::with_capacity(1 + module_segments.len() + 1);
+            path_segments.push(context.crate_name.clone());
+            path_segments.extend(module_segments.iter().cloned());
+            path_segments.push(module_name);
+            let module_path = path_segments.join("::");
+            if module_paths.insert(module_path.clone()) {
+                contract_source_dependencies
+                    .insert(module_path, BTreeSet::from([source_path.clone()]));
+            }
+        }
+    }
+    if module_paths.is_empty() {
+        return Ok(None);
+    }
+    let module_paths = module_paths.into_iter().collect::<Vec<_>>();
+    let contract_output_plans = native_contract_output_plans_from_module_paths(
+        &context.package_name,
+        &module_paths,
+        context.starknet_target.casm,
+    );
+    Ok(Some((contract_source_dependencies, contract_output_plans)))
+}
+
+#[cfg(feature = "native-compile")]
 fn native_workspace_relative_cairo_path_from_debug(
     workspace_root: &Path,
     debug_path: &str,
@@ -8354,8 +8528,8 @@ fn build_native_compile_session_state(
         tracked_sources,
         tracked_source_bytes,
         tracked_sources_content_hash,
-        contract_source_dependencies,
-        contract_output_plans,
+        mut contract_source_dependencies,
+        mut contract_output_plans,
         session_image_hit,
         buildinfo_hit,
         buildinfo_replay_hit,
@@ -8439,6 +8613,32 @@ fn build_native_compile_session_state(
         buildinfo_hit,
         buildinfo_replay_hit
     ));
+    let mut bootstrapped_contract_metadata = false;
+    if contract_output_plans.is_empty() {
+        match native_bootstrap_contract_metadata_from_sources(
+            workspace_root,
+            &signature.context,
+            &tracked_sources,
+        ) {
+            Ok(Some((bootstrapped_dependencies, bootstrapped_plans))) => {
+                native_progress_log(format!(
+                    "native session-state contract bootstrap seeded {} plan(s)",
+                    bootstrapped_plans.len()
+                ));
+                contract_source_dependencies = bootstrapped_dependencies;
+                contract_output_plans = bootstrapped_plans;
+                bootstrapped_contract_metadata = true;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(
+                    workspace_root = %workspace_root.display(),
+                    error = %format!("{err:#}"),
+                    "native session-state contract bootstrap failed; continuing without seeded plans"
+                );
+            }
+        }
+    }
     tracing::debug!(
         workspace_root = %workspace_root.display(),
         db_init_ms,
@@ -8495,11 +8695,11 @@ fn build_native_compile_session_state(
         contract_source_dependencies,
         contract_output_plans,
     };
-    if !session_image_hit {
+    if bootstrapped_contract_metadata || !session_image_hit {
         let snapshot = native_compile_session_image_snapshot_from_state(&state);
         persist_native_compile_session_image_snapshot_best_effort(workspace_root, &snapshot);
     }
-    if !buildinfo_hit || !session_image_hit {
+    if bootstrapped_contract_metadata || !buildinfo_hit || !session_image_hit {
         let buildinfo = native_buildinfo_file_from_state(&state, state.journal_cursor_applied);
         persist_native_buildinfo_sidecar_best_effort(workspace_root, &buildinfo);
     }
@@ -9606,6 +9806,31 @@ fn with_native_compile_session<T>(
             session.source_root_modified_unix_ms = source_root_mtime;
             state_mutated = true;
         }
+        if session.contract_output_plans.is_empty() {
+            match native_bootstrap_contract_metadata_from_sources(
+                workspace_root,
+                &signature.context,
+                &session.tracked_sources,
+            ) {
+                Ok(Some((bootstrapped_dependencies, bootstrapped_plans))) => {
+                    native_progress_log(format!(
+                        "native session refresh contract bootstrap seeded {} plan(s)",
+                        bootstrapped_plans.len()
+                    ));
+                    session.contract_source_dependencies = bootstrapped_dependencies;
+                    session.contract_output_plans = bootstrapped_plans;
+                    state_mutated = true;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        workspace_root = %workspace_root.display(),
+                        error = %format!("{err:#}"),
+                        "native session refresh contract bootstrap failed; continuing without seeded plans"
+                    );
+                }
+            }
+        }
         estimated_bytes = native_compile_session_state_estimated_bytes(&session);
         (
             NativeCompileSessionSnapshot {
@@ -10081,31 +10306,11 @@ fn run_native_build_inner(
                     .collect();
             }
             if all_plans.is_empty() {
-                let contract_stems = native_contract_file_stems(&module_paths);
-                all_plans.reserve(module_paths.len());
-                for (module_path, contract_stem) in module_paths.iter().zip(contract_stems.iter()) {
-                    let package_name = native_contract_package_name(module_path).to_string();
-                    let contract_name = native_contract_name(module_path).to_string();
-                    let artifact_id = native_starknet_artifact_id(&package_name, module_path);
-                    let file_stem = format!(
-                        "{}_{}",
-                        context.package_name,
-                        sanitize_artifact_component(contract_stem)
-                    );
-                    let artifact_file = format!("{file_stem}.contract_class.json");
-                    let casm_file = context
-                        .starknet_target
-                        .casm
-                        .then(|| format!("{file_stem}.compiled_contract_class.json"));
-                    all_plans.push(NativeContractOutputPlan {
-                        module_path: module_path.clone(),
-                        artifact_id,
-                        package_name,
-                        contract_name,
-                        artifact_file,
-                        casm_file,
-                    });
-                }
+                all_plans = native_contract_output_plans_from_module_paths(
+                    &context.package_name,
+                    &module_paths,
+                    context.starknet_target.casm,
+                );
             }
             if !all_plans.is_empty() {
                 native_update_compile_session_post_build_state(
