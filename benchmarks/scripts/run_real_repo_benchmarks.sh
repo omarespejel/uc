@@ -50,6 +50,15 @@ validate_positive_int() {
   fi
 }
 
+validate_non_negative_number() {
+  local flag="$1"
+  local value="$2"
+  if [[ ! "$value" =~ ^([0-9]+([.][0-9]+)?|[.][0-9]+)$ ]]; then
+    echo "$flag must be a non-negative number, got: $value" >&2
+    exit 2
+  fi
+}
+
 validate_timeout_secs() {
   local value="$1"
   if [[ ! "$value" =~ ^[0-9]+$ ]]; then
@@ -132,6 +141,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+validate_positive_int "RUNS" "$RUNS"
+validate_positive_int "COLD_RUNS" "$COLD_RUNS"
+validate_non_negative_number "WARM_SETTLE_SECONDS" "$WARM_SETTLE_SECONDS"
+
 if [[ "${#CASE_MANIFESTS[@]}" -eq 0 ]]; then
   echo "run_real_repo_benchmarks.sh requires at least one --case" >&2
   usage >&2
@@ -198,6 +211,10 @@ PY
 
 stats_json_from_samples() {
   local samples_file="$1"
+  if [[ ! -s "$samples_file" ]]; then
+    echo "stats_json_from_samples: no samples recorded in $samples_file" >&2
+    return 1
+  fi
   jq -s '
     sort as $s
     | def quantile($p):
@@ -219,6 +236,38 @@ stats_json_from_samples() {
       p95_ms: ($s | quantile(0.95))
     }
   ' "$samples_file"
+}
+
+measurement_ok_json() {
+  local stage="$1"
+  local sample_count="$2"
+  local stats_json="$3"
+  jq -n \
+    --arg stage "$stage" \
+    --argjson sample_count "$sample_count" \
+    --argjson stats "$stats_json" \
+    '{
+      status: "ok",
+      stage: $stage,
+      sample_count: $sample_count,
+      stats: $stats
+    }'
+}
+
+measurement_failure_json() {
+  local stage="$1"
+  local exit_code="$2"
+  local log_path="$3"
+  jq -n \
+    --arg stage "$stage" \
+    --argjson exit_code "$exit_code" \
+    --arg log_path "$log_path" \
+    '{
+      status: "failed",
+      stage: $stage,
+      exit_code: $exit_code,
+      log_path: $log_path
+    }'
 }
 
 prefetch_manifest_dependencies() {
@@ -249,8 +298,25 @@ replace_manifest_arg() {
   local manifest_path="$1"
   shift
   local -a command=("$@")
-  local manifest_index=$(( ${#command[@]} - 1 ))
-  command[$manifest_index]="$manifest_path"
+  local replaced=0
+  local idx=0
+  while [[ "$idx" -lt "${#command[@]}" ]]; do
+    if [[ "${command[$idx]}" == "--manifest-path" ]]; then
+      local value_index=$(( idx + 1 ))
+      if [[ "$value_index" -ge "${#command[@]}" ]]; then
+        echo "replace_manifest_arg: --manifest-path is missing its value" >&2
+        return 1
+      fi
+      command[$value_index]="$manifest_path"
+      replaced=1
+      break
+    fi
+    idx=$(( idx + 1 ))
+  done
+  if [[ "$replaced" -ne 1 ]]; then
+    echo "replace_manifest_arg: command is missing --manifest-path: ${command[*]}" >&2
+    return 1
+  fi
   printf '%s\0' "${command[@]}"
 }
 
@@ -264,6 +330,7 @@ run_cold_stats() {
   local baseline_dir="$TMP_DIR/${tag}-${tool}-cold-baseline"
   local run_root="$TMP_DIR/${tag}-${tool}-cold-runs"
   local samples_file="$TMP_DIR/${tag}-${tool}-build.cold.samples"
+  local stage="build.cold"
   : > "$samples_file"
   rm -rf "$baseline_dir" "$run_root"
   mkdir -p "$baseline_dir" "$run_root"
@@ -281,9 +348,19 @@ run_cold_stats() {
     while IFS= read -r -d '' item; do
       command+=("$item")
     done < <(replace_manifest_arg "$run_dir/Scarb.toml" "${command_template[@]}")
-    measure_command_ms "$run_dir" "$log_path" "${command[@]}" >> "$samples_file"
+    local exit_code=0
+    measure_command_ms "$run_dir" "$log_path" "${command[@]}" >> "$samples_file" || exit_code=$?
+    if [[ "$exit_code" -ne 0 ]]; then
+      measurement_failure_json "$stage" "$exit_code" "$log_path"
+      return 0
+    fi
   done
-  stats_json_from_samples "$samples_file"
+  local stats_json
+  if ! stats_json="$(stats_json_from_samples "$samples_file")"; then
+    measurement_failure_json "$stage" "-1" "$samples_file"
+    return 0
+  fi
+  measurement_ok_json "$stage" "$sample_count" "$stats_json"
 }
 
 run_warm_noop_stats() {
@@ -295,6 +372,7 @@ run_warm_noop_stats() {
   local -a command_template=("$@")
   local warm_dir="$TMP_DIR/${tag}-${tool}-warm"
   local samples_file="$TMP_DIR/${tag}-${tool}-build.warm_noop.samples"
+  local stage="build.warm_noop"
   local -a command=()
   : > "$samples_file"
   rm -rf "$warm_dir"
@@ -305,13 +383,29 @@ run_warm_noop_stats() {
     command+=("$item")
   done < <(replace_manifest_arg "$warm_dir/Scarb.toml" "${command_template[@]}")
 
-  measure_command_ms "$warm_dir" "$RESULTS_DIR/real-repo-${tag}-${tool}-warm-prime.log" "${command[@]}" >/dev/null
+  local warm_prime_log="$RESULTS_DIR/real-repo-${tag}-${tool}-warm-prime.log"
+  local exit_code=0
+  measure_command_ms "$warm_dir" "$warm_prime_log" "${command[@]}" >/dev/null || exit_code=$?
+  if [[ "$exit_code" -ne 0 ]]; then
+    measurement_failure_json "$stage.prime" "$exit_code" "$warm_prime_log"
+    return 0
+  fi
   sleep "$WARM_SETTLE_SECONDS"
   for idx in $(seq 1 "$sample_count"); do
     local log_path="$RESULTS_DIR/real-repo-${tag}-${tool}-build.warm_noop-run-${idx}.log"
-    measure_command_ms "$warm_dir" "$log_path" "${command[@]}" >> "$samples_file"
+    local exit_code=0
+    measure_command_ms "$warm_dir" "$log_path" "${command[@]}" >> "$samples_file" || exit_code=$?
+    if [[ "$exit_code" -ne 0 ]]; then
+      measurement_failure_json "$stage" "$exit_code" "$log_path"
+      return 0
+    fi
   done
-  stats_json_from_samples "$samples_file"
+  local stats_json
+  if ! stats_json="$(stats_json_from_samples "$samples_file")"; then
+    measurement_failure_json "$stage" "-1" "$samples_file"
+    return 0
+  fi
+  measurement_ok_json "$stage" "$sample_count" "$stats_json"
 }
 
 benchmark_supported_case() {
@@ -323,7 +417,11 @@ benchmark_supported_case() {
   prefetch_manifest_dependencies "$manifest_path"
 
   local -a scarb_cmd=(scarb --manifest-path "$manifest_path" --offline build)
-  local -a uc_cmd=("$UC_BIN" build --engine uc --daemon-mode off --offline --manifest-path "$manifest_path")
+  local -a uc_cmd=(env "UC_NATIVE_DISALLOW_SCARB_FALLBACK=1")
+  if [[ -n "${UC_NATIVE_CORELIB_SRC:-}" ]]; then
+    uc_cmd+=("UC_NATIVE_CORELIB_SRC=$UC_NATIVE_CORELIB_SRC")
+  fi
+  uc_cmd+=("$UC_BIN" build --engine uc --daemon-mode off --offline --manifest-path "$manifest_path")
 
   local scarb_cold_json
   local scarb_warm_json
@@ -331,8 +429,8 @@ benchmark_supported_case() {
   local uc_warm_json
   scarb_cold_json="$(run_cold_stats "$source_dir" "$tag" "scarb" "$COLD_RUNS" "${scarb_cmd[@]}")"
   scarb_warm_json="$(run_warm_noop_stats "$source_dir" "$tag" "scarb" "$RUNS" "${scarb_cmd[@]}")"
-  UC_NATIVE_DISALLOW_SCARB_FALLBACK=1 uc_cold_json="$(run_cold_stats "$source_dir" "$tag" "uc" "$COLD_RUNS" "${uc_cmd[@]}")"
-  UC_NATIVE_DISALLOW_SCARB_FALLBACK=1 uc_warm_json="$(run_warm_noop_stats "$source_dir" "$tag" "uc" "$RUNS" "${uc_cmd[@]}")"
+  uc_cold_json="$(run_cold_stats "$source_dir" "$tag" "uc" "$COLD_RUNS" "${uc_cmd[@]}")"
+  uc_warm_json="$(run_warm_noop_stats "$source_dir" "$tag" "uc" "$RUNS" "${uc_cmd[@]}")"
 
   jq -n \
     --arg tag "$tag" \
@@ -346,6 +444,14 @@ benchmark_supported_case() {
       tag: $tag,
       manifest_path: $manifest_path,
       native_support: $native_support,
+      benchmark_status: (
+        if [
+          $scarb_cold.status,
+          $scarb_warm.status,
+          $uc_cold.status,
+          $uc_warm.status
+        ] | all(. == "ok") then "ok" else "failed" end
+      ),
       benchmarks: {
         scarb: {
           build: {
@@ -424,13 +530,30 @@ jq -s \
   jq -r '
     def r3: ((. * 1000 | round) / 1000);
     .cases[]
-    | select(.native_support.supported == true)
+    | select(.native_support.supported == true and .benchmark_status == "ok")
     | . as $case
-    | ($case.benchmarks.scarb.build.cold.p95_ms) as $scarb_cold
-    | ($case.benchmarks.uc.build.cold.p95_ms) as $uc_cold
-    | ($case.benchmarks.scarb.build.warm_noop.p95_ms) as $scarb_warm
-    | ($case.benchmarks.uc.build.warm_noop.p95_ms) as $uc_warm
+    | ($case.benchmarks.scarb.build.cold.stats.p95_ms) as $scarb_cold
+    | ($case.benchmarks.uc.build.cold.stats.p95_ms) as $uc_cold
+    | ($case.benchmarks.scarb.build.warm_noop.stats.p95_ms) as $scarb_warm
+    | ($case.benchmarks.uc.build.warm_noop.stats.p95_ms) as $uc_warm
     | "| \($case.tag) | \($scarb_cold | r3) | \($uc_cold | r3) | \((if $uc_cold == 0 then null else $scarb_cold / $uc_cold end) | r3) | \($scarb_warm | r3) | \($uc_warm | r3) | \((if $uc_warm == 0 then null else $scarb_warm / $uc_warm end) | r3) |"
+  ' "$OUT_JSON"
+  echo
+  echo "## Native-Eligible Cases With Build Failures"
+  echo "| Tag | Tool | Stage | Exit Code | Log Path |"
+  echo "|---|---|---|---:|---|"
+  jq -r '
+    .cases[]
+    | select(.native_support.supported == true and .benchmark_status != "ok")
+    | . as $case
+    | [
+        {tool: "scarb", lane: $case.benchmarks.scarb.build.cold},
+        {tool: "scarb", lane: $case.benchmarks.scarb.build.warm_noop},
+        {tool: "uc", lane: $case.benchmarks.uc.build.cold},
+        {tool: "uc", lane: $case.benchmarks.uc.build.warm_noop}
+      ][]
+    | select(.lane.status != "ok")
+    | "| \($case.tag) | \(.tool) | \(.lane.stage) | \(.lane.exit_code) | \(.lane.log_path) |"
   ' "$OUT_JSON"
   echo
   echo "## Native-Ineligible Cases"
