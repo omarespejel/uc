@@ -31,6 +31,10 @@ Benchmark reports must separate:
 - native-eligible workloads that failed during timed execution, with exit code and log path
 - native-ineligible workloads that were skipped, along with the exact reason
 
+Examples of native-ineligible reasons that should be reported explicitly:
+- exact `cairo-version` mismatch against the native compiler
+- legacy package editions (`2023_01`, `2023_10`, `2023_11`) without an exact `[package].cairo-version`
+
 ## Comparator Rule
 Every build-path engine change must run dual-run comparison (`scarb-direct` vs `uc build`) and record:
 - artifact mismatch count,
