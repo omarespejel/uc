@@ -98,27 +98,49 @@ If a native-eligible case fails during `scarb` or `uc` execution, the harness
 records that build failure in a separate section with exit code and log path
 instead of aborting the whole benchmark run.
 
+## Build Deployed-Contract Source Index From Inventory
+
+```bash
+# Shape-only sample: validates reviewed source inventory and writes a source index.
+./benchmarks/scripts/build_deployed_contract_source_index.sh \
+  --inventory benchmarks/corpora/deployed-contract-source-inventory.example.json \
+  --out benchmarks/results/generated-deployed-contract-source-index.sample.json
+```
+
+The inventory is the durable raw evidence layer for deployed-contract claims. It
+records the chain/snapshot/block selection, deduplication policy, license
+policy, source availability, and every reviewed source record before
+deduplication. The builder enforces the constraints mirrored in
+`benchmarks/corpora/deployed-contract-source-inventory.schema.json`, validates
+that every manifest path points at a local `Scarb.toml`, deduplicates by the
+configured key, and writes source-index JSON that conforms to
+`benchmarks/corpora/deployed-contract-source-index.schema.json`.
+
+Do not hand-author launch source indexes. Keep the inventory as the reviewed
+input, generate the source index from it, and commit or immutably archive both
+the exact inventory and generated source index used for any public claim.
+
 ## Generate Deployed-Contract Corpus From Source Index
 
 ```bash
-# Shape-only sample: validates source lock input and writes a generated corpus.
+# Shape-only sample: validates generated source-index input and writes a generated corpus.
 ./benchmarks/scripts/generate_deployed_contract_corpus.sh \
   --source-index benchmarks/corpora/deployed-contract-source-index.example.json \
   --out benchmarks/results/generated-deployed-contract-corpus.sample.json
 ```
 
-The source index is the durable selection artifact for deployed-contract
-evidence. It records chain/snapshot/block selection, deduplication, license
-policy, source availability, and the local `Scarb.toml` chosen for each contract
-or deduped class. The generator enforces the constraints mirrored in
+The source index is the deterministic selection artifact for deployed-contract
+evidence. It records chain/snapshot/block selection, deduplication counts,
+license policy, source availability, and the local `Scarb.toml` chosen for each
+contract or deduped class. The generator enforces the constraints mirrored in
 `benchmarks/corpora/deployed-contract-source-index.schema.json`, resolves all
 relative manifest paths to absolute paths, and writes corpus JSON that conforms
 to `benchmarks/corpora/deployed-contract-corpus.schema.json` for the benchmark
 runner.
 
-Do not hand-author launch corpus JSON. Keep the source index as the reviewed
-input, generate the corpus from it, and commit or immutably archive the exact
-source index used for any public claim.
+Do not hand-author launch corpus JSON. Keep the source inventory and generated
+source index as the reviewed inputs, generate the corpus from them, and commit
+or immutably archive the exact artifacts used for any public claim.
 
 ## Run Deployed-Contract Corpus Evidence
 

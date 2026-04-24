@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "corpus_id": "starknet-mainnet-deployed-source-inventory-sample-2026-04-25",
+  "chain": "starknet-mainnet",
+  "selection": {
+    "source": "sample fixture, not a chain snapshot",
+    "snapshot_id": "sample-only-2026-04-25",
+    "from_block": 1,
+    "to_block": 1,
+    "coverage": "sample",
+    "notes": "This demonstrates the inventory shape. Do not use it for launch claims."
+  },
+  "deduplication": {
+    "key": "class_hash",
+    "rules": "Keep the first reviewed source record per class hash."
+  },
+  "license_policy": "Sample fixture is repository-local test code and not a deployed-contract source license review.",
+  "source_availability": {
+    "policy": "local_manifest_paths",
+    "notes": "Every record must point at a local Scarb.toml before source-index generation."
+  },
+  "records": [
+    {
+      "tag": "sample_counter",
+      "contract_address": "0x0123",
+      "class_hash": "0x0456",
+      "source_ref": "benchmarks/fixtures/scarb_smoke in this repository",
+      "manifest_path": "../fixtures/scarb_smoke/Scarb.toml",
+      "cairo_version": "2.14.0",
+      "scarb_version": "2.14.0",
+      "license": "sample-only",
+      "notes": "Shape-only inventory sample."
+    }
+  ]
+}
