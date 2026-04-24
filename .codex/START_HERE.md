@@ -21,6 +21,7 @@
 - Format: `cargo fmt --all`
 - Fast validation: `make validate-fast`
 - Native validation: `make validate-native`
+- Helper-lane validation: `make validate-helper-lane`
 - Refresh repo map: `make agent-map`
 - Strict smoke benchmark: `make benchmark-strict-smoke`
 - Strict research benchmark: `make benchmark-strict-research`
@@ -40,6 +41,8 @@
 - Make the smallest coherent change that can be tested.
 - Add tests before or with risky code changes.
 - Re-run focused validation before broader benchmarks.
+- For older Cairo native repos, build the helper with `./scripts/build_native_toolchain_helper.sh --lane 2.14` and export the printed `UC_NATIVE_TOOLCHAIN_2_14_BIN`.
+- Before measuring a real manifest, run `./scripts/doctor.sh --uc-bin /abs/path/to/uc --manifest-path /abs/path/to/Scarb.toml` to catch missing helper lanes early.
 - Update `docs/agent/REPO_MAP.md` with `make agent-map` when repo entrypoints change.
 - Push coherent slices to a PR instead of holding large local diffs.
 - Assume GitHub Actions are disabled or manual-only. If you need a remote workflow run, trigger it deliberately with `workflow_dispatch`; do not expect automatic CI on push or PR.

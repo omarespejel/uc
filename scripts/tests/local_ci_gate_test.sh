@@ -30,9 +30,24 @@ run_case \
   $'make doctor\nmake agent-validate\n'
 
 run_case \
+  "agent-launch-doc" \
+  $'docs/AGENT_FIRST_LAUNCH_MINIMUM_2026-04-24.md\n' \
+  $'make doctor\nmake agent-validate\n'
+
+run_case \
   "bench-only" \
   $'benchmarks/scripts/run_local_benchmarks.sh\n' \
   $'make doctor\nmake validate-bench-scripts\n'
+
+run_case \
+  "doctor-script" \
+  $'scripts/doctor.sh\n' \
+  $'make doctor\nmake validate-scripts\nmake agent-validate\n'
+
+run_case \
+  "script-and-benchmark" \
+  $'scripts/doctor.sh\nbenchmarks/scripts/run_local_benchmarks.sh\n' \
+  $'make doctor\nmake validate-scripts\nmake validate-bench-scripts\nmake agent-validate\n'
 
 run_case \
   "rust-fast" \

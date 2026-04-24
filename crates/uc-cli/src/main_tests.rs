@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(not(feature = "helper-cairo-214"))]
 use cairo_lang_semantic::db::SemanticGroup;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
@@ -1657,6 +1658,7 @@ fn native_disallow_scarb_fallback_parses_expected_values() {
     std::env::remove_var("UC_NATIVE_DISALLOW_SCARB_FALLBACK");
 }
 
+#[cfg(not(feature = "helper-cairo-214"))]
 #[test]
 fn native_skip_unused_import_diagnostics_parses_expected_values() {
     let _guard = integration_env_lock()
@@ -1674,6 +1676,83 @@ fn native_skip_unused_import_diagnostics_parses_expected_values() {
     std::env::set_var("UC_NATIVE_SKIP_UNUSED_IMPORT_DIAGNOSTICS", "invalid");
     assert!(native_skip_unused_import_diagnostics());
     std::env::remove_var("UC_NATIVE_SKIP_UNUSED_IMPORT_DIAGNOSTICS");
+}
+
+#[cfg(all(feature = "native-compile", feature = "helper-cairo-214"))]
+#[test]
+fn native_helper_cairo214_skip_unused_import_diagnostics_is_not_session_keyed() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::env::set_var("UC_NATIVE_SKIP_UNUSED_IMPORT_DIAGNOSTICS", "1");
+    assert!(
+        !native_skip_unused_import_diagnostics(),
+        "helper lane should not report an unsupported diagnostics knob as active"
+    );
+    std::env::set_var("UC_NATIVE_SKIP_UNUSED_IMPORT_DIAGNOSTICS", "0");
+    assert!(
+        !native_skip_unused_import_diagnostics(),
+        "helper lane should not let an ignored env var change behavior"
+    );
+    std::env::remove_var("UC_NATIVE_SKIP_UNUSED_IMPORT_DIAGNOSTICS");
+
+    let dir = unique_test_dir("uc-native-helper-skip-unused-signature");
+    let mut signature = native_test_compile_session_signature(&dir, "manifest-blake3:helper");
+    signature.skip_unused_import_diagnostics = false;
+    let disabled_hash = native_compile_session_signature_hash(&signature);
+    signature.skip_unused_import_diagnostics = true;
+    let enabled_hash = native_compile_session_signature_hash(&signature);
+    assert_eq!(
+        disabled_hash, enabled_hash,
+        "helper lane must not key cache/session identity on a knob it cannot apply"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(all(feature = "native-compile", feature = "helper-cairo-214"))]
+#[test]
+fn native_helper_cairo214_removed_unmodified_tracked_file_invalidates_cached_content() {
+    let workspace = unique_test_dir("uc-helper-removed-tracked-file");
+    let src_dir = workspace.join("src");
+    fs::create_dir_all(&src_dir).expect("failed to create src dir");
+    let tracked_path = src_dir.join("tracked.cairo");
+    fs::write(&tracked_path, "fn tracked() -> felt252 { 7 }\n")
+        .expect("failed to write tracked source");
+
+    let mut db = RootDatabase::builder()
+        .with_optimizations(Optimizations::enabled_with_default_movable_functions(
+            InliningStrategy::Default,
+        ))
+        .with_default_plugin_suite(starknet_plugin_suite())
+        .build()
+        .expect("failed to build root database");
+    {
+        let file_id = FileId::new(&db, FileLongId::OnDisk(tracked_path.clone()));
+        assert!(
+            db.file_content(file_id).is_some(),
+            "test must prime the helper lane's cached file content"
+        );
+    }
+
+    fs::remove_file(&tracked_path).expect("failed to remove tracked source");
+    let removed_applied = native_apply_file_keyed_session_updates(
+        &mut db,
+        &workspace,
+        &[],
+        &[String::from("src/tracked.cairo")],
+    )
+    .expect("removed tracked file update should succeed");
+    assert!(
+        removed_applied,
+        "helper lane must invalidate removed tracked files even without a pre-existing override slot"
+    );
+    assert!(
+        db.file_content(FileId::new(&db, FileLongId::OnDisk(tracked_path)))
+            .is_none(),
+        "removed tracked files should clear cached helper file content"
+    );
+
+    fs::remove_dir_all(&workspace).ok();
 }
 
 #[test]
@@ -2055,6 +2134,7 @@ version = "{requested_version}"
     write_fake_uc_support_helper(
         &helper_path,
         &NativeSupportReport {
+            schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
             manifest_path: manifest_path.display().to_string(),
             status: NativeSupportStatus::Supported,
             supported: true,
@@ -2120,6 +2200,7 @@ cairo-version = "{requested_version}"
     write_fake_uc_support_helper(
         &helper_path,
         &NativeSupportReport {
+            schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
             manifest_path: manifest_path.display().to_string(),
             status: NativeSupportStatus::Supported,
             supported: true,
@@ -2188,6 +2269,7 @@ cairo-version = "{requested_version}"
 
     let report = native_support_report_from_manifest_path(&manifest_path)
         .expect("missing helper should still return a report");
+    assert_eq!(report.schema_version, UC_AGENT_JSON_SCHEMA_VERSION);
     assert_eq!(report.status, NativeSupportStatus::Unsupported);
     assert_eq!(
         report.issue_kind.as_deref(),
@@ -2197,8 +2279,40 @@ cairo-version = "{requested_version}"
         .diagnostics
         .first()
         .expect("missing helper diagnostic should be present");
+    assert_eq!(diagnostic.schema_version, UC_AGENT_JSON_SCHEMA_VERSION);
     assert_eq!(diagnostic.code, "UCN1004");
     assert_eq!(diagnostic.category, "toolchain_lane_unavailable");
+    assert_eq!(diagnostic.safe_automated_action, "build_helper_lane");
+    assert!(
+        diagnostic
+            .docs_url
+            .starts_with("https://github.com/omarespejel/uc/blob/main/"),
+        "diagnostics should expose an absolute docs URL"
+    );
+    assert!(
+        diagnostic
+            .docs_url
+            .ends_with("AGENT_DIAGNOSTICS.md#ucn1004"),
+        "diagnostics should point agents to stable remediation docs anchors"
+    );
+    assert!(
+        diagnostic
+            .how_to_fix
+            .iter()
+            .any(|fix| fix.contains(&format!(
+                "./scripts/build_native_toolchain_helper.sh --lane {requested_major_minor}"
+            ))),
+        "missing helper diagnostics should point agents to the productized helper builder"
+    );
+    assert!(
+        diagnostic
+            .next_commands
+            .iter()
+            .any(|cmd| cmd.contains(&format!(
+                "./scripts/build_native_toolchain_helper.sh --lane {requested_major_minor}"
+            ))),
+        "agent diagnostics should include an executable next command"
+    );
     assert_eq!(
         report
             .toolchain
@@ -2206,6 +2320,131 @@ cairo-version = "{requested_version}"
             .map(|toolchain| toolchain.source.clone()),
         Some(NativeToolchainSource::ExternalHelper)
     );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_support_report_json_contract_includes_doctor_fields() {
+    let _guard = integration_env_lock().lock().unwrap();
+    let current = parse_cairo_version_major_minor(native_cairo_lang_compiler_version())
+        .expect("compiler version should parse");
+    let requested = if current == (2, 14) { (2, 16) } else { (2, 14) };
+    let requested_major_minor = format_cairo_version_major_minor(requested);
+    let requested_version = format!("{requested_major_minor}.0");
+    let helper_env = native_toolchain_env_var_name_for_major_minor(&requested_major_minor);
+    let _helper = ScopedDynamicEnvVar::unset_with_lock(&_guard, helper_env.clone());
+
+    let dir = unique_test_dir("uc-native-support-json-contract");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let manifest_path = dir.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+cairo-version = "{requested_version}"
+"#
+        ),
+    )
+    .expect("write manifest");
+
+    let report = native_support_report_from_manifest_path(&manifest_path)
+        .expect("missing helper should still return support JSON");
+    let json = serde_json::to_value(&report).expect("support report should serialize");
+    assert_eq!(json["schema_version"], UC_AGENT_JSON_SCHEMA_VERSION);
+    assert_eq!(json["status"], "unsupported");
+    assert_eq!(json["supported"], false);
+    assert_eq!(json["issue_kind"], "missing_toolchain_helper");
+    assert_eq!(json["diagnostics"][0]["code"], "UCN1004");
+    assert_eq!(
+        json["diagnostics"][0]["schema_version"],
+        UC_AGENT_JSON_SCHEMA_VERSION
+    );
+    assert_eq!(
+        json["diagnostics"][0]["category"],
+        "toolchain_lane_unavailable"
+    );
+    assert_eq!(json["diagnostics"][0]["retryable"], false);
+    assert_eq!(json["diagnostics"][0]["fallback_used"], false);
+    assert_eq!(
+        json["diagnostics"][0]["safe_automated_action"],
+        "build_helper_lane"
+    );
+    assert_eq!(
+        json["diagnostics"][0]["toolchain_expected"],
+        requested_major_minor
+    );
+    let diagnostic_json = json["diagnostics"][0]
+        .as_object()
+        .expect("diagnostic should serialize as an object");
+    assert!(
+        diagnostic_json.contains_key("toolchain_found"),
+        "missing helper diagnostics should serialize toolchain_found explicitly"
+    );
+    assert!(
+        diagnostic_json
+            .get("toolchain_found")
+            .is_some_and(serde_json::Value::is_null),
+        "missing helper diagnostics should expose null found toolchain"
+    );
+    let fixes = json["diagnostics"][0]["how_to_fix"]
+        .as_array()
+        .expect("how_to_fix should stay an array");
+    assert!(
+        fixes
+            .iter()
+            .any(|fix| fix.as_str().unwrap_or_default().contains(&helper_env)),
+        "doctor depends on remediation mentioning the helper env var"
+    );
+    assert!(
+        fixes
+            .iter()
+            .any(|fix| fix.as_str().unwrap_or_default().contains(&format!(
+                "./scripts/build_native_toolchain_helper.sh --lane {requested_major_minor}"
+            ))),
+        "doctor depends on lane-specific helper build remediation"
+    );
+    let commands = json["diagnostics"][0]["next_commands"]
+        .as_array()
+        .expect("next_commands should stay an array");
+    assert!(
+        commands
+            .iter()
+            .any(|cmd| cmd.as_str().unwrap_or_default().contains(&format!(
+                "./scripts/build_native_toolchain_helper.sh --lane {requested_major_minor}"
+            ))),
+        "agent diagnostics should include the exact helper lane build command"
+    );
+    assert!(
+        commands
+            .iter()
+            .any(|cmd| cmd.as_str().unwrap_or_default().contains("--format json")),
+        "agent diagnostics should keep a JSON retry/probe command"
+    );
+    assert!(
+        json["diagnostics"][0]["docs_url"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("https://github.com/omarespejel/uc/blob/main/"),
+        "agent diagnostics should link an absolute docs URL"
+    );
+    assert!(
+        json["diagnostics"][0]["docs_url"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("AGENT_DIAGNOSTICS.md#ucn1004"),
+        "agent diagnostics should link a stable docs anchor"
+    );
+    assert_eq!(json["toolchain"]["source"], "external_helper");
+    assert_eq!(
+        json["toolchain"]["requested_major_minor"],
+        requested_major_minor
+    );
+    assert_eq!(json["toolchain"]["requested_version"], requested_version);
+
+    fs::remove_dir_all(&dir).ok();
 }
 
 #[cfg(feature = "native-compile")]
@@ -6433,7 +6672,7 @@ fn native_test_compile_session_signature(
     }
 }
 
-#[cfg(feature = "native-compile")]
+#[cfg(all(feature = "native-compile", not(feature = "helper-cairo-214")))]
 #[test]
 fn native_compile_session_signature_hash_changes_when_unused_import_diagnostics_toggle_changes() {
     let dir = unique_test_dir("uc-native-signature-unused-import-toggle");
@@ -7283,7 +7522,10 @@ fn native_test_db_with_single_real_crate(
             cache_file: None,
         },
     );
+    #[cfg(not(feature = "helper-cairo-214"))]
     set_crate_configs_input(&mut db, crate_configs);
+    #[cfg(feature = "helper-cairo-214")]
+    set_crate_configs_input(&mut db, Some(crate_configs));
     (db, crate_input)
 }
 
@@ -7316,7 +7558,10 @@ fn native_seeded_root_database_returns_writable_db() {
         },
     );
 
+    #[cfg(not(feature = "helper-cairo-214"))]
     set_crate_configs_input(&mut db, crate_configs);
+    #[cfg(feature = "helper-cairo-214")]
+    set_crate_configs_input(&mut db, Some(crate_configs));
     assert_eq!(db.crate_configs().len(), baseline_len + 1);
 
     fs::remove_dir_all(&dir).ok();
@@ -7416,7 +7661,7 @@ fn native_seeded_root_database_supports_native_setup_project_end_to_end() {
     fs::remove_dir_all(&dir).ok();
 }
 
-#[cfg(feature = "native-compile")]
+#[cfg(all(feature = "native-compile", not(feature = "helper-cairo-214")))]
 #[test]
 fn native_seeded_root_database_propagates_skip_unused_import_diagnostics_flag() {
     let dir = unique_test_dir("uc-native-skip-unused-import-flag");
@@ -7872,6 +8117,80 @@ fn native_crate_cache_restore_rejects_signature_mismatch() {
         .cache_file
         .is_none(),
         "signature mismatch must not inject cached blob"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_crate_cache_restore_preserves_existing_config_fields() {
+    let dir = unique_test_dir("uc-native-crate-cache-preserve-config");
+    let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
+    let signature_hash = native_compile_session_signature_hash(&signature);
+    let (mut db, crate_input) = native_test_db_with_single_real_crate(&dir, "demo");
+    let (descriptor, original_root, original_settings) = {
+        let crate_id = CrateInput::into_crate_ids(&db, [crate_input.clone()])
+            .into_iter()
+            .next()
+            .expect("crate id should be interned");
+        let original_config = db
+            .crate_config(crate_id)
+            .expect("crate config should exist before restore");
+        (
+            native_crate_cache_descriptor_for_crate(&db, crate_id)
+                .expect("real crate config should produce cache descriptor"),
+            format!("{:?}", original_config.root),
+            format!("{:?}", original_config.settings),
+        )
+    };
+    let entry_hash = native_crate_cache_entry_hash(&signature_hash, &descriptor.cache_key);
+    let (blob_path, entry_path) = native_crate_cache_entry_paths(&dir, &entry_hash)
+        .expect("native crate cache paths should resolve");
+    let cache_blob = b"native-cache-blob".to_vec();
+    if let Some(parent) = blob_path.parent() {
+        fs::create_dir_all(parent).expect("failed to create native cache directory");
+    }
+    atomic_write_bytes(&blob_path, &cache_blob, "test native crate cache blob")
+        .expect("failed to write native crate cache blob");
+    let entry = NativeCrateCacheEntryFile {
+        schema_version: NATIVE_CRATE_CACHE_ENTRY_SCHEMA_VERSION,
+        signature_hash: signature_hash.clone(),
+        crate_cache_key: descriptor.cache_key,
+        blob_hash: blake3::hash(&cache_blob).to_hex().to_string(),
+        blob_size: cache_blob.len() as u64,
+        generated_at_epoch_ms: epoch_ms_u64().unwrap_or_default(),
+    };
+    let entry_bytes = serde_json::to_vec(&entry).expect("failed to encode cache entry");
+    atomic_write_bytes(
+        &entry_path,
+        &entry_bytes,
+        "test native crate cache metadata",
+    )
+    .expect("failed to write native crate cache metadata");
+
+    let stats = native_restore_crate_cache_into_db(&dir, &signature_hash, &mut db);
+    assert_eq!(stats.restored, 1);
+    let crate_id = CrateInput::into_crate_ids(&db, [crate_input.clone()])
+        .into_iter()
+        .next()
+        .expect("crate id should be interned after restore");
+    let restored_config = db
+        .crate_config(crate_id)
+        .expect("crate config should exist after restore");
+    assert_eq!(
+        format!("{:?}", restored_config.root),
+        original_root,
+        "restore must preserve the existing crate root while injecting cache_file"
+    );
+    assert_eq!(
+        format!("{:?}", restored_config.settings),
+        original_settings,
+        "restore must preserve existing crate settings while injecting cache_file"
+    );
+    assert!(
+        restored_config.cache_file.is_some(),
+        "restore should inject cache_file without replacing other config fields"
     );
 
     fs::remove_dir_all(&dir).ok();

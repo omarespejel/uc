@@ -8,6 +8,11 @@ This directory is the checked-in handoff layer for humans, coding agents, and PR
 - `.codex/START_HERE.md`: exact bootstrap sequence for a fresh clone.
 - `PR_BOT_POLICY.md`: how CodeRabbit and Qodo should be configured and interpreted.
 - `REPO_MAP.md`: generated map of the current repo entrypoints and hot files.
+- `AGENT_FIRST_COMPILER.md`: product and architecture direction for agent-operable compiler workflows.
+- `AGENT_DIAGNOSTICS.md`: stable diagnostic-code contract for agent JSON consumers.
+- `AGENT_QUICKSTART.md`: command sequence agents should prefer before build, fix, or benchmark work.
+- `HUMAN_QUICKSTART.md`: human-oriented command sequence for the same support/build surfaces.
+- `schemas/`: JSON schemas for diagnostic, support, and build report outputs.
 
 ## Why This Exists
 
@@ -33,3 +38,7 @@ That split keeps PR bot review on GitHub while moving routine tests and benchmar
 - Qodo compliance checklist: <https://docs.qodo.ai/qodo-documentation/qodo-merge/pr-agent/tools/compliance>
 - GitHub manual workflows (`workflow_dispatch`): <https://docs.github.com/en/actions/how-tos/managing-workflow-runs-and-deployments/managing-workflow-runs/manually-running-a-workflow>
 - Git hooks and `core.hooksPath`: <https://git-scm.com/docs/githooks>
+- AGENTS.md standard: <https://agents.md/>
+- Model Context Protocol schema reference: <https://modelcontextprotocol.io/specification/2025-11-25/schema>
+- Language Server Protocol overview: <https://microsoft.github.io/language-server-protocol/>
+- SARIF 2.1.0: <https://docs.oasis-open.org/sarif/sarif/v2.1.0/os/sarif-v2.1.0-os.html>

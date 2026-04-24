@@ -22,6 +22,7 @@ native-compile = [
   "dep:scarb-stable-hash",
 ]
 dev-benchmark-command = []
+helper-cairo-214 = []
 
 [dependencies]
 anyhow.workspace = true

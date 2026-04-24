@@ -35,6 +35,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 walkdir = "2"
 
+[workspace.metadata.uc-native-toolchain-helpers."2.14"]
+cairo-version = "2.14.0"
+salsa-version = "0.24.0"
+lockfile = "toolchains/cairo-2.14/Cargo.lock"
+
 [patch.crates-io]
 cairo-lang-filesystem = { path = "third_party/cairo-lang-filesystem" }
 cairo-lang-semantic = { path = "third_party/cairo-lang-semantic" }

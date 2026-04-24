@@ -75,17 +75,35 @@ if [[ "$1" == "build" ]]; then
     esac
   done
   printf 'build %s disallow=%s corelib=%s report=%s\n' "$manifest" "${UC_NATIVE_DISALLOW_SCARB_FALLBACK:-}" "${UC_NATIVE_CORELIB_SRC:-}" "$report_path" >> "$args_log"
+  if [[ "$manifest" == *"unstable"* && "${UC_NATIVE_DISALLOW_SCARB_FALLBACK:-}" == "1" ]]; then
+    state_dir="${MOCK_UC_STATE_DIR:-}"
+    if [[ -n "$state_dir" ]]; then
+      mkdir -p "$state_dir"
+      case_tag="$(basename "$(dirname "$manifest")")-$(basename "$manifest")-$(printf '%s' "$manifest" | cksum)"
+      case_tag="${case_tag//[^A-Za-z0-9_.-]/_}"
+      count_file="$state_dir/${case_tag}.count"
+      count=0
+      if [[ -f "$count_file" ]]; then
+        count="$(cat "$count_file")"
+      fi
+      count=$((count + 1))
+      printf '%s' "$count" > "$count_file"
+      if [[ "$count" -eq 4 ]]; then
+        sleep 1.5
+      fi
+    fi
+  fi
   if [[ -n "$report_path" ]]; then
     mkdir -p "$(dirname "$report_path")"
     compile_backend="uc_native"
     fallback_used="false"
     diagnostics='[]'
-    if [[ "$manifest" == *"fallback-used"* ]]; then
-      compile_backend="scarb_fallback"
-      fallback_used="true"
-      diagnostics='[{"code":"UCN2002","category":"native_fallback_local_native_error","severity":"warn","title":"Native local build downgraded to Scarb","what_happened":"native failed","why":"native failed","how_to_fix":["fix native"],"retryable":true,"fallback_used":true,"toolchain_expected":"2.16.0","toolchain_found":"2.16.0"}]'
-    fi
-    cat > "$report_path" <<REPORT
+  if [[ "$manifest" == *"fallback-used"* ]]; then
+    compile_backend="scarb_fallback"
+    fallback_used="true"
+    diagnostics='[{"code":"UCN2002","category":"native_fallback_local_native_error","severity":"warn","title":"Native local build downgraded to Scarb","what_happened":"native failed","why":"native failed","how_to_fix":["fix native"],"retryable":true,"fallback_used":true,"toolchain_expected":"2.16.0","toolchain_found":"2.16.0"}]'
+  fi
+  cat > "$report_path" <<REPORT
 {
   "generated_at_epoch_ms": 1,
   "engine": "uc",
@@ -381,6 +399,135 @@ test_real_repo_benchmark_records_supported_build_failures() {
   assert_contains "$markdown_text" "| fails-build | scarb | build.cold | 17 |"
 }
 
+test_real_repo_benchmark_surfaces_stability_warnings() {
+  local cases_root="$TEST_TMP_DIR/stability-cases"
+  local mock_bin_dir="$TEST_TMP_DIR/stability-mock-bin"
+  local mock_uc="$mock_bin_dir/uc"
+  local mock_scarb="$mock_bin_dir/scarb"
+  local results_dir="$TEST_TMP_DIR/stability-results"
+  mkdir -p "$mock_bin_dir" "$results_dir"
+  write_mock_uc_bin "$mock_uc"
+  write_mock_scarb_bin "$mock_scarb"
+  write_manifest_case "$cases_root" "unstable-supported"
+
+  local stdout_text
+  stdout_text="$(
+    PATH="$mock_bin_dir:$PATH" \
+    MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/stability-uc.args" \
+    MOCK_UC_STATE_DIR="$TEST_TMP_DIR/stability-uc.state" \
+    MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/stability-scarb.args" \
+    "$BENCH_SCRIPT" \
+      --uc-bin "$mock_uc" \
+      --results-dir "$results_dir" \
+      --runs 4 \
+      --cold-runs 5 \
+      --warm-settle-seconds 0 \
+      --case "$cases_root/unstable-supported/Scarb.toml" unstable-supported
+  )"
+  local json_path
+  json_path="$(awk -F': ' '/Benchmark JSON:/ {print $2}' <<<"$stdout_text")"
+  local md_path
+  md_path="$(awk -F': ' '/Benchmark Markdown:/ {print $2}' <<<"$stdout_text")"
+
+  local unstable_count
+  unstable_count="$(jq -r '.summary.unstable_lane_count' "$json_path")"
+  local has_expected_unstable_tag
+  has_expected_unstable_tag="$(jq -r '.summary.unstable_lanes | any(.tag=="unstable-supported")' "$json_path")"
+  if [[ "$unstable_count" -lt 1 || "$has_expected_unstable_tag" != "true" ]]; then
+    echo "expected unstable lane warning to be recorded" >&2
+    cat "$json_path" >&2
+    return 1
+  fi
+
+  local markdown_text
+  markdown_text="$(cat "$md_path")"
+  assert_contains "$markdown_text" "## Stability Warnings"
+  assert_contains "$markdown_text" "| unstable-supported |"
+}
+
+test_real_repo_benchmark_keeps_unstable_lanes_on_partial_failures() {
+  local cases_root="$TEST_TMP_DIR/partial-stability-cases"
+  local mock_bin_dir="$TEST_TMP_DIR/partial-stability-mock-bin"
+  local mock_uc="$mock_bin_dir/uc"
+  local mock_scarb="$mock_bin_dir/scarb"
+  local results_dir="$TEST_TMP_DIR/partial-stability-results"
+  mkdir -p "$mock_bin_dir" "$results_dir"
+  write_mock_uc_bin "$mock_uc"
+  write_mock_scarb_bin "$mock_scarb"
+  write_manifest_case "$cases_root" "unstable-fails-build"
+
+  local stdout_text
+  stdout_text="$(
+    PATH="$mock_bin_dir:$PATH" \
+    MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/partial-stability-uc.args" \
+    MOCK_UC_STATE_DIR="$TEST_TMP_DIR/partial-stability-uc.state" \
+    MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/partial-stability-scarb.args" \
+    "$BENCH_SCRIPT" \
+      --uc-bin "$mock_uc" \
+      --results-dir "$results_dir" \
+      --runs 4 \
+      --cold-runs 5 \
+      --warm-settle-seconds 0 \
+      --case "$cases_root/unstable-fails-build/Scarb.toml" unstable-fails-build
+  )"
+  local json_path
+  json_path="$(awk -F': ' '/Benchmark JSON:/ {print $2}' <<<"$stdout_text")"
+
+  local benchmark_status
+  benchmark_status="$(jq -r '.cases[] | select(.tag=="unstable-fails-build") | .benchmark_status' "$json_path")"
+  if [[ "$benchmark_status" != "failed" ]]; then
+    echo "fixture should create a partially failed benchmark case" >&2
+    cat "$json_path" >&2
+    return 1
+  fi
+
+  local unstable_count
+  unstable_count="$(jq -r '.summary.unstable_lane_count' "$json_path")"
+  local has_expected_unstable_tag
+  has_expected_unstable_tag="$(jq -r '.summary.unstable_lanes | any(.tag=="unstable-fails-build")' "$json_path")"
+  if [[ "$unstable_count" -lt 1 || "$has_expected_unstable_tag" != "true" ]]; then
+    echo "expected unstable ok lanes to remain visible despite a failed sibling lane" >&2
+    cat "$json_path" >&2
+    return 1
+  fi
+}
+
+test_real_repo_benchmark_instability_state_is_manifest_specific() {
+  local cases_root_a="$TEST_TMP_DIR/stability-collision-a"
+  local cases_root_b="$TEST_TMP_DIR/stability-collision-b"
+  local mock_bin_dir="$TEST_TMP_DIR/stability-collision-mock-bin"
+  local mock_uc="$mock_bin_dir/uc"
+  local mock_scarb="$mock_bin_dir/scarb"
+  local results_dir="$TEST_TMP_DIR/stability-collision-results"
+  local state_dir="$TEST_TMP_DIR/stability-collision-state"
+  mkdir -p "$mock_bin_dir" "$results_dir" "$state_dir"
+  write_mock_uc_bin "$mock_uc"
+  write_mock_scarb_bin "$mock_scarb"
+  write_manifest_case "$cases_root_a" "unstable-same-name"
+  write_manifest_case "$cases_root_b" "unstable-same-name"
+
+  PATH="$mock_bin_dir:$PATH" \
+  MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/stability-collision-uc.args" \
+  MOCK_UC_STATE_DIR="$state_dir" \
+  MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/stability-collision-scarb.args" \
+  "$BENCH_SCRIPT" \
+    --uc-bin "$mock_uc" \
+    --results-dir "$results_dir" \
+    --runs 1 \
+    --cold-runs 1 \
+    --warm-settle-seconds 0 \
+    --case "$cases_root_a/unstable-same-name/Scarb.toml" unstable-a \
+    --case "$cases_root_b/unstable-same-name/Scarb.toml" unstable-b >/dev/null
+
+  local counter_count
+  counter_count="$(find "$state_dir" -name '*.count' -type f | wc -l | tr -d ' ')"
+  if [[ "$counter_count" != "4" ]]; then
+    echo "expected one instability counter per manifest, got $counter_count" >&2
+    find "$state_dir" -name '*.count' -type f -print >&2
+    return 1
+  fi
+}
+
 run_test "real_repo_benchmark_rejects_missing_case_values" \
   test_real_repo_benchmark_rejects_missing_case_values
 run_test "real_repo_benchmark_rejects_zero_runs_from_environment" \
@@ -389,3 +536,9 @@ run_test "real_repo_benchmark_records_support_matrix_categories" \
   test_real_repo_benchmark_records_support_matrix_categories
 run_test "real_repo_benchmark_records_supported_build_failures" \
   test_real_repo_benchmark_records_supported_build_failures
+run_test "real_repo_benchmark_surfaces_stability_warnings" \
+  test_real_repo_benchmark_surfaces_stability_warnings
+run_test "real_repo_benchmark_keeps_unstable_lanes_on_partial_failures" \
+  test_real_repo_benchmark_keeps_unstable_lanes_on_partial_failures
+run_test "real_repo_benchmark_instability_state_is_manifest_specific" \
+  test_real_repo_benchmark_instability_state_is_manifest_specific

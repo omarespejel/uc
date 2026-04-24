@@ -51,6 +51,7 @@ main() {
 
   local docs_surface_changed=0
   local benchmark_changed=0
+  local script_changed=0
   local rust_changed=0
   local native_changed=0
 
@@ -58,8 +59,13 @@ main() {
     while IFS= read -r path; do
       [[ -n "$path" ]] || continue
       case "$path" in
-        AGENTS.md|.codex/START_HERE.md|docs/agent/*|.coderabbit.yaml|.pr_agent.toml|best_practices.md|pr_compliance_checklist.yaml|.github/workflows/*|Makefile|scripts/doctor.sh|scripts/refresh_repo_map.sh|scripts/validate_agent_surface.sh|scripts/install_git_hooks.sh|scripts/local_ci_gate.sh|scripts/tests/local_ci_gate_test.sh|.githooks/pre-push)
+        AGENTS.md|.codex/START_HERE.md|docs/agent/*|docs/AGENT_FIRST_LAUNCH_MINIMUM_2026-04-24.md|.coderabbit.yaml|.pr_agent.toml|best_practices.md|pr_compliance_checklist.yaml|.github/workflows/*|Makefile|scripts/doctor.sh|scripts/refresh_repo_map.sh|scripts/validate_agent_surface.sh|scripts/install_git_hooks.sh|scripts/local_ci_gate.sh|scripts/tests/local_ci_gate_test.sh|.githooks/pre-push)
           docs_surface_changed=1
+          ;;
+      esac
+      case "$path" in
+        scripts/doctor.sh|scripts/build_native_toolchain_helper.sh|scripts/tests/*|docs/NATIVE_TOOLCHAIN_HELPERS.md)
+          script_changed=1
           ;;
       esac
       case "$path" in
@@ -107,12 +113,17 @@ main() {
     return 0
   fi
 
+  if (( script_changed )); then
+    log "selected local gate: validate-scripts"
+    run_make validate-scripts
+  fi
+
   if (( benchmark_changed )); then
     log "selected local gate: validate-bench-scripts"
     run_make validate-bench-scripts
   fi
 
-  if (( docs_surface_changed || !benchmark_changed )); then
+  if (( docs_surface_changed || script_changed || !benchmark_changed )); then
     log "selected local gate: agent-validate"
     run_make agent-validate
   fi

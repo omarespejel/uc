@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/omarespejel/uc/docs/agent/schemas/build-report.schema.json",
+  "title": "uc BuildReport",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "generated_at_epoch_ms",
+    "engine",
+    "daemon_used",
+    "manifest_path",
+    "workspace_root",
+    "profile",
+    "session_key",
+    "command",
+    "exit_code",
+    "elapsed_ms",
+    "cache_hit",
+    "fingerprint",
+    "artifact_count",
+    "diagnostics"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "generated_at_epoch_ms": { "type": "number" },
+    "engine": { "type": "string" },
+    "daemon_used": { "type": "boolean" },
+    "manifest_path": { "type": "string" },
+    "workspace_root": { "type": "string" },
+    "profile": { "type": "string" },
+    "session_key": { "type": "string" },
+    "command": { "type": "array", "items": { "type": "string" } },
+    "exit_code": { "type": "integer" },
+    "elapsed_ms": { "type": "number" },
+    "cache_hit": { "type": "boolean" },
+    "fingerprint": { "type": "string" },
+    "artifact_count": { "type": "integer" },
+    "phase_telemetry": { "type": ["object", "null"] },
+    "compile_backend": { "type": "string" },
+    "native_toolchain": { "type": "object" },
+    "diagnostics": {
+      "type": "array",
+      "items": { "$ref": "native-diagnostic.schema.json" }
+    }
+  }
+}

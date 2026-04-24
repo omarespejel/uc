@@ -14,16 +14,23 @@ use cairo_lang_defs::ids::ModuleId;
 use cairo_lang_defs::ids::NamedLanguageElementId;
 #[cfg(feature = "native-compile")]
 use cairo_lang_defs::ids::TopLevelLanguageElementId;
-#[cfg(feature = "native-compile")]
+#[cfg(all(feature = "native-compile", not(feature = "helper-cairo-214")))]
 use cairo_lang_filesystem::db::{
     ensure_keyed_file_override_slots, files_group_input, init_dev_corelib, set_crate_configs_input,
     set_file_override_content_keyed, CrateConfigurationInput, FilesGroup,
+};
+#[cfg(all(feature = "native-compile", feature = "helper-cairo-214"))]
+use cairo_lang_filesystem::db::{
+    file_overrides, files_group_input, init_dev_corelib, set_crate_configs_input,
+    update_file_overrides_input_helper, CrateConfigurationInput, FilesGroup,
 };
 #[cfg(feature = "native-compile")]
 use cairo_lang_filesystem::detect::detect_corelib;
 #[cfg(feature = "native-compile")]
 use cairo_lang_filesystem::ids::{BlobLongId, CrateId, CrateInput, CrateLongId, Directory};
-#[cfg(feature = "native-compile")]
+#[cfg(all(feature = "native-compile", feature = "helper-cairo-214"))]
+use cairo_lang_filesystem::ids::{FileId, FileInput, FileLongId};
+#[cfg(all(feature = "native-compile", not(feature = "helper-cairo-214")))]
 use cairo_lang_filesystem::ids::{FileId, FileLongId};
 #[cfg(feature = "native-compile")]
 use cairo_lang_lowering::cache::generate_crate_cache;
@@ -31,9 +38,11 @@ use cairo_lang_lowering::cache::generate_crate_cache;
 use cairo_lang_lowering::optimizations::config::Optimizations;
 #[cfg(feature = "native-compile")]
 use cairo_lang_lowering::utils::InliningStrategy;
-#[cfg(feature = "native-compile")]
+#[cfg(all(feature = "native-compile", not(feature = "helper-cairo-214")))]
 use cairo_lang_semantic::db::SemanticGroupEx;
-#[cfg(feature = "native-compile")]
+#[cfg(all(feature = "native-compile", feature = "helper-cairo-214"))]
+use cairo_lang_starknet::compile::compile_prepared_db as compile_starknet_prepared_db;
+#[cfg(all(feature = "native-compile", not(feature = "helper-cairo-214")))]
 use cairo_lang_starknet::compile::{
     compile_prepared_db as compile_starknet_prepared_db,
     compile_prepared_db_without_diagnostics as compile_starknet_prepared_db_without_diagnostics,
@@ -51,6 +60,8 @@ use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use notify::event::{ModifyKind as NotifyModifyKind, RenameMode as NotifyRenameMode};
 #[cfg(feature = "native-compile")]
 use notify::{EventKind as NotifyEventKind, RecommendedWatcher, RecursiveMode, Watcher};
+#[cfg(all(feature = "native-compile", feature = "helper-cairo-214"))]
+use salsa::Setter;
 #[cfg(feature = "native-compile")]
 use scarb_stable_hash::short_hash;
 use serde::{Deserialize, Serialize};
@@ -219,7 +230,7 @@ const DEFAULT_DAEMON_SHARED_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const DEFAULT_UC_DISABLE_SCARB_ARTIFACTS_FINGERPRINT: bool = true;
 const DEFAULT_UC_NATIVE_BUILD_MODE: &str = "auto";
 const DEFAULT_UC_NATIVE_DISALLOW_SCARB_FALLBACK: bool = false;
-#[cfg(feature = "native-compile")]
+#[cfg(all(feature = "native-compile", not(feature = "helper-cairo-214")))]
 const DEFAULT_UC_NATIVE_SKIP_UNUSED_IMPORT_DIAGNOSTICS: bool = true;
 const TOOLCHAIN_CHECK_CACHE_SCHEMA_VERSION: u32 = 1;
 const MAX_TOOLCHAIN_CHECK_CACHE_BYTES: u64 = 64 * 1024;
@@ -242,6 +253,9 @@ const CACHEABLE_ARTIFACT_SUFFIXES: [&str; 7] = [
     ".starknet_artifacts.json",
     ".executable.json",
 ];
+const UC_AGENT_JSON_SCHEMA_VERSION: u32 = 1;
+const UC_AGENT_DIAGNOSTICS_DOC_URL: &str =
+    "https://github.com/omarespejel/uc/blob/main/docs/agent/AGENT_DIAGNOSTICS.md";
 
 #[derive(Parser, Debug)]
 #[command(name = "uc")]
@@ -427,20 +441,37 @@ enum NativeDiagnosticSeverity {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct NativeDiagnostic {
+    #[serde(default = "uc_agent_json_schema_version")]
+    schema_version: u32,
     code: String,
     category: String,
     severity: NativeDiagnosticSeverity,
     title: String,
+    docs_url: String,
     what_happened: String,
     why: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     how_to_fix: Vec<String>,
+    #[serde(default)]
+    next_commands: Vec<String>,
+    safe_automated_action: String,
     retryable: bool,
     fallback_used: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     toolchain_expected: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     toolchain_found: Option<String>,
+}
+
+fn native_diagnostic_docs_url(code: &str) -> String {
+    format!(
+        "{}#{}",
+        UC_AGENT_DIAGNOSTICS_DOC_URL,
+        code.to_ascii_lowercase()
+    )
+}
+
+fn uc_agent_json_schema_version() -> u32 {
+    UC_AGENT_JSON_SCHEMA_VERSION
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -461,6 +492,8 @@ struct NativeToolchainReport {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct NativeSupportReport {
+    #[serde(default = "uc_agent_json_schema_version")]
+    schema_version: u32,
     manifest_path: String,
     status: NativeSupportStatus,
     supported: bool,
@@ -474,7 +507,7 @@ struct NativeSupportReport {
     issue_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     toolchain: Option<NativeToolchainReport>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     diagnostics: Vec<NativeDiagnostic>,
 }
 
@@ -872,6 +905,8 @@ struct StarknetArtifactFiles {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct BuildReport {
+    #[serde(default = "uc_agent_json_schema_version")]
+    schema_version: u32,
     generated_at_epoch_ms: u128,
     engine: String,
     daemon_used: bool,
@@ -1860,12 +1895,17 @@ fn parse_env_bool(name: &str, default: bool) -> bool {
     }
 }
 
-#[cfg(feature = "native-compile")]
+#[cfg(all(feature = "native-compile", not(feature = "helper-cairo-214")))]
 fn native_skip_unused_import_diagnostics() -> bool {
     parse_env_bool(
         "UC_NATIVE_SKIP_UNUSED_IMPORT_DIAGNOSTICS",
         DEFAULT_UC_NATIVE_SKIP_UNUSED_IMPORT_DIAGNOSTICS,
     )
+}
+
+#[cfg(all(feature = "native-compile", feature = "helper-cairo-214"))]
+fn native_skip_unused_import_diagnostics() -> bool {
+    false
 }
 
 #[cfg(feature = "native-compile")]
@@ -2368,15 +2408,84 @@ impl NativeCompileSupportIssue {
                     native_toolchain_env_var_name_for_major_minor(requested.split('.').take(2).collect::<Vec<_>>().join(".").as_str());
                 vec![
                     format!("Use a uc binary built against Cairo {requested} for this project."),
+                    format!("Or run `./scripts/build_native_toolchain_helper.sh --lane {}` to build a compatible helper lane.", requested.split('.').take(2).collect::<Vec<_>>().join(".")),
                     format!("Or set `{helper_env}` to a compatible helper binary."),
                 ]
             }
-            Self::MissingToolchainHelper { helper_env, .. } => vec![format!(
-                "Set `{helper_env}` to the path of a uc binary built with the required cairo-lang lane."
-            )],
+            Self::MissingToolchainHelper {
+                helper_env,
+                requested,
+            } => vec![
+                format!(
+                    "Run `./scripts/build_native_toolchain_helper.sh --lane {}` to build the required helper lane.",
+                    requested.split('.').take(2).collect::<Vec<_>>().join(".")
+                ),
+                format!(
+                    "Set `{helper_env}` to the path of a uc binary built with the required cairo-lang lane."
+                ),
+            ],
             Self::InvalidToolchainHelper { helper_env, .. } => vec![
+                "Rebuild the helper with `./scripts/build_native_toolchain_helper.sh --lane <major.minor>` if the binary is stale or missing.".to_string(),
                 format!("Point `{helper_env}` at an executable uc binary for the required Cairo lane."),
             ],
+        }
+    }
+
+    fn next_commands(&self) -> Vec<String> {
+        match self {
+            Self::LegacyEditionRequiresPinnedCairoVersion { .. } => vec![
+                "uc support native --manifest-path <Scarb.toml> --format json".to_string(),
+                "scarb metadata --manifest-path <Scarb.toml>".to_string(),
+            ],
+            Self::UnsupportedManifestConstraint { .. } => {
+                vec!["uc support native --manifest-path <Scarb.toml> --format json".to_string()]
+            }
+            Self::UnparseableCompilerVersion { .. } => vec![
+                "uc support native --manifest-path <Scarb.toml> --format json".to_string(),
+                "scarb --version".to_string(),
+            ],
+            Self::CompilerVersionMismatch { requested, .. } => {
+                let lane = requested.split('.').take(2).collect::<Vec<_>>().join(".");
+                vec![
+                    format!("./scripts/build_native_toolchain_helper.sh --lane {lane}"),
+                    "uc support native --manifest-path <Scarb.toml> --format json".to_string(),
+                ]
+            }
+            Self::MissingToolchainHelper {
+                requested,
+                helper_env,
+            } => {
+                let lane = requested.split('.').take(2).collect::<Vec<_>>().join(".");
+                vec![
+                    format!("./scripts/build_native_toolchain_helper.sh --lane {lane}"),
+                    format!("{helper_env}=<helper-uc-path> uc support native --manifest-path <Scarb.toml> --format json"),
+                ]
+            }
+            Self::InvalidToolchainHelper {
+                requested,
+                helper_env,
+                ..
+            } => {
+                let lane = requested.split('.').take(2).collect::<Vec<_>>().join(".");
+                vec![
+                    format!("./scripts/build_native_toolchain_helper.sh --lane {lane}"),
+                    format!("{helper_env}=<helper-uc-path> uc support native --manifest-path <Scarb.toml> --format json"),
+                ]
+            }
+        }
+    }
+
+    fn safe_automated_action(&self) -> &'static str {
+        match self {
+            Self::MissingToolchainHelper { .. } => "build_helper_lane",
+            Self::InvalidToolchainHelper { .. } => "rebuild_helper_lane",
+            Self::CompilerVersionMismatch { .. } | Self::UnparseableCompilerVersion { .. } => {
+                "select_matching_toolchain_lane"
+            }
+            Self::LegacyEditionRequiresPinnedCairoVersion { .. }
+            | Self::UnsupportedManifestConstraint { .. } => {
+                "manual_manifest_or_lockfile_fix_required"
+            }
         }
     }
 
@@ -2397,14 +2506,19 @@ impl NativeCompileSupportIssue {
                 requested, path, ..
             } => (Some(requested.clone()), Some(path.clone())),
         };
+        let code = self.code();
         NativeDiagnostic {
-            code: self.code().to_string(),
+            schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+            code: code.to_string(),
             category: self.category().to_string(),
             severity: NativeDiagnosticSeverity::Error,
             title: self.title().to_string(),
+            docs_url: native_diagnostic_docs_url(code),
             what_happened: self.what_happened(),
             why: self.reason(),
             how_to_fix: self.how_to_fix(),
+            next_commands: self.next_commands(),
+            safe_automated_action: self.safe_automated_action().to_string(),
             retryable: false,
             fallback_used: false,
             toolchain_expected,
@@ -2595,6 +2709,7 @@ fn native_support_report_from_manifest_path(manifest_path: &Path) -> Result<Nati
                 return Ok(report);
             }
             Ok(NativeSupportReport {
+                schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
                 manifest_path: manifest_path.display().to_string(),
                 status: NativeSupportStatus::Supported,
                 supported: true,
@@ -2607,6 +2722,7 @@ fn native_support_report_from_manifest_path(manifest_path: &Path) -> Result<Nati
             })
         }
         Err(issue) => Ok(NativeSupportReport {
+            schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
             manifest_path: manifest_path.display().to_string(),
             status: NativeSupportStatus::Unsupported,
             supported: false,
@@ -2623,6 +2739,7 @@ fn native_support_report_from_manifest_path(manifest_path: &Path) -> Result<Nati
 #[cfg(not(feature = "native-compile"))]
 fn native_support_report_from_manifest_path(manifest_path: &Path) -> Result<NativeSupportReport> {
     Ok(NativeSupportReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
         manifest_path: manifest_path.display().to_string(),
         status: NativeSupportStatus::Unavailable,
         supported: false,
@@ -2634,10 +2751,12 @@ fn native_support_report_from_manifest_path(manifest_path: &Path) -> Result<Nati
         issue_kind: Some("native_compile_feature_disabled".to_string()),
         toolchain: None,
         diagnostics: vec![NativeDiagnostic {
+            schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
             code: "UCN0001".to_string(),
             category: "feature_unavailable".to_string(),
             severity: NativeDiagnosticSeverity::Error,
             title: "Native compile feature is disabled".to_string(),
+            docs_url: native_diagnostic_docs_url("UCN0001"),
             what_happened:
                 "This uc binary was built without native-compile support.".to_string(),
             why: "The current executable cannot probe or run native Cairo compilation."
@@ -2645,6 +2764,11 @@ fn native_support_report_from_manifest_path(manifest_path: &Path) -> Result<Nati
             how_to_fix: vec![
                 "Use a uc binary built with the native-compile feature enabled.".to_string(),
             ],
+            next_commands: vec![
+                "cargo build -p uc-cli --features native-compile".to_string(),
+                "uc support native --manifest-path <Scarb.toml> --format json".to_string(),
+            ],
+            safe_automated_action: "use_native_enabled_binary".to_string(),
             retryable: false,
             fallback_used: false,
             toolchain_expected: None,
@@ -7831,16 +7955,74 @@ fn compile_native_casm_contract(
     contract_class: ContractClass,
     max_casm_bytecode_size: usize,
 ) -> Result<CasmContractClass> {
+    #[cfg(not(feature = "helper-cairo-214"))]
     let extracted_program = contract_class
         .extract_sierra_program(false)
         .context("failed to extract native Sierra program for CASM emission")?;
-    CasmContractClass::from_contract_class(
+    #[cfg(not(feature = "helper-cairo-214"))]
+    let casm = CasmContractClass::from_contract_class(
         contract_class,
         extracted_program,
         false,
         max_casm_bytecode_size,
-    )
-    .context("failed to compile native CASM contract class")
+    );
+    #[cfg(feature = "helper-cairo-214")]
+    let casm =
+        CasmContractClass::from_contract_class(contract_class, false, max_casm_bytecode_size);
+    casm.context("failed to compile native CASM contract class")
+}
+
+#[cfg(all(feature = "native-compile", feature = "helper-cairo-214"))]
+fn ensure_keyed_file_override_slots(
+    _db: &mut RootDatabase,
+    _files: impl IntoIterator<Item = FileInput>,
+) -> usize {
+    0
+}
+
+#[cfg(all(feature = "native-compile", feature = "helper-cairo-214"))]
+fn set_file_override_content_keyed(
+    db: &mut RootDatabase,
+    file: FileInput,
+    content: Option<Arc<str>>,
+) -> bool {
+    let overrides = update_file_overrides_input_helper(db, file, content);
+    files_group_input(db)
+        .set_file_overrides(db)
+        .to(Some(overrides));
+    true
+}
+
+#[cfg(feature = "native-compile")]
+fn native_set_skip_unused_import_diagnostics(
+    db: &mut RootDatabase,
+    skip_unused_import_diagnostics: bool,
+) {
+    #[cfg(not(feature = "helper-cairo-214"))]
+    db.set_skip_unused_import_diagnostics(skip_unused_import_diagnostics);
+    #[cfg(feature = "helper-cairo-214")]
+    // Cairo 2.14 does not expose this database knob. Keep helper signatures
+    // stable by forcing the effective setting to false before this point.
+    let _ = (db, skip_unused_import_diagnostics);
+}
+
+#[cfg(feature = "native-compile")]
+fn native_removed_override_slot_exists(
+    db: &RootDatabase,
+    _file_id: FileId,
+    #[cfg(not(feature = "helper-cairo-214"))] file: &cairo_lang_filesystem::ids::FileInput,
+) -> bool {
+    #[cfg(not(feature = "helper-cairo-214"))]
+    {
+        files_group_input(db)
+            .keyed_file_overrides(db)
+            .as_ref()
+            .is_some_and(|overrides| overrides.contains_key(file))
+    }
+    #[cfg(feature = "helper-cairo-214")]
+    {
+        file_overrides(db).contains_key(&_file_id) || db.file_content(_file_id).is_some()
+    }
 }
 
 #[cfg(feature = "native-compile")]
@@ -7881,11 +8063,14 @@ fn native_compile_session_signature_hash(signature: &NativeCompileSessionSignatu
     } else {
         b"0"
     });
-    hasher.update(if signature.skip_unused_import_diagnostics {
-        b"skip-unused-import-diagnostics:1"
-    } else {
-        b"skip-unused-import-diagnostics:0"
-    });
+    #[cfg(not(feature = "helper-cairo-214"))]
+    {
+        hasher.update(if signature.skip_unused_import_diagnostics {
+            b"skip-unused-import-diagnostics:1"
+        } else {
+            b"skip-unused-import-diagnostics:0"
+        });
+    }
 
     let mut external_dependencies = signature.context.external_non_starknet_dependencies.clone();
     external_dependencies.sort();
@@ -9161,7 +9346,10 @@ fn native_restore_crate_cache_into_db(
         updated = true;
     }
     if updated {
+        #[cfg(not(feature = "helper-cairo-214"))]
         set_crate_configs_input(db, crate_configs);
+        #[cfg(feature = "helper-cairo-214")]
+        set_crate_configs_input(db, Some(crate_configs));
     }
     stats
 }
@@ -9423,7 +9611,7 @@ fn native_seeded_root_database(
         .with_default_plugin_suite(starknet_plugin_suite())
         .build()
         .context("failed to initialize native cairo compiler database")?;
-    db.set_skip_unused_import_diagnostics(skip_unused_import_diagnostics);
+    native_set_skip_unused_import_diagnostics(&mut db, skip_unused_import_diagnostics);
     init_dev_corelib(&mut db, corelib_src.to_path_buf());
     tracing::debug!(
         corelib_src = %corelib_src.display(),
@@ -10456,10 +10644,12 @@ fn native_apply_file_keyed_session_updates(
         )?;
         let file_id = FileId::new(db, FileLongId::OnDisk(absolute_path));
         let file = db.file_input(file_id).clone();
-        let slot_exists = files_group_input(db)
-            .keyed_file_overrides(db)
-            .as_ref()
-            .is_some_and(|overrides| overrides.contains_key(&file));
+        let slot_exists = native_removed_override_slot_exists(
+            db,
+            file_id,
+            #[cfg(not(feature = "helper-cairo-214"))]
+            &file,
+        );
         if slot_exists {
             removed_updates.push((file, None));
         }
@@ -11393,6 +11583,9 @@ fn run_native_build_inner(
                         &session.contract_output_plans,
                         session.contract_output_plans_verified,
                     );
+                // Cairo 2.14 lacks the no-diagnostics compiler entrypoint, so
+                // helper builds must not claim or select that fast path.
+                #[cfg(not(feature = "helper-cairo-214"))]
                 if skip_global_contract_diagnostics {
                     native_progress_log(
                         "native contract compile using verified no-diagnostics fast path",
@@ -11412,20 +11605,32 @@ fn run_native_build_inner(
                             profile,
                             capture_statement_locations,
                         );
-                        if skip_global_contract_diagnostics {
-                            compile_starknet_prepared_db_without_diagnostics(
-                                &session.db,
-                                &contract_refs,
-                                compiler_config,
-                            )
-                        } else {
+                        #[cfg(not(feature = "helper-cairo-214"))]
+                        let result = {
+                            if skip_global_contract_diagnostics {
+                                compile_starknet_prepared_db_without_diagnostics(
+                                    &session.db,
+                                    &contract_refs,
+                                    compiler_config,
+                                )
+                            } else {
+                                compile_starknet_prepared_db(
+                                    &session.db,
+                                    &contract_refs,
+                                    compiler_config,
+                                )
+                            }
+                        };
+                        #[cfg(feature = "helper-cairo-214")]
+                        let result = {
+                            let _ = skip_global_contract_diagnostics;
                             compile_starknet_prepared_db(
                                 &session.db,
                                 &contract_refs,
                                 compiler_config,
                             )
-                        }
-                        .map_err(|err| {
+                        };
+                        result.map_err(|err| {
                             mark_native_fallback_eligible_for_external_dependencies(
                                 err.context("native starknet compile failed"),
                                 &context,
