@@ -1,0 +1,24 @@
+pr_compliances:
+  - title: Native compile invalidation coverage
+    compliance_label: true
+    objective: Changes to native compile restore, cache reuse, or incremental refresh must keep artifact correctness ahead of performance.
+    success_criteria: The PR includes focused regression tests for the affected invalidation or restore path and the code falls back conservatively on uncertainty.
+    failure_criteria: Native cache or restore logic changed without regression coverage, or the code can reuse stale state when validation is ambiguous.
+
+  - title: Benchmark rigor is preserved
+    compliance_label: true
+    objective: Performance-sensitive PRs must keep benchmark methodology reproducible.
+    success_criteria: Benchmark-related changes preserve explicit daemon mode, pinning behavior, sample counts, and gate configuration, and any methodology change is documented.
+    failure_criteria: The PR loosens benchmark conditions, hides lane settings, or changes perf gates without explanation.
+
+  - title: Bot and agent entrypoints stay in sync
+    compliance_label: true
+    objective: Checked-in repo instructions must stay usable for humans, coding agents, and review bots.
+    success_criteria: PRs that change repo bootstrap, commands, docs, or review tooling update the relevant files under `AGENTS.md`, `.codex/`, and `docs/agent/`.
+    failure_criteria: Repo entrypoints drift or become stale after a command, path, or workflow change.
+
+  - title: Daemon and fallback behavior remain explicit
+    compliance_label: true
+    objective: Build execution should not fail or fall back silently in ways that hide risk.
+    success_criteria: Daemon, native compile, and fallback changes preserve actionable logging and respect explicit disallow-fallback modes.
+    failure_criteria: The PR introduces silent fallback, weakens error reporting, or obscures why a native path was not used.

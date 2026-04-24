@@ -168,6 +168,12 @@ const DEFAULT_NATIVE_CAPTURE_STATEMENT_LOCATIONS: bool = true;
 #[cfg(feature = "native-compile")]
 const DEFAULT_NATIVE_CAPTURE_STATEMENT_LOCATIONS_ON_COLD: bool = false;
 #[cfg(feature = "native-compile")]
+const DEFAULT_NATIVE_PROGRESS_ENABLED: bool = false;
+#[cfg(feature = "native-compile")]
+const DEFAULT_NATIVE_PROGRESS_HEARTBEAT_SECS: u64 = 5;
+#[cfg(feature = "native-compile")]
+const DEFAULT_NATIVE_PROGRESS_COMPILE_BATCH_SIZE: usize = 0;
+#[cfg(feature = "native-compile")]
 const DEFAULT_NATIVE_DEPENDENCY_METADATA_ENABLED: bool = false;
 #[cfg(feature = "native-compile")]
 const DEFAULT_NATIVE_EAGER_KEYED_SLOT_PRIME: bool = true;
@@ -176,11 +182,11 @@ const DEFAULT_NATIVE_COMPILE_SESSION_MEMORY_MULTIPLIER: u64 = 64;
 #[cfg(feature = "native-compile")]
 const DEFAULT_NATIVE_COMPILE_SESSION_MEMORY_BASE_OVERHEAD_BYTES: u64 = 32 * 1024 * 1024;
 #[cfg(feature = "native-compile")]
-const NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION: u32 = 1;
+const NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION: u32 = 2;
 #[cfg(feature = "native-compile")]
 const MAX_NATIVE_COMPILE_SESSION_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 #[cfg(feature = "native-compile")]
-const NATIVE_BUILDINFO_SCHEMA_VERSION: u32 = 1;
+const NATIVE_BUILDINFO_SCHEMA_VERSION: u32 = 2;
 #[cfg(feature = "native-compile")]
 const MAX_NATIVE_BUILDINFO_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(feature = "native-compile")]
@@ -912,6 +918,7 @@ struct NativeCompileSessionState {
     main_crate_inputs: Vec<CrateInput>,
     tracked_sources: BTreeMap<String, NativeTrackedFileState>,
     tracked_source_bytes: u64,
+    tracked_sources_content_hash: String,
     journal_cursor_applied: u64,
     source_root_modified_unix_ms: u64,
     contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
@@ -937,6 +944,8 @@ struct NativeCompileSessionImageFile {
     source_root_modified_unix_ms: u64,
     tracked_sources: BTreeMap<String, NativeTrackedFileState>,
     tracked_source_bytes: u64,
+    #[serde(default)]
+    tracked_sources_content_hash: String,
     contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
     contract_output_plans: Vec<NativeContractOutputPlan>,
     #[serde(default)]
@@ -951,6 +960,7 @@ struct NativeCompileSessionImageSnapshot {
     source_root_modified_unix_ms: u64,
     tracked_sources: BTreeMap<String, NativeTrackedFileState>,
     tracked_source_bytes: u64,
+    tracked_sources_content_hash: String,
     contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
     contract_output_plans: Vec<NativeContractOutputPlan>,
     journal_cursor_applied: u64,
@@ -983,6 +993,8 @@ struct NativeBuildInfoFile {
     tracked_source_bytes: u64,
     tracked_sources_signature: String,
     #[serde(default)]
+    tracked_sources_content_hash: String,
+    #[serde(default)]
     contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
     #[serde(default)]
     contract_output_plans: Vec<NativeContractOutputPlan>,
@@ -996,6 +1008,7 @@ struct NativeBuildInfoFile {
 struct NativeBuildInfoSnapshot {
     tracked_sources: BTreeMap<String, NativeTrackedFileState>,
     tracked_source_bytes: u64,
+    tracked_sources_content_hash: String,
     contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
     contract_output_plans: Vec<NativeContractOutputPlan>,
     journal_cursor_applied: u64,
@@ -2196,6 +2209,112 @@ fn native_capture_statement_locations_on_cold() -> bool {
             DEFAULT_NATIVE_CAPTURE_STATEMENT_LOCATIONS_ON_COLD,
         )
     })
+}
+
+#[cfg(feature = "native-compile")]
+fn native_progress_enabled() -> bool {
+    static VALUE: OnceLock<bool> = OnceLock::new();
+    *VALUE.get_or_init(|| parse_env_bool("UC_NATIVE_PROGRESS", DEFAULT_NATIVE_PROGRESS_ENABLED))
+}
+
+#[cfg(feature = "native-compile")]
+fn native_progress_heartbeat_secs() -> u64 {
+    static VALUE: OnceLock<u64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_env_u64(
+            "UC_NATIVE_PROGRESS_HEARTBEAT_SECS",
+            DEFAULT_NATIVE_PROGRESS_HEARTBEAT_SECS,
+        )
+    })
+}
+
+#[cfg(feature = "native-compile")]
+fn native_progress_compile_batch_size() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(
+        || match std::env::var("UC_NATIVE_PROGRESS_COMPILE_BATCH_SIZE") {
+            Ok(raw) => match raw.parse::<usize>() {
+                Ok(value) => value,
+                Err(_) => {
+                    tracing::warn!(
+                        env = "UC_NATIVE_PROGRESS_COMPILE_BATCH_SIZE",
+                        value = %raw,
+                        default = DEFAULT_NATIVE_PROGRESS_COMPILE_BATCH_SIZE,
+                        "invalid numeric setting; using default"
+                    );
+                    DEFAULT_NATIVE_PROGRESS_COMPILE_BATCH_SIZE
+                }
+            },
+            Err(_) => parse_env_usize(
+                "UC_NATIVE_COMPILE_BATCH_SIZE",
+                DEFAULT_NATIVE_PROGRESS_COMPILE_BATCH_SIZE,
+            ),
+        },
+    )
+}
+
+#[cfg(feature = "native-compile")]
+fn native_progress_log(message: impl AsRef<str>) {
+    if native_progress_enabled() {
+        eprintln!("uc: {}", message.as_ref());
+    }
+}
+
+#[cfg(feature = "native-compile")]
+struct NativeProgressHeartbeat {
+    stop_tx: Option<mpsc::Sender<()>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "native-compile")]
+impl NativeProgressHeartbeat {
+    fn start(label: impl Into<String>) -> Self {
+        if !native_progress_enabled() {
+            return Self {
+                stop_tx: None,
+                handle: None,
+            };
+        }
+        let interval_secs = native_progress_heartbeat_secs();
+        if interval_secs == 0 {
+            return Self {
+                stop_tx: None,
+                handle: None,
+            };
+        }
+        let label = label.into();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let started_at = Instant::now();
+            loop {
+                match stop_rx.recv_timeout(Duration::from_secs(interval_secs)) {
+                    Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        eprintln!(
+                            "uc: {label} still running ({:.1}s elapsed)",
+                            started_at.elapsed().as_secs_f64()
+                        );
+                    }
+                }
+            }
+        });
+        Self {
+            stop_tx: Some(stop_tx),
+            handle: Some(handle),
+        }
+    }
+}
+
+#[cfg(feature = "native-compile")]
+impl Drop for NativeProgressHeartbeat {
+    fn drop(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 #[cfg(feature = "native-compile")]
@@ -6090,7 +6209,7 @@ fn native_filter_changed_files_to_contract_source_index(
     (scoped_changed, scoped_removed)
 }
 
-#[cfg(all(feature = "native-compile", test))]
+#[cfg(feature = "native-compile")]
 fn native_changed_files_affect_tracked_contracts(
     changed_files: &[String],
     removed_files: &[String],
@@ -6110,6 +6229,46 @@ fn native_changed_files_affect_tracked_contracts(
         .iter()
         .chain(removed_files.iter())
         .any(|source| by_source.contains_key(source.as_str()))
+}
+
+#[cfg(feature = "native-compile")]
+fn native_compile_batch_ranges(
+    total_contracts: usize,
+    configured_batch_size: usize,
+) -> Vec<(usize, usize)> {
+    if total_contracts == 0 {
+        return Vec::new();
+    }
+    let batch_size = if configured_batch_size == 0 {
+        total_contracts
+    } else {
+        configured_batch_size.min(total_contracts).max(1)
+    };
+    (0..total_contracts)
+        .step_by(batch_size)
+        .map(|start| (start, (start + batch_size).min(total_contracts)))
+        .collect()
+}
+
+#[cfg(feature = "native-compile")]
+fn native_compile_batch_summary(
+    all_plans: &[NativeContractOutputPlan],
+    selected_indices: &[usize],
+) -> String {
+    let preview = selected_indices
+        .iter()
+        .take(3)
+        .filter_map(|index| all_plans.get(*index))
+        .map(|plan| plan.module_path.clone())
+        .collect::<Vec<_>>();
+    let remaining = selected_indices.len().saturating_sub(preview.len());
+    if preview.is_empty() {
+        return format!("{} contract(s)", selected_indices.len());
+    }
+    if remaining == 0 {
+        return preview.join(", ");
+    }
+    format!("{} (+{} more)", preview.join(", "), remaining)
 }
 
 #[cfg(all(feature = "native-compile", test))]
@@ -6429,12 +6588,119 @@ fn native_compile_session_signature_hash(signature: &NativeCompileSessionSignatu
 }
 
 #[cfg(feature = "native-compile")]
+fn native_source_hash_index_path(workspace_root: &Path) -> Result<PathBuf> {
+    let path = workspace_root.join(".uc/cache/native-session/source-hash-index-v1.json");
+    ensure_path_within_root(workspace_root, &path, "native source hash index path")?;
+    Ok(path)
+}
+
+#[cfg(feature = "native-compile")]
+fn native_tracked_sources_content_hash(
+    workspace_root: &Path,
+    tracked_sources: &BTreeMap<String, NativeTrackedFileState>,
+) -> Result<String> {
+    let index_path = native_source_hash_index_path(workspace_root)?;
+    let mut index = load_fingerprint_index_cached(&index_path).unwrap_or_else(|err| {
+        tracing::warn!(
+            path = %index_path.display(),
+            error = %format!("{err:#}"),
+            "failed to load native source hash index; rebuilding"
+        );
+        FingerprintIndex::empty()
+    });
+    let now_ms = epoch_ms_u64().unwrap_or_default();
+    let recheck_window_ms = fingerprint_mtime_recheck_window_ms();
+    let mut updated_entries = BTreeMap::new();
+    let mut hasher = Hasher::new();
+    hasher.update(b"uc-native-tracked-sources-content-hash-v1");
+
+    for tracked_path in tracked_sources.keys() {
+        let absolute = {
+            let path = Path::new(tracked_path);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                let absolute = workspace_root.join(path);
+                ensure_path_within_root(
+                    workspace_root,
+                    &absolute,
+                    "native tracked source hash path",
+                )?;
+                absolute
+            }
+        };
+        let metadata = fs::metadata(&absolute)
+            .with_context(|| format!("failed to stat {}", absolute.display()))?;
+        if !metadata.is_file() {
+            bail!("tracked source is not a file: {}", absolute.display());
+        }
+        let size_bytes = metadata.len();
+        let modified_unix_ms = metadata_modified_unix_ms(&metadata)?;
+        let file_hash = if let Some(cached) = index.entries.get(tracked_path) {
+            let should_rehash_recent = now_ms.saturating_sub(modified_unix_ms) <= recheck_window_ms;
+            if cached.size_bytes == size_bytes
+                && cached.modified_unix_ms == modified_unix_ms
+                && !should_rehash_recent
+            {
+                cached.blake3_hex.clone()
+            } else {
+                hash_fingerprint_source_file(&absolute)?
+            }
+        } else {
+            hash_fingerprint_source_file(&absolute)?
+        };
+        updated_entries.insert(
+            tracked_path.clone(),
+            FingerprintIndexEntry {
+                size_bytes,
+                modified_unix_ms,
+                blake3_hex: file_hash.clone(),
+            },
+        );
+        hasher.update(tracked_path.as_bytes());
+        hasher.update(b":");
+        hasher.update(file_hash.as_bytes());
+        hasher.update(b"\n");
+    }
+
+    if index.entries != updated_entries || index.schema_version != FINGERPRINT_INDEX_SCHEMA_VERSION
+    {
+        index.schema_version = FINGERPRINT_INDEX_SCHEMA_VERSION;
+        index.entries = updated_entries;
+        index.directories.clear();
+        index.context_digest = None;
+        index.last_fingerprint = None;
+        store_fingerprint_index_cached(&index_path, &index);
+        if let Err(err) = save_fingerprint_index(&index_path, &index) {
+            tracing::warn!(
+                path = %index_path.display(),
+                error = %format!("{err:#}"),
+                "failed to persist native source hash index"
+            );
+        }
+    }
+
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+#[cfg(feature = "native-compile")]
 fn native_compile_session_image_path(workspace_root: &Path) -> Result<PathBuf> {
-    let image_path = workspace_root.join(".uc/cache/native-session/session-image-v1.json");
+    let image_path = workspace_root.join(".uc/cache/native-session/session-image-v2.bin");
     ensure_path_within_root(
         workspace_root,
         &image_path,
         "native compile session image path",
+    )?;
+    Ok(image_path)
+}
+
+#[cfg(feature = "native-compile")]
+fn native_compile_session_image_legacy_path(workspace_root: &Path) -> Result<PathBuf> {
+    let image_path = workspace_root.join(".uc/cache/native-session/session-image-v1.json");
+    ensure_path_within_root(
+        workspace_root,
+        &image_path,
+        "native compile session legacy image path",
     )?;
     Ok(image_path)
 }
@@ -6448,6 +6714,7 @@ fn native_compile_session_image_snapshot_from_state(
         source_root_modified_unix_ms: session.source_root_modified_unix_ms,
         tracked_sources: session.tracked_sources.clone(),
         tracked_source_bytes: session.tracked_source_bytes,
+        tracked_sources_content_hash: session.tracked_sources_content_hash.clone(),
         contract_source_dependencies: session.contract_source_dependencies.clone(),
         contract_output_plans: session.contract_output_plans.clone(),
         journal_cursor_applied: session.journal_cursor_applied,
@@ -6470,12 +6737,13 @@ fn persist_native_compile_session_image_snapshot(
         source_root_modified_unix_ms: snapshot.source_root_modified_unix_ms,
         tracked_sources: snapshot.tracked_sources.clone(),
         tracked_source_bytes: snapshot.tracked_source_bytes,
+        tracked_sources_content_hash: snapshot.tracked_sources_content_hash.clone(),
         contract_source_dependencies: snapshot.contract_source_dependencies.clone(),
         contract_output_plans: snapshot.contract_output_plans.clone(),
         journal_cursor_applied: snapshot.journal_cursor_applied,
         generated_at_epoch_ms: epoch_ms_u64().unwrap_or_default(),
     };
-    let bytes = serde_json::to_vec(&image).context("failed to encode native session image")?;
+    let bytes = postcard::to_allocvec(&image).context("failed to encode native session image")?;
     if bytes.len() as u64 > MAX_NATIVE_COMPILE_SESSION_IMAGE_BYTES {
         tracing::warn!(
             path = %image_path.display(),
@@ -6506,106 +6774,153 @@ fn persist_native_compile_session_image_snapshot_best_effort(
 fn try_native_compile_session_image_restore(
     workspace_root: &Path,
     signature: &NativeCompileSessionSignature,
-    source_root_modified_unix_ms: u64,
+    tracked_sources_content_hash: &str,
 ) -> Option<NativeCompileSessionImageSnapshot> {
-    let image_path = match native_compile_session_image_path(workspace_root) {
-        Ok(path) => path,
-        Err(err) => {
-            tracing::warn!(
-                workspace_root = %workspace_root.display(),
-                error = %format!("{err:#}"),
-                "native session image path is invalid; ignoring persisted image"
-            );
-            return None;
-        }
-    };
-    let metadata = match fs::metadata(&image_path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return None,
-        Err(err) => {
-            tracing::warn!(
-                path = %image_path.display(),
-                error = %err,
-                "failed to stat native session image; ignoring"
-            );
-            return None;
-        }
-    };
-    if metadata.len() > MAX_NATIVE_COMPILE_SESSION_IMAGE_BYTES {
-        tracing::warn!(
-            path = %image_path.display(),
-            bytes = metadata.len(),
-            max_bytes = MAX_NATIVE_COMPILE_SESSION_IMAGE_BYTES,
-            "ignoring oversized native session image"
-        );
-        let _ = fs::remove_file(&image_path);
-        return None;
-    }
-    let bytes = match read_bytes_with_limit(
-        &image_path,
-        MAX_NATIVE_COMPILE_SESSION_IMAGE_BYTES,
-        "native session image",
-    ) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            tracing::warn!(
-                path = %image_path.display(),
-                error = %format!("{err:#}"),
-                "failed to read native session image; ignoring"
-            );
-            return None;
-        }
-    };
-    let decoded: NativeCompileSessionImageFile = match serde_json::from_slice::<
-        NativeCompileSessionImageFile,
-    >(&bytes)
-    {
-        Ok(image) if image.schema_version == NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION => image,
-        Ok(_) => return None,
-        Err(err) => {
-            tracing::warn!(
-                path = %image_path.display(),
-                error = %err,
-                "failed to decode native session image; ignoring"
-            );
-            return None;
-        }
-    };
     let signature_hash = native_compile_session_signature_hash(signature);
-    if decoded.signature_hash != signature_hash {
-        return None;
-    }
-    if decoded.source_root_modified_unix_ms != source_root_modified_unix_ms {
-        return None;
-    }
-    let tracked_source_bytes = match native_tracked_sources_total_bytes(&decoded.tracked_sources) {
-        Ok(bytes) => bytes,
-        Err(err) => {
+    let candidate_paths = [
+        (
+            native_compile_session_image_path(workspace_root),
+            "native session image",
+            true,
+        ),
+        (
+            native_compile_session_image_legacy_path(workspace_root),
+            "legacy native session image",
+            false,
+        ),
+    ];
+
+    for (path_result, label, is_binary) in candidate_paths {
+        let image_path = match path_result {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::warn!(
+                    workspace_root = %workspace_root.display(),
+                    error = %format!("{err:#}"),
+                    "{label} path is invalid; ignoring persisted image"
+                );
+                continue;
+            }
+        };
+        let metadata = match fs::metadata(&image_path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                tracing::warn!(
+                    path = %image_path.display(),
+                    error = %err,
+                    "failed to stat {label}; ignoring"
+                );
+                continue;
+            }
+        };
+        if metadata.len() > MAX_NATIVE_COMPILE_SESSION_IMAGE_BYTES {
             tracing::warn!(
                 path = %image_path.display(),
-                error = %format!("{err:#}"),
-                "native session image tracked source set is invalid; ignoring"
+                bytes = metadata.len(),
+                max_bytes = MAX_NATIVE_COMPILE_SESSION_IMAGE_BYTES,
+                "ignoring oversized {label}"
             );
-            return None;
+            let _ = fs::remove_file(&image_path);
+            continue;
         }
-    };
-    if tracked_source_bytes != decoded.tracked_source_bytes {
-        tracing::warn!(
-            path = %image_path.display(),
-            image_bytes = decoded.tracked_source_bytes,
-            computed_bytes = tracked_source_bytes,
-            "native session image tracked-source byte budget drift; using computed value"
-        );
+        let bytes =
+            match read_bytes_with_limit(&image_path, MAX_NATIVE_COMPILE_SESSION_IMAGE_BYTES, label)
+            {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %image_path.display(),
+                        error = %format!("{err:#}"),
+                        "failed to read {label}; ignoring"
+                    );
+                    continue;
+                }
+            };
+        let decoded: NativeCompileSessionImageFile = if is_binary {
+            match postcard::from_bytes::<NativeCompileSessionImageFile>(&bytes) {
+                Ok(image)
+                    if image.schema_version == NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION =>
+                {
+                    image
+                }
+                Ok(_) => continue,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %image_path.display(),
+                        error = %err,
+                        "failed to decode {label}; ignoring"
+                    );
+                    continue;
+                }
+            }
+        } else {
+            match serde_json::from_slice::<NativeCompileSessionImageFile>(&bytes) {
+                Ok(image) => image,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %image_path.display(),
+                        error = %err,
+                        "failed to decode {label}; ignoring"
+                    );
+                    continue;
+                }
+            }
+        };
+        if decoded.signature_hash != signature_hash {
+            continue;
+        }
+        let tracked_source_bytes =
+            match native_tracked_sources_total_bytes(&decoded.tracked_sources) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %image_path.display(),
+                        error = %format!("{err:#}"),
+                        "{label} tracked source set is invalid; ignoring"
+                    );
+                    continue;
+                }
+            };
+        let computed_content_hash = if decoded.tracked_sources_content_hash.is_empty() {
+            match native_tracked_sources_content_hash(workspace_root, &decoded.tracked_sources) {
+                Ok(hash) => hash,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %image_path.display(),
+                        error = %format!("{err:#}"),
+                        "failed to compute content hash for {label}; ignoring"
+                    );
+                    continue;
+                }
+            }
+        } else {
+            decoded.tracked_sources_content_hash.clone()
+        };
+        if computed_content_hash != tracked_sources_content_hash {
+            continue;
+        }
+        if tracked_source_bytes != decoded.tracked_source_bytes {
+            tracing::warn!(
+                path = %image_path.display(),
+                image_bytes = decoded.tracked_source_bytes,
+                computed_bytes = tracked_source_bytes,
+                "{label} tracked-source byte budget drift; using computed value"
+            );
+        }
+        return Some(NativeCompileSessionImageSnapshot {
+            signature_hash: signature_hash.clone(),
+            source_root_modified_unix_ms: decoded.source_root_modified_unix_ms,
+            tracked_sources: decoded.tracked_sources,
+            tracked_source_bytes,
+            tracked_sources_content_hash: computed_content_hash,
+            contract_source_dependencies: decoded.contract_source_dependencies,
+            contract_output_plans: decoded.contract_output_plans,
+            journal_cursor_applied: decoded.journal_cursor_applied,
+        });
     }
-    Some(NativeCompileSessionImageSnapshot {
-        signature_hash,
-        source_root_modified_unix_ms: decoded.source_root_modified_unix_ms,
-        tracked_sources: decoded.tracked_sources,
-        tracked_source_bytes,
-        contract_source_dependencies: decoded.contract_source_dependencies,
-        contract_output_plans: decoded.contract_output_plans,
-        journal_cursor_applied: decoded.journal_cursor_applied,
-    })
+
+    None
 }
 
 #[cfg(feature = "native-compile")]
@@ -6617,17 +6932,31 @@ fn native_source_journal_path(workspace_root: &Path) -> Result<PathBuf> {
 
 #[cfg(feature = "native-compile")]
 fn native_buildinfo_sidecar_path(workspace_root: &Path) -> Result<PathBuf> {
-    let path = workspace_root.join(".uc/native-buildinfo.json");
+    let path = workspace_root.join(".uc/native-buildinfo-v2.bin");
     ensure_path_within_root(workspace_root, &path, "native buildinfo path")?;
     Ok(path)
 }
 
 #[cfg(feature = "native-compile")]
+fn native_buildinfo_sidecar_legacy_path(workspace_root: &Path) -> Result<PathBuf> {
+    let path = workspace_root.join(".uc/native-buildinfo.json");
+    ensure_path_within_root(workspace_root, &path, "native legacy buildinfo path")?;
+    Ok(path)
+}
+
+#[cfg(feature = "native-compile")]
+#[cfg_attr(not(test), allow(dead_code))]
 fn native_has_persisted_session_state_hints(workspace_root: &Path) -> bool {
     native_compile_session_image_path(workspace_root)
         .ok()
         .is_some_and(|path| path.is_file())
+        || native_compile_session_image_legacy_path(workspace_root)
+            .ok()
+            .is_some_and(|path| path.is_file())
         || native_buildinfo_sidecar_path(workspace_root)
+            .ok()
+            .is_some_and(|path| path.is_file())
+        || native_buildinfo_sidecar_legacy_path(workspace_root)
             .ok()
             .is_some_and(|path| path.is_file())
 }
@@ -6835,6 +7164,7 @@ fn native_buildinfo_file_from_snapshot(
     source_root_modified_unix_ms: u64,
     tracked_sources: BTreeMap<String, NativeTrackedFileState>,
     tracked_source_bytes: u64,
+    tracked_sources_content_hash: String,
     contract_source_dependencies: BTreeMap<String, BTreeSet<String>>,
     contract_output_plans: Vec<NativeContractOutputPlan>,
     journal_cursor_applied: u64,
@@ -6847,6 +7177,7 @@ fn native_buildinfo_file_from_snapshot(
         tracked_sources,
         tracked_source_bytes,
         tracked_sources_signature,
+        tracked_sources_content_hash,
         contract_source_dependencies,
         contract_output_plans,
         journal_cursor_applied,
@@ -6864,6 +7195,7 @@ fn native_buildinfo_file_from_state(
         session.source_root_modified_unix_ms,
         session.tracked_sources.clone(),
         session.tracked_source_bytes,
+        session.tracked_sources_content_hash.clone(),
         session.contract_source_dependencies.clone(),
         session.contract_output_plans.clone(),
         journal_cursor_applied,
@@ -6880,7 +7212,7 @@ fn persist_native_buildinfo_sidecar(
         .parent()
         .context("native buildinfo path has no parent directory")?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
-    let bytes = serde_json::to_vec(buildinfo).context("failed to encode native buildinfo")?;
+    let bytes = postcard::to_allocvec(buildinfo).context("failed to encode native buildinfo")?;
     if bytes.len() as u64 > MAX_NATIVE_BUILDINFO_BYTES {
         tracing::warn!(
             path = %sidecar_path.display(),
@@ -6912,118 +7244,162 @@ fn load_native_buildinfo_sidecar_snapshot(
     workspace_root: &Path,
     signature: &NativeCompileSessionSignature,
 ) -> Option<(NativeBuildInfoSnapshot, u64)> {
-    let sidecar_path = match native_buildinfo_sidecar_path(workspace_root) {
-        Ok(path) => path,
-        Err(err) => {
-            tracing::warn!(
-                workspace_root = %workspace_root.display(),
-                error = %format!("{err:#}"),
-                "native buildinfo path is invalid; ignoring sidecar"
-            );
-            return None;
-        }
-    };
-    let metadata = match fs::metadata(&sidecar_path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return None,
-        Err(err) => {
-            tracing::warn!(
-                path = %sidecar_path.display(),
-                error = %err,
-                "failed to stat native buildinfo sidecar; ignoring"
-            );
-            return None;
-        }
-    };
-    if metadata.len() > MAX_NATIVE_BUILDINFO_BYTES {
-        tracing::warn!(
-            path = %sidecar_path.display(),
-            bytes = metadata.len(),
-            max_bytes = MAX_NATIVE_BUILDINFO_BYTES,
-            "ignoring oversized native buildinfo sidecar"
-        );
-        let _ = fs::remove_file(&sidecar_path);
-        return None;
-    }
-    let bytes = match read_bytes_with_limit(
-        &sidecar_path,
-        MAX_NATIVE_BUILDINFO_BYTES,
-        "native buildinfo sidecar",
-    ) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            tracing::warn!(
-                path = %sidecar_path.display(),
-                error = %format!("{err:#}"),
-                "failed to read native buildinfo sidecar; ignoring"
-            );
-            return None;
-        }
-    };
-    let decoded = match serde_json::from_slice::<NativeBuildInfoFile>(&bytes) {
-        Ok(file) if file.schema_version == NATIVE_BUILDINFO_SCHEMA_VERSION => file,
-        Ok(_) => return None,
-        Err(err) => {
-            tracing::warn!(
-                path = %sidecar_path.display(),
-                error = %err,
-                "failed to decode native buildinfo sidecar; ignoring"
-            );
-            return None;
-        }
-    };
     let signature_hash = native_compile_session_signature_hash(signature);
-    if decoded.signature_hash != signature_hash {
-        return None;
-    }
-    let tracked_source_bytes = match native_tracked_sources_total_bytes(&decoded.tracked_sources) {
-        Ok(bytes) => bytes,
-        Err(err) => {
+    let candidate_paths = [
+        (
+            native_buildinfo_sidecar_path(workspace_root),
+            "native buildinfo sidecar",
+            true,
+        ),
+        (
+            native_buildinfo_sidecar_legacy_path(workspace_root),
+            "legacy native buildinfo sidecar",
+            false,
+        ),
+    ];
+
+    for (path_result, label, is_binary) in candidate_paths {
+        let sidecar_path = match path_result {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::warn!(
+                    workspace_root = %workspace_root.display(),
+                    error = %format!("{err:#}"),
+                    "{label} path is invalid; ignoring sidecar"
+                );
+                continue;
+            }
+        };
+        let metadata = match fs::metadata(&sidecar_path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                tracing::warn!(
+                    path = %sidecar_path.display(),
+                    error = %err,
+                    "failed to stat {label}; ignoring"
+                );
+                continue;
+            }
+        };
+        if metadata.len() > MAX_NATIVE_BUILDINFO_BYTES {
             tracing::warn!(
                 path = %sidecar_path.display(),
-                error = %format!("{err:#}"),
-                "native buildinfo sidecar tracked source set is invalid; ignoring"
+                bytes = metadata.len(),
+                max_bytes = MAX_NATIVE_BUILDINFO_BYTES,
+                "ignoring oversized {label}"
             );
-            return None;
+            let _ = fs::remove_file(&sidecar_path);
+            continue;
         }
-    };
-    let tracked_sources_signature = native_tracked_sources_signature(&decoded.tracked_sources);
-    if decoded.tracked_sources_signature != tracked_sources_signature {
-        tracing::warn!(
-            path = %sidecar_path.display(),
-            "native buildinfo sidecar tracked source signature mismatch; ignoring"
-        );
-        return None;
+        let bytes = match read_bytes_with_limit(&sidecar_path, MAX_NATIVE_BUILDINFO_BYTES, label) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!(
+                    path = %sidecar_path.display(),
+                    error = %format!("{err:#}"),
+                    "failed to read {label}; ignoring"
+                );
+                continue;
+            }
+        };
+        let decoded = if is_binary {
+            match postcard::from_bytes::<NativeBuildInfoFile>(&bytes) {
+                Ok(file) if file.schema_version == NATIVE_BUILDINFO_SCHEMA_VERSION => file,
+                Ok(_) => continue,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %sidecar_path.display(),
+                        error = %err,
+                        "failed to decode {label}; ignoring"
+                    );
+                    continue;
+                }
+            }
+        } else {
+            match serde_json::from_slice::<NativeBuildInfoFile>(&bytes) {
+                Ok(file) => file,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %sidecar_path.display(),
+                        error = %err,
+                        "failed to decode {label}; ignoring"
+                    );
+                    continue;
+                }
+            }
+        };
+        if decoded.signature_hash != signature_hash {
+            continue;
+        }
+        let tracked_source_bytes =
+            match native_tracked_sources_total_bytes(&decoded.tracked_sources) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %sidecar_path.display(),
+                        error = %format!("{err:#}"),
+                        "{label} tracked source set is invalid; ignoring"
+                    );
+                    continue;
+                }
+            };
+        let tracked_sources_signature = native_tracked_sources_signature(&decoded.tracked_sources);
+        if decoded.tracked_sources_signature != tracked_sources_signature {
+            tracing::warn!(
+                path = %sidecar_path.display(),
+                "{label} tracked source signature mismatch; ignoring"
+            );
+            continue;
+        }
+        let tracked_sources_content_hash = if decoded.tracked_sources_content_hash.is_empty() {
+            match native_tracked_sources_content_hash(workspace_root, &decoded.tracked_sources) {
+                Ok(hash) => hash,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %sidecar_path.display(),
+                        error = %format!("{err:#}"),
+                        "failed to compute content hash for {label}; ignoring"
+                    );
+                    continue;
+                }
+            }
+        } else {
+            decoded.tracked_sources_content_hash.clone()
+        };
+        if tracked_source_bytes != decoded.tracked_source_bytes {
+            tracing::warn!(
+                path = %sidecar_path.display(),
+                sidecar_bytes = decoded.tracked_source_bytes,
+                computed_bytes = tracked_source_bytes,
+                "{label} tracked-source byte budget drift; using computed value"
+            );
+        }
+        return Some((
+            NativeBuildInfoSnapshot {
+                tracked_sources: decoded.tracked_sources,
+                tracked_source_bytes,
+                tracked_sources_content_hash,
+                contract_source_dependencies: decoded.contract_source_dependencies,
+                contract_output_plans: decoded.contract_output_plans,
+                journal_cursor_applied: decoded.journal_cursor_applied,
+            },
+            decoded.source_root_modified_unix_ms,
+        ));
     }
-    if tracked_source_bytes != decoded.tracked_source_bytes {
-        tracing::warn!(
-            path = %sidecar_path.display(),
-            sidecar_bytes = decoded.tracked_source_bytes,
-            computed_bytes = tracked_source_bytes,
-            "native buildinfo tracked-source byte budget drift; using computed value"
-        );
-    }
-    Some((
-        NativeBuildInfoSnapshot {
-            tracked_sources: decoded.tracked_sources,
-            tracked_source_bytes,
-            contract_source_dependencies: decoded.contract_source_dependencies,
-            contract_output_plans: decoded.contract_output_plans,
-            journal_cursor_applied: decoded.journal_cursor_applied,
-        },
-        decoded.source_root_modified_unix_ms,
-    ))
+
+    None
 }
 
 #[cfg(feature = "native-compile")]
 fn try_native_buildinfo_sidecar_restore(
     workspace_root: &Path,
     signature: &NativeCompileSessionSignature,
-    source_root_modified_unix_ms: u64,
+    tracked_sources_content_hash: &str,
 ) -> Option<NativeBuildInfoSnapshot> {
-    let (snapshot, snapshot_source_root_modified_unix_ms) =
+    let (snapshot, _snapshot_source_root_modified_unix_ms) =
         load_native_buildinfo_sidecar_snapshot(workspace_root, signature)?;
-    if snapshot_source_root_modified_unix_ms != source_root_modified_unix_ms {
+    if snapshot.tracked_sources_content_hash != tracked_sources_content_hash {
         return None;
     }
     Some(snapshot)
@@ -7033,11 +7409,11 @@ fn try_native_buildinfo_sidecar_restore(
 fn try_native_buildinfo_sidecar_restore_with_journal_replay(
     workspace_root: &Path,
     signature: &NativeCompileSessionSignature,
-    source_root_modified_unix_ms: u64,
+    tracked_sources_content_hash: &str,
 ) -> Option<NativeBuildInfoSnapshot> {
     let (snapshot, snapshot_source_root_modified_unix_ms) =
         load_native_buildinfo_sidecar_snapshot(workspace_root, signature)?;
-    if snapshot_source_root_modified_unix_ms == source_root_modified_unix_ms {
+    if snapshot.tracked_sources_content_hash == tracked_sources_content_hash {
         return None;
     }
     let journal = load_native_source_change_journal(workspace_root);
@@ -7057,7 +7433,7 @@ fn try_native_buildinfo_sidecar_restore_with_journal_replay(
     tracing::debug!(
         workspace_root = %workspace_root.display(),
         sidecar_source_root_mtime = snapshot_source_root_modified_unix_ms,
-        current_source_root_mtime = source_root_modified_unix_ms,
+        current_tracked_sources_content_hash = tracked_sources_content_hash,
         sidecar_journal_cursor = snapshot.journal_cursor_applied,
         journal_cursor = journal.cursor,
         changed_files = journal.changed_files.len(),
@@ -7556,13 +7932,21 @@ fn native_persist_crate_cache_after_build_best_effort(
 }
 
 #[cfg(feature = "native-compile")]
-fn build_native_compile_session_state(
-    workspace_root: &Path,
-    signature: NativeCompileSessionSignature,
-) -> Result<NativeCompileSessionState> {
-    let source_roots = native_compile_source_roots(&signature.context);
-    let signature_hash = native_compile_session_signature_hash(&signature);
-    let db_start = Instant::now();
+fn native_setup_project(db: &mut RootDatabase, path: &Path) -> Result<Vec<CrateInput>> {
+    native_progress_log(format!("native setup_project start ({})", path.display()));
+    let started = Instant::now();
+    let main_crate_inputs = setup_project(db, path)
+        .with_context(|| format!("failed to setup native cairo project {}", path.display()))?;
+    native_progress_log(format!(
+        "native setup_project finished (main_crates={}, elapsed_ms={:.1})",
+        main_crate_inputs.len(),
+        started.elapsed().as_secs_f64() * 1000.0
+    ));
+    Ok(main_crate_inputs)
+}
+
+#[cfg(feature = "native-compile")]
+fn native_seeded_root_database(corelib_src: &Path) -> Result<RootDatabase> {
     let mut db = RootDatabase::builder()
         .with_optimizations(Optimizations::enabled_with_default_movable_functions(
             InliningStrategy::Default,
@@ -7570,42 +7954,89 @@ fn build_native_compile_session_state(
         .with_default_plugin_suite(starknet_plugin_suite())
         .build()
         .context("failed to initialize native cairo compiler database")?;
+    init_dev_corelib(&mut db, corelib_src.to_path_buf());
+    tracing::debug!(
+        corelib_src = %corelib_src.display(),
+        "native root database initialized"
+    );
+    Ok(db)
+}
+
+#[cfg(feature = "native-compile")]
+fn build_native_compile_session_state(
+    workspace_root: &Path,
+    signature: NativeCompileSessionSignature,
+) -> Result<NativeCompileSessionState> {
+    let source_roots = native_compile_source_roots(&signature.context);
+    let signature_hash = native_compile_session_signature_hash(&signature);
+    native_progress_log(format!(
+        "native session-state build start (workspace={}, package={})",
+        workspace_root.display(),
+        signature.context.package_name
+    ));
+    let _heartbeat = NativeProgressHeartbeat::start("native session-state build");
+    let db_start = Instant::now();
+    let mut db = native_seeded_root_database(&signature.context.corelib_src)?;
     let db_init_ms = db_start.elapsed().as_secs_f64() * 1000.0;
-    init_dev_corelib(&mut db, signature.context.corelib_src.clone());
+    native_progress_log(format!(
+        "native session-state db init finished in {:.1}ms",
+        db_init_ms
+    ));
+    native_progress_log(format!(
+        "native session-state setup_project start ({})",
+        signature.context.cairo_project_dir.display()
+    ));
     let setup_start = Instant::now();
-    let main_crate_inputs = setup_project(&mut db, &signature.context.cairo_project_dir)
-        .with_context(|| {
-            format!(
-                "failed to setup native cairo project {}",
-                signature.context.cairo_project_dir.display()
-            )
-        })?;
+    let _setup_heartbeat = NativeProgressHeartbeat::start("native session-state setup_project");
+    let main_crate_inputs = native_setup_project(&mut db, &signature.context.cairo_project_dir)?;
     let setup_project_ms = setup_start.elapsed().as_secs_f64() * 1000.0;
+    native_progress_log(format!(
+        "native session-state setup_project finished in {:.1}ms",
+        setup_project_ms
+    ));
     let crate_cache_restore_start = Instant::now();
     let crate_cache_restore_stats =
         native_restore_crate_cache_into_db(workspace_root, &signature_hash, &mut db);
     let crate_cache_restore_ms = crate_cache_restore_start.elapsed().as_secs_f64() * 1000.0;
+    native_progress_log(format!(
+        "native session-state crate-cache restore finished in {:.1}ms (restored={}, missing={}, rejected={})",
+        crate_cache_restore_ms,
+        crate_cache_restore_stats.restored,
+        crate_cache_restore_stats.missing,
+        crate_cache_restore_stats.rejected
+    ));
+    native_progress_log("native session-state source scan start");
     let scan_start = Instant::now();
-    let mut precollected_tracked_sources: Option<(BTreeMap<String, NativeTrackedFileState>, u64)> =
-        None;
-    let source_root_modified_unix_ms = if native_has_persisted_session_state_hints(workspace_root) {
-        native_source_roots_modified_unix_ms(workspace_root, &source_roots)?
-    } else {
+    let _scan_heartbeat = NativeProgressHeartbeat::start("native session-state source scan");
+    let (
+        mut precollected_tracked_sources,
+        source_root_modified_unix_ms,
+        current_tracked_sources_content_hash,
+    ) = {
         let (tracked_sources, tracked_source_bytes, latest_source_root_modified_unix_ms) =
             native_collect_tracked_sources_with_source_root_mtime(workspace_root, &source_roots)?;
-        precollected_tracked_sources = Some((tracked_sources, tracked_source_bytes));
-        latest_source_root_modified_unix_ms
+        let tracked_sources_content_hash =
+            native_tracked_sources_content_hash(workspace_root, &tracked_sources)?;
+        (
+            Some((
+                tracked_sources,
+                tracked_source_bytes,
+                tracked_sources_content_hash.clone(),
+            )),
+            latest_source_root_modified_unix_ms,
+            tracked_sources_content_hash,
+        )
     };
     let restored_image = try_native_compile_session_image_restore(
         workspace_root,
         &signature,
-        source_root_modified_unix_ms,
+        &current_tracked_sources_content_hash,
     );
     let restored_buildinfo = if restored_image.is_none() {
         try_native_buildinfo_sidecar_restore(
             workspace_root,
             &signature,
-            source_root_modified_unix_ms,
+            &current_tracked_sources_content_hash,
         )
     } else {
         None
@@ -7614,7 +8045,7 @@ fn build_native_compile_session_state(
         try_native_buildinfo_sidecar_restore_with_journal_replay(
             workspace_root,
             &signature,
-            source_root_modified_unix_ms,
+            &current_tracked_sources_content_hash,
         )
     } else {
         None
@@ -7622,6 +8053,7 @@ fn build_native_compile_session_state(
     let (
         tracked_sources,
         tracked_source_bytes,
+        tracked_sources_content_hash,
         contract_source_dependencies,
         contract_output_plans,
         session_image_hit,
@@ -7632,6 +8064,7 @@ fn build_native_compile_session_state(
         (
             image.tracked_sources,
             image.tracked_source_bytes,
+            image.tracked_sources_content_hash,
             image.contract_source_dependencies,
             image.contract_output_plans,
             true,
@@ -7643,6 +8076,7 @@ fn build_native_compile_session_state(
         (
             buildinfo.tracked_sources,
             buildinfo.tracked_source_bytes,
+            buildinfo.tracked_sources_content_hash,
             buildinfo.contract_source_dependencies,
             buildinfo.contract_output_plans,
             false,
@@ -7654,6 +8088,7 @@ fn build_native_compile_session_state(
         (
             buildinfo.tracked_sources,
             buildinfo.tracked_source_bytes,
+            buildinfo.tracked_sources_content_hash,
             buildinfo.contract_source_dependencies,
             buildinfo.contract_output_plans,
             false,
@@ -7662,17 +8097,30 @@ fn build_native_compile_session_state(
             buildinfo.journal_cursor_applied,
         )
     } else {
-        let (tracked_sources, tracked_source_bytes) =
-            if let Some((tracked_sources, tracked_source_bytes)) =
+        let (tracked_sources, tracked_source_bytes, tracked_sources_content_hash) =
+            if let Some((tracked_sources, tracked_source_bytes, tracked_sources_content_hash)) =
                 precollected_tracked_sources.take()
             {
-                (tracked_sources, tracked_source_bytes)
+                (
+                    tracked_sources,
+                    tracked_source_bytes,
+                    tracked_sources_content_hash,
+                )
             } else {
-                native_collect_tracked_sources(workspace_root, &source_roots)?
+                let (tracked_sources, tracked_source_bytes) =
+                    native_collect_tracked_sources(workspace_root, &source_roots)?;
+                let tracked_sources_content_hash =
+                    native_tracked_sources_content_hash(workspace_root, &tracked_sources)?;
+                (
+                    tracked_sources,
+                    tracked_source_bytes,
+                    tracked_sources_content_hash,
+                )
             };
         (
             tracked_sources,
             tracked_source_bytes,
+            tracked_sources_content_hash,
             BTreeMap::new(),
             Vec::new(),
             false,
@@ -7682,6 +8130,15 @@ fn build_native_compile_session_state(
         )
     };
     let source_scan_ms = scan_start.elapsed().as_secs_f64() * 1000.0;
+    native_progress_log(format!(
+        "native session-state source scan finished in {:.1}ms (tracked={}, bytes={}, image_hit={}, buildinfo_hit={}, replay_hit={})",
+        source_scan_ms,
+        tracked_sources.len(),
+        tracked_source_bytes,
+        session_image_hit,
+        buildinfo_hit,
+        buildinfo_replay_hit
+    ));
     tracing::debug!(
         workspace_root = %workspace_root.display(),
         db_init_ms,
@@ -7732,6 +8189,7 @@ fn build_native_compile_session_state(
         main_crate_inputs,
         tracked_sources,
         tracked_source_bytes,
+        tracked_sources_content_hash,
         journal_cursor_applied,
         source_root_modified_unix_ms,
         contract_source_dependencies,
@@ -7745,6 +8203,11 @@ fn build_native_compile_session_state(
         let buildinfo = native_buildinfo_file_from_state(&state, state.journal_cursor_applied);
         persist_native_buildinfo_sidecar_best_effort(workspace_root, &buildinfo);
     }
+    native_progress_log(format!(
+        "native session-state build finished (tracked={}, journal_cursor={})",
+        state.tracked_sources.len(),
+        state.journal_cursor_applied
+    ));
     Ok(state)
 }
 
@@ -8525,6 +8988,11 @@ fn with_native_compile_session<T>(
     let source_roots = native_compile_source_roots(&signature.context);
     let (session_handle, session_cache_hit) =
         native_compile_session_handle(workspace_root, signature)?;
+    native_progress_log(format!(
+        "native session refresh start (cache_hit={}, daemon_context={}, rebuild_on_empty_delta={})",
+        session_cache_hit, daemon_context, rebuild_on_empty_delta
+    ));
+    let _heartbeat = NativeProgressHeartbeat::start("native session refresh");
     let (needs_full_rebuild, session_applied_cursor) = {
         let session = session_handle
             .lock()
@@ -8601,6 +9069,8 @@ fn with_native_compile_session<T>(
                         let previous_sources = snapshot_previous_sources();
                         let (current_sources, current_source_bytes) =
                             native_collect_tracked_sources(workspace_root, &source_roots)?;
+                        let current_sources_content_hash =
+                            native_tracked_sources_content_hash(workspace_root, &current_sources)?;
                         let (changed_files, removed_files) =
                             native_diff_tracked_sources(&previous_sources, &current_sources);
                         let source_root_mtime =
@@ -8608,7 +9078,11 @@ fn with_native_compile_session<T>(
                         (
                             changed_files,
                             removed_files,
-                            Some((current_sources, current_source_bytes)),
+                            Some((
+                                current_sources,
+                                current_source_bytes,
+                                current_sources_content_hash,
+                            )),
                             source_root_mtime,
                             true,
                         )
@@ -8620,6 +9094,8 @@ fn with_native_compile_session<T>(
                 let previous_sources = snapshot_previous_sources();
                 let (current_sources, current_source_bytes) =
                     native_collect_tracked_sources(workspace_root, &source_roots)?;
+                let current_sources_content_hash =
+                    native_tracked_sources_content_hash(workspace_root, &current_sources)?;
                 let (changed_files, removed_files) =
                     native_diff_tracked_sources(&previous_sources, &current_sources);
                 let source_root_mtime =
@@ -8627,7 +9103,11 @@ fn with_native_compile_session<T>(
                 (
                     changed_files,
                     removed_files,
-                    Some((current_sources, current_source_bytes)),
+                    Some((
+                        current_sources,
+                        current_source_bytes,
+                        current_sources_content_hash,
+                    )),
                     source_root_mtime,
                     true,
                 )
@@ -8637,6 +9117,8 @@ fn with_native_compile_session<T>(
         let previous_sources = snapshot_previous_sources();
         let (current_sources, current_source_bytes) =
             native_collect_tracked_sources(workspace_root, &source_roots)?;
+        let current_sources_content_hash =
+            native_tracked_sources_content_hash(workspace_root, &current_sources)?;
         let (changed_files, removed_files) =
             native_diff_tracked_sources(&previous_sources, &current_sources);
         let source_root_mtime =
@@ -8644,12 +9126,23 @@ fn with_native_compile_session<T>(
         (
             changed_files,
             removed_files,
-            Some((current_sources, current_source_bytes)),
+            Some((
+                current_sources,
+                current_source_bytes,
+                current_sources_content_hash,
+            )),
             source_root_mtime,
             false,
         )
     };
     let drift_scan_ms = drift_scan_start.elapsed().as_secs_f64() * 1000.0;
+    native_progress_log(format!(
+        "native session refresh drift scan finished in {:.1}ms (changed={}, removed={}, journal_full_scan={})",
+        drift_scan_ms,
+        changed_files.len(),
+        removed_files.len(),
+        journal_fallback_full_scan
+    ));
 
     let changed_source_set_detected = !changed_files.is_empty() || !removed_files.is_empty();
     let force_full_rebuild_on_empty_delta = native_should_force_full_rebuild_on_empty_delta(
@@ -8678,6 +9171,10 @@ fn with_native_compile_session<T>(
             removed_files.len(),
         )
     };
+    native_progress_log(format!(
+        "native session refresh action = {:?}",
+        refresh_action
+    ));
     if matches!(refresh_action, NativeSessionRefreshAction::FullRebuild)
         && changed_source_set_detected
     {
@@ -8787,9 +9284,12 @@ fn with_native_compile_session<T>(
                     "native changed-file set does not affect tracked contracts; skipping file-keyed session update"
                 );
             }
-            if let Some((tracked_sources, tracked_source_bytes)) = current_source_snapshot.take() {
+            if let Some((tracked_sources, tracked_source_bytes, tracked_sources_content_hash)) =
+                current_source_snapshot.take()
+            {
                 session.tracked_sources = tracked_sources;
                 session.tracked_source_bytes = tracked_source_bytes;
+                session.tracked_sources_content_hash = tracked_sources_content_hash;
                 state_mutated = true;
             }
             if source_root_mtime != 0 {
@@ -8826,7 +9326,12 @@ fn with_native_compile_session<T>(
     if let Some(buildinfo_snapshot) = buildinfo_snapshot {
         persist_native_buildinfo_sidecar_best_effort(workspace_root, &buildinfo_snapshot);
     }
+    native_progress_log("native session refresh invoking build closure");
     let result = f(&snapshot);
+    native_progress_log(format!(
+        "native session refresh closure finished (ok={})",
+        result.is_ok()
+    ));
     if result.is_ok() && daemon_context {
         if let Some(commit) = source_journal_commit {
             native_commit_source_journal_delta(workspace_root, &source_roots, commit);
@@ -9102,11 +9607,63 @@ fn run_native_build_inner(
                     ));
                 }
             }
+            if !session.contract_output_plans.is_empty()
+                && (!session.changed_files.is_empty() || !session.removed_files.is_empty())
+            {
+                if !native_changed_files_affect_tracked_contracts(
+                    &session.changed_files,
+                    &session.removed_files,
+                    &session.contract_output_plans,
+                    &session.contract_source_dependencies,
+                ) {
+                    if let Some(keep_files) = native_cached_noop_keep_files(
+                        &target_dir,
+                        &context.package_name,
+                        &session.contract_output_plans,
+                    )? {
+                        let produced_paths = keep_files.iter().cloned().collect::<Vec<_>>();
+                        tracing::debug!(
+                            changed_files = session.changed_files.len(),
+                            removed_files = session.removed_files.len(),
+                            contracts = session.contract_output_plans.len(),
+                            "native compile reused cached artifacts for changed files outside the tracked contract set"
+                        );
+                        return Ok((
+                            keep_files.len(),
+                            0.0,
+                            0.0,
+                            0.0,
+                            produced_paths,
+                            session.changed_files.len() as u64,
+                            session.removed_files.len() as u64,
+                            session.contract_output_plans.len() as u64,
+                            0_u64,
+                            false,
+                            session.journal_fallback_full_scan,
+                            Vec::new(),
+                            None,
+                        ));
+                    }
+                }
+            }
             let crate_ids =
                 CrateInput::into_crate_ids(&session.db, session.main_crate_inputs.iter().cloned());
+            native_progress_log(format!(
+                "native find_contracts start (changed={}, removed={})",
+                session.changed_files.len(),
+                session.removed_files.len()
+            ));
+            let find_contracts_started_at = Instant::now();
             let contracts = find_contracts(&session.db, &crate_ids);
+            native_progress_log(format!(
+                "native find_contracts finished in {:.1}ms (contracts={})",
+                find_contracts_started_at.elapsed().as_secs_f64() * 1000.0,
+                contracts.len()
+            ));
 
             if contracts.is_empty() {
+                native_progress_log("native cairo program compile start");
+                let _heartbeat = NativeProgressHeartbeat::start("native cairo program compile");
                 let frontend_compile_start = Instant::now();
                 let program = compile_prepared_db_program(
                     &session.db,
@@ -9124,6 +9681,10 @@ fn run_native_build_inner(
                     )
                 })?;
                 let frontend_compile_ms = frontend_compile_start.elapsed().as_secs_f64() * 1000.0;
+                native_progress_log(format!(
+                    "native cairo program compile finished in {:.1}ms",
+                    frontend_compile_ms
+                ));
                 let artifact_write_start = Instant::now();
                 let output_name = format!("{}.sierra", context.package_name);
                 write_native_sierra_artifact(
@@ -9228,34 +9789,71 @@ fn run_native_build_inner(
             let (frontend_compile_ms, contract_classes) = if selected_indices.is_empty() {
                 (0.0, Vec::new())
             } else {
+                let batch_ranges = native_compile_batch_ranges(
+                    selected_indices.len(),
+                    native_progress_compile_batch_size(),
+                );
+                native_progress_log(format!(
+                    "native contract compile start (selected={}, total={}, batches={}, summary={})",
+                    selected_indices.len(),
+                    contracts.len(),
+                    batch_ranges.len(),
+                    native_compile_batch_summary(&all_plans, &selected_indices)
+                ));
                 let frontend_compile_start = Instant::now();
-                let contract_refs: Vec<_> = selected_indices
-                    .iter()
-                    .map(|index| &contracts[*index])
-                    .collect();
-                let contract_classes = compile_starknet_prepared_db(
-                    &session.db,
-                    &contract_refs,
-                    native_compiler_config(
-                        &session.main_crate_inputs,
-                        profile,
-                        capture_statement_locations,
-                    ),
-                )
-                .map_err(|err| {
-                    mark_native_fallback_eligible_for_external_dependencies(
-                        err.context("native starknet compile failed"),
-                        &context,
-                    )
-                })?;
-                let frontend_compile_ms = frontend_compile_start.elapsed().as_secs_f64() * 1000.0;
-                if contract_classes.len() != selected_indices.len() {
-                    bail!(
-                        "native compile returned mismatched contract classes (expected {}, got {})",
-                        selected_indices.len(),
-                        contract_classes.len()
+                let mut contract_classes = Vec::with_capacity(selected_indices.len());
+                for (batch_ordinal, (start, end)) in batch_ranges.iter().copied().enumerate() {
+                    let batch_indices = &selected_indices[start..end];
+                    let batch_label = format!(
+                        "native contract compile batch {}/{}",
+                        batch_ordinal + 1,
+                        batch_ranges.len()
                     );
+                    native_progress_log(format!(
+                        "{batch_label} start (contracts={}, summary={})",
+                        batch_indices.len(),
+                        native_compile_batch_summary(&all_plans, batch_indices)
+                    ));
+                    let _heartbeat = NativeProgressHeartbeat::start(batch_label.clone());
+                    let batch_compile_start = Instant::now();
+                    let contract_refs: Vec<_> = batch_indices
+                        .iter()
+                        .map(|index| &contracts[*index])
+                        .collect();
+                    let mut batch_classes = compile_starknet_prepared_db(
+                        &session.db,
+                        &contract_refs,
+                        native_compiler_config(
+                            &session.main_crate_inputs,
+                            profile,
+                            capture_statement_locations,
+                        ),
+                    )
+                    .map_err(|err| {
+                        mark_native_fallback_eligible_for_external_dependencies(
+                            err.context("native starknet compile failed"),
+                            &context,
+                        )
+                    })?;
+                    if batch_classes.len() != batch_indices.len() {
+                        bail!(
+                            "native compile returned mismatched contract classes in batch {} (expected {}, got {})",
+                            batch_ordinal + 1,
+                            batch_indices.len(),
+                            batch_classes.len()
+                        );
+                    }
+                    native_progress_log(format!(
+                        "{batch_label} finished in {:.1}ms",
+                        batch_compile_start.elapsed().as_secs_f64() * 1000.0
+                    ));
+                    contract_classes.append(&mut batch_classes);
                 }
+                let frontend_compile_ms = frontend_compile_start.elapsed().as_secs_f64() * 1000.0;
+                native_progress_log(format!(
+                    "native contract compile finished in {:.1}ms",
+                    frontend_compile_ms
+                ));
                 (frontend_compile_ms, contract_classes)
             };
             #[cfg(debug_assertions)]

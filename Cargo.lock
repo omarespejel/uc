@@ -2888,6 +2888,7 @@ dependencies = [
  "clap",
  "libc",
  "notify",
+ "postcard",
  "salsa",
  "scarb-stable-hash",
  "serde",

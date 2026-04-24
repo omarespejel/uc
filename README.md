@@ -39,6 +39,8 @@ make compare-local
 ./benchmarks/scripts/compare_benchmark_results.sh --baseline <scarb.json> --candidate <uc.json> --out <delta.md>
 cargo run -p uc-cli -- build --manifest-path /path/to/Scarb.toml
 UC_PHASE_TIMING=1 cargo run -p uc-cli -- build --engine uc --daemon-mode off --manifest-path /path/to/Scarb.toml
+UC_NATIVE_PROGRESS=1 UC_NATIVE_PROGRESS_HEARTBEAT_SECS=5 cargo run -p uc-cli -- build --engine uc --daemon-mode off --offline --manifest-path /path/to/Scarb.toml
+UC_NATIVE_PROGRESS=1 UC_NATIVE_PROGRESS_COMPILE_BATCH_SIZE=1 cargo run -p uc-cli -- build --engine uc --daemon-mode off --offline --manifest-path /path/to/Scarb.toml
 cargo run -p uc-cli -- daemon start
 cargo run -p uc-cli -- daemon status
 cargo run -p uc-cli -- build --engine uc --daemon-mode require --manifest-path /path/to/Scarb.toml

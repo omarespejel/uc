@@ -1,0 +1,22 @@
+name: agent-surface
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  validate-agent-surface:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Validate checked-in agent surface
+        run: |
+          chmod +x scripts/doctor.sh scripts/refresh_repo_map.sh scripts/validate_agent_surface.sh
+          make agent-map
+          make agent-validate

@@ -1,0 +1,16 @@
+[github_app]
+pr_commands = [
+  "/agentic_describe",
+  "/agentic_review",
+  "/compliance"
+]
+
+[review_agent]
+comments_location_policy = "both"
+inline_comments_severity_threshold = 3
+issues_user_guidelines = "Read AGENTS.md, .codex/START_HERE.md, docs/agent/PR_BOT_POLICY.md, and docs/agent/REPO_MAP.md first. Prioritize correctness bugs, invalidation mistakes, daemon safety, artifact drift, benchmark bias, and missing tests. Ignore formatting-only nits when existing tooling already covers them."
+compliance_user_guidelines = "Apply pr_compliance_checklist.yaml with emphasis on native compile correctness, conservative cache reuse, explicit fallback behavior, and strict benchmark methodology."
+
+[pr_compliance]
+enable_global_pr_compliance = false
+extra_instructions = "Use the local pr_compliance_checklist.yaml as the repo-specific gate for native compile, benchmark, and agent-surface changes."
