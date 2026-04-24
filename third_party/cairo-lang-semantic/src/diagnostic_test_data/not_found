@@ -165,7 +165,7 @@ error[E0002]: Method `sqrt` not found on type `core::integer::u32`. Consider imp
 
 //! > ==========================================================================
 
-//! > Test matching imports for missing methods from external crates.asdfasdfa
+//! > Test matching imports for missing methods from external crates.
 
 //! > test_runner_name
 test_expr_diagnostics(expect_diagnostics: true)

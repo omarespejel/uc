@@ -1218,7 +1218,7 @@ impl<'db> DiagnosticEntry<'db> for SemanticDiagnostic<'db> {
     fn severity(&self) -> Severity {
         match &self.kind {
             SemanticDiagnosticKind::UnusedVariable
-            | SemanticDiagnosticKind::UnhandledMustUseType { .. }
+            | SemanticDiagnosticKind::UnhandledMustUseType(_)
             | SemanticDiagnosticKind::UnhandledMustUseFunction
             | SemanticDiagnosticKind::TraitInTraitMustBeExplicit
             | SemanticDiagnosticKind::ImplInImplMustBeExplicit
@@ -1227,7 +1227,7 @@ impl<'db> DiagnosticEntry<'db> for SemanticDiagnostic<'db> {
             | SemanticDiagnosticKind::ImplItemForbiddenInTheImpl
             | SemanticDiagnosticKind::UnstableFeature { .. }
             | SemanticDiagnosticKind::DeprecatedFeature { .. }
-            | SemanticDiagnosticKind::UnusedImport { .. }
+            | SemanticDiagnosticKind::UnusedImport(_)
             | SemanticDiagnosticKind::CallingShadowedFunction { .. }
             | SemanticDiagnosticKind::UnusedConstant
             | SemanticDiagnosticKind::UnusedUse
