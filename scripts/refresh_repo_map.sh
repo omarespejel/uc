@@ -15,7 +15,11 @@ line_of() {
   local pattern="$1"
   local file="$2"
   local line
-  line="$({ rg -n "$pattern" "$file" || true; } | head -n 1 | cut -d: -f1)"
+  if command -v rg >/dev/null 2>&1; then
+    line="$({ rg -n "$pattern" "$file" || true; } | head -n 1 | cut -d: -f1)"
+  else
+    line="$({ grep -nE "$pattern" "$file" || true; } | head -n 1 | cut -d: -f1)"
+  fi
   if [[ -n "$line" ]]; then
     printf '%s' "$line"
   else
