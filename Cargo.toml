@@ -3,7 +3,10 @@ members = [
   "crates/uc-cli",
   "crates/uc-core",
 ]
-exclude = ["third_party/cairo-lang-filesystem"]
+exclude = [
+  "third_party/cairo-lang-filesystem",
+  "third_party/cairo-lang-semantic",
+]
 resolver = "2"
 
 [workspace.package]
@@ -36,3 +39,4 @@ walkdir = "2"
 
 [patch.crates-io]
 cairo-lang-filesystem = { path = "third_party/cairo-lang-filesystem" }
+cairo-lang-semantic = { path = "third_party/cairo-lang-semantic" }
