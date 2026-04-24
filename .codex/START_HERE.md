@@ -12,6 +12,7 @@
    - supremacy/perf research: `docs/SUPREMACY_RESEARCH_2026-03-06.md`
 5. If the task is larger than a trivial one-line fix, create or reuse a scoped branch and plan to open a PR before broadening the change.
 6. Open normal PRs, not draft PRs, so CodeRabbit and Qodo review the branch immediately.
+7. Before editing, re-check `AGENTS.md` PR-First Rule: PR first, bot loop immediately after push, merge only after a 3-minute quiet window.
 
 ## Common Commands
 
@@ -40,3 +41,4 @@
 - Push coherent slices to a PR instead of holding large local diffs.
 - Keep the PR in ready-for-review state; do not switch to draft unless a human explicitly asks for it.
 - After each meaningful push, run the review loop: check CodeRabbit and Qodo, fix relevant findings, and only merge after a 3-minute quiet window with no new useful bot feedback.
+- Treat that review loop as mandatory for every non-trivial change.

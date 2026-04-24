@@ -2,10 +2,10 @@ use serde::Deserialize;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 #[derive(Debug, Deserialize)]
@@ -33,6 +33,11 @@ struct StarknetArtifactFiles {
 
 struct TestWorkspace {
     root: PathBuf,
+}
+
+struct TimedOutput {
+    output: Output,
+    timed_out: bool,
 }
 
 #[derive(Default)]
@@ -125,6 +130,62 @@ fn make_test_workspace_from_source(name: &str, source: &Path) -> TestWorkspace {
     TestWorkspace { root }
 }
 
+fn make_garaga_sp1_workspace(name: &str) -> TestWorkspace {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be after unix epoch")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "uc-cli-integration-{name}-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir_all(root.join("src")).expect("failed to create garaga fixture src directory");
+    fs::write(
+        root.join("Scarb.toml"),
+        r#"[package]
+name = "semantic_guard_garaga"
+version = "0.1.0"
+edition = "2024_07"
+cairo-version = "2.14.0"
+
+[dependencies]
+starknet = "2.14.0"
+garaga = { git = "https://github.com/keep-starknet-strange/garaga", tag = "v1.0.1" }
+
+[[target.starknet-contract]]
+sierra = true
+casm = true
+allowed-libfuncs-list.name = "experimental"
+"#,
+    )
+    .expect("failed to write garaga fixture manifest");
+    fs::write(
+        root.join("src/lib.cairo"),
+        r#"use garaga::apps::sp1_constants::{precomputed_lines, vk};
+
+#[starknet::contract]
+pub mod C {
+    use super::{precomputed_lines, vk};
+
+    #[storage]
+    struct Storage {}
+
+    #[external(v0)]
+    fn ping(self: @ContractState) -> felt252 {
+        let _proof_vk = vk;
+        let _precomputed = precomputed_lines;
+        1
+    }
+}
+"#,
+    )
+    .expect("failed to write garaga fixture source");
+    let _ = fs::remove_dir_all(root.join(".uc"));
+    let _ = fs::remove_dir_all(root.join("target"));
+    let _ = fs::remove_dir_all(root.join(".scarb"));
+    TestWorkspace { root }
+}
+
 fn copy_dir_recursive(source: &Path, destination: &Path) -> std::io::Result<()> {
     for entry in WalkDir::new(source).follow_links(false) {
         let entry = entry?;
@@ -143,6 +204,36 @@ fn copy_dir_recursive(source: &Path, destination: &Path) -> std::io::Result<()> 
         }
     }
     Ok(())
+}
+
+fn run_command_with_timeout(mut command: Command, timeout: Duration) -> TimedOutput {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().expect("failed to spawn timed command");
+    let started = Instant::now();
+    loop {
+        match child.try_wait().expect("failed to poll timed command") {
+            Some(_) => {
+                return TimedOutput {
+                    output: child
+                        .wait_with_output()
+                        .expect("failed to collect timed command output"),
+                    timed_out: false,
+                };
+            }
+            None if started.elapsed() >= timeout => {
+                child
+                    .kill()
+                    .expect("failed to kill timed command after timeout");
+                return TimedOutput {
+                    output: child
+                        .wait_with_output()
+                        .expect("failed to collect timed-out command output"),
+                    timed_out: true,
+                };
+            }
+            None => thread::sleep(Duration::from_millis(100)),
+        }
+    }
 }
 
 fn uc_bin() -> PathBuf {
@@ -181,6 +272,14 @@ fn scarb_version_line() -> String {
         .unwrap_or("scarb unknown")
         .trim()
         .to_string()
+}
+
+fn run_scarb_fetch(root: &Path) -> Output {
+    Command::new("scarb")
+        .current_dir(root)
+        .arg("fetch")
+        .output()
+        .expect("failed to execute scarb fetch")
 }
 
 fn run_uc_build_for_root(
@@ -350,6 +449,60 @@ fn run_uc_build_output_only_with_env_overrides(
         command.env_remove("UC_NATIVE_DISALLOW_SCARB_FALLBACK");
     }
     command.output().expect("failed to execute uc build")
+}
+
+fn run_uc_build_output_only_with_timeout_and_env_overrides(
+    root: &Path,
+    manifest_path: &Path,
+    daemon_mode: &str,
+    daemon_socket_path: Option<&Path>,
+    overrides: BuildEnvOverrides<'_>,
+    timeout: Duration,
+) -> TimedOutput {
+    let mut command = Command::new(uc_bin());
+    command
+        .current_dir(root)
+        .arg("build")
+        .arg("--engine")
+        .arg("uc")
+        .arg("--daemon-mode")
+        .arg(daemon_mode)
+        .arg("--offline")
+        .arg("--manifest-path")
+        .arg(manifest_path)
+        .env("UC_NATIVE_PROGRESS", "1")
+        .env("UC_NATIVE_PROGRESS_HEARTBEAT_SECS", "2")
+        .env("UC_NATIVE_PROGRESS_COMPILE_BATCH_SIZE", "1")
+        .env("UC_PHASE_TIMING", "1");
+    if let Some(socket_path) = daemon_socket_path {
+        command.env("UC_DAEMON_SOCKET_PATH", socket_path);
+    } else {
+        command.env_remove("UC_DAEMON_SOCKET_PATH");
+    }
+    if let Some(path) = overrides.path_override {
+        command.env("PATH", path);
+    }
+    if let Some(version) = overrides.scarb_version_override {
+        command.env("UC_SCARB_VERSION_LINE", version);
+    } else {
+        command.env_remove("UC_SCARB_VERSION_LINE");
+    }
+    if let Some(mode) = overrides.native_mode_override {
+        command.env("UC_NATIVE_BUILD_MODE", mode);
+    } else {
+        command.env_remove("UC_NATIVE_BUILD_MODE");
+    }
+    if let Some(corelib_src) = overrides.native_corelib_override {
+        command.env("UC_NATIVE_CORELIB_SRC", corelib_src);
+    } else {
+        command.env_remove("UC_NATIVE_CORELIB_SRC");
+    }
+    if let Some(value) = overrides.native_disallow_scarb_fallback_override {
+        command.env("UC_NATIVE_DISALLOW_SCARB_FALLBACK", value);
+    } else {
+        command.env_remove("UC_NATIVE_DISALLOW_SCARB_FALLBACK");
+    }
+    run_command_with_timeout(command, timeout)
 }
 
 fn run_uc_build(workspace: &TestWorkspace, report_tag: &str) -> (Output, BuildReport) {
@@ -1357,6 +1510,59 @@ fn integration_native_require_mode_succeeds_without_scarb_on_research_workspaces
     assert!(
         warm_report.cache_hit,
         "native require warm build on research workspaces fixture should hit cache"
+    );
+}
+
+#[test]
+fn integration_native_require_garaga_sp1_fixture_fails_fast_with_diagnostics() {
+    let _guard = serial_guard();
+    if !scarb_available() {
+        eprintln!(
+            "skipping integration_native_require_garaga_sp1_fixture_fails_fast_with_diagnostics: scarb not available"
+        );
+        return;
+    }
+    let Some(corelib_src) = local_native_corelib_src() else {
+        eprintln!(
+            "skipping integration_native_require_garaga_sp1_fixture_fails_fast_with_diagnostics: compatible local cairo corelib not found"
+        );
+        return;
+    };
+    let workspace = make_garaga_sp1_workspace("native-require-garaga-sp1");
+    let manifest = workspace.root.join("Scarb.toml");
+
+    let fetch_output = run_scarb_fetch(&workspace.root);
+    assert_success(&fetch_output, "garaga sp1 fixture scarb fetch");
+
+    let timed = run_uc_build_output_only_with_timeout_and_env_overrides(
+        &workspace.root,
+        &manifest,
+        "off",
+        None,
+        BuildEnvOverrides {
+            native_mode_override: Some("require"),
+            native_corelib_override: Some(&corelib_src),
+            native_disallow_scarb_fallback_override: Some("1"),
+            ..BuildEnvOverrides::default()
+        },
+        Duration::from_secs(35),
+    );
+    let combined = output_to_utf8(&timed.output);
+    assert!(
+        !timed.timed_out,
+        "garaga sp1 native build must fail fast with diagnostics instead of hanging\n{combined}"
+    );
+    assert!(
+        !timed.output.status.success(),
+        "garaga sp1 native build should surface diagnostics until native parity covers garaga constants"
+    );
+    assert!(
+        combined.contains("error[E2126]: Constant type must not depend on its value."),
+        "expected garaga constant diagnostic in output\n{combined}"
+    );
+    assert!(
+        combined.contains("src/src/apps/sp1_constants.cairo"),
+        "expected diagnostic path for garaga sp1 constants in output\n{combined}"
     );
 }
 

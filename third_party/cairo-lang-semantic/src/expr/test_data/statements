@@ -1,0 +1,218 @@
+//! > Missing semicolon in let statement (parsing error).
+
+//! > test_runner_name
+test_function_diagnostics(expect_diagnostics: true)
+
+//! > function_code
+fn foo() {
+    let mut x = 3
+    x = 2;
+}
+
+//! > function_name
+foo
+
+//! > expected_diagnostics
+error[E1001]: Missing token ';'.
+ --> lib.cairo:2:18
+    let mut x = 3
+                 ^
+
+//! > ==========================================================================
+
+//! > Missing semicolon in "tail" let statement (parsing error).
+
+//! > test_runner_name
+test_function_diagnostics(expect_diagnostics: true)
+
+//! > function_code
+fn foo() {
+    let mut _x = 3
+}
+
+//! > function_name
+foo
+
+//! > expected_diagnostics
+error[E1001]: Missing token ';'.
+ --> lib.cairo:2:19
+    let mut _x = 3
+                  ^
+
+//! > ==========================================================================
+
+//! > Missing semicolon in return statement (parsing error).
+
+//! > test_runner_name
+test_function_diagnostics(expect_diagnostics: true)
+
+//! > function_code
+fn foo() -> felt252 {
+    if true {
+        return 1
+    }
+    2
+}
+
+//! > function_name
+foo
+
+//! > expected_diagnostics
+error[E1001]: Missing token ';'.
+ --> lib.cairo:3:17
+        return 1
+                ^
+
+//! > ==========================================================================
+
+//! > Missing semicolon in "tail" return statement (parsing error).
+
+//! > test_runner_name
+test_function_diagnostics(expect_diagnostics: true)
+
+//! > function_code
+fn foo() -> felt252 {
+    return 1
+}
+
+//! > function_name
+foo
+
+//! > expected_diagnostics
+error[E1001]: Missing token ';'.
+ --> lib.cairo:2:13
+    return 1
+            ^
+
+//! > ==========================================================================
+
+//! > Missing semicolon in expression statement.
+
+//! > test_runner_name
+test_function_diagnostics(expect_diagnostics: true)
+
+//! > function_code
+fn foo() {
+    bar()
+    bar();
+}
+
+//! > function_name
+foo
+
+//! > module_code
+fn bar() {}
+
+//! > expected_diagnostics
+error[E2133]: Missing semicolon
+ --> lib.cairo:3:10
+    bar()
+         ^
+
+//! > ==========================================================================
+
+//! > "Missing" semicolon in tail expression is OK
+
+//! > test_runner_name
+test_function_diagnostics(expect_diagnostics: false)
+
+//! > function_code
+fn foo() -> felt252 {
+    2
+}
+
+//! > function_name
+foo
+
+//! > expected_diagnostics
+
+//! > ==========================================================================
+
+//! > Blocks, `if`s, and `match`s, don't require semicolon, even not in tail expressions.
+
+//! > test_runner_name
+test_function_diagnostics(expect_diagnostics: false)
+
+//! > function_code
+fn foo() {
+    // `if` without ';' in the end
+    if true {}
+    let opt = Some(3);
+    // `match` without ';' in the end
+    match opt {
+        Some(_) => {},
+        None(_) => {},
+    }
+    // Block without ';' in the end
+    {}
+    // Another statement to make the previous ones non-tail.
+    let _x = 3;
+}
+
+//! > function_name
+foo
+
+//! > expected_diagnostics
+
+//! > ==========================================================================
+
+//! > Test a statement with an unknown attribute
+
+//! > test_runner_name
+test_function_diagnostics(expect_diagnostics: true)
+
+//! > function_code
+fn foo() {
+    #[unknown_attr1]
+    #[unknown_attr2]
+    #[cairofmt::skip]
+    let _x = 3;
+}
+
+//! > function_name
+foo
+
+//! > expected_diagnostics
+error[E2155]: Unknown statement attribute.
+ --> lib.cairo:2:5
+    #[unknown_attr1]
+    ^^^^^^^^^^^^^^^^
+
+error[E2155]: Unknown statement attribute.
+ --> lib.cairo:3:5
+    #[unknown_attr2]
+    ^^^^^^^^^^^^^^^^
+
+//! > ==========================================================================
+
+//! > Test attributes on statement lists.
+
+//! > test_runner_name
+test_function_diagnostics(expect_diagnostics: false)
+
+//! > function_code
+fn foo() {
+    let _x = {
+        #[feature("testing")]
+        unstable_function_with_note() // Tail expression has attributes.
+    };
+
+    #[feature("testing")]
+    unstable_function_with_note(); // Non-tail statements have attributes.
+
+    #[feature("testing")]
+    unstable_function_with_note(); // Attr on non-expression tail works.
+}
+
+//! > function_name
+foo
+
+//! > module_code
+#[unstable(feature: "testing", note: "Some reason", since: "1.0.0")]
+fn unstable_function_with_note() -> felt252 {
+    0
+}
+
+//! > function_body
+
+//! > expected_diagnostics

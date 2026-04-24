@@ -22,6 +22,7 @@
 
 ## Human Triage Rules
 
+- Every agent should read `AGENTS.md` and `.codex/START_HERE.md` before changing code, then follow this PR loop by default.
 - Open a normal ready-for-review PR early for any non-trivial change so review bots have a real diff to inspect.
 - Do not use draft PRs for normal engineering work in this repo; CodeRabbit and Qodo need a reviewable PR state.
 - Treat the PR as the working unit: push small coherent slices, let bots review, then address relevant findings before expanding scope.

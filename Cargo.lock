@@ -488,8 +488,6 @@ dependencies = [
 [[package]]
 name = "cairo-lang-semantic"
 version = "2.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2fc762fbc27a9cbef0b40bd9be792fe6111bd4bfdeccd90ca518c4968be3eeaf"
 dependencies = [
  "cairo-lang-debug",
  "cairo-lang-defs",
