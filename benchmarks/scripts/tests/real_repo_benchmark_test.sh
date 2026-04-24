@@ -162,6 +162,32 @@ test_real_repo_benchmark_rejects_missing_case_values() {
   fi
 }
 
+test_real_repo_benchmark_rejects_zero_runs_from_environment() {
+  local cases_root="$TEST_TMP_DIR/env-cases"
+  local mock_bin_dir="$TEST_TMP_DIR/env-mock-bin"
+  local mock_uc="$mock_bin_dir/uc"
+  local mock_scarb="$mock_bin_dir/scarb"
+  local stderr_path="$TEST_TMP_DIR/env-zero-runs.err"
+  mkdir -p "$mock_bin_dir"
+  write_mock_uc_bin "$mock_uc"
+  write_mock_scarb_bin "$mock_scarb"
+  write_manifest_case "$cases_root" "supported"
+
+  if RUNS=0 PATH="$mock_bin_dir:$PATH" "$BENCH_SCRIPT" \
+    --uc-bin "$mock_uc" \
+    --results-dir "$TEST_TMP_DIR/env-results" \
+    --case "$cases_root/supported/Scarb.toml" supported \
+    >"$TEST_TMP_DIR/env-zero-runs.out" 2>"$stderr_path"; then
+    echo "expected real repo benchmark script to reject RUNS=0 from environment" >&2
+    return 1
+  fi
+  if ! grep -q "RUNS must be a positive integer" "$stderr_path"; then
+    echo "expected explicit RUNS validation failure" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+}
+
 test_real_repo_benchmark_separates_supported_and_ineligible_cases() {
   local cases_root="$TEST_TMP_DIR/cases"
   local mock_bin_dir="$TEST_TMP_DIR/mock-bin"
@@ -177,6 +203,7 @@ test_real_repo_benchmark_separates_supported_and_ineligible_cases() {
   local stdout_text
   stdout_text="$(
     PATH="$mock_bin_dir:$PATH" \
+    UC_NATIVE_CORELIB_SRC="/tmp/fake-corelib/src" \
     MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/uc.args" \
     MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/scarb.args" \
     "$BENCH_SCRIPT" \
@@ -218,7 +245,7 @@ test_real_repo_benchmark_separates_supported_and_ineligible_cases() {
   assert_contains "$markdown_text" "| supported |"
   assert_contains "$markdown_text" "| unsupported | 2.14.0 |"
 
-  if ! grep -q "build .*supported.* disallow=1" "$TEST_TMP_DIR/uc.args"; then
+  if ! grep -q "build .*supported.* disallow=1 corelib=/tmp/fake-corelib/src" "$TEST_TMP_DIR/uc.args"; then
     echo "expected supported case to run uc build" >&2
     cat "$TEST_TMP_DIR/uc.args" >&2
     return 1
@@ -285,6 +312,8 @@ test_real_repo_benchmark_records_supported_build_failures() {
 
 run_test "real_repo_benchmark_rejects_missing_case_values" \
   test_real_repo_benchmark_rejects_missing_case_values
+run_test "real_repo_benchmark_rejects_zero_runs_from_environment" \
+  test_real_repo_benchmark_rejects_zero_runs_from_environment
 run_test "real_repo_benchmark_separates_supported_and_ineligible_cases" \
   test_real_repo_benchmark_separates_supported_and_ineligible_cases
 run_test "real_repo_benchmark_records_supported_build_failures" \
