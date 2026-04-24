@@ -136,6 +136,7 @@ set -euo pipefail
 args_log="${MOCK_SCARB_ARGS_LOG:?}"
 manifest=""
 subcommand=""
+seen_offline=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --manifest-path)
@@ -147,6 +148,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --offline)
+      seen_offline=1
       shift
       ;;
     *)
@@ -158,6 +160,10 @@ done
 if [[ -z "$subcommand" ]]; then
   echo "missing scarb subcommand" >&2
   exit 20
+fi
+if [[ "$seen_offline" -ne 1 ]]; then
+  echo "missing scarb --offline" >&2
+  exit 21
 fi
 if [[ -z "$manifest" && "$subcommand" == "fetch" ]]; then
   manifest="$PWD/Scarb.toml"

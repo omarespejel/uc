@@ -99,6 +99,7 @@ records that build failure in a separate section with exit code and log path
 instead of aborting the whole benchmark run.
 
 ## Run Deployed-Contract Corpus Evidence
+
 ```bash
 # Validate and normalize a corpus without running builds.
 ./benchmarks/scripts/run_deployed_contract_corpus.sh \

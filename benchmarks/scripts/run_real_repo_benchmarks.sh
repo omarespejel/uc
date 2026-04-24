@@ -321,15 +321,10 @@ measurement_failure_json() {
 
 prefetch_manifest_dependencies() {
   local manifest_path="$1"
-  local manifest_dir
   if [[ -n "${PREFETCHED_MANIFESTS[$manifest_path]:-}" ]]; then
     return
   fi
-  manifest_dir="$(cd "$(dirname "$manifest_path")" && pwd -P)"
-  (
-    cd "$manifest_dir"
-    scarb fetch >/dev/null
-  )
+  scarb --manifest-path "$manifest_path" --offline fetch >/dev/null
   PREFETCHED_MANIFESTS["$manifest_path"]=1
 }
 
