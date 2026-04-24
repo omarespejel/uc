@@ -254,7 +254,8 @@ const CACHEABLE_ARTIFACT_SUFFIXES: [&str; 7] = [
     ".executable.json",
 ];
 const UC_AGENT_JSON_SCHEMA_VERSION: u32 = 1;
-const UC_AGENT_DIAGNOSTICS_DOC_PATH: &str = "docs/agent/AGENT_DIAGNOSTICS.md";
+const UC_AGENT_DIAGNOSTICS_DOC_URL: &str =
+    "https://github.com/omarespejel/uc/blob/main/docs/agent/AGENT_DIAGNOSTICS.md";
 
 #[derive(Parser, Debug)]
 #[command(name = "uc")]
@@ -466,7 +467,7 @@ struct NativeDiagnostic {
 fn native_diagnostic_docs_url(code: &str) -> String {
     format!(
         "{}#{}",
-        UC_AGENT_DIAGNOSTICS_DOC_PATH,
+        UC_AGENT_DIAGNOSTICS_DOC_URL,
         code.to_ascii_lowercase()
     )
 }

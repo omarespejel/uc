@@ -2284,8 +2284,14 @@ cairo-version = "{requested_version}"
     assert_eq!(diagnostic.category, "toolchain_lane_unavailable");
     assert_eq!(diagnostic.safe_automated_action, "build_helper_lane");
     assert!(
-        diagnostic.docs_url.contains("AGENT_DIAGNOSTICS.md#ucn1004"),
-        "diagnostics should point agents to stable remediation docs"
+        diagnostic
+            .docs_url
+            .starts_with("https://github.com/omarespejel/uc/blob/main/"),
+        "diagnostics should expose an absolute docs URL"
+    );
+    assert!(
+        diagnostic.docs_url.ends_with("AGENT_DIAGNOSTICS.md#ucn1004"),
+        "diagnostics should point agents to stable remediation docs anchors"
     );
     assert!(
         diagnostic
@@ -2419,7 +2425,14 @@ cairo-version = "{requested_version}"
         json["diagnostics"][0]["docs_url"]
             .as_str()
             .unwrap_or_default()
-            .contains("AGENT_DIAGNOSTICS.md#ucn1004"),
+            .starts_with("https://github.com/omarespejel/uc/blob/main/"),
+        "agent diagnostics should link an absolute docs URL"
+    );
+    assert!(
+        json["diagnostics"][0]["docs_url"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("AGENT_DIAGNOSTICS.md#ucn1004"),
         "agent diagnostics should link a stable docs anchor"
     );
     assert_eq!(json["toolchain"]["source"], "external_helper");

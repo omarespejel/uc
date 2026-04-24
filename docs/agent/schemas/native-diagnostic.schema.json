@@ -25,7 +25,7 @@
     "category": { "type": "string", "minLength": 1 },
     "severity": { "enum": ["info", "warn", "error"] },
     "title": { "type": "string", "minLength": 1 },
-    "docs_url": { "type": "string", "minLength": 1 },
+    "docs_url": { "type": "string", "format": "uri", "minLength": 1 },
     "what_happened": { "type": "string", "minLength": 1 },
     "why": { "type": "string", "minLength": 1 },
     "how_to_fix": { "type": "array", "items": { "type": "string" } },

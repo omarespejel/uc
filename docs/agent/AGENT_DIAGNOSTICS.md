@@ -11,7 +11,7 @@ Every `NativeDiagnostic` emitted by `uc support native --format json`, `uc build
 - `category`: stable machine category.
 - `severity`: `info`, `warn`, or `error`.
 - `title`: short human label.
-- `docs_url`: repository-relative remediation anchor.
+- `docs_url`: absolute GitHub remediation URL with a stable diagnostic-code anchor.
 - `what_happened`: concrete failure statement.
 - `why`: root cause or best-known causal explanation.
 - `how_to_fix`: ordered remediation text for humans and agents.
