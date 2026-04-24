@@ -115,18 +115,6 @@ ITEM_KEYS = {
     "license",
     "notes",
 }
-CORPUS_ITEM_KEYS = {
-    "tag",
-    "contract_address",
-    "class_hash",
-    "source_ref",
-    "manifest_path",
-    "cairo_version",
-    "scarb_version",
-    "license",
-    "notes",
-}
-
 def fail(message):
     print(message, file=sys.stderr)
     raise SystemExit(1)
@@ -241,7 +229,7 @@ for index, raw_item in enumerate(items):
     manifest_raw = require_str(item, "manifest_path", f"source_index.items[{index}]")
     manifest_path = resolve_manifest_path(manifest_raw, tag)
 
-    normalized = {key: item[key] for key in CORPUS_ITEM_KEYS if key in item}
+    normalized = {key: item[key] for key in ITEM_KEYS if key in item}
     normalized["manifest_path"] = str(manifest_path)
     normalized["contract_address"] = require_str(item, "contract_address", f"source_index.items[{index}]")
     normalized["source_ref"] = require_str(item, "source_ref", f"source_index.items[{index}]")
