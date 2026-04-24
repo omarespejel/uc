@@ -1,9 +1,14 @@
 name: agent-surface
 
 on:
-  pull_request:
-  push:
-    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-surface-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   validate-agent-surface:

@@ -1,11 +1,15 @@
 SHELL := /bin/sh
 
-.PHONY: bootstrap doctor agent-map agent-validate validate-bench-scripts validate-fast validate-native benchmark-local benchmark-uc benchmark-smoke benchmark-delta benchmark-strict-smoke benchmark-strict-research perf-fast perf-fast-semantic compare-local gh-bootstrap
+.PHONY: bootstrap install-hooks doctor agent-map agent-validate validate-local-ci validate-bench-scripts validate-fast validate-native local-ci benchmark-local benchmark-uc benchmark-smoke benchmark-delta benchmark-strict-smoke benchmark-strict-research perf-fast perf-fast-semantic compare-local gh-bootstrap
 
 bootstrap:
 	@mkdir -p benchmarks/results benchmarks/baselines
-	@chmod +x benchmarks/scripts/run_local_benchmarks.sh benchmarks/scripts/run_dual_run_comparator.sh benchmarks/scripts/run_fast_perf_check.sh benchmarks/scripts/run_stability_benchmarks.sh benchmarks/scripts/run_native_only_gate.sh benchmarks/scripts/run_native_real_repo_smoke.sh benchmarks/scripts/tests/benchmark_host_preflight_test.sh benchmarks/scripts/tests/native_ci_gate_test.sh scripts/github/bootstrap_github_stack.sh scripts/doctor.sh scripts/refresh_repo_map.sh scripts/validate_agent_surface.sh
+	@chmod +x benchmarks/scripts/run_local_benchmarks.sh benchmarks/scripts/run_dual_run_comparator.sh benchmarks/scripts/run_fast_perf_check.sh benchmarks/scripts/run_stability_benchmarks.sh benchmarks/scripts/run_native_only_gate.sh benchmarks/scripts/run_native_real_repo_smoke.sh benchmarks/scripts/tests/benchmark_host_preflight_test.sh benchmarks/scripts/tests/native_ci_gate_test.sh scripts/github/bootstrap_github_stack.sh scripts/doctor.sh scripts/refresh_repo_map.sh scripts/validate_agent_surface.sh scripts/install_git_hooks.sh scripts/local_ci_gate.sh scripts/tests/local_ci_gate_test.sh .githooks/pre-push
+	@$(MAKE) install-hooks
 	@echo "Bootstrap complete."
+
+install-hooks:
+	@./scripts/install_git_hooks.sh
 
 doctor:
 	@./scripts/doctor.sh
@@ -16,21 +20,29 @@ agent-map:
 agent-validate:
 	@./scripts/validate_agent_surface.sh
 
+validate-local-ci:
+	@./scripts/tests/local_ci_gate_test.sh
+
 validate-bench-scripts:
 	@./benchmarks/scripts/tests/benchmark_host_preflight_test.sh
 	@./benchmarks/scripts/tests/native_ci_gate_test.sh
 
 validate-fast:
 	@$(MAKE) agent-validate
+	@$(MAKE) validate-local-ci
 	@$(MAKE) validate-bench-scripts
 	@cargo fmt --all --check
 	@cargo test -p uc-core --quiet
 
 validate-native:
 	@$(MAKE) agent-validate
+	@$(MAKE) validate-local-ci
 	@$(MAKE) validate-bench-scripts
 	@cargo test -p uc-cli main_tests::native_ -- --nocapture
 	@cargo test -p uc-cli commands::build::tests::native_ -- --nocapture
+
+local-ci:
+	@./scripts/local_ci_gate.sh
 
 benchmark-local:
 	@./benchmarks/scripts/run_local_benchmarks.sh --matrix research --tool scarb

@@ -14,6 +14,10 @@ required_files=(
   .pr_agent.toml
   best_practices.md
   pr_compliance_checklist.yaml
+  scripts/install_git_hooks.sh
+  scripts/local_ci_gate.sh
+  scripts/tests/local_ci_gate_test.sh
+  .githooks/pre-push
   .claude/skills/uc-pr-review-loop/SKILL.md
   .claude/skills/uc-native-debug/SKILL.md
   .claude/skills/uc-benchmark-gate/SKILL.md

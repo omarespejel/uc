@@ -33,7 +33,7 @@ for cmd in git cargo rustc rg jq scarb; do
 done
 check_optional gh
 
-for path in AGENTS.md .codex/START_HERE.md .coderabbit.yaml .pr_agent.toml best_practices.md pr_compliance_checklist.yaml docs/agent/PR_BOT_POLICY.md docs/agent/REPO_MAP.md; do
+for path in AGENTS.md .codex/START_HERE.md .coderabbit.yaml .pr_agent.toml best_practices.md pr_compliance_checklist.yaml docs/agent/PR_BOT_POLICY.md docs/agent/REPO_MAP.md scripts/install_git_hooks.sh scripts/local_ci_gate.sh scripts/tests/local_ci_gate_test.sh .githooks/pre-push; do
   if [[ -f "$path" ]]; then
     printf '[ok] file %s\n' "$path"
   else
@@ -41,6 +41,21 @@ for path in AGENTS.md .codex/START_HERE.md .coderabbit.yaml .pr_agent.toml best_
     failures=$((failures + 1))
   fi
 done
+
+hooks_path="$(git config --get core.hooksPath || true)"
+if [[ "$hooks_path" == ".githooks" || "$hooks_path" == "$ROOT/.githooks" ]]; then
+  printf '[ok] git core.hooksPath=%s\n' "$hooks_path"
+else
+  printf '[missing] git core.hooksPath is not set to .githooks (run: make install-hooks)\n' >&2
+  failures=$((failures + 1))
+fi
+
+if [[ -x .githooks/pre-push ]]; then
+  printf '[ok] executable hook .githooks/pre-push\n'
+else
+  printf '[missing] executable hook .githooks/pre-push\n' >&2
+  failures=$((failures + 1))
+fi
 
 if command -v cargo >/dev/null 2>&1; then
   printf 'cargo: %s\n' "$(cargo --version)"

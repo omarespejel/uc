@@ -5,6 +5,7 @@
 - Keep AI reviews focused on production bugs, invalidation errors, daemon safety, artifact drift, missing tests, and benchmark methodology.
 - Minimize style-only noise that humans or formatters already cover.
 - Make the repository easy for both review bots and coding agents to bootstrap correctly.
+- Keep GitHub spend bounded by using PR bots for review, while running routine tests and benchmarks locally.
 
 ## CodeRabbit
 
@@ -25,6 +26,7 @@
 - Open a normal ready-for-review PR early for any non-trivial change so review bots have a real diff to inspect.
 - Do not use draft PRs for normal engineering work in this repo; CodeRabbit and Qodo need a reviewable PR state.
 - Treat the PR as the working unit: push small coherent slices, let bots review, then address relevant findings before expanding scope.
+- GitHub Actions are manual-only in this repo by policy. Do not wait for automatic CI that should not exist; use the local validation lanes and pre-push hook instead.
 - Treat CodeRabbit and Qodo as review accelerators, not as merge authority.
 - Fix real correctness or regression findings first.
 - If two bots disagree, verify in code and tests rather than following either blindly.
