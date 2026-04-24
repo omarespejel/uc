@@ -15,6 +15,7 @@ declare -a STRICT_CASE_TAGS=()
 declare -a BACKEND_CASE_MANIFESTS=()
 declare -a BACKEND_CASE_TAGS=()
 declare -a BACKEND_CASE_ALLOWED=()
+declare -A PREFETCHED_MANIFESTS=()
 
 usage() {
   cat <<'USAGE'
@@ -91,6 +92,19 @@ fi
 
 mkdir -p "$RESULTS_DIR"
 
+prefetch_manifest_dependencies() {
+  local manifest_path="$1"
+  if [[ -n "${PREFETCHED_MANIFESTS[$manifest_path]:-}" ]]; then
+    return
+  fi
+  if ! command -v scarb >/dev/null 2>&1; then
+    echo "scarb is required to prefetch dependencies for offline real-repo smoke runs" >&2
+    exit 1
+  fi
+  scarb fetch --manifest-path "$manifest_path" >/dev/null
+  PREFETCHED_MANIFESTS["$manifest_path"]=1
+}
+
 run_case() {
   local manifest_path="$1"
   local tag="$2"
@@ -98,6 +112,7 @@ run_case() {
   local report_path="$RESULTS_DIR/native-real-${tag}.json"
   local log_path="$RESULTS_DIR/native-real-${tag}.log"
 
+  prefetch_manifest_dependencies "$manifest_path"
   "$UC_BIN" build \
     --engine uc \
     --daemon-mode off \

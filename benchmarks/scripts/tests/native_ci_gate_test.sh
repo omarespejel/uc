@@ -75,6 +75,19 @@ EOF
   chmod +x "$path"
 }
 
+write_mock_scarb_bin() {
+  local path="$1"
+  cat > "$path" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+args_log="${MOCK_SCARB_ARGS_LOG:?}"
+printf '%s\n' "$*" >> "$args_log"
+exit 0
+EOF
+  chmod +x "$path"
+}
+
 test_detects_unsupported_executable_fixture_log() {
   local log_path="$TEST_TMP_DIR/executable.log"
   write_file "$log_path" \
@@ -191,8 +204,13 @@ test_native_real_repo_smoke_requires_cases() {
 test_native_real_repo_smoke_passes_offline_to_uc() {
   local mock_uc="$TEST_TMP_DIR/mock-uc-offline"
   local args_log="$TEST_TMP_DIR/native-real-offline.args"
+  local mock_bin_dir="$TEST_TMP_DIR/mock-bin-offline"
+  mkdir -p "$mock_bin_dir"
+  write_mock_scarb_bin "$mock_bin_dir/scarb"
   write_mock_uc_bin "$mock_uc"
 
+  PATH="$mock_bin_dir:$PATH" \
+  MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/native-real-offline.scarb.args" \
   MOCK_UC_ARGS_LOG="$args_log" \
     "$NATIVE_REAL_REPO_SMOKE_SCRIPT" \
       --uc-bin "$mock_uc" \
@@ -201,6 +219,7 @@ test_native_real_repo_smoke_passes_offline_to_uc() {
       >"$TEST_TMP_DIR/native-real-offline.out" 2>"$TEST_TMP_DIR/native-real-offline.err"
 
   assert_contains "$(cat "$args_log")" "--offline"
+  assert_contains "$(cat "$TEST_TMP_DIR/native-real-offline.scarb.args")" "fetch --manifest-path $TEST_TMP_DIR/fake/Scarb.toml"
 }
 
 run_test "detects unsupported executable fixture log" test_detects_unsupported_executable_fixture_log
