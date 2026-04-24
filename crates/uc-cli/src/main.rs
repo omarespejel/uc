@@ -737,7 +737,6 @@ struct StarknetArtifactEntry {
 #[cfg(feature = "native-compile")]
 struct StarknetArtifactFiles {
     sierra: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     casm: Option<String>,
 }
 

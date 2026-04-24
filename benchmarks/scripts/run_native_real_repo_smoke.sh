@@ -10,6 +10,7 @@ source "$LIB_PATH"
 
 UC_BIN="${UC_BIN:-$ROOT_DIR/target/release/uc}"
 RESULTS_DIR="$ROOT_DIR/benchmarks/results"
+CASE_TIMEOUT_SECS="${UC_NATIVE_REAL_REPO_TIMEOUT_SECS:-0}"
 declare -a STRICT_CASE_MANIFESTS=()
 declare -a STRICT_CASE_TAGS=()
 declare -a BACKEND_CASE_MANIFESTS=()
@@ -22,6 +23,7 @@ usage() {
   cat <<'USAGE'
 Usage:
   run_native_real_repo_smoke.sh [--uc-bin /abs/path/to/uc] [--results-dir /abs/path]
+    [--timeout-secs <seconds>]
     [--strict-case <manifest-path> <tag> ...]
     [--backend-case <manifest-path> <tag> <allowed-backends-csv> ...]
 USAGE
@@ -32,6 +34,15 @@ require_option_value() {
   local value="${2-}"
   if [[ -z "$value" || "$value" == -* ]]; then
     echo "Missing value for $flag" >&2
+    usage >&2
+    exit 2
+  fi
+}
+
+validate_timeout_secs() {
+  local value="$1"
+  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+    echo "Invalid timeout seconds: $value" >&2
     usage >&2
     exit 2
   fi
@@ -62,6 +73,12 @@ while [[ $# -gt 0 ]]; do
     --results-dir)
       require_option_value "$1" "${2-}"
       RESULTS_DIR="$2"
+      shift 2
+      ;;
+    --timeout-secs)
+      require_option_value "$1" "${2-}"
+      validate_timeout_secs "$2"
+      CASE_TIMEOUT_SECS="$2"
       shift 2
       ;;
     --strict-case)
@@ -133,6 +150,54 @@ prefetch_manifest_dependencies() {
   PREFETCHED_MANIFESTS["$manifest_path"]=1
 }
 
+run_uc_build_case() {
+  local log_path="$1"
+  local tag="$2"
+  shift 2
+  local uc_exit=0
+
+  set +e
+  if [[ "$CASE_TIMEOUT_SECS" -gt 0 ]]; then
+    python3 - "$CASE_TIMEOUT_SECS" "$log_path" "$@" <<'PY'
+import subprocess
+import sys
+from pathlib import Path
+
+timeout_secs = int(sys.argv[1])
+log_path = Path(sys.argv[2])
+command = sys.argv[3:]
+log_path.parent.mkdir(parents=True, exist_ok=True)
+with log_path.open("wb") as log_file:
+    try:
+        completed = subprocess.run(
+            command,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            timeout=timeout_secs,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        log_file.write(
+            f"\nuc build timed out after {timeout_secs}s: {' '.join(command)}\n".encode(
+                "utf-8"
+            )
+        )
+        raise SystemExit(124)
+raise SystemExit(completed.returncode)
+PY
+    uc_exit=$?
+  else
+    "$@" >"$log_path" 2>&1
+    uc_exit=$?
+  fi
+  set -e
+
+  if [[ $uc_exit -ne 0 ]]; then
+    echo "uc build failed for '$tag' with exit code $uc_exit (see $log_path)" >&2
+    return "$uc_exit"
+  fi
+}
+
 run_case() {
   local manifest_path="$1"
   local tag="$2"
@@ -141,13 +206,15 @@ run_case() {
   local log_path="$RESULTS_DIR/native-real-${tag}.log"
 
   prefetch_manifest_dependencies "$manifest_path"
-  "$UC_BIN" build \
+  run_uc_build_case \
+    "$log_path" \
+    "$tag" \
+    "$UC_BIN" build \
     --engine uc \
     --daemon-mode off \
     --offline \
     --manifest-path "$manifest_path" \
-    --report-path "$report_path" \
-    >"$log_path" 2>&1
+    --report-path "$report_path"
 
   uc_native_ci_verify_report "$report_path" "$tag" "$allowed_backends"
 }

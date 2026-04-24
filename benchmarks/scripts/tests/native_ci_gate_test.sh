@@ -87,6 +87,18 @@ EOF
   chmod +x "$path"
 }
 
+write_mock_sleeping_uc_bin() {
+  local path="$1"
+  cat > "$path" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+sleep 2
+exit 0
+EOF
+  chmod +x "$path"
+}
+
 test_detects_unsupported_executable_fixture_log() {
   local log_path="$TEST_TMP_DIR/executable.log"
   write_file "$log_path" \
@@ -150,6 +162,24 @@ test_verify_report_accepts_controlled_fallback_backend() {
   write_file "$report_path" '{"exit_code":0,"command":["scarb","build"]}'
 
   uc_native_ci_verify_report "$report_path" "controlled-fallback" "scarb,uc-native" >/dev/null
+}
+
+test_verify_report_rejects_non_zero_exit_code() {
+  local report_path="$TEST_TMP_DIR/non-zero-exit.json"
+  local stderr_path="$TEST_TMP_DIR/non-zero-exit.err"
+  write_file "$report_path" '{"exit_code":1,"command":["uc-native","build"]}'
+
+  if uc_native_ci_verify_report "$report_path" "non-zero-exit" "uc-native" \
+    >"$TEST_TMP_DIR/non-zero-exit.out" 2>"$stderr_path"; then
+    echo "verification should reject non-zero exit_code reports" >&2
+    return 1
+  fi
+
+  if ! grep -q "non-zero report exit code" "$stderr_path"; then
+    echo "expected non-zero exit_code rejection message" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
 }
 
 test_native_only_script_rejects_missing_uc_bin_value() {
@@ -291,12 +321,50 @@ test_native_real_repo_smoke_passes_offline_to_uc() {
   assert_contains "$(cat "$TEST_TMP_DIR/native-real-offline.scarb.args")" "cmd=fetch"
 }
 
+test_native_real_repo_smoke_times_out_with_diagnostic() {
+  local mock_uc="$TEST_TMP_DIR/mock-uc-timeout"
+  local mock_bin_dir="$TEST_TMP_DIR/mock-bin-timeout"
+  local fake_manifest_dir="$TEST_TMP_DIR/fake-timeout"
+  local stderr_path="$TEST_TMP_DIR/native-real-timeout.err"
+  mkdir -p "$mock_bin_dir"
+  mkdir -p "$fake_manifest_dir"
+  : > "$fake_manifest_dir/Scarb.toml"
+  write_mock_scarb_bin "$mock_bin_dir/scarb"
+  write_mock_sleeping_uc_bin "$mock_uc"
+
+  if PATH="$mock_bin_dir:$PATH" \
+    MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/native-real-timeout.scarb.args" \
+    MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/native-real-timeout.args" \
+    "$NATIVE_REAL_REPO_SMOKE_SCRIPT" \
+      --uc-bin "$mock_uc" \
+      --results-dir "$TEST_TMP_DIR/results-timeout" \
+      --timeout-secs 1 \
+      --backend-case "$fake_manifest_dir/Scarb.toml" timeout-case uc-native \
+      >"$TEST_TMP_DIR/native-real-timeout.out" 2>"$stderr_path"; then
+    echo "expected native real repo smoke script to time out" >&2
+    return 1
+  fi
+
+  if ! grep -q "exit code 124" "$stderr_path"; then
+    echo "expected timeout exit code in stderr" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+
+  if ! grep -q "timed out after 1s" "$TEST_TMP_DIR/results-timeout/native-real-timeout-case.log"; then
+    echo "expected timeout marker in case log" >&2
+    cat "$TEST_TMP_DIR/results-timeout/native-real-timeout-case.log" >&2
+    return 1
+  fi
+}
+
 run_test "detects unsupported executable fixture log" test_detects_unsupported_executable_fixture_log
 run_test "detects generic unsupported capability log" test_detects_generic_unsupported_capability_log
 run_test "ignores generic failure log" test_ignores_generic_failure_log
 run_test "verify report accepts uc-native backend" test_verify_report_accepts_uc_native_backend
 run_test "verify report rejects scarb fallback for native-only" test_verify_report_rejects_scarb_fallback_for_native_only
 run_test "verify report accepts controlled fallback backend" test_verify_report_accepts_controlled_fallback_backend
+run_test "verify report rejects non-zero exit_code" test_verify_report_rejects_non_zero_exit_code
 run_test "native-only script rejects missing uc-bin value" test_native_only_script_rejects_missing_uc_bin_value
 run_test "native real repo smoke rejects missing results-dir value" test_native_real_repo_smoke_rejects_missing_results_dir_value
 run_test "native real repo smoke rejects flag-shaped case operands" test_native_real_repo_smoke_rejects_flag_shaped_case_operands
@@ -304,3 +372,4 @@ run_test "native real repo smoke requires cases" test_native_real_repo_smoke_req
 run_test "native real repo smoke rejects duplicate tags" test_native_real_repo_smoke_rejects_duplicate_tags
 run_test "native real repo smoke rejects invalid tags" test_native_real_repo_smoke_rejects_invalid_tags
 run_test "native real repo smoke passes offline to uc" test_native_real_repo_smoke_passes_offline_to_uc
+run_test "native real repo smoke times out with diagnostic" test_native_real_repo_smoke_times_out_with_diagnostic

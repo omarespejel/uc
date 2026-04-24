@@ -459,7 +459,7 @@ fn daemon_build_request_payload_fields_override_hybrid_root_fields() {
 
 #[cfg(feature = "native-compile")]
 #[test]
-fn starknet_artifact_files_omits_casm_when_none() {
+fn starknet_artifact_files_serializes_null_casm_when_none() {
     let files = StarknetArtifactFiles {
         sierra: "demo.contract_class.json".to_string(),
         casm: None,
@@ -470,8 +470,8 @@ fn starknet_artifact_files_omits_casm_when_none() {
         Some("demo.contract_class.json")
     );
     assert!(
-        json.get("casm").is_none(),
-        "casm key should be omitted when not generated"
+        json.get("casm").is_some_and(serde_json::Value::is_null),
+        "casm key should be encoded as null to match scarb's manifest schema"
     );
 }
 
@@ -6163,6 +6163,17 @@ fn native_compile_session_image_restore_normalizes_workspace_absolute_tracked_so
         .expect("tracked source bytes should be computed");
     let tracked_sources_content_hash =
         native_tracked_sources_content_hash(&dir, &tracked_sources).expect("content hash");
+    let relative_tracked_sources = BTreeMap::from([(
+        "src/lib.cairo".to_string(),
+        tracked_sources
+            .values()
+            .next()
+            .cloned()
+            .expect("absolute tracked source state should exist"),
+    )]);
+    let relative_tracked_sources_content_hash =
+        native_tracked_sources_content_hash(&dir, &relative_tracked_sources)
+            .expect("relative content hash");
     let snapshot = NativeCompileSessionImageSnapshot {
         signature_hash: native_compile_session_signature_hash(&signature),
         source_root_modified_unix_ms: 123,
@@ -6176,14 +6187,21 @@ fn native_compile_session_image_restore_normalizes_workspace_absolute_tracked_so
     persist_native_compile_session_image_snapshot(&dir, &snapshot)
         .expect("native session image should persist");
 
-    let restored =
-        try_native_compile_session_image_restore(&dir, &signature, &tracked_sources_content_hash)
-            .expect("normalized tracked sources should restore");
+    let restored = try_native_compile_session_image_restore(
+        &dir,
+        &signature,
+        &relative_tracked_sources_content_hash,
+    )
+    .expect("normalized tracked sources should restore");
     assert!(
         restored.tracked_sources.contains_key("src/lib.cairo"),
         "workspace-relative key should replace persisted absolute source path"
     );
     assert_eq!(restored.tracked_sources.len(), 1);
+    assert_eq!(
+        restored.tracked_sources_content_hash, relative_tracked_sources_content_hash,
+        "restored session image should carry the caller-visible relative-key hash"
+    );
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -6296,6 +6314,17 @@ fn native_buildinfo_sidecar_restore_normalizes_workspace_absolute_tracked_source
         .expect("tracked source bytes should be computed");
     let tracked_sources_content_hash =
         native_tracked_sources_content_hash(&dir, &tracked_sources).expect("content hash");
+    let relative_tracked_sources = BTreeMap::from([(
+        "src/lib.cairo".to_string(),
+        tracked_sources
+            .values()
+            .next()
+            .cloned()
+            .expect("absolute tracked source state should exist"),
+    )]);
+    let relative_tracked_sources_content_hash =
+        native_tracked_sources_content_hash(&dir, &relative_tracked_sources)
+            .expect("relative content hash");
     let buildinfo = native_buildinfo_file_from_snapshot(
         native_compile_session_signature_hash(&signature),
         123,
@@ -6308,14 +6337,21 @@ fn native_buildinfo_sidecar_restore_normalizes_workspace_absolute_tracked_source
     );
     persist_native_buildinfo_sidecar(&dir, &buildinfo).expect("native buildinfo should persist");
 
-    let restored =
-        try_native_buildinfo_sidecar_restore(&dir, &signature, &tracked_sources_content_hash)
-            .expect("normalized tracked sources should restore from buildinfo");
+    let restored = try_native_buildinfo_sidecar_restore(
+        &dir,
+        &signature,
+        &relative_tracked_sources_content_hash,
+    )
+    .expect("normalized tracked sources should restore from buildinfo");
     assert!(
         restored.tracked_sources.contains_key("src/lib.cairo"),
         "workspace-relative key should replace persisted absolute source path"
     );
     assert_eq!(restored.tracked_sources.len(), 1);
+    assert_eq!(
+        restored.tracked_sources_content_hash, relative_tracked_sources_content_hash,
+        "restored buildinfo should carry the caller-visible relative-key hash"
+    );
 
     fs::remove_dir_all(&dir).ok();
 }
