@@ -15,6 +15,7 @@ native-compile = [
   "dep:cairo-lang-defs",
   "dep:cairo-lang-filesystem",
   "dep:cairo-lang-lowering",
+  "dep:cairo-lang-semantic",
   "dep:cairo-lang-starknet",
   "dep:cairo-lang-starknet-classes",
   "dep:notify",
@@ -29,6 +30,7 @@ cairo-lang-compiler = { workspace = true, optional = true }
 cairo-lang-defs = { workspace = true, optional = true }
 cairo-lang-filesystem = { workspace = true, optional = true }
 cairo-lang-lowering = { workspace = true, optional = true }
+cairo-lang-semantic = { workspace = true, optional = true }
 cairo-lang-starknet = { workspace = true, optional = true }
 cairo-lang-starknet-classes = { workspace = true, optional = true }
 clap.workspace = true
