@@ -75,6 +75,12 @@ if [[ "$1" == "build" ]]; then
     esac
   done
   printf 'build %s disallow=%s report=%s\n' "$manifest" "${UC_NATIVE_DISALLOW_SCARB_FALLBACK:-}" "$report_path" >> "$args_log"
+  compile_backend="uc_native"
+  diagnostics="[]"
+  if [[ "$manifest" == *"fallback-used"* ]]; then
+    compile_backend="scarb_fallback"
+    diagnostics='[{"code":"UCN2002","category":"native_fallback_local_native_error","severity":"warn","title":"Native local build downgraded to Scarb","what_happened":"native failed","why":"native failed","how_to_fix":["fix native"],"retryable":true,"fallback_used":true,"toolchain_expected":"2.16.0","toolchain_found":"2.16.0"}]'
+  fi
   if [[ -n "$report_path" ]]; then
     mkdir -p "$(dirname "$report_path")"
     cat > "$report_path" <<REPORT
@@ -93,7 +99,7 @@ if [[ "$1" == "build" ]]; then
   "fingerprint": "fp-$manifest",
   "artifact_count": 1,
   "phase_telemetry": null,
-  "compile_backend": "uc_native",
+  "compile_backend": "$compile_backend",
   "native_toolchain": {
     "requested_version": "2.16.0",
     "requested_major_minor": "2.16",
@@ -103,7 +109,7 @@ if [[ "$1" == "build" ]]; then
     "helper_path": null,
     "helper_env": null
   },
-  "diagnostics": []
+  "diagnostics": $diagnostics
 }
 REPORT
   fi
@@ -308,6 +314,30 @@ test_rejects_duplicate_class_hash_when_class_deduped() {
   fi
 }
 
+test_rejects_unknown_top_level_keys() {
+  local case_root="$TEST_TMP_DIR/unknown-key/cases"
+  local corpus_dir="$TEST_TMP_DIR/unknown-key/corpora"
+  local results_dir="$TEST_TMP_DIR/unknown-key/results"
+  mkdir -p "$corpus_dir" "$results_dir"
+  write_manifest_case "$case_root" "a"
+  local item
+  item="$(item_json a "../cases/a/Scarb.toml" "0x01" "2.14.0")"
+  write_corpus_file "$corpus_dir/corpus.json" sample class_hash "$item"
+  jq '.unexpected = true' "$corpus_dir/corpus.json" > "$corpus_dir/corpus.tmp"
+  mv "$corpus_dir/corpus.tmp" "$corpus_dir/corpus.json"
+
+  local stderr_path="$TEST_TMP_DIR/unknown-key.err"
+  if "$CORPUS_SCRIPT" --corpus "$corpus_dir/corpus.json" --results-dir "$results_dir" --plan-only >"$TEST_TMP_DIR/unknown-key.out" 2>"$stderr_path"; then
+    echo "expected unknown top-level keys to be rejected" >&2
+    return 1
+  fi
+  if ! grep -q "corpus has unsupported field(s): unexpected" "$stderr_path"; then
+    echo "expected unknown-key validation error" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+}
+
 run_corpus_benchmark() {
   local coverage="$1"
   local corpus_dir="$TEST_TMP_DIR/run-$coverage/corpora"
@@ -335,6 +365,50 @@ run_corpus_benchmark() {
     --cold-runs 1 \
     --warm-settle-seconds 0 \
     --corpus "$corpus_dir/corpus.json"
+}
+
+test_complete_corpus_with_fallback_blocks_compiled_all_claim() {
+  local corpus_dir="$TEST_TMP_DIR/fallback/corpora"
+  local case_root="$TEST_TMP_DIR/fallback/cases"
+  local results_dir="$TEST_TMP_DIR/fallback/results"
+  local mock_bin_dir="$TEST_TMP_DIR/fallback/mock-bin"
+  mkdir -p "$corpus_dir" "$case_root" "$results_dir" "$mock_bin_dir"
+  write_manifest_case "$case_root" "cairo214"
+  write_manifest_case "$case_root" "fallback-used"
+  write_mock_uc_bin "$mock_bin_dir/uc"
+  write_mock_scarb_bin "$mock_bin_dir/scarb"
+
+  local item_a item_b
+  item_a="$(item_json cairo214 "../cases/cairo214/Scarb.toml" "0x214" "2.14.0")"
+  item_b="$(item_json fallback-used "../cases/fallback-used/Scarb.toml" "0xfallback" "2.16.0")"
+  write_corpus_file "$corpus_dir/corpus.json" complete_deployed_contracts class_hash "$item_a" "$item_b"
+
+  local stdout_text
+  stdout_text="$(
+    PATH="$mock_bin_dir:$PATH" \
+    MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/fallback/uc.args" \
+    MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/fallback/scarb.args" \
+    "$CORPUS_SCRIPT" \
+      --uc-bin "$mock_bin_dir/uc" \
+      --results-dir "$results_dir" \
+      --runs 1 \
+      --cold-runs 1 \
+      --warm-settle-seconds 0 \
+      --corpus "$corpus_dir/corpus.json"
+  )"
+
+  local json_path safe reason fallback_used claim
+  json_path="$(awk -F': ' '/Corpus Benchmark JSON:/ {print $2}' <<<"$stdout_text")"
+  [[ -f "$json_path" ]] || { echo "missing corpus benchmark json: $json_path" >&2; return 1; }
+  safe="$(jq -r '.claim_guard.safe_to_say_compiled_all_deployed_contracts_in_corpus' "$json_path")"
+  reason="$(jq -r '.claim_guard.reason' "$json_path")"
+  fallback_used="$(jq -r '.summary.support_matrix.fallback_used' "$json_path")"
+  claim="$(jq -r '.claim_guard.compiled_all_claim_text // ""' "$json_path")"
+  if [[ "$safe" != "false" || "$reason" != *"fallback"* || "$fallback_used" != "1" || -n "$claim" ]]; then
+    echo "fallback-used complete corpus should not emit compiled-all launch claim" >&2
+    cat "$json_path" >&2
+    return 1
+  fi
 }
 
 test_sample_corpus_blocks_compiled_all_claim() {
@@ -388,7 +462,11 @@ run_test "rejects_duplicate_tags" \
   test_rejects_duplicate_tags
 run_test "rejects_duplicate_class_hash_when_class_deduped" \
   test_rejects_duplicate_class_hash_when_class_deduped
+run_test "rejects_unknown_top_level_keys" \
+  test_rejects_unknown_top_level_keys
 run_test "sample_corpus_blocks_compiled_all_claim" \
   test_sample_corpus_blocks_compiled_all_claim
+run_test "complete_corpus_with_fallback_blocks_compiled_all_claim" \
+  test_complete_corpus_with_fallback_blocks_compiled_all_claim
 run_test "complete_supported_corpus_emits_bounded_claim" \
   test_complete_supported_corpus_emits_bounded_claim

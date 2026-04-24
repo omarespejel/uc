@@ -191,6 +191,11 @@ def require_int(obj, key, ctx):
         fail(f"{ctx}.{key} must be a non-negative integer")
     return value
 
+def reject_unknown_keys(obj, allowed, ctx):
+    unknown = sorted(set(obj) - set(allowed))
+    if unknown:
+        fail(f"{ctx} has unsupported field(s): {', '.join(unknown)}")
+
 def version_key(version):
     parts = []
     for part in re.split(r"[._+-]", version):
@@ -201,11 +206,21 @@ def version_key(version):
     return parts
 
 doc = require_obj(json.loads(corpus_path.read_text()), "corpus")
+reject_unknown_keys(
+    doc,
+    {"schema_version", "corpus_id", "chain", "selection", "deduplication", "license_policy", "items"},
+    "corpus",
+)
 if doc.get("schema_version") != 1:
     fail("corpus.schema_version must be 1")
 corpus_id = require_str(doc, "corpus_id", "corpus")
 chain = require_str(doc, "chain", "corpus")
 selection = require_obj(doc.get("selection"), "corpus.selection")
+reject_unknown_keys(
+    selection,
+    {"source", "snapshot_id", "from_block", "to_block", "coverage", "notes"},
+    "corpus.selection",
+)
 for key in ["source", "snapshot_id"]:
     require_str(selection, key, "corpus.selection")
 from_block = require_int(selection, "from_block", "corpus.selection")
@@ -216,6 +231,7 @@ coverage = require_str(selection, "coverage", "corpus.selection")
 if coverage not in {"sample", "complete_deployed_contracts"}:
     fail("corpus.selection.coverage must be sample or complete_deployed_contracts")
 dedup = require_obj(doc.get("deduplication"), "corpus.deduplication")
+reject_unknown_keys(dedup, {"key", "input_count", "deduped_count", "rules"}, "corpus.deduplication")
 dedupe_key = require_str(dedup, "key", "corpus.deduplication")
 if dedupe_key not in {"class_hash", "source_package", "none"}:
     fail("corpus.deduplication.key must be class_hash, source_package, or none")
@@ -235,6 +251,21 @@ seen_class_hashes = set()
 normalized_items = []
 for index, item in enumerate(items):
     item = require_obj(item, f"corpus.items[{index}]")
+    reject_unknown_keys(
+        item,
+        {
+            "tag",
+            "contract_address",
+            "class_hash",
+            "source_ref",
+            "manifest_path",
+            "cairo_version",
+            "scarb_version",
+            "license",
+            "notes",
+        },
+        f"corpus.items[{index}]",
+    )
     tag = require_str(item, "tag", f"corpus.items[{index}]")
     if not tag_re.match(tag):
         fail(f"corpus.items[{index}].tag has invalid characters: {tag}")
@@ -332,15 +363,18 @@ jq -n \
   --slurpfile corpus "$NORMALIZED_CORPUS" \
   --slurpfile bench "$REAL_JSON" \
   'def counts: $bench[0].summary.support_matrix;
+   def item_count: ($corpus[0].summary.item_count // 0);
+   def failed_native_benchmarks:
+     ([ $bench[0].cases[] | select(.benchmark_status == "failed") ] | length);
    def compiled_all:
      ($corpus[0].selection.coverage == "complete_deployed_contracts")
+     and ((counts.native_supported // 0) == item_count)
+     and ((counts.fallback_used // 0) == 0)
      and ((counts.native_unsupported // 0) == 0)
      and ((counts.build_failed // 0) == 0)
-     and ([ $bench[0].cases[] | select(.benchmark_status == "failed") ] | length == 0);
+     and (failed_native_benchmarks == 0);
    def native_all:
-     compiled_all
-     and ((counts.native_supported // 0) == ($corpus[0].summary.item_count // 0))
-     and ((counts.fallback_used // 0) == 0);
+     compiled_all;
    {
      schema_version: 1,
      generated_at: $generated_at,
@@ -363,11 +397,15 @@ jq -n \
        reason: (
          if $corpus[0].selection.coverage != "complete_deployed_contracts" then
            "corpus selection coverage is sample, not complete_deployed_contracts"
+         elif (counts.fallback_used // 0) != 0 then
+           "one or more corpus items used fallback"
          elif (counts.native_unsupported // 0) != 0 then
            "one or more corpus items are native_unsupported"
          elif (counts.build_failed // 0) != 0 then
            "one or more corpus items failed during auto-build classification"
-         elif ([ $bench[0].cases[] | select(.benchmark_status == "failed") ] | length) != 0 then
+         elif (counts.native_supported // 0) != item_count then
+           "not every corpus item was native_supported"
+         elif failed_native_benchmarks != 0 then
            "one or more native-supported benchmark cases failed"
          else
            "claim is bounded to this pinned corpus artifact"
