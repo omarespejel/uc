@@ -48,7 +48,7 @@ fn allow_on_function() {
 }
 
 fn with_underscore() {
-    let _undescroe_no_warn = 4;
+    let _underscore_no_warn = 4;
 }
 
 fn allow_on_statements() {

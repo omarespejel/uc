@@ -160,6 +160,7 @@ impl<T: Database + ?Sized> SemanticGroup for T {}
 
 /// Initializes the [`SemanticGroup`] database to a proper state.
 pub fn init_semantic_group(db: &mut dyn Database) {
+    semantic_group_input(db).set_default_analyzer_plugins(db).to(Some(vec![]));
     semantic_group_input(db).set_analyzer_plugin_overrides(db).to(Some(OrderedHashMap::default()));
 }
 

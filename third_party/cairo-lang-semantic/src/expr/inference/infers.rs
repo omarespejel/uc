@@ -510,7 +510,7 @@ fn infer_concrete_trait_by_self<'r, 'db, 'mt>(
         match tmp_inference.infer_generic_args(function_generic_params, lookup_context, stable_ptr) {
             Ok(generic_args) => generic_args,
             Err(err_set) => {
-                if let Some(err) = inference.consume_error_without_reporting(err_set) {
+                if let Some(err) = tmp_inference.consume_error_without_reporting(err_set) {
                     inference_errors.push((trait_function, err));
                 }
                 return None;
@@ -522,18 +522,18 @@ fn infer_concrete_trait_by_self<'r, 'db, 'mt>(
         GenericSubstitution::new(function_generic_params, &function_generic_args);
     let substitution = trait_substitution.concat(function_substitution);
 
-    let fixed_param_ty = substitution.substitute(inference.db, first_param.ty).ok()?;
-    let (_, n_snapshots) = match inference.conform_ty_ex(self_ty, fixed_param_ty, true) {
+    let fixed_param_ty = substitution.substitute(tmp_inference.db, first_param.ty).ok()?;
+    let (_, n_snapshots) = match tmp_inference.conform_ty_ex(self_ty, fixed_param_ty, true) {
         Ok(conform) => conform,
         Err(err_set) => {
-            if let Some(err) = inference.consume_error_without_reporting(err_set) {
+            if let Some(err) = tmp_inference.consume_error_without_reporting(err_set) {
                 inference_errors.push((trait_function, err));
             }
             return None;
         }
     };
 
-    let generic_args = inference.rewrite(trait_generic_args).no_err();
+    let generic_args = tmp_inference.rewrite(trait_generic_args).no_err();
 
     Some((ConcreteTraitLongId { trait_id, generic_args }.intern(inference.db), n_snapshots))
 }

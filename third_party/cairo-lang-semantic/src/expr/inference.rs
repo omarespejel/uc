@@ -1470,7 +1470,7 @@ impl<'db, 'id> Inference<'db, 'id> {
         err_set: ErrorSet,
         report: impl FnOnce() -> DiagnosticAdded,
     ) {
-        if matches!(self.error_status, Err(InferenceErrorStatus::Pending { .. })) {
+        if matches!(self.error_status, Err(InferenceErrorStatus::Pending(_))) {
             self.consume_reported_error(err_set, report());
         }
     }

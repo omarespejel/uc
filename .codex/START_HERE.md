@@ -40,5 +40,5 @@
 - Update `docs/agent/REPO_MAP.md` with `make agent-map` when repo entrypoints change.
 - Push coherent slices to a PR instead of holding large local diffs.
 - Keep the PR in ready-for-review state; do not switch to draft unless a human explicitly asks for it.
-- After each meaningful push, run the review loop: check CodeRabbit and Qodo, fix relevant findings, and only merge after a 3-minute quiet window with no new useful bot feedback.
+- After each non-trivial push, run the review loop: check CodeRabbit and Qodo, fix relevant findings, and only merge after a 3-minute quiet window with no new useful bot feedback.
 - Treat that review loop as mandatory for every non-trivial change.

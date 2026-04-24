@@ -16,7 +16,7 @@ use cairo_lang_defs::ids::{
     TraitFunctionLongId, TraitImplId, TraitImplLongId, TraitLongId, TraitTypeId, TraitTypeLongId,
     VarId, VariantLongId,
 };
-use cairo_lang_diagnostics::{Diagnostics, Maybe};
+use cairo_lang_diagnostics::{Diagnostics, Maybe, skip_diagnostic};
 use cairo_lang_filesystem::db::FilesGroup;
 use cairo_lang_filesystem::ids::CrateId;
 use cairo_lang_syntax::node::TypedStablePtr;
@@ -69,6 +69,7 @@ pub fn load_cached_crate_modules_semantic<'db>(
     db: &'db dyn Database,
     crate_id: CrateId<'db>,
 ) -> Option<ModuleSemanticDataCacheAndLoadingData<'db>> {
+    const USIZE_BYTES: usize = std::mem::size_of::<usize>();
     let def_loading_data = db.cached_crate_modules(crate_id)?.1;
 
     let blob_id = db.crate_config(crate_id)?.cache_file?;
@@ -76,21 +77,19 @@ pub fn load_cached_crate_modules_semantic<'db>(
         return Default::default();
     };
 
-    let def_size = usize::from_be_bytes(content[..8].try_into().unwrap());
+    let def_size = usize::from_be_bytes(content.get(..USIZE_BYTES)?.try_into().ok()?);
+    let semantic_start = USIZE_BYTES.checked_add(def_size)?;
+    let semantic_size = usize::from_be_bytes(
+        content
+            .get(semantic_start..semantic_start.checked_add(USIZE_BYTES)?)?
+            .try_into()
+            .ok()?,
+    );
+    let payload_start = semantic_start.checked_add(USIZE_BYTES)?;
+    let payload_end = payload_start.checked_add(semantic_size)?;
+    let content = content.get(payload_start..payload_end)?;
 
-    let semantic_start = 8 + def_size;
-    let semantic_size =
-        usize::from_be_bytes(content[semantic_start..semantic_start + 8].try_into().unwrap());
-
-    let content = &content[semantic_start + 8..semantic_start + 8 + semantic_size];
-
-    let (module_data, semantic_lookups): SemanticCache<'_> = postcard::from_bytes(content)
-        .unwrap_or_else(|e| {
-            panic!(
-                "failed to deserialize modules cache for crate `{}`: {e}",
-                crate_id.long(db).name().long(db),
-            )
-        });
+    let (module_data, semantic_lookups): SemanticCache<'_> = postcard::from_bytes(content).ok()?;
 
     let mut ctx = SemanticCacheLoadingContext::new(db, semantic_lookups, def_loading_data);
     Some(ModuleSemanticDataCacheAndLoadingData {
@@ -1755,7 +1754,7 @@ impl GenericParamConstCached {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 struct GenericParamImplCached {
     id: GenericParamCached,
-    concrete_trait: ConcreteTraitCached,
+    concrete_trait: Option<ConcreteTraitCached>,
     type_constraints: OrderedHashMap<TraitTypeCached, TypeIdCached>,
 }
 
@@ -1766,7 +1765,10 @@ impl GenericParamImplCached {
     ) -> Self {
         Self {
             id: GenericParamCached::new(generic_param.id, &mut ctx.defs_ctx),
-            concrete_trait: ConcreteTraitCached::new(generic_param.concrete_trait.unwrap(), ctx),
+            concrete_trait: generic_param
+                .concrete_trait
+                .ok()
+                .map(|concrete_trait| ConcreteTraitCached::new(concrete_trait, ctx)),
 
             type_constraints: generic_param
                 .type_constraints
@@ -1778,7 +1780,10 @@ impl GenericParamImplCached {
     fn embed<'db>(self, ctx: &mut SemanticCacheLoadingContext<'db>) -> GenericParamImpl<'db> {
         GenericParamImpl {
             id: self.id.get_embedded(&ctx.defs_loading_data, ctx.db),
-            concrete_trait: Ok(self.concrete_trait.embed(ctx)),
+            concrete_trait: self
+                .concrete_trait
+                .map(|concrete_trait| Ok(concrete_trait.embed(ctx)))
+                .unwrap_or_else(|| Err(skip_diagnostic())),
             type_constraints: self
                 .type_constraints
                 .into_iter()

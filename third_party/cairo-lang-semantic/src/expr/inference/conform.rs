@@ -83,6 +83,7 @@ pub trait InferenceConform<'db> {
         generic_args: &[GenericArgumentId<'db>],
         var: InferenceVar,
     ) -> bool;
+    fn const_contains_var(&mut self, const_id: ConstValueId<'db>, var: InferenceVar) -> bool;
     fn impl_contains_var(&mut self, impl_id: ImplId<'db>, var: InferenceVar) -> bool;
     fn negative_impl_contains_var(
         &mut self,
@@ -507,7 +508,7 @@ impl<'db> InferenceConform<'db> for Inference<'db, '_> {
         for garg in generic_args {
             if match *garg {
                 GenericArgumentId::Type(ty) => self.internal_ty_contains_var(ty, var),
-                GenericArgumentId::Constant(_) => false,
+                GenericArgumentId::Constant(const_value) => self.const_contains_var(const_value, var),
                 GenericArgumentId::Impl(impl_id) => self.impl_contains_var(impl_id, var),
                 GenericArgumentId::NegImpl(neg_impl_id) => {
                     self.negative_impl_contains_var(neg_impl_id, var)
@@ -517,6 +518,38 @@ impl<'db> InferenceConform<'db> for Inference<'db, '_> {
             }
         }
         false
+    }
+
+    fn const_contains_var(&mut self, const_id: ConstValueId<'db>, var: InferenceVar) -> bool {
+        if let Ok(ty) = const_id.ty(self.db)
+            && self.internal_ty_contains_var(ty, var)
+        {
+            return true;
+        }
+        match const_id.long(self.db) {
+            ConstValue::Int(_, _) | ConstValue::Generic(_) | ConstValue::Missing(_) => false,
+            ConstValue::Struct(members, _) => {
+                members.iter().any(|member| self.const_contains_var(*member, var))
+            }
+            ConstValue::Enum(_, value) | ConstValue::NonZero(value) => {
+                self.const_contains_var(*value, var)
+            }
+            ConstValue::Var(new_var, _) => {
+                if InferenceVar::Const(new_var.id) == var {
+                    return true;
+                }
+                if let Some(const_value) = self.const_assignment.get(&new_var.id) {
+                    return self.const_contains_var(*const_value, var);
+                }
+                false
+            }
+            ConstValue::ImplConstant(impl_constant) => {
+                self.impl_contains_var(impl_constant.impl_id(), var)
+                    || self
+                        .reduce_impl_constant(*impl_constant)
+                        .is_ok_and(|reduced| reduced != const_id && self.const_contains_var(reduced, var))
+            }
+        }
     }
 
     /// Checks if an impl contains a certain [InferenceVar] somewhere. Used to avoid inference
@@ -814,11 +847,15 @@ impl<'db> Inference<'db, '_> {
             TypeLongId::ImplType(id) => self.impl_contains_var(id.impl_id(), var),
             TypeLongId::GenericParameter(_) | TypeLongId::Missing(_) => false,
             TypeLongId::Coupon(function_id) => self.function_contains_var(*function_id, var),
-            TypeLongId::FixedSizeArray { type_id, .. } => {
-                self.internal_ty_contains_var(*type_id, var)
+            TypeLongId::FixedSizeArray { type_id, size } => {
+                self.internal_ty_contains_var(*type_id, var) || self.const_contains_var(*size, var)
             }
             TypeLongId::Closure(closure) => {
                 closure.param_tys.iter().any(|ty| self.internal_ty_contains_var(*ty, var))
+                    || closure
+                        .captured_types
+                        .iter()
+                        .any(|ty| self.internal_ty_contains_var(*ty, var))
                     || self.internal_ty_contains_var(closure.ret_ty, var)
             }
         }

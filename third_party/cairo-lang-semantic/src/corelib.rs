@@ -493,13 +493,27 @@ pub fn unwrap_error_propagation_type<'db>(
             if let [ok_variant, err_variant] =
                 db.concrete_enum_variants(*enm).to_option()?.as_slice()
             {
-                let name = enm.enum_id(db).name(db);
-                if name.long(db) == "Option" {
+                let enum_id = enm.enum_id(db);
+                let option_enum_id = match core_option_ty(db, ok_variant.ty).long(db) {
+                    TypeLongId::Concrete(semantic::ConcreteTypeId::Enum(core_enum)) => {
+                        Some(core_enum.enum_id(db))
+                    }
+                    _ => None,
+                };
+                if option_enum_id == Some(enum_id) {
                     return Some(ErrorPropagationType::Option {
                         some_variant: *ok_variant,
                         none_variant: *err_variant,
                     });
-                } else if name.long(db) == "Result" {
+                }
+                let result_enum_id = match core_result_ty(db, ok_variant.ty, err_variant.ty).long(db)
+                {
+                    TypeLongId::Concrete(semantic::ConcreteTypeId::Enum(core_enum)) => {
+                        Some(core_enum.enum_id(db))
+                    }
+                    _ => None,
+                };
+                if result_enum_id == Some(enum_id) {
                     return Some(ErrorPropagationType::Result {
                         ok_variant: *ok_variant,
                         err_variant: *err_variant,
@@ -883,7 +897,13 @@ pub fn try_extract_nz_wrapped_type<'db>(
     let extern_ty = try_extract_matches!(concrete_ty, ConcreteTypeId::Extern)?;
     let ConcreteExternTypeLongId { extern_type_id, generic_args } = extern_ty.long(db);
     let [GenericArgumentId::Type(inner)] = generic_args[..] else { return None };
-    (extern_type_id.name(db).long(db) == "NonZero").then_some(inner)
+    let expected_extern_type_id = match core_nonzero_ty(db, inner).long(db) {
+        TypeLongId::Concrete(ConcreteTypeId::Extern(expected)) => {
+            Some(expected.long(db).extern_type_id)
+        }
+        _ => None,
+    }?;
+    (*extern_type_id == expected_extern_type_id).then_some(inner)
 }
 
 /// Returns the inner type of a `Box<T>` type, if `ty` is a `Box`.
@@ -895,7 +915,13 @@ pub fn try_extract_box_inner_type<'db>(
     let extern_ty = try_extract_matches!(concrete_ty, ConcreteTypeId::Extern)?;
     let ConcreteExternTypeLongId { extern_type_id, generic_args } = extern_ty.long(db);
     let [GenericArgumentId::Type(inner)] = generic_args[..] else { return None };
-    (extern_type_id.name(db).long(db) == "Box").then_some(inner)
+    let expected_extern_type_id = match core_box_ty(db, inner).long(db) {
+        TypeLongId::Concrete(ConcreteTypeId::Extern(expected)) => {
+            Some(expected.long(db).extern_type_id)
+        }
+        _ => None,
+    }?;
+    (*extern_type_id == expected_extern_type_id).then_some(inner)
 }
 
 /// Returns the ranges of a BoundedInt if it is a BoundedInt type.
@@ -906,7 +932,14 @@ pub fn try_extract_bounded_int_type_ranges<'db>(
     let concrete_ty = try_extract_matches!(ty.long(db), TypeLongId::Concrete)?;
     let extern_ty = try_extract_matches!(concrete_ty, ConcreteTypeId::Extern)?;
     let ConcreteExternTypeLongId { extern_type_id, generic_args } = extern_ty.long(db);
-    require(extern_type_id.name(db).long(db) == "BoundedInt")?;
+    let expected_extern_type_id = match bounded_int_ty(db, BigInt::zero(), BigInt::from(1_u8)).long(db)
+    {
+        TypeLongId::Concrete(ConcreteTypeId::Extern(expected)) => {
+            Some(expected.long(db).extern_type_id)
+        }
+        _ => None,
+    }?;
+    require(*extern_type_id == expected_extern_type_id)?;
     let [GenericArgumentId::Constant(min), GenericArgumentId::Constant(max)] = generic_args[..]
     else {
         return None;

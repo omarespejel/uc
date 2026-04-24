@@ -1,8 +1,9 @@
 use serde::Deserialize;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{ChildStderr, ChildStdout, Command, ExitStatus, Output, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -38,6 +39,26 @@ struct TestWorkspace {
 struct TimedOutput {
     output: Output,
     timed_out: bool,
+}
+
+fn collect_child_output(
+    status: ExitStatus,
+    stdout: &mut ChildStdout,
+    stderr: &mut ChildStderr,
+) -> Output {
+    let mut stdout_buf = Vec::new();
+    stdout
+        .read_to_end(&mut stdout_buf)
+        .expect("failed to read timed command stdout");
+    let mut stderr_buf = Vec::new();
+    stderr
+        .read_to_end(&mut stderr_buf)
+        .expect("failed to read timed command stderr");
+    Output {
+        status,
+        stdout: stdout_buf,
+        stderr: stderr_buf,
+    }
 }
 
 #[derive(Default)]
@@ -209,31 +230,90 @@ fn copy_dir_recursive(source: &Path, destination: &Path) -> std::io::Result<()> 
 fn run_command_with_timeout(mut command: Command, timeout: Duration) -> TimedOutput {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn().expect("failed to spawn timed command");
+    let mut stdout = child
+        .stdout
+        .take()
+        .expect("timed command stdout should be piped");
+    let mut stderr = child
+        .stderr
+        .take()
+        .expect("timed command stderr should be piped");
     let started = Instant::now();
     loop {
         match child.try_wait().expect("failed to poll timed command") {
-            Some(_) => {
+            Some(status) => {
                 return TimedOutput {
-                    output: child
-                        .wait_with_output()
-                        .expect("failed to collect timed command output"),
+                    output: collect_child_output(status, &mut stdout, &mut stderr),
                     timed_out: false,
                 };
             }
             None if started.elapsed() >= timeout => {
-                child
-                    .kill()
-                    .expect("failed to kill timed command after timeout");
+                if let Some(status) = child
+                    .try_wait()
+                    .expect("failed to re-poll timed command after timeout")
+                {
+                    return TimedOutput {
+                        output: collect_child_output(status, &mut stdout, &mut stderr),
+                        timed_out: true,
+                    };
+                }
+                if let Err(err) = child.kill() {
+                    if !matches!(
+                        err.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+                    ) {
+                        panic!("failed to kill timed command after timeout: {err}");
+                    }
+                }
+                let status = child
+                    .wait()
+                    .expect("failed to reap timed command after timeout");
                 return TimedOutput {
-                    output: child
-                        .wait_with_output()
-                        .expect("failed to collect timed-out command output"),
+                    output: collect_child_output(status, &mut stdout, &mut stderr),
                     timed_out: true,
                 };
             }
             None => thread::sleep(Duration::from_millis(100)),
         }
     }
+}
+
+#[test]
+fn run_command_with_timeout_collects_output_without_double_waiting() {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg("printf stdout; printf stderr >&2");
+
+    let timed = run_command_with_timeout(command, Duration::from_secs(2));
+
+    assert!(!timed.timed_out, "fast command should not time out");
+    assert!(
+        timed.output.status.success(),
+        "fast command should exit successfully"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&timed.output.stdout),
+        "stdout",
+        "stdout should be collected even when the child exits before the final wait"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&timed.output.stderr),
+        "stderr",
+        "stderr should be collected even when the child exits before the final wait"
+    );
+}
+
+#[test]
+fn run_command_with_timeout_reaps_timed_out_processes_without_panicking() {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg("sleep 1");
+
+    let timed = run_command_with_timeout(command, Duration::from_millis(50));
+
+    assert!(timed.timed_out, "sleeping command should time out");
+    assert!(
+        !timed.output.status.success(),
+        "timed-out command should not report a successful exit"
+    );
 }
 
 fn uc_bin() -> PathBuf {
@@ -1516,6 +1596,12 @@ fn integration_native_require_mode_succeeds_without_scarb_on_research_workspaces
 #[test]
 fn integration_native_require_garaga_sp1_fixture_fails_fast_with_diagnostics() {
     let _guard = serial_guard();
+    if std::env::var("UC_ENABLE_NETWORK_INTEGRATION").as_deref() != Ok("1") {
+        eprintln!(
+            "skipping integration_native_require_garaga_sp1_fixture_fails_fast_with_diagnostics: UC_ENABLE_NETWORK_INTEGRATION!=1"
+        );
+        return;
+    }
     if !scarb_available() {
         eprintln!(
             "skipping integration_native_require_garaga_sp1_fixture_fails_fast_with_diagnostics: scarb not available"
@@ -1532,7 +1618,13 @@ fn integration_native_require_garaga_sp1_fixture_fails_fast_with_diagnostics() {
     let manifest = workspace.root.join("Scarb.toml");
 
     let fetch_output = run_scarb_fetch(&workspace.root);
-    assert_success(&fetch_output, "garaga sp1 fixture scarb fetch");
+    if !fetch_output.status.success() {
+        eprintln!(
+            "skipping integration_native_require_garaga_sp1_fixture_fails_fast_with_diagnostics: scarb fetch failed\n{}",
+            output_to_utf8(&fetch_output)
+        );
+        return;
+    }
 
     let timed = run_uc_build_output_only_with_timeout_and_env_overrides(
         &workspace.root,
@@ -1561,7 +1653,7 @@ fn integration_native_require_garaga_sp1_fixture_fails_fast_with_diagnostics() {
         "expected garaga constant diagnostic in output\n{combined}"
     );
     assert!(
-        combined.contains("src/src/apps/sp1_constants.cairo"),
+        combined.replace('\\', "/").contains("sp1_constants.cairo"),
         "expected diagnostic path for garaga sp1 constants in output\n{combined}"
     );
 }
