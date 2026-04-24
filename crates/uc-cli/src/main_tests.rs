@@ -1696,7 +1696,7 @@ fn parse_cairo_version_major_minor_handles_common_formats() {
 
 #[cfg(feature = "native-compile")]
 #[test]
-fn ensure_native_manifest_cairo_version_supported_accepts_older_minor_and_rejects_incompatible() {
+fn ensure_native_manifest_cairo_version_supported_requires_matching_major_minor() {
     let (compiler_major, compiler_minor) =
         parse_cairo_version_major_minor(native_cairo_lang_compiler_version())
             .expect("compiler version should parse");
@@ -1724,8 +1724,16 @@ cairo-version = "{compiler_major}.{}.0"
             compiler_minor - 1
         ))
         .expect("older-minor manifest should parse");
-        ensure_native_manifest_cairo_version_supported(&older_minor_manifest)
-            .expect("same-major older-minor cairo-version should be accepted");
+        let err = ensure_native_manifest_cairo_version_supported(&older_minor_manifest)
+            .expect_err("older minor cairo-version should be rejected");
+        assert!(
+            format!("{err:#}").contains("requires the same cairo major.minor"),
+            "error should explain that native compile requires the same major.minor"
+        );
+        assert!(
+            native_error_allows_scarb_fallback(&err),
+            "older minor cairo-version mismatch should allow scarb fallback"
+        );
     }
 
     let incompatible_manifest: TomlValue = toml::from_str(&format!(
@@ -1764,6 +1772,35 @@ cairo-version = "{}.{compiler_minor}.0"
     assert!(
         native_error_allows_scarb_fallback(&major_err),
         "major cairo-version mismatch should allow scarb fallback"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn ensure_native_manifest_cairo_version_supported_rejects_unparseable_compiler_version() {
+    let manifest: TomlValue = toml::from_str(
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+cairo-version = "2.14.0"
+"#,
+    )
+    .expect("manifest should parse");
+
+    let err = ensure_native_manifest_cairo_version_supported_with_compiler(
+        &manifest,
+        "lockhash-deadbeefdeadbeefdeadbeefdeadbeef",
+    )
+    .expect_err("unparseable native compiler version should be rejected");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("unknown or unparseable"),
+        "error should explain that the native compiler version could not be parsed"
+    );
+    assert!(
+        native_error_allows_scarb_fallback(&err),
+        "unparseable native compiler version should allow scarb fallback"
     );
 }
 
