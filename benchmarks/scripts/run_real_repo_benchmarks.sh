@@ -344,8 +344,7 @@ run_cold_stats() {
   done
   local stats_json
   if ! stats_json="$(stats_json_from_samples "$samples_file")"; then
-    local exit_code=$?
-    measurement_failure_json "$stage" "$exit_code" "$samples_file"
+    measurement_failure_json "$stage" "-1" "$samples_file"
     return 0
   fi
   measurement_ok_json "$stage" "$sample_count" "$stats_json"
@@ -390,8 +389,7 @@ run_warm_noop_stats() {
   done
   local stats_json
   if ! stats_json="$(stats_json_from_samples "$samples_file")"; then
-    local exit_code=$?
-    measurement_failure_json "$stage" "$exit_code" "$samples_file"
+    measurement_failure_json "$stage" "-1" "$samples_file"
     return 0
   fi
   measurement_ok_json "$stage" "$sample_count" "$stats_json"
