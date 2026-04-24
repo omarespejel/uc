@@ -36,10 +36,9 @@ run_test() {
 
 write_file() {
   local path="$1"
-  shift
-  cat > "$path" <<EOF
-$*
-EOF
+  local content="${2-}"
+  # This helper intentionally writes a single multi-line string payload.
+  printf '%s\n' "$content" > "$path"
 }
 
 write_mock_uc_bin() {
@@ -181,6 +180,27 @@ test_native_real_repo_smoke_rejects_missing_results_dir_value() {
   fi
 }
 
+test_native_real_repo_smoke_rejects_flag_shaped_case_operands() {
+  local mock_uc="$TEST_TMP_DIR/mock-uc-flag-operands"
+  write_mock_uc_bin "$mock_uc"
+  local stderr_path="$TEST_TMP_DIR/native-real-flag-operands.err"
+  if MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/native-real-flag-operands.args" \
+    "$NATIVE_REAL_REPO_SMOKE_SCRIPT" \
+      --uc-bin "$mock_uc" \
+      --results-dir "$TEST_TMP_DIR/results-flag-operands" \
+      --strict-case --backend-case fake-tag \
+      >"$TEST_TMP_DIR/native-real-flag-operands.out" 2>"$stderr_path"; then
+    echo "expected native real repo smoke script to reject flag-shaped case operands" >&2
+    return 1
+  fi
+
+  if ! grep -q "Missing value for --strict-case manifest-path" "$stderr_path"; then
+    echo "expected strict-case manifest-path validation error" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+}
+
 test_native_real_repo_smoke_requires_cases() {
   local mock_uc="$TEST_TMP_DIR/mock-uc-no-cases"
   write_mock_uc_bin "$mock_uc"
@@ -196,6 +216,49 @@ test_native_real_repo_smoke_requires_cases() {
 
   if ! grep -q "requires at least one --strict-case or --backend-case" "$stderr_path"; then
     echo "expected empty case configuration error" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+}
+
+test_native_real_repo_smoke_rejects_duplicate_tags() {
+  local mock_uc="$TEST_TMP_DIR/mock-uc-duplicate-tags"
+  write_mock_uc_bin "$mock_uc"
+  local stderr_path="$TEST_TMP_DIR/native-real-duplicate-tags.err"
+  if MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/native-real-duplicate-tags.args" \
+    "$NATIVE_REAL_REPO_SMOKE_SCRIPT" \
+      --uc-bin "$mock_uc" \
+      --results-dir "$TEST_TMP_DIR/results-duplicate-tags" \
+      --strict-case "$TEST_TMP_DIR/a/Scarb.toml" same-tag \
+      --backend-case "$TEST_TMP_DIR/b/Scarb.toml" same-tag uc-native \
+      >"$TEST_TMP_DIR/native-real-duplicate-tags.out" 2>"$stderr_path"; then
+    echo "expected native real repo smoke script to reject duplicate tags" >&2
+    return 1
+  fi
+
+  if ! grep -q "Duplicate case tag: same-tag" "$stderr_path"; then
+    echo "expected duplicate tag error" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+}
+
+test_native_real_repo_smoke_rejects_invalid_tags() {
+  local mock_uc="$TEST_TMP_DIR/mock-uc-invalid-tags"
+  write_mock_uc_bin "$mock_uc"
+  local stderr_path="$TEST_TMP_DIR/native-real-invalid-tags.err"
+  if MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/native-real-invalid-tags.args" \
+    "$NATIVE_REAL_REPO_SMOKE_SCRIPT" \
+      --uc-bin "$mock_uc" \
+      --results-dir "$TEST_TMP_DIR/results-invalid-tags" \
+      --strict-case "$TEST_TMP_DIR/a/Scarb.toml" ../escape \
+      >"$TEST_TMP_DIR/native-real-invalid-tags.out" 2>"$stderr_path"; then
+    echo "expected native real repo smoke script to reject invalid tags" >&2
+    return 1
+  fi
+
+  if ! grep -q "Invalid case tag: ../escape" "$stderr_path"; then
+    echo "expected invalid tag error" >&2
     cat "$stderr_path" >&2
     return 1
   fi
@@ -236,5 +299,8 @@ run_test "verify report rejects scarb fallback for native-only" test_verify_repo
 run_test "verify report accepts controlled fallback backend" test_verify_report_accepts_controlled_fallback_backend
 run_test "native-only script rejects missing uc-bin value" test_native_only_script_rejects_missing_uc_bin_value
 run_test "native real repo smoke rejects missing results-dir value" test_native_real_repo_smoke_rejects_missing_results_dir_value
+run_test "native real repo smoke rejects flag-shaped case operands" test_native_real_repo_smoke_rejects_flag_shaped_case_operands
 run_test "native real repo smoke requires cases" test_native_real_repo_smoke_requires_cases
+run_test "native real repo smoke rejects duplicate tags" test_native_real_repo_smoke_rejects_duplicate_tags
+run_test "native real repo smoke rejects invalid tags" test_native_real_repo_smoke_rejects_invalid_tags
 run_test "native real repo smoke passes offline to uc" test_native_real_repo_smoke_passes_offline_to_uc

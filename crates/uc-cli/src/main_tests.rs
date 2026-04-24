@@ -6469,16 +6469,18 @@ fn native_seeded_root_database_returns_writable_db() {
 
     let mut db =
         native_seeded_root_database(&corelib_src).expect("root database should initialize");
+    let baseline_len = db.crate_configs().len();
+    let demo_input = CrateInput::Real {
+        name: "demo".into(),
+        discriminator: Some("demo".into()),
+    };
     let db_ref: &dyn salsa::Database = &db;
     let mut crate_configs = files_group_input(db_ref)
         .crate_configs(db_ref)
         .clone()
         .unwrap_or_default();
     crate_configs.insert(
-        CrateInput::Real {
-            name: "demo".into(),
-            discriminator: Some("demo".into()),
-        },
+        demo_input.clone(),
         CrateConfigurationInput {
             root: cairo_lang_filesystem::ids::DirectoryInput::Real(dir.join("src")),
             settings: Default::default(),
@@ -6487,7 +6489,7 @@ fn native_seeded_root_database_returns_writable_db() {
     );
 
     set_crate_configs_input(&mut db, crate_configs);
-    assert_eq!(db.crate_configs().len(), 2);
+    assert_eq!(db.crate_configs().len(), baseline_len + 1);
 
     fs::remove_dir_all(&dir).ok();
 }

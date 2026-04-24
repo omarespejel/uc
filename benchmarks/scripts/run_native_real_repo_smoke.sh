@@ -16,6 +16,7 @@ declare -a BACKEND_CASE_MANIFESTS=()
 declare -a BACKEND_CASE_TAGS=()
 declare -a BACKEND_CASE_ALLOWED=()
 declare -A PREFETCHED_MANIFESTS=()
+declare -A SEEN_TAGS=()
 
 usage() {
   cat <<'USAGE'
@@ -29,11 +30,26 @@ USAGE
 require_option_value() {
   local flag="$1"
   local value="${2-}"
-  if [[ -z "$value" || "$value" == --* ]]; then
+  if [[ -z "$value" || "$value" == -* ]]; then
     echo "Missing value for $flag" >&2
     usage >&2
     exit 2
   fi
+}
+
+validate_case_tag() {
+  local tag="$1"
+  if [[ ! "$tag" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "Invalid case tag: $tag" >&2
+    usage >&2
+    exit 2
+  fi
+  if [[ -n "${SEEN_TAGS[$tag]:-}" ]]; then
+    echo "Duplicate case tag: $tag" >&2
+    usage >&2
+    exit 2
+  fi
+  SEEN_TAGS["$tag"]=1
 }
 
 while [[ $# -gt 0 ]]; do
@@ -53,6 +69,9 @@ while [[ $# -gt 0 ]]; do
         usage >&2
         exit 2
       fi
+      require_option_value "--strict-case manifest-path" "${2-}"
+      require_option_value "--strict-case tag" "${3-}"
+      validate_case_tag "$3"
       STRICT_CASE_MANIFESTS+=("$2")
       STRICT_CASE_TAGS+=("$3")
       shift 3
@@ -62,6 +81,10 @@ while [[ $# -gt 0 ]]; do
         usage >&2
         exit 2
       fi
+      require_option_value "--backend-case manifest-path" "${2-}"
+      require_option_value "--backend-case tag" "${3-}"
+      require_option_value "--backend-case allowed-backends-csv" "${4-}"
+      validate_case_tag "$3"
       BACKEND_CASE_MANIFESTS+=("$2")
       BACKEND_CASE_TAGS+=("$3")
       BACKEND_CASE_ALLOWED+=("$4")
