@@ -70,6 +70,22 @@ Stability runs default to `--host-preflight require` and fail fast if noisy host
 These checked-in scripts back the GitHub Actions native-only and real-repo smoke gates.
 Keep CI gate logic in scripts instead of workflow heredocs so it stays testable and reviewable.
 
+## Benchmark Real Repos With Eligibility Split
+```bash
+./benchmarks/scripts/run_real_repo_benchmarks.sh \
+  --uc-bin ./target/release/uc \
+  --results-dir benchmarks/results \
+  --runs 5 \
+  --cold-runs 5 \
+  --case /abs/path/to/repo-a/Scarb.toml repo-a \
+  --case /abs/path/to/repo-b/Scarb.toml repo-b
+```
+
+This local-only harness uses `uc support native --format json` to classify each
+manifest before any timed run. Native-eligible cases are benchmarked against
+Scarb on `build.cold` and `build.warm_noop`; native-ineligible cases are listed
+separately with the exact unsupported reason and are excluded from speedup claims.
+
 ## Fast Iteration Loop (Developer Lane)
 ```bash
 ./benchmarks/scripts/run_fast_perf_check.sh

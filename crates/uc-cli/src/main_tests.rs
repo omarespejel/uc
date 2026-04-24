@@ -1804,6 +1804,66 @@ cairo-version = "2.14.0"
     );
 }
 
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_support_report_from_manifest_path_marks_supported_and_unsupported_manifests() {
+    let dir = unique_test_dir("uc-native-support-report");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let manifest_path = dir.join("Scarb.toml");
+    let (compiler_major, compiler_minor) =
+        parse_cairo_version_major_minor(native_cairo_lang_compiler_version())
+            .expect("compiler version should parse");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+cairo-version = "{compiler_major}.{compiler_minor}.0"
+"#
+        ),
+    )
+    .expect("write supported manifest");
+
+    let supported_report = native_support_report_from_manifest_path(&manifest_path)
+        .expect("supported manifest should probe successfully");
+    assert_eq!(supported_report.status, NativeSupportStatus::Supported);
+    assert!(supported_report.supported);
+    assert!(supported_report.reason.is_none());
+
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+cairo-version = "{compiler_major}.{}.0"
+"#,
+            compiler_minor.saturating_add(1)
+        ),
+    )
+    .expect("write unsupported manifest");
+
+    let unsupported_report = native_support_report_from_manifest_path(&manifest_path)
+        .expect("unsupported manifest should still produce a report");
+    assert_eq!(unsupported_report.status, NativeSupportStatus::Unsupported);
+    assert!(!unsupported_report.supported);
+    assert_eq!(
+        unsupported_report.issue_kind.as_deref(),
+        Some("compiler_version_mismatch")
+    );
+    assert!(
+        unsupported_report
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("requires the same cairo major.minor"),
+        "unsupported report should explain the version mismatch"
+    );
+}
+
 #[test]
 fn daemon_build_plan_cache_key_is_order_independent_for_features() {
     let common_a = BuildCommonArgs {

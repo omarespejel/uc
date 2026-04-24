@@ -24,6 +24,12 @@ Measure and prove that `uc` outperforms Scarb on real workflows while maintainin
 ## Baseline Rule
 Before changing `uc` engine behavior, rerun baseline against current Scarb and snapshot results.
 
+## Eligibility Rule
+Do not mix native-ineligible manifests into `uc` vs Scarb speedup claims.
+Benchmark reports must separate:
+- native-eligible workloads that were actually measured against `uc` native build
+- native-ineligible workloads that were skipped, along with the exact reason
+
 ## Comparator Rule
 Every build-path engine change must run dual-run comparison (`scarb-direct` vs `uc build`) and record:
 - artifact mismatch count,
