@@ -184,6 +184,13 @@ def optional_str(obj, key, ctx):
         fail(f"{ctx}.{key} must be a string")
 
 
+def optional_non_empty_str(obj, key, ctx):
+    if key in obj:
+        value = obj.get(key)
+        if not isinstance(value, str) or not value:
+            fail(f"{ctx}.{key} must be a non-empty string")
+
+
 def require_int(obj, key, ctx):
     value = obj.get(key)
     if type(value) is not int or value < 0:
@@ -267,13 +274,15 @@ for index, raw_record in enumerate(records):
     seen_tags.add(tag)
 
     class_hash = require_str(record, "class_hash", f"inventory.records[{index}]")
-    source_kind = require_str(record, "source_kind", f"inventory.records[{index}]")
+    source_kind = record.get("source_kind", "deployed_contract")
+    if not isinstance(source_kind, str) or not source_kind:
+        fail(f"inventory.records[{index}].source_kind must be deployed_contract or declared_class")
     if source_kind not in {"deployed_contract", "declared_class"}:
         fail(f"inventory.records[{index}].source_kind must be deployed_contract or declared_class")
     if source_kind == "deployed_contract":
         require_str(record, "contract_address", f"inventory.records[{index}]")
     else:
-        optional_str(record, "contract_address", f"inventory.records[{index}]")
+        optional_non_empty_str(record, "contract_address", f"inventory.records[{index}]")
     manifest_raw = require_str(record, "manifest_path", f"inventory.records[{index}]")
     manifest_path = resolve_manifest_path(manifest_raw, tag)
     source_package_id = record.get("source_package_id")

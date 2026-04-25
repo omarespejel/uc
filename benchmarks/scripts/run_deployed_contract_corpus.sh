@@ -189,6 +189,12 @@ def optional_str(obj, key, ctx):
     if key in obj and not isinstance(obj.get(key), str):
         fail(f"{ctx}.{key} must be a string")
 
+def optional_non_empty_str(obj, key, ctx):
+    if key in obj:
+        value = obj.get(key)
+        if not isinstance(value, str) or not value:
+            fail(f"{ctx}.{key} must be a non-empty string")
+
 def require_int(obj, key, ctx):
     value = obj.get(key)
     if type(value) is not int or value < 0:
@@ -281,13 +287,15 @@ for index, item in enumerate(items):
         fail(f"duplicate corpus item tag: {tag}")
     seen_tags.add(tag)
     class_hash = require_str(item, "class_hash", f"corpus.items[{index}]")
-    source_kind = require_str(item, "source_kind", f"corpus.items[{index}]")
+    source_kind = item.get("source_kind", "deployed_contract")
+    if not isinstance(source_kind, str) or not source_kind:
+        fail(f"corpus.items[{index}].source_kind must be deployed_contract or declared_class")
     if source_kind not in {"deployed_contract", "declared_class"}:
         fail(f"corpus.items[{index}].source_kind must be deployed_contract or declared_class")
     if source_kind == "deployed_contract":
         require_str(item, "contract_address", f"corpus.items[{index}]")
     else:
-        optional_str(item, "contract_address", f"corpus.items[{index}]")
+        optional_non_empty_str(item, "contract_address", f"corpus.items[{index}]")
     if dedupe_key == "class_hash":
         if class_hash in seen_class_hashes:
             fail(f"duplicate class_hash in class_hash-deduped corpus: {class_hash}")

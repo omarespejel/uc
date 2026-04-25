@@ -280,6 +280,38 @@ test_generates_declared_class_without_contract_address() {
   fi
 }
 
+test_rejects_empty_declared_class_contract_address() {
+  local index_dir="$TEST_TMP_DIR/declared-class-empty/index"
+  local case_root="$index_dir/cases"
+  mkdir -p "$index_dir"
+  write_manifest_case "$case_root" "a"
+  local item
+  item="$(source_item_json class_only "cases/a/Scarb.toml" "0xclass" "2.14.0")"
+  item="$(jq '.source_kind = "declared_class" | .contract_address = ""' <<<"$item")"
+  write_source_index_file "$index_dir/source-index.json" sample class_hash "$item"
+  expect_generator_failure "$index_dir/source-index.json" "source_index.items[0].contract_address must be a non-empty string"
+}
+
+test_normalizes_legacy_missing_source_kind_as_deployed_contract() {
+  local index_dir="$TEST_TMP_DIR/legacy-source-kind/index"
+  local case_root="$index_dir/cases"
+  local out_dir="$TEST_TMP_DIR/legacy-source-kind/out"
+  mkdir -p "$index_dir" "$out_dir"
+  write_manifest_case "$case_root" "a"
+  local item stdout_text corpus_path
+  item="$(source_item_json legacy "cases/a/Scarb.toml" "0xlegacy" "2.14.0")"
+  item="$(jq 'del(.source_kind)' <<<"$item")"
+  write_source_index_file "$index_dir/source-index.json" sample class_hash "$item"
+
+  stdout_text="$("$GENERATOR_SCRIPT" --source-index "$index_dir/source-index.json" --out "$out_dir/corpus.json")"
+  corpus_path="$(extract_labeled_path "Corpus JSON" <<<"$stdout_text")"
+  if [[ "$(jq -r '.items[0].source_kind' "$corpus_path")" != "deployed_contract" ]]; then
+    echo "legacy missing source_kind should normalize to deployed_contract" >&2
+    cat "$corpus_path" >&2
+    return 1
+  fi
+}
+
 test_rejects_missing_manifest_path() {
   local index_dir="$TEST_TMP_DIR/missing-manifest/index"
   mkdir -p "$index_dir"
@@ -423,6 +455,10 @@ run_test "rejects_duplicate_class_hash_when_class_deduped" \
   test_rejects_duplicate_class_hash_when_class_deduped
 run_test "generates_declared_class_without_contract_address" \
   test_generates_declared_class_without_contract_address
+run_test "rejects_empty_declared_class_contract_address" \
+  test_rejects_empty_declared_class_contract_address
+run_test "normalizes_legacy_missing_source_kind_as_deployed_contract" \
+  test_normalizes_legacy_missing_source_kind_as_deployed_contract
 run_test "rejects_missing_manifest_path" \
   test_rejects_missing_manifest_path
 run_test "rejects_absolute_manifest_path" \

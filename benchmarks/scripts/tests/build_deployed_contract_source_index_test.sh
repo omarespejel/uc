@@ -266,6 +266,37 @@ test_accepts_declared_class_without_contract_address() {
   fi
 }
 
+test_rejects_empty_declared_class_contract_address() {
+  local inventory_dir="$TEST_TMP_DIR/declared-class-empty/inventory"
+  local case_root="$inventory_dir/cases"
+  mkdir -p "$inventory_dir"
+  write_manifest_case "$case_root" "a"
+  local record
+  record="$(inventory_record_json class_only "cases/a/Scarb.toml" "0xclass" "2.14.0")"
+  write_inventory_file "$inventory_dir/inventory.json" sample class_hash "$record"
+  mutate_inventory "$inventory_dir/inventory.json" '.records[0].source_kind = "declared_class" | .records[0].contract_address = ""'
+  expect_builder_failure "$inventory_dir/inventory.json" "inventory.records[0].contract_address must be a non-empty string"
+}
+
+test_normalizes_legacy_missing_source_kind_as_deployed_contract() {
+  local inventory_dir="$TEST_TMP_DIR/legacy-source-kind/inventory"
+  local case_root="$inventory_dir/cases"
+  mkdir -p "$inventory_dir"
+  write_manifest_case "$case_root" "a"
+  local record source_index_path stdout_text
+  record="$(inventory_record_json legacy "cases/a/Scarb.toml" "0xlegacy" "2.14.0")"
+  write_inventory_file "$inventory_dir/inventory.json" sample class_hash "$record"
+  mutate_inventory "$inventory_dir/inventory.json" 'del(.records[0].source_kind)'
+
+  stdout_text="$("$BUILDER_SCRIPT" --inventory "$inventory_dir/inventory.json" --out "$inventory_dir/source-index.json")"
+  source_index_path="$(extract_labeled_path "Source index JSON" <<<"$stdout_text")"
+  if [[ "$(jq -r '.items[0].source_kind' "$source_index_path")" != "deployed_contract" ]]; then
+    echo "legacy missing source_kind should normalize to deployed_contract" >&2
+    cat "$source_index_path" >&2
+    return 1
+  fi
+}
+
 test_rejects_outside_output_directory() {
   local inventory_dir="$TEST_TMP_DIR/outside-out/inventory"
   local case_root="$inventory_dir/cases"
@@ -316,6 +347,8 @@ run_test "rejects manifest path traversal" test_rejects_manifest_path_traversal
 run_test "rejects source_package dedupe without id" test_rejects_source_package_dedupe_without_id
 run_test "rejects null source_package_id when present" test_rejects_null_source_package_id_when_present
 run_test "accepts declared_class without contract_address" test_accepts_declared_class_without_contract_address
+run_test "rejects empty declared_class contract_address" test_rejects_empty_declared_class_contract_address
+run_test "normalizes legacy missing source_kind as deployed_contract" test_normalizes_legacy_missing_source_kind_as_deployed_contract
 run_test "rejects outside output directory" test_rejects_outside_output_directory
 run_test "rejects inventory output overwrite aliases" test_rejects_inventory_output_overwrite_aliases
 

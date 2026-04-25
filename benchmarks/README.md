@@ -174,6 +174,9 @@ a combined JSON/Markdown artifact with:
   - `deployed_contract` rows must include `contract_address`
   - `declared_class` rows benchmark class source evidence but do not count as
     deployed-contract coverage
+  - legacy rows without `source_kind` are read as `deployed_contract` for
+    backward compatibility, but new reviewed inventories should set it
+    explicitly
 - deduplication and source/license policy metadata,
 - Cairo version min/max across the corpus,
 - a support matrix for `native_supported`, `native_unsupported`,

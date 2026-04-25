@@ -58,13 +58,17 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["tag", "source_kind", "class_hash", "source_ref", "manifest_path", "cairo_version"],
+        "required": ["tag", "class_hash", "source_ref", "manifest_path", "cairo_version"],
         "allOf": [
           {
             "if": {
               "properties": { "source_kind": { "const": "deployed_contract" } },
               "required": ["source_kind"]
             },
+            "then": { "required": ["contract_address"] }
+          },
+          {
+            "if": { "not": { "required": ["source_kind"] } },
             "then": { "required": ["contract_address"] }
           }
         ],

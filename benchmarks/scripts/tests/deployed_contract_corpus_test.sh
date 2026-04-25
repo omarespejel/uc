@@ -660,6 +660,48 @@ test_complete_corpus_with_declared_class_blocks_deployed_claim() {
   assert_contains "$markdown_text" "| class-only | declared_class | declared-class:0xclass |"
 }
 
+test_rejects_empty_declared_class_contract_address() {
+  local case_root="$TEST_TMP_DIR/declared-class-empty/cases"
+  local corpus_dir="$TEST_TMP_DIR/declared-class-empty/corpora"
+  local results_dir="$TEST_TMP_DIR/declared-class-empty/results"
+  mkdir -p "$corpus_dir" "$results_dir"
+  write_manifest_case "$case_root" "class-only"
+  local item stderr_path
+  item="$(item_json class-only "../cases/class-only/Scarb.toml" "0xclass" "2.14.0")"
+  item="$(jq '.source_kind = "declared_class" | .contract_address = ""' <<<"$item")"
+  write_corpus_file "$corpus_dir/corpus.json" sample class_hash "$item"
+  stderr_path="$TEST_TMP_DIR/declared-class-empty.err"
+  if "$CORPUS_SCRIPT" --corpus "$corpus_dir/corpus.json" --results-dir "$results_dir" --plan-only >"$TEST_TMP_DIR/declared-class-empty.out" 2>"$stderr_path"; then
+    echo "expected declared_class empty contract_address to be rejected" >&2
+    return 1
+  fi
+  if ! grep -Fq "corpus.items[0].contract_address must be a non-empty string" "$stderr_path"; then
+    echo "expected empty contract_address validation error" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+}
+
+test_normalizes_legacy_missing_source_kind_as_deployed_contract() {
+  local case_root="$TEST_TMP_DIR/legacy-source-kind/cases"
+  local corpus_dir="$TEST_TMP_DIR/legacy-source-kind/corpora"
+  local results_dir="$TEST_TMP_DIR/legacy-source-kind/results"
+  mkdir -p "$corpus_dir" "$results_dir"
+  write_manifest_case "$case_root" "legacy"
+  local item stdout_text json_path
+  item="$(item_json legacy "../cases/legacy/Scarb.toml" "0xlegacy" "2.14.0")"
+  item="$(jq 'del(.source_kind)' <<<"$item")"
+  write_corpus_file "$corpus_dir/corpus.json" sample class_hash "$item"
+
+  stdout_text="$("$CORPUS_SCRIPT" --corpus "$corpus_dir/corpus.json" --results-dir "$results_dir" --plan-only)"
+  json_path="$(extract_labeled_path "Corpus plan JSON" <<<"$stdout_text")"
+  if [[ "$(jq -r '.corpus.items[0].source_kind' "$json_path")" != "deployed_contract" || "$(jq -r '.corpus.summary.source_kind_counts.deployed_contract' "$json_path")" != "1" ]]; then
+    echo "legacy missing source_kind should normalize to deployed_contract" >&2
+    cat "$json_path" >&2
+    return 1
+  fi
+}
+
 run_test "plan_only_normalizes_sample_corpus" \
   test_plan_only_normalizes_sample_corpus
 run_test "rejects_duplicate_tags" \
@@ -682,3 +724,7 @@ run_test "complete_supported_corpus_emits_bounded_claim" \
   test_complete_supported_corpus_emits_bounded_claim
 run_test "complete_corpus_with_declared_class_blocks_deployed_claim" \
   test_complete_corpus_with_declared_class_blocks_deployed_claim
+run_test "rejects_empty_declared_class_contract_address" \
+  test_rejects_empty_declared_class_contract_address
+run_test "normalizes_legacy_missing_source_kind_as_deployed_contract" \
+  test_normalizes_legacy_missing_source_kind_as_deployed_contract
