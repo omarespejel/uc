@@ -50,8 +50,8 @@ If `.diagnostics[].fallback_used` is true, classify the result as fallback-used 
 
 ```sh
 ./benchmarks/scripts/build_deployed_contract_source_index.sh \
-  --inventory /abs/path/to/reviewed-deployed-contract-source-inventory.json \
-  --out /abs/path/to/pinned-deployed-contract-source-index.json
+  --inventory /abs/path/to/source-root/reviewed-deployed-contract-source-inventory.json \
+  --out /abs/path/to/source-root/pinned-deployed-contract-source-index.json
 
 ./benchmarks/scripts/generate_deployed_contract_corpus.sh \
   --source-index /abs/path/to/pinned-deployed-contract-source-index.json \

@@ -90,8 +90,8 @@ UC_NATIVE_TOOLCHAIN_2_14_BIN=/abs/path/to/uc-cairo214-helper \
 
 # Pinned deployed-contract corpus support matrix and guarded claim artifact
 ./benchmarks/scripts/build_deployed_contract_source_index.sh \
-  --inventory /abs/path/to/reviewed-deployed-contract-source-inventory.json \
-  --out /abs/path/to/pinned-deployed-contract-source-index.json
+  --inventory /abs/path/to/source-root/reviewed-deployed-contract-source-inventory.json \
+  --out /abs/path/to/source-root/pinned-deployed-contract-source-index.json
 
 ./benchmarks/scripts/generate_deployed_contract_corpus.sh \
   --source-index /abs/path/to/pinned-deployed-contract-source-index.json \

@@ -90,7 +90,7 @@
             "type": "string",
             "minLength": 1,
             "pattern": "^[^/].*",
-            "description": "Path to Scarb.toml relative to this inventory file."
+            "description": "Path to Scarb.toml relative to this inventory file. Must stay under the inventory directory."
           },
           "cairo_version": { "type": "string", "minLength": 1 },
           "source_package_id": {

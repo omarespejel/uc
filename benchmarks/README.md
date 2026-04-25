@@ -104,7 +104,7 @@ instead of aborting the whole benchmark run.
 # Shape-only sample: validates reviewed source inventory and writes a source index.
 ./benchmarks/scripts/build_deployed_contract_source_index.sh \
   --inventory benchmarks/corpora/deployed-contract-source-inventory.example.json \
-  --out benchmarks/results/generated-deployed-contract-source-index.sample.json
+  --out benchmarks/corpora/generated-deployed-contract-source-index.sample.json
 ```
 
 The inventory is the durable raw evidence layer for deployed-contract claims. It
@@ -115,6 +115,10 @@ deduplication. The builder enforces the constraints mirrored in
 that every manifest path points at a local `Scarb.toml`, deduplicates by the
 configured key, and writes source-index JSON that conforms to
 `benchmarks/corpora/deployed-contract-source-index.schema.json`.
+
+Write the generated source index next to the reviewed inventory. Source paths
+are intentionally confined under the inventory/source-index directory so a
+reviewed artifact cannot escape into unrelated local files via `..` traversal.
 
 Do not hand-author launch source indexes. Keep the inventory as the reviewed
 input, generate the source index from it, and commit or immutably archive both

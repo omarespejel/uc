@@ -68,7 +68,7 @@
             "type": "string",
             "minLength": 1,
             "pattern": "^[^/].*",
-            "description": "Path to Scarb.toml relative to this source-index file."
+            "description": "Path to Scarb.toml relative to this source-index file. Must stay under the source-index directory."
           },
           "cairo_version": { "type": "string", "minLength": 1 },
           "scarb_version": { "type": "string" },

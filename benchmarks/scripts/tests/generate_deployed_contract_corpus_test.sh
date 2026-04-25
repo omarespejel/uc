@@ -132,14 +132,14 @@ mutate_source_index() {
 }
 
 test_generates_corpus_and_plan_only_accepts_it() {
-  local case_root="$TEST_TMP_DIR/generate/cases"
   local index_dir="$TEST_TMP_DIR/generate/index"
+  local case_root="$index_dir/cases"
   local results_dir="$TEST_TMP_DIR/generate/results"
   local out_dir="$TEST_TMP_DIR/generate/out"
   mkdir -p "$index_dir" "$results_dir" "$out_dir"
   write_manifest_case "$case_root" "sample"
   local item stdout_text corpus_path plan_stdout plan_json manifest_path source_availability
-  item="$(source_item_json sample "../cases/sample/Scarb.toml" "0x01" "2.14.0")"
+  item="$(source_item_json sample "cases/sample/Scarb.toml" "0x01" "2.14.0")"
   write_source_index_file "$index_dir/source-index.json" sample class_hash "$item"
 
   stdout_text="$(
@@ -176,36 +176,36 @@ test_generates_corpus_and_plan_only_accepts_it() {
 }
 
 test_rejects_unknown_top_level_keys() {
-  local case_root="$TEST_TMP_DIR/unknown/cases"
   local index_dir="$TEST_TMP_DIR/unknown/index"
+  local case_root="$index_dir/cases"
   mkdir -p "$index_dir"
   write_manifest_case "$case_root" "a"
   local item
-  item="$(source_item_json a "../cases/a/Scarb.toml" "0x01" "2.14.0")"
+  item="$(source_item_json a "cases/a/Scarb.toml" "0x01" "2.14.0")"
   write_source_index_file "$index_dir/source-index.json" sample class_hash "$item"
   mutate_source_index "$index_dir/source-index.json" '.unexpected = true'
   expect_generator_failure "$index_dir/source-index.json" "source_index has unsupported field(s): unexpected"
 }
 
 test_rejects_boolean_integer_fields() {
-  local case_root="$TEST_TMP_DIR/bool/cases"
   local index_dir="$TEST_TMP_DIR/bool/index"
+  local case_root="$index_dir/cases"
   mkdir -p "$index_dir"
   write_manifest_case "$case_root" "a"
   local item
-  item="$(source_item_json a "../cases/a/Scarb.toml" "0x01" "2.14.0")"
+  item="$(source_item_json a "cases/a/Scarb.toml" "0x01" "2.14.0")"
   write_source_index_file "$index_dir/source-index.json" sample class_hash "$item"
   mutate_source_index "$index_dir/source-index.json" '.selection.from_block = true'
   expect_generator_failure "$index_dir/source-index.json" "source_index.selection.from_block must be a non-negative integer"
 }
 
 test_rejects_non_string_optional_fields() {
-  local case_root="$TEST_TMP_DIR/optional/cases"
   local index_dir="$TEST_TMP_DIR/optional/index"
+  local case_root="$index_dir/cases"
   mkdir -p "$index_dir"
   write_manifest_case "$case_root" "a"
   local item
-  item="$(source_item_json a "../cases/a/Scarb.toml" "0x01" "2.14.0")"
+  item="$(source_item_json a "cases/a/Scarb.toml" "0x01" "2.14.0")"
 
   local -a filters=(
     '.selection.notes = {}'
@@ -234,27 +234,27 @@ test_rejects_non_string_optional_fields() {
 }
 
 test_rejects_duplicate_tags() {
-  local case_root="$TEST_TMP_DIR/dupe-tag/cases"
   local index_dir="$TEST_TMP_DIR/dupe-tag/index"
+  local case_root="$index_dir/cases"
   mkdir -p "$index_dir"
   write_manifest_case "$case_root" "a"
   write_manifest_case "$case_root" "b"
   local item_a item_b
-  item_a="$(source_item_json same "../cases/a/Scarb.toml" "0x01" "2.14.0")"
-  item_b="$(source_item_json same "../cases/b/Scarb.toml" "0x02" "2.14.0")"
+  item_a="$(source_item_json same "cases/a/Scarb.toml" "0x01" "2.14.0")"
+  item_b="$(source_item_json same "cases/b/Scarb.toml" "0x02" "2.14.0")"
   write_source_index_file "$index_dir/source-index.json" sample none "$item_a" "$item_b"
   expect_generator_failure "$index_dir/source-index.json" "duplicate source index item tag: same"
 }
 
 test_rejects_duplicate_class_hash_when_class_deduped() {
-  local case_root="$TEST_TMP_DIR/dupe-class/cases"
   local index_dir="$TEST_TMP_DIR/dupe-class/index"
+  local case_root="$index_dir/cases"
   mkdir -p "$index_dir"
   write_manifest_case "$case_root" "a"
   write_manifest_case "$case_root" "b"
   local item_a item_b
-  item_a="$(source_item_json a "../cases/a/Scarb.toml" "0xsame" "2.14.0")"
-  item_b="$(source_item_json b "../cases/b/Scarb.toml" "0xsame" "2.14.0")"
+  item_a="$(source_item_json a "cases/a/Scarb.toml" "0xsame" "2.14.0")"
+  item_b="$(source_item_json b "cases/b/Scarb.toml" "0xsame" "2.14.0")"
   write_source_index_file "$index_dir/source-index.json" sample class_hash "$item_a" "$item_b"
   expect_generator_failure "$index_dir/source-index.json" "duplicate class_hash in class_hash-deduped source index: 0xsame"
 }
@@ -263,14 +263,14 @@ test_rejects_missing_manifest_path() {
   local index_dir="$TEST_TMP_DIR/missing-manifest/index"
   mkdir -p "$index_dir"
   local item
-  item="$(source_item_json missing "../cases/missing/Scarb.toml" "0x01" "2.14.0")"
+  item="$(source_item_json missing "cases/missing/Scarb.toml" "0x01" "2.14.0")"
   write_source_index_file "$index_dir/source-index.json" sample class_hash "$item"
   expect_generator_failure "$index_dir/source-index.json" "manifest_path does not exist for missing"
 }
 
 test_rejects_absolute_manifest_path() {
-  local case_root="$TEST_TMP_DIR/absolute-manifest/cases"
   local index_dir="$TEST_TMP_DIR/absolute-manifest/index"
+  local case_root="$index_dir/cases"
   mkdir -p "$index_dir"
   write_manifest_case "$case_root" "a"
   local item
@@ -279,9 +279,20 @@ test_rejects_absolute_manifest_path() {
   expect_generator_failure "$index_dir/source-index.json" "manifest_path for absolute must be relative to the source index"
 }
 
+test_rejects_manifest_path_traversal() {
+  local index_dir="$TEST_TMP_DIR/traversal/index"
+  local escape_root="$TEST_TMP_DIR/traversal/outside"
+  mkdir -p "$index_dir"
+  write_manifest_case "$escape_root" "a"
+  local item
+  item="$(source_item_json escape "../outside/a/Scarb.toml" "0x01" "2.14.0")"
+  write_source_index_file "$index_dir/source-index.json" sample class_hash "$item"
+  expect_generator_failure "$index_dir/source-index.json" "manifest_path for escape must stay under the source index directory"
+}
+
 test_rejects_manifest_not_named_scarb_toml() {
-  local case_root="$TEST_TMP_DIR/wrong-name/cases"
   local index_dir="$TEST_TMP_DIR/wrong-name/index"
+  local case_root="$index_dir/cases"
   mkdir -p "$index_dir" "$case_root/a"
   cat > "$case_root/a/NotScarb.toml" <<'MANIFEST'
 [package]
@@ -290,57 +301,57 @@ version = "0.1.0"
 edition = "2024_07"
 MANIFEST
   local item
-  item="$(source_item_json wrong_name "../cases/a/NotScarb.toml" "0x01" "2.14.0")"
+  item="$(source_item_json wrong_name "cases/a/NotScarb.toml" "0x01" "2.14.0")"
   write_source_index_file "$index_dir/source-index.json" sample class_hash "$item"
   expect_generator_failure "$index_dir/source-index.json" "manifest_path for wrong_name must point to Scarb.toml"
 }
 
 test_rejects_deduped_count_mismatch() {
-  local case_root="$TEST_TMP_DIR/dedup-mismatch/cases"
   local index_dir="$TEST_TMP_DIR/dedup-mismatch/index"
+  local case_root="$index_dir/cases"
   mkdir -p "$index_dir"
   write_manifest_case "$case_root" "a"
   local item
-  item="$(source_item_json a "../cases/a/Scarb.toml" "0x01" "2.14.0")"
+  item="$(source_item_json a "cases/a/Scarb.toml" "0x01" "2.14.0")"
   write_source_index_file "$index_dir/source-index.json" sample class_hash "$item"
   mutate_source_index "$index_dir/source-index.json" '.deduplication.deduped_count = 2'
   expect_generator_failure "$index_dir/source-index.json" "source_index.deduplication.deduped_count (2) must equal items length (1)"
 }
 
 test_rejects_input_count_less_than_deduped() {
-  local case_root="$TEST_TMP_DIR/input-lt-deduped/cases"
   local index_dir="$TEST_TMP_DIR/input-lt-deduped/index"
+  local case_root="$index_dir/cases"
   mkdir -p "$index_dir"
   write_manifest_case "$case_root" "a"
   write_manifest_case "$case_root" "b"
   local item_a item_b
-  item_a="$(source_item_json a "../cases/a/Scarb.toml" "0x01" "2.14.0")"
-  item_b="$(source_item_json b "../cases/b/Scarb.toml" "0x02" "2.14.0")"
+  item_a="$(source_item_json a "cases/a/Scarb.toml" "0x01" "2.14.0")"
+  item_b="$(source_item_json b "cases/b/Scarb.toml" "0x02" "2.14.0")"
   write_source_index_file "$index_dir/source-index.json" sample class_hash "$item_a" "$item_b"
   mutate_source_index "$index_dir/source-index.json" '.deduplication.input_count = 1'
   expect_generator_failure "$index_dir/source-index.json" "source_index.deduplication.input_count must be >= deduped_count"
 }
 
 test_rejects_source_index_output_overwrite() {
-  local case_root="$TEST_TMP_DIR/overwrite/cases"
   local index_dir="$TEST_TMP_DIR/overwrite/index"
+  local case_root="$index_dir/cases"
   mkdir -p "$index_dir"
   write_manifest_case "$case_root" "a"
   local item source_index_path
-  item="$(source_item_json a "../cases/a/Scarb.toml" "0x01" "2.14.0")"
+  item="$(source_item_json a "cases/a/Scarb.toml" "0x01" "2.14.0")"
   source_index_path="$index_dir/source-index.json"
   write_source_index_file "$source_index_path" sample class_hash "$item"
   expect_generator_failure "$source_index_path" "Refusing to overwrite source index with generated corpus" "$source_index_path"
 }
 
 test_rejects_source_index_output_symlink_overwrite() {
-  local case_root="$TEST_TMP_DIR/overwrite-symlink/cases"
   local index_dir="$TEST_TMP_DIR/overwrite-symlink/index"
+  local case_root="$index_dir/cases"
   local out_dir="$TEST_TMP_DIR/overwrite-symlink/out"
   mkdir -p "$index_dir" "$out_dir"
   write_manifest_case "$case_root" "a"
   local item source_index_path out_path stderr_path exit_code
-  item="$(source_item_json a "../cases/a/Scarb.toml" "0x01" "2.14.0")"
+  item="$(source_item_json a "cases/a/Scarb.toml" "0x01" "2.14.0")"
   source_index_path="$index_dir/source-index.json"
   out_path="$out_dir/source-index-alias.json"
   write_source_index_file "$source_index_path" sample class_hash "$item"
@@ -365,13 +376,13 @@ test_rejects_source_index_output_symlink_overwrite() {
 }
 
 test_rejects_output_directory() {
-  local case_root="$TEST_TMP_DIR/out-dir/cases"
   local index_dir="$TEST_TMP_DIR/out-dir/index"
+  local case_root="$index_dir/cases"
   local out_dir="$TEST_TMP_DIR/out-dir/generated"
   mkdir -p "$index_dir" "$out_dir"
   write_manifest_case "$case_root" "a"
   local item source_index_path
-  item="$(source_item_json a "../cases/a/Scarb.toml" "0x01" "2.14.0")"
+  item="$(source_item_json a "cases/a/Scarb.toml" "0x01" "2.14.0")"
   source_index_path="$index_dir/source-index.json"
   write_source_index_file "$source_index_path" sample class_hash "$item"
   expect_generator_failure "$source_index_path" "--out must be a file path, got directory" "$out_dir"
@@ -393,6 +404,8 @@ run_test "rejects_missing_manifest_path" \
   test_rejects_missing_manifest_path
 run_test "rejects_absolute_manifest_path" \
   test_rejects_absolute_manifest_path
+run_test "rejects_manifest_path_traversal" \
+  test_rejects_manifest_path_traversal
 run_test "rejects_manifest_not_named_scarb_toml" \
   test_rejects_manifest_not_named_scarb_toml
 run_test "rejects_deduped_count_mismatch" \

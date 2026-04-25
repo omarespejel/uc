@@ -55,7 +55,9 @@ Required evidence for that line:
   `benchmarks/corpora/deployed-contract-source-inventory.schema.json`.
 - Generated source-index JSON produced by
   `benchmarks/scripts/build_deployed_contract_source_index.sh`; do not
-  hand-author the source index for launch evidence.
+  hand-author the source index for launch evidence. Write it next to the
+  reviewed inventory so source manifest paths remain contained under the same
+  evidence directory.
 - Generated corpus JSON produced by
   `benchmarks/scripts/generate_deployed_contract_corpus.sh`; do not hand-author
   the run corpus for launch evidence.

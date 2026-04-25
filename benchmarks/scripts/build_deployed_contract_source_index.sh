@@ -184,6 +184,10 @@ def resolve_manifest_path(raw, tag):
     if manifest_path.is_absolute():
         fail(f"manifest_path for {tag} must be relative to the inventory: {manifest_path}")
     manifest_path = (inventory_dir / manifest_path).resolve()
+    try:
+        manifest_path.relative_to(inventory_dir)
+    except ValueError:
+        fail(f"manifest_path for {tag} must stay under the inventory directory: {manifest_path}")
     if not manifest_path.is_file():
         fail(f"manifest_path does not exist for {tag}: {manifest_path}")
     if manifest_path.name != "Scarb.toml":

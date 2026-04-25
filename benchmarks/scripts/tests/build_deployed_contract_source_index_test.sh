@@ -133,16 +133,16 @@ expect_builder_failure() {
 }
 
 test_builds_deduped_source_index_and_corpus() {
-  local case_root="$TEST_TMP_DIR/build/cases"
   local inventory_dir="$TEST_TMP_DIR/build/inventory"
-  local out_dir="$TEST_TMP_DIR/build/out"
+  local case_root="$inventory_dir/cases"
+  local out_dir="$inventory_dir"
   local results_dir="$TEST_TMP_DIR/build/results"
   mkdir -p "$inventory_dir" "$out_dir" "$results_dir"
   write_manifest_case "$case_root" "first"
   write_manifest_case "$case_root" "dupe"
   local record_a record_b stdout_text source_index_path corpus_stdout corpus_path plan_stdout plan_json
-  record_a="$(inventory_record_json first "../cases/first/Scarb.toml" "0xsame" "2.14.0")"
-  record_b="$(inventory_record_json dupe "../cases/dupe/Scarb.toml" "0xsame" "2.14.0")"
+  record_a="$(inventory_record_json first "cases/first/Scarb.toml" "0xsame" "2.14.0")"
+  record_b="$(inventory_record_json dupe "cases/dupe/Scarb.toml" "0xsame" "2.14.0")"
   write_inventory_file "$inventory_dir/inventory.json" sample class_hash "$record_a" "$record_b"
 
   stdout_text="$("$BUILDER_SCRIPT" --inventory "$inventory_dir/inventory.json" --out "$out_dir/source-index.json")"
@@ -176,12 +176,12 @@ test_builds_deduped_source_index_and_corpus() {
 }
 
 test_rejects_unknown_keys_and_boolean_ints() {
-  local case_root="$TEST_TMP_DIR/invalid/cases"
   local inventory_dir="$TEST_TMP_DIR/invalid/inventory"
+  local case_root="$inventory_dir/cases"
   mkdir -p "$inventory_dir"
   write_manifest_case "$case_root" "a"
   local record
-  record="$(inventory_record_json a "../cases/a/Scarb.toml" "0x01" "2.14.0")"
+  record="$(inventory_record_json a "cases/a/Scarb.toml" "0x01" "2.14.0")"
   write_inventory_file "$inventory_dir/inventory.json" sample class_hash "$record"
   mutate_inventory "$inventory_dir/inventory.json" '.unexpected = true'
   expect_builder_failure "$inventory_dir/inventory.json" "inventory has unsupported field(s): unexpected"
@@ -196,14 +196,14 @@ test_rejects_unknown_keys_and_boolean_ints() {
 }
 
 test_rejects_duplicate_tags_and_absolute_manifest() {
-  local case_root="$TEST_TMP_DIR/dupes/cases"
   local inventory_dir="$TEST_TMP_DIR/dupes/inventory"
+  local case_root="$inventory_dir/cases"
   mkdir -p "$inventory_dir"
   write_manifest_case "$case_root" "a"
   write_manifest_case "$case_root" "b"
   local record_a record_b
-  record_a="$(inventory_record_json same "../cases/a/Scarb.toml" "0x01" "2.14.0")"
-  record_b="$(inventory_record_json same "../cases/b/Scarb.toml" "0x02" "2.14.0")"
+  record_a="$(inventory_record_json same "cases/a/Scarb.toml" "0x01" "2.14.0")"
+  record_b="$(inventory_record_json same "cases/b/Scarb.toml" "0x02" "2.14.0")"
   write_inventory_file "$inventory_dir/duplicate-tags.json" sample none "$record_a" "$record_b"
   expect_builder_failure "$inventory_dir/duplicate-tags.json" "duplicate inventory record tag: same"
 
@@ -212,37 +212,48 @@ test_rejects_duplicate_tags_and_absolute_manifest() {
   expect_builder_failure "$inventory_dir/absolute.json" "manifest_path for absolute must be relative to the inventory"
 }
 
+test_rejects_manifest_path_traversal() {
+  local inventory_dir="$TEST_TMP_DIR/traversal/inventory"
+  local escape_root="$TEST_TMP_DIR/traversal/outside"
+  mkdir -p "$inventory_dir"
+  write_manifest_case "$escape_root" "a"
+  local record
+  record="$(inventory_record_json escape "../outside/a/Scarb.toml" "0x01" "2.14.0")"
+  write_inventory_file "$inventory_dir/inventory.json" sample class_hash "$record"
+  expect_builder_failure "$inventory_dir/inventory.json" "manifest_path for escape must stay under the inventory directory"
+}
+
 test_rejects_source_package_dedupe_without_id() {
-  local case_root="$TEST_TMP_DIR/source-package/cases"
   local inventory_dir="$TEST_TMP_DIR/source-package/inventory"
+  local case_root="$inventory_dir/cases"
   mkdir -p "$inventory_dir"
   write_manifest_case "$case_root" "a"
   local record
-  record="$(inventory_record_json a "../cases/a/Scarb.toml" "0x01" "2.14.0")"
+  record="$(inventory_record_json a "cases/a/Scarb.toml" "0x01" "2.14.0")"
   write_inventory_file "$inventory_dir/inventory.json" sample source_package "$record"
   expect_builder_failure "$inventory_dir/inventory.json" "source_package_id must be a non-empty string when deduplication.key is source_package"
 }
 
 test_rejects_null_source_package_id_when_present() {
-  local case_root="$TEST_TMP_DIR/source-package-null/cases"
   local inventory_dir="$TEST_TMP_DIR/source-package-null/inventory"
+  local case_root="$inventory_dir/cases"
   mkdir -p "$inventory_dir"
   write_manifest_case "$case_root" "a"
   local record
-  record="$(inventory_record_json a "../cases/a/Scarb.toml" "0x01" "2.14.0")"
+  record="$(inventory_record_json a "cases/a/Scarb.toml" "0x01" "2.14.0")"
   write_inventory_file "$inventory_dir/inventory.json" sample class_hash "$record"
   mutate_inventory "$inventory_dir/inventory.json" '.records[0].source_package_id = null'
   expect_builder_failure "$inventory_dir/inventory.json" "inventory.records[0].source_package_id must be a string"
 }
 
 test_rejects_inventory_output_overwrite_aliases() {
-  local case_root="$TEST_TMP_DIR/overwrite/cases"
   local inventory_dir="$TEST_TMP_DIR/overwrite/inventory"
+  local case_root="$inventory_dir/cases"
   local out_dir="$TEST_TMP_DIR/overwrite/out"
   mkdir -p "$inventory_dir" "$out_dir"
   write_manifest_case "$case_root" "a"
   local record inventory_path out_path stderr_path exit_code
-  record="$(inventory_record_json a "../cases/a/Scarb.toml" "0x01" "2.14.0")"
+  record="$(inventory_record_json a "cases/a/Scarb.toml" "0x01" "2.14.0")"
   inventory_path="$inventory_dir/inventory.json"
   write_inventory_file "$inventory_path" sample class_hash "$record"
   expect_builder_failure "$inventory_path" "Refusing to overwrite source inventory with generated source index" "$inventory_path"
@@ -270,6 +281,7 @@ test_rejects_inventory_output_overwrite_aliases() {
 run_test "builds deduped source index and corpus" test_builds_deduped_source_index_and_corpus
 run_test "rejects unknown keys and boolean ints" test_rejects_unknown_keys_and_boolean_ints
 run_test "rejects duplicate tags and absolute manifest" test_rejects_duplicate_tags_and_absolute_manifest
+run_test "rejects manifest path traversal" test_rejects_manifest_path_traversal
 run_test "rejects source_package dedupe without id" test_rejects_source_package_dedupe_without_id
 run_test "rejects null source_package_id when present" test_rejects_null_source_package_id_when_present
 run_test "rejects inventory output overwrite aliases" test_rejects_inventory_output_overwrite_aliases
