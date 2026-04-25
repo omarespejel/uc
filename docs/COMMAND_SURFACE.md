@@ -39,6 +39,7 @@
 - Supports: `--manifest-path`, `--format json`, `--json`, `--report-path`.
 - Emits package, workspace, target, dependency, lockfile, requested toolchain, read-only native support when determinable, and stable diagnostics in one JSON report.
 - The report includes `readonly=true` and `mutation_status=none`; use this as the agent pre-build project-state surface.
+- The raw report is local evidence and can include absolute paths plus manifest/lockfile hashes; redact or avoid forwarding it when sharing outside the host.
 
 7. `uc support native`
 - Probes whether a manifest is eligible for native compile in the current `uc` binary.
