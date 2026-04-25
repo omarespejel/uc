@@ -20,6 +20,7 @@
   "items": [
     {
       "tag": "example-contract",
+      "source_kind": "deployed_contract",
       "contract_address": "0x0",
       "class_hash": "0x0",
       "source_ref": "local fixture",

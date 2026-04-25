@@ -22,6 +22,7 @@
   "records": [
     {
       "tag": "sample_counter",
+      "source_kind": "deployed_contract",
       "contract_address": "0x0123",
       "class_hash": "0x0456",
       "source_ref": "benchmarks/corpora/source-fixtures/scarb_smoke in this repository",

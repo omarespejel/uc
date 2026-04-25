@@ -119,6 +119,7 @@ DEDUP_KEYS = {"key", "rules"}
 SOURCE_AVAILABILITY_KEYS = {"policy", "notes"}
 RECORD_KEYS = {
     "tag",
+    "source_kind",
     "contract_address",
     "class_hash",
     "source_ref",
@@ -131,6 +132,7 @@ RECORD_KEYS = {
 }
 SOURCE_INDEX_ITEM_KEYS = {
     "tag",
+    "source_kind",
     "contract_address",
     "class_hash",
     "source_ref",
@@ -265,6 +267,13 @@ for index, raw_record in enumerate(records):
     seen_tags.add(tag)
 
     class_hash = require_str(record, "class_hash", f"inventory.records[{index}]")
+    source_kind = require_str(record, "source_kind", f"inventory.records[{index}]")
+    if source_kind not in {"deployed_contract", "declared_class"}:
+        fail(f"inventory.records[{index}].source_kind must be deployed_contract or declared_class")
+    if source_kind == "deployed_contract":
+        require_str(record, "contract_address", f"inventory.records[{index}]")
+    else:
+        optional_str(record, "contract_address", f"inventory.records[{index}]")
     manifest_raw = require_str(record, "manifest_path", f"inventory.records[{index}]")
     manifest_path = resolve_manifest_path(manifest_raw, tag)
     source_package_id = record.get("source_package_id")
@@ -275,7 +284,7 @@ for index, raw_record in enumerate(records):
 
     normalized = {key: record[key] for key in SOURCE_INDEX_ITEM_KEYS if key in record}
     normalized["manifest_path"] = os.path.relpath(manifest_path, out_dir)
-    normalized["contract_address"] = require_str(record, "contract_address", f"inventory.records[{index}]")
+    normalized["source_kind"] = source_kind
     normalized["source_ref"] = require_str(record, "source_ref", f"inventory.records[{index}]")
     normalized["cairo_version"] = require_str(record, "cairo_version", f"inventory.records[{index}]")
     for optional_key in ["scarb_version", "license", "notes"]:

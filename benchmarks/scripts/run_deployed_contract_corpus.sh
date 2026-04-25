@@ -262,6 +262,7 @@ for index, item in enumerate(items):
         item,
         {
             "tag",
+            "source_kind",
             "contract_address",
             "class_hash",
             "source_ref",
@@ -280,6 +281,13 @@ for index, item in enumerate(items):
         fail(f"duplicate corpus item tag: {tag}")
     seen_tags.add(tag)
     class_hash = require_str(item, "class_hash", f"corpus.items[{index}]")
+    source_kind = require_str(item, "source_kind", f"corpus.items[{index}]")
+    if source_kind not in {"deployed_contract", "declared_class"}:
+        fail(f"corpus.items[{index}].source_kind must be deployed_contract or declared_class")
+    if source_kind == "deployed_contract":
+        require_str(item, "contract_address", f"corpus.items[{index}]")
+    else:
+        optional_str(item, "contract_address", f"corpus.items[{index}]")
     if dedupe_key == "class_hash":
         if class_hash in seen_class_hashes:
             fail(f"duplicate class_hash in class_hash-deduped corpus: {class_hash}")
@@ -293,7 +301,7 @@ for index, item in enumerate(items):
         fail(f"manifest_path does not exist for {tag}: {manifest_path}")
     normalized = dict(item)
     normalized["manifest_path"] = str(manifest_path)
-    normalized["contract_address"] = require_str(item, "contract_address", f"corpus.items[{index}]")
+    normalized["source_kind"] = source_kind
     normalized["source_ref"] = require_str(item, "source_ref", f"corpus.items[{index}]")
     normalized["cairo_version"] = require_str(item, "cairo_version", f"corpus.items[{index}]")
     for optional_key in ["scarb_version", "license", "notes"]:
@@ -306,6 +314,10 @@ normalized_doc["items"] = normalized_items
 normalized_doc["summary"] = {
     "item_count": len(normalized_items),
     "unique_class_hash_count": len({item["class_hash"] for item in normalized_items}),
+    "source_kind_counts": {
+        kind: sum(1 for item in normalized_items if item["source_kind"] == kind)
+        for kind in sorted({item["source_kind"] for item in normalized_items})
+    },
     "cairo_version_min": versions[0],
     "cairo_version_max": versions[-1],
     "cairo_versions": versions,
@@ -382,10 +394,13 @@ jq -n \
   --slurpfile bench "$REAL_JSON" \
   'def counts: $bench[0].summary.support_matrix;
    def item_count: ($corpus[0].summary.item_count // 0);
+   def non_deployed_item_count:
+     ([ $corpus[0].items[] | select(.source_kind != "deployed_contract") ] | length);
    def failed_native_benchmarks:
      ([ $bench[0].cases[] | select(.benchmark_status == "failed") ] | length);
    def compiled_all:
      ($corpus[0].selection.coverage == "complete_deployed_contracts")
+     and (non_deployed_item_count == 0)
      and ((counts.native_supported // 0) == item_count)
      and ((counts.fallback_used // 0) == 0)
      and ((counts.native_unsupported // 0) == 0)
@@ -404,6 +419,7 @@ jq -n \
      summary: {
        item_count: $corpus[0].summary.item_count,
        unique_class_hash_count: $corpus[0].summary.unique_class_hash_count,
+       source_kind_counts: ($corpus[0].summary.source_kind_counts // {}),
        cairo_version_min: $corpus[0].summary.cairo_version_min,
        cairo_version_max: $corpus[0].summary.cairo_version_max,
        support_matrix: counts,
@@ -415,6 +431,8 @@ jq -n \
        reason: (
          if $corpus[0].selection.coverage != "complete_deployed_contracts" then
            "corpus selection coverage is sample, not complete_deployed_contracts"
+         elif non_deployed_item_count != 0 then
+           "corpus contains non-deployed source_kind rows"
          elif (counts.fallback_used // 0) != 0 then
            "one or more corpus items used fallback"
          elif (counts.native_unsupported // 0) != 0 then
@@ -478,12 +496,21 @@ jq -n \
     | "| \(.key) | \(.value) |"
   ' "$OUT_JSON"
   echo
+  echo "## Source Kind Summary"
+  echo "| Source Kind | Count |"
+  echo "|---|---:|"
+  jq -r '
+    .summary.source_kind_counts
+    | to_entries[]
+    | "| \(.key) | \(.value) |"
+  ' "$OUT_JSON"
+  echo
   echo "## Corpus Items"
-  echo "| Tag | Contract Address | Class Hash | Cairo Version | Source Ref | Manifest |"
-  echo "|---|---|---|---|---|---|"
+  echo "| Tag | Source Kind | Address/Class Ref | Class Hash | Cairo Version | Source Ref | Manifest |"
+  echo "|---|---|---|---|---|---|---|"
   jq -r '
     .corpus.items[]
-    | "| \(.tag) | \(.contract_address) | \(.class_hash) | \(.cairo_version) | \(.source_ref) | \(.manifest_path) |"
+    | "| \(.tag) | \(.source_kind) | \(if .source_kind == "deployed_contract" then .contract_address else "declared-class:" + .class_hash end) | \(.class_hash) | \(.cairo_version) | \(.source_ref) | \(.manifest_path) |"
   ' "$OUT_JSON"
   echo
   echo "## Real Repo Benchmark Summary"

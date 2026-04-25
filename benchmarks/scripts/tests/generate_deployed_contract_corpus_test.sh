@@ -60,6 +60,7 @@ source_item_json() {
     --arg cairo_version "$cairo_version" \
     '{
       tag: $tag,
+      source_kind: "deployed_contract",
       contract_address: "0x123",
       class_hash: $class_hash,
       source_ref: "local test fixture",
@@ -259,6 +260,26 @@ test_rejects_duplicate_class_hash_when_class_deduped() {
   expect_generator_failure "$index_dir/source-index.json" "duplicate class_hash in class_hash-deduped source index: 0xsame"
 }
 
+test_generates_declared_class_without_contract_address() {
+  local index_dir="$TEST_TMP_DIR/declared-class/index"
+  local case_root="$index_dir/cases"
+  local out_dir="$TEST_TMP_DIR/declared-class/out"
+  mkdir -p "$index_dir" "$out_dir"
+  write_manifest_case "$case_root" "a"
+  local item stdout_text corpus_path
+  item="$(source_item_json class_only "cases/a/Scarb.toml" "0xclass" "2.14.0")"
+  item="$(jq '.source_kind = "declared_class" | del(.contract_address)' <<<"$item")"
+  write_source_index_file "$index_dir/source-index.json" sample class_hash "$item"
+
+  stdout_text="$("$GENERATOR_SCRIPT" --source-index "$index_dir/source-index.json" --out "$out_dir/corpus.json")"
+  corpus_path="$(extract_labeled_path "Corpus JSON" <<<"$stdout_text")"
+  if [[ "$(jq -r '.items[0].source_kind' "$corpus_path")" != "declared_class" || "$(jq -r '.items[0] | has("contract_address")' "$corpus_path")" != "false" ]]; then
+    echo "declared class corpus row should not require or synthesize contract_address" >&2
+    cat "$corpus_path" >&2
+    return 1
+  fi
+}
+
 test_rejects_missing_manifest_path() {
   local index_dir="$TEST_TMP_DIR/missing-manifest/index"
   mkdir -p "$index_dir"
@@ -400,6 +421,8 @@ run_test "rejects_duplicate_tags" \
   test_rejects_duplicate_tags
 run_test "rejects_duplicate_class_hash_when_class_deduped" \
   test_rejects_duplicate_class_hash_when_class_deduped
+run_test "generates_declared_class_without_contract_address" \
+  test_generates_declared_class_without_contract_address
 run_test "rejects_missing_manifest_path" \
   test_rejects_missing_manifest_path
 run_test "rejects_absolute_manifest_path" \

@@ -70,6 +70,7 @@ If `.diagnostics[].fallback_used` is true, classify the result as fallback-used 
 Read:
 
 - `.summary.support_matrix`
+- `.summary.source_kind_counts`
 - `.summary.cairo_version_min`
 - `.summary.cairo_version_max`
 - `.claim_guard.safe_to_say_compiled_all_deployed_contracts_in_corpus`
@@ -78,6 +79,11 @@ Read:
 Only use `.claim_guard.compiled_all_claim_text` when the guard is true. If the
 guard is false, report `.claim_guard.reason` and keep the artifact as support
 matrix evidence, not launch copy.
+
+For launch copy that says "deployed contracts", every row must be
+`source_kind=deployed_contract`. `declared_class` rows are valid support
+evidence for class source compatibility, but they intentionally block the
+deployed-contract claim guard.
 
 Treat the source inventory as the durable raw evidence input. The source index
 and generated corpus JSON are deterministic artifacts and should be regenerated

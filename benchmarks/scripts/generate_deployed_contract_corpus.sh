@@ -107,6 +107,7 @@ DEDUP_KEYS = {"key", "input_count", "deduped_count", "rules"}
 SOURCE_AVAILABILITY_KEYS = {"policy", "notes"}
 ITEM_KEYS = {
     "tag",
+    "source_kind",
     "contract_address",
     "class_hash",
     "source_ref",
@@ -236,6 +237,13 @@ for index, raw_item in enumerate(items):
     seen_tags.add(tag)
 
     class_hash = require_str(item, "class_hash", f"source_index.items[{index}]")
+    source_kind = require_str(item, "source_kind", f"source_index.items[{index}]")
+    if source_kind not in {"deployed_contract", "declared_class"}:
+        fail(f"source_index.items[{index}].source_kind must be deployed_contract or declared_class")
+    if source_kind == "deployed_contract":
+        require_str(item, "contract_address", f"source_index.items[{index}]")
+    else:
+        optional_str(item, "contract_address", f"source_index.items[{index}]")
     if dedupe_key == "class_hash":
         if class_hash in seen_class_hashes:
             fail(f"duplicate class_hash in class_hash-deduped source index: {class_hash}")
@@ -246,7 +254,7 @@ for index, raw_item in enumerate(items):
 
     normalized = {key: item[key] for key in ITEM_KEYS if key in item}
     normalized["manifest_path"] = str(manifest_path)
-    normalized["contract_address"] = require_str(item, "contract_address", f"source_index.items[{index}]")
+    normalized["source_kind"] = source_kind
     normalized["source_ref"] = require_str(item, "source_ref", f"source_index.items[{index}]")
     normalized["cairo_version"] = require_str(item, "cairo_version", f"source_index.items[{index}]")
     for optional_key in ["scarb_version", "license", "notes"]:

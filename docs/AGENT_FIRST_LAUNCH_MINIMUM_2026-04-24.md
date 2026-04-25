@@ -64,6 +64,10 @@ Required evidence for that line:
 - The chain, block range, or index snapshot used to select deployed contracts,
   recorded in `selection`.
 - Cairo/Scarb version extraction rules, recorded per `items[]` row.
+- Source-kind classification per `items[]` row:
+  `deployed_contract` rows require a deployed address, while `declared_class`
+  rows are class-source evidence and cannot support a deployed-contract universe
+  claim.
 - Deduplication rules for repeated class hashes or reused source packages,
   recorded in `deduplication`.
 - License/source availability rules, recorded in `license_policy` or the
@@ -74,13 +78,15 @@ Required evidence for that line:
 - Host metadata, binary SHA, helper lane SHA, flags, and sample counts inherited
   from the embedded real-repo benchmark artifact.
 - `claim_guard.safe_to_say_compiled_all_deployed_contracts_in_corpus=true` in
-  the generated corpus artifact.
+  the generated corpus artifact. This requires a complete deployed-contract
+  snapshot and no `declared_class` rows.
 
 ## Real-Repo Launch Table
 
 The launch table should always include these columns:
 
 - repo/corpus item
+- source kind
 - Cairo version requested
 - selected native lane
 - support classification
