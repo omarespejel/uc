@@ -48,7 +48,7 @@ The helper-lane compatibility shims are covered by targeted regressions for:
 
 If a repo needs an external helper lane, doctor will report the missing or invalid `UC_NATIVE_TOOLCHAIN_<major>_<minor>_BIN` env var before a build starts.
 
-If a repo asks for a lane that is not productized by this release, `uc support native --format json` emits `UCN1006` with `safe_automated_action=manual_legacy_adapter_required`. Agents must keep that repo in the support matrix as `native_unsupported` unless a reviewed compatible helper binary is supplied explicitly through the reported helper env var.
+If a repo asks for a lane that is not productized by this release, `uc support native --manifest-path <Scarb.toml> --format json` emits `UCN1006` with `safe_automated_action=manual_legacy_adapter_required`. Agents must pass `--manifest-path` and keep that repo in the support matrix as `native_unsupported` unless a reviewed compatible helper binary is supplied explicitly through the reported helper env var.
 
 ## Cairo 2.5 Boundary
 

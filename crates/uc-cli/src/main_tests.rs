@@ -1873,9 +1873,10 @@ cairo-version = "{compiler_major}.{}.0"
         .expect("older-minor manifest should parse");
         let err = ensure_native_manifest_cairo_version_supported(&older_minor_manifest)
             .expect_err("older minor cairo-version should be rejected");
+        let rendered = format!("{err:#}");
         assert!(
-            format!("{err:#}").contains("requires the same cairo major.minor"),
-            "error should explain that native compile requires the same major.minor"
+            rendered.contains("helper lane") || rendered.contains("same cairo major.minor"),
+            "error should explain that native compile needs a compatible lane: {rendered}"
         );
         assert!(
             native_error_allows_scarb_fallback(&err),
@@ -1895,9 +1896,11 @@ cairo-version = "{compiler_major}.{}.0"
     .expect("incompatible manifest should parse");
     let err = ensure_native_manifest_cairo_version_supported(&incompatible_manifest)
         .expect_err("newer minor cairo-version should be rejected");
+    let rendered = format!("{err:#}");
     assert!(
-        format!("{err:#}").contains("incompatible with package cairo-version"),
-        "error should describe cairo-version mismatch"
+        rendered.contains("helper lane")
+            || rendered.contains("incompatible with package cairo-version"),
+        "error should describe the required native lane: {rendered}"
     );
     assert!(
         native_error_allows_scarb_fallback(&err),
@@ -2064,7 +2067,7 @@ cairo-version = "{compiler_major}.{compiler_minor}.0"
         });
     let Some(requested_major_minor) = requested_major_minor else {
         fs::remove_dir_all(&dir).ok();
-        return;
+        panic!("expected at least one productized external helper lane different from the builtin compiler lane; unsupported-helper path was not exercised");
     };
     let helper_env = native_toolchain_env_var_name_for_major_minor(&requested_major_minor);
     let _helper = ScopedDynamicEnvVar::unset_with_lock(&_guard, helper_env);
@@ -2539,12 +2542,86 @@ starknet = "={requested_version}"
         }),
         "diagnostic should tell agents to keep this workload in the support matrix"
     );
+    assert!(
+        fixes.iter().all(|fix| !fix
+            .as_str()
+            .unwrap_or_default()
+            .contains("build_native_toolchain_helper")),
+        "agents must not be told to run the productized helper builder in how_to_fix for unsupported lanes"
+    );
     assert_eq!(json["toolchain"]["source"], "external_helper");
     assert_eq!(
         json["toolchain"]["requested_major_minor"],
         requested_major_minor
     );
     assert_eq!(json["toolchain"]["requested_version"], requested_version);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn build_native_compile_context_rejects_unproductized_helper_lane() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let requested_major_minor = "2.5";
+    let requested_version = "2.5.3";
+    let helper_env = native_toolchain_env_var_name_for_major_minor(requested_major_minor);
+    let _helper = ScopedDynamicEnvVar::unset_with_lock(&_guard, helper_env.clone());
+    assert!(
+        !native_toolchain_helper_lane_is_productized(requested_major_minor),
+        "this regression documents the current Cairo 2.5 build preflight boundary; update it when a real 2.5 adapter lands"
+    );
+
+    let dir = unique_test_dir("uc-native-context-unproductized-helper");
+    fs::create_dir_all(dir.join("src")).expect("failed to create src directory");
+    fs::write(dir.join("src/lib.cairo"), "fn main() {}\n").expect("failed to write lib.cairo");
+    let manifest_path = dir.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"[package]
+name = "demo-native"
+version = "0.1.0"
+edition = "2023_11"
+cairo-version = "{requested_version}"
+
+[dependencies]
+starknet = "={requested_version}"
+"#
+        ),
+    )
+    .expect("failed to write manifest");
+
+    let common = BuildCommonArgs {
+        manifest_path: Some(manifest_path.clone()),
+        package: None,
+        workspace: false,
+        features: Vec::new(),
+        offline: true,
+        release: false,
+        profile: None,
+    };
+    let err = build_native_compile_context(&common, &manifest_path, &dir)
+        .expect_err("unproductized helper lane should fail during native build preflight");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("Cairo 2.5 helper lane"),
+        "error should classify the required helper lane: {rendered}"
+    );
+    assert!(
+        rendered.contains(&helper_env),
+        "error should expose the reviewed helper env var for manual adapters: {rendered}"
+    );
+    assert!(
+        rendered.contains("native-supported"),
+        "error should avoid marking this workload supported without a reviewed adapter: {rendered}"
+    );
+    assert!(
+        native_error_allows_scarb_fallback(&err),
+        "unproductized helper lane failures should remain scarb-fallback eligible"
+    );
 
     fs::remove_dir_all(&dir).ok();
 }

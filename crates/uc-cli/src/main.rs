@@ -2398,7 +2398,7 @@ impl NativeCompileSupportIssue {
     fn reason(&self) -> String {
         match self {
             Self::LegacyEditionRequiresPinnedCairoVersion { edition } => format!(
-                "native compile could not resolve an exact Cairo toolchain for legacy edition {edition}; pin [package].cairo-version, commit a lockfile with an exact starknet version, or let `scarb metadata` resolve dependencies once before retrying"
+                "native compile could not resolve an exact Cairo toolchain for legacy edition {edition}; native compile requires an exact [package].cairo-version for legacy edition {edition}, or a committed lockfile/resolved metadata entry with an exact starknet version"
             ),
             Self::UnsupportedManifestConstraint { requested } => format!(
                 "native compile requires an exact cairo-version (major.minor[.patch]); unsupported constraint `{requested}`"
@@ -2708,10 +2708,18 @@ fn native_compile_support_issue_with_compiler(
 fn select_native_toolchain_from_requirement(
     requirement: &NativeToolchainRequirement,
 ) -> Result<std::result::Result<NativeToolchainSelection, NativeCompileSupportIssue>> {
-    if let Some(issue) = native_compile_support_issue_with_compiler(
+    select_native_toolchain_from_requirement_with_compiler(
         requirement,
         native_cairo_lang_compiler_version(),
-    ) {
+    )
+}
+
+#[cfg(feature = "native-compile")]
+fn select_native_toolchain_from_requirement_with_compiler(
+    requirement: &NativeToolchainRequirement,
+    compiler: &str,
+) -> Result<std::result::Result<NativeToolchainSelection, NativeCompileSupportIssue>> {
+    if let Some(issue) = native_compile_support_issue_with_compiler(requirement, compiler) {
         if matches!(
             issue,
             NativeCompileSupportIssue::CompilerVersionMismatch { .. }
@@ -2916,9 +2924,16 @@ fn ensure_native_toolchain_requirement_supported_with_compiler(
     requirement: &NativeToolchainRequirement,
     compiler: &str,
 ) -> Result<()> {
-    let Some(issue) = native_compile_support_issue_with_compiler(requirement, compiler) else {
+    let Err(issue) = select_native_toolchain_from_requirement_with_compiler(requirement, compiler)?
+    else {
         return Ok(());
     };
+    log_native_compile_support_issue(&issue, compiler);
+    Err(native_fallback_eligible_error(issue.reason()))
+}
+
+#[cfg(feature = "native-compile")]
+fn log_native_compile_support_issue(issue: &NativeCompileSupportIssue, compiler: &str) {
     match &issue {
         NativeCompileSupportIssue::LegacyEditionRequiresPinnedCairoVersion { edition } => {
             tracing::warn!(
@@ -2942,7 +2957,6 @@ fn ensure_native_toolchain_requirement_supported_with_compiler(
             );
         }
     }
-    Err(native_fallback_eligible_error(issue.reason()))
 }
 
 #[cfg(all(feature = "native-compile", test))]
