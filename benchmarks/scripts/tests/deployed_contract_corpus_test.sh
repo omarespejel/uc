@@ -17,6 +17,16 @@ assert_contains() {
   fi
 }
 
+assert_not_contains() {
+  local haystack="$1"
+  local needle="$2"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    echo "assert_not_contains failed: did not expect to find '$needle'" >&2
+    echo "actual: $haystack" >&2
+    return 1
+  fi
+}
+
 run_test() {
   local name="$1"
   shift
@@ -687,6 +697,50 @@ test_complete_non_deduped_corpus_emits_deployed_contract_claim() {
   assert_contains "$markdown_text" "Compiled-all claim: We compiled every contract"
 }
 
+test_complete_single_item_claim_uses_singular_nouns() {
+  local corpus_dir="$TEST_TMP_DIR/single-item/corpora"
+  local case_root="$TEST_TMP_DIR/single-item/cases"
+  local results_dir="$TEST_TMP_DIR/single-item/results"
+  local mock_bin_dir="$TEST_TMP_DIR/single-item/mock-bin"
+  mkdir -p "$corpus_dir" "$case_root" "$results_dir" "$mock_bin_dir"
+  write_manifest_case "$case_root" "single"
+  write_mock_uc_bin "$mock_bin_dir/uc"
+  write_mock_scarb_bin "$mock_bin_dir/scarb"
+
+  local item stdout_text json_path md_path claim selected_claim markdown_text
+  item="$(item_json single "../cases/single/Scarb.toml" "0xsingle" "2.14.0")"
+  write_corpus_file "$corpus_dir/corpus.json" complete_deployed_contracts none "$item"
+
+  stdout_text="$(
+    PATH="$mock_bin_dir:$PATH" \
+    MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/single-item/uc.args" \
+    MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/single-item/scarb.args" \
+    "$CORPUS_SCRIPT" \
+      --uc-bin "$mock_bin_dir/uc" \
+      --results-dir "$results_dir" \
+      --runs 1 \
+      --cold-runs 1 \
+      --warm-settle-seconds 0 \
+      --corpus "$corpus_dir/corpus.json"
+  )"
+
+  json_path="$(extract_labeled_path "Corpus Benchmark JSON" <<<"$stdout_text")"
+  md_path="$(extract_labeled_path "Corpus Benchmark Markdown" <<<"$stdout_text")"
+  [[ -f "$json_path" ]] || { echo "missing corpus benchmark json: $json_path" >&2; return 1; }
+  [[ -f "$md_path" ]] || { echo "missing corpus benchmark markdown: $md_path" >&2; return 1; }
+
+  claim="$(jq -r '.claim_guard.compiled_all_claim_text // ""' "$json_path")"
+  selected_claim="$(jq -r '.claim_guard.selected_units_claim_text // ""' "$json_path")"
+  markdown_text="$(cat "$md_path")"
+  assert_contains "$claim" "(1 item, 1 unique class hash,"
+  assert_not_contains "$claim" "1 items"
+  assert_not_contains "$claim" "1 unique class hashes"
+  assert_contains "$selected_claim" "(1 item from 1 input record, 1 unique class hash,"
+  assert_not_contains "$selected_claim" "1 input records"
+  assert_contains "$markdown_text" "Compiled-all claim: We compiled every contract"
+  assert_contains "$markdown_text" "(1 item, 1 unique class hash,"
+}
+
 test_complete_non_deduped_count_mismatch_blocks_deployed_contract_claim() {
   local stderr_path="$TEST_TMP_DIR/non-deduped-count-mismatch.err"
   if run_corpus_benchmark complete_deployed_contracts none 3 >"$TEST_TMP_DIR/non-deduped-count-mismatch.out" 2>"$stderr_path"; then
@@ -862,6 +916,8 @@ run_test "complete_class_deduped_corpus_emits_selected_unit_claim_only" \
   test_complete_class_deduped_corpus_emits_selected_unit_claim_only
 run_test "complete_non_deduped_corpus_emits_deployed_contract_claim" \
   test_complete_non_deduped_corpus_emits_deployed_contract_claim
+run_test "complete_single_item_claim_uses_singular_nouns" \
+  test_complete_single_item_claim_uses_singular_nouns
 run_test "complete_non_deduped_count_mismatch_blocks_deployed_contract_claim" \
   test_complete_non_deduped_count_mismatch_blocks_deployed_contract_claim
 run_test "native_benchmark_failure_blocks_native_support_claim" \
