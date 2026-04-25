@@ -532,6 +532,54 @@ fn agent_eval_decision_shell_escapes_next_command_paths() {
 }
 
 #[test]
+fn agent_eval_decision_uses_manifest_path_for_manifest_safe_actions() {
+    let support = NativeSupportReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        manifest_path: "/tmp/My Project/Scarb.toml".to_string(),
+        status: NativeSupportStatus::Unsupported,
+        supported: false,
+        reason: Some("cache refresh needed".to_string()),
+        compiler_version: Some("2.16.0".to_string()),
+        package_cairo_version: Some("2.16.0".to_string()),
+        issue_kind: Some("cache_refresh_required".to_string()),
+        toolchain: None,
+        diagnostics: vec![NativeDiagnostic {
+            schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+            code: "UCN1006".to_string(),
+            category: "cache".to_string(),
+            severity: NativeDiagnosticSeverity::Warn,
+            title: "Refresh cache".to_string(),
+            docs_url: native_diagnostic_docs_url("UCN1006"),
+            what_happened: "cache refresh needed".to_string(),
+            why: "cached state is stale".to_string(),
+            how_to_fix: vec!["refresh cache".to_string()],
+            next_commands: Vec::new(),
+            safe_automated_action: "refresh_cache".to_string(),
+            retryable: true,
+            fallback_used: false,
+            toolchain_expected: None,
+            toolchain_found: None,
+        }],
+    };
+
+    let (decision, _, safe_actions, next_commands) = agent_eval_decision(&support);
+    assert_eq!(decision, AgentEvalDecision::RunSafeActionThenRetry);
+    assert_eq!(safe_actions, vec!["refresh_cache".to_string()]);
+    assert!(
+        next_commands.iter().any(|command| command.contains(
+            "uc agent safe-action refresh-cache --manifest-path '/tmp/My Project/Scarb.toml'"
+        )),
+        "agent eval should use --manifest-path for manifest-scoped safe actions: {next_commands:?}"
+    );
+    assert!(
+        !next_commands
+            .iter()
+            .any(|command| command.contains("--lane")),
+        "manifest-scoped safe actions must not receive lane arguments: {next_commands:?}"
+    );
+}
+
+#[test]
 fn agent_eval_decision_selects_first_runnable_safe_action() {
     let mut support = NativeSupportReport {
         schema_version: UC_AGENT_JSON_SCHEMA_VERSION,

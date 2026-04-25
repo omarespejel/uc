@@ -2079,22 +2079,33 @@ fn agent_eval_decision(
         .iter()
         .find_map(|action| AgentSafeActionKind::from_safe_automated_action(action))
     {
-        let lane = support
-            .toolchain
-            .as_ref()
-            .and_then(|toolchain| {
-                toolchain
-                    .requested_major_minor
-                    .clone()
-                    .or_else(|| toolchain.requested_version.clone())
-            })
-            .unwrap_or_else(|| "<lane>".to_string());
-        let lane = shell_escape_command_arg(&lane);
-        next_commands.push(format!(
-            "uc agent safe-action {} --lane {}",
-            action.cli_name(),
-            lane
-        ));
+        let next_command = match action {
+            AgentSafeActionKind::BuildHelperLane | AgentSafeActionKind::RebuildHelperLane => {
+                let lane = support
+                    .toolchain
+                    .as_ref()
+                    .and_then(|toolchain| {
+                        toolchain
+                            .requested_major_minor
+                            .clone()
+                            .or_else(|| toolchain.requested_version.clone())
+                    })
+                    .unwrap_or_else(|| "<lane>".to_string());
+                format!(
+                    "uc agent safe-action {} --lane {}",
+                    action.cli_name(),
+                    shell_escape_command_arg(&lane)
+                )
+            }
+            AgentSafeActionKind::RefreshCache
+            | AgentSafeActionKind::RerunDoctor
+            | AgentSafeActionKind::RegenerateSupportMatrix => format!(
+                "uc agent safe-action {} --manifest-path {}",
+                action.cli_name(),
+                manifest_path
+            ),
+        };
+        next_commands.push(next_command);
         return (
             AgentEvalDecision::RunSafeActionThenRetry,
             "run_safe_action_then_retry_support_probe".to_string(),
