@@ -72,13 +72,28 @@ validate_timeout_secs() {
 canonical_existing_file_path() {
   local label="$1"
   local path="$2"
-  if [[ ! -e "$path" ]]; then
-    echo "$label is missing: $path" >&2
+  if [[ ! -f "$path" ]]; then
+    echo "$label is missing or not a regular file: $path" >&2
     exit 1
   fi
-  local dir
+  local dir base
   dir="$(cd "$(dirname "$path")" && pwd -P)"
-  printf '%s/%s\n' "$dir" "$(basename "$path")"
+  base="$(basename "$path")"
+  if [[ "$dir" == "/" ]]; then
+    printf '/%s\n' "$base"
+  else
+    printf '%s/%s\n' "${dir%/}" "$base"
+  fi
+}
+
+canonical_existing_dir_path() {
+  local label="$1"
+  local path="$2"
+  if [[ ! -d "$path" ]]; then
+    echo "$label is missing or not a directory: $path" >&2
+    exit 1
+  fi
+  (cd "$path" && pwd -P)
 }
 
 canonical_dir_path() {
@@ -236,6 +251,11 @@ fi
 if ! command -v python3 >/dev/null 2>&1; then
   echo "python3 is required for real repo benchmarks" >&2
   exit 1
+fi
+
+if [[ -n "${UC_NATIVE_CORELIB_SRC:-}" ]]; then
+  UC_NATIVE_CORELIB_SRC="$(canonical_existing_dir_path "UC_NATIVE_CORELIB_SRC" "$UC_NATIVE_CORELIB_SRC")"
+  export UC_NATIVE_CORELIB_SRC
 fi
 
 RESULTS_DIR="$(canonical_dir_path "results directory" "$RESULTS_DIR")"

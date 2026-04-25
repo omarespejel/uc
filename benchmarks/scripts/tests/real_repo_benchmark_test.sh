@@ -301,6 +301,22 @@ test_real_repo_benchmark_rejects_no_cases_with_updated_usage() {
   fi
 }
 
+test_real_repo_benchmark_rejects_directory_uc_bin() {
+  local stderr_path="$TEST_TMP_DIR/directory-uc-bin.err"
+  if "$BENCH_SCRIPT" \
+    --uc-bin "$TEST_TMP_DIR" \
+    --case /tmp/Scarb.toml supported \
+    >"$TEST_TMP_DIR/directory-uc-bin.out" 2>"$stderr_path"; then
+    echo "expected real repo benchmark script to reject directory --uc-bin" >&2
+    return 1
+  fi
+  if ! grep -q "UC binary is missing or not a regular file" "$stderr_path"; then
+    echo "expected regular-file validation for --uc-bin" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+}
+
 test_real_repo_benchmark_accepts_cases_file() {
   local cases_root="$TEST_TMP_DIR/cases-file-cases"
   local mock_bin_dir="$TEST_TMP_DIR/cases-file-mock-bin"
@@ -349,7 +365,8 @@ test_real_repo_benchmark_canonicalizes_relative_paths() {
   local cases_root="$work_dir/cases"
   local mock_bin_dir="$work_dir/bin"
   local results_dir="$work_dir/results"
-  mkdir -p "$mock_bin_dir" "$results_dir"
+  local corelib_dir="$work_dir/corelib/src"
+  mkdir -p "$mock_bin_dir" "$results_dir" "$corelib_dir"
   write_mock_uc_bin "$mock_bin_dir/uc"
   write_mock_scarb_bin "$mock_bin_dir/scarb"
   write_manifest_case "$cases_root" "supported"
@@ -360,6 +377,7 @@ test_real_repo_benchmark_canonicalizes_relative_paths() {
     PATH="$mock_bin_dir:$PATH" \
     MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/relative-paths-uc.args" \
     MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/relative-paths-scarb.args" \
+    UC_NATIVE_CORELIB_SRC=corelib/src \
     "$BENCH_SCRIPT" \
       --uc-bin bin/uc \
       --results-dir results \
@@ -390,6 +408,13 @@ test_real_repo_benchmark_canonicalizes_relative_paths() {
   canonical_results_dir="$(cd "$results_dir" && pwd -P)"
   if ! grep -q "report=$canonical_results_dir/real-repo-supported-uc-auto-build-report.json" "$TEST_TMP_DIR/relative-paths-uc.args"; then
     echo "expected absolute report path under the requested results directory" >&2
+    cat "$TEST_TMP_DIR/relative-paths-uc.args" >&2
+    return 1
+  fi
+  local canonical_corelib_dir
+  canonical_corelib_dir="$(cd "$corelib_dir" && pwd -P)"
+  if ! grep -q "corelib=$canonical_corelib_dir" "$TEST_TMP_DIR/relative-paths-uc.args"; then
+    echo "expected relative UC_NATIVE_CORELIB_SRC to be canonicalized before cwd changes" >&2
     cat "$TEST_TMP_DIR/relative-paths-uc.args" >&2
     return 1
   fi
@@ -427,7 +452,8 @@ test_real_repo_benchmark_records_support_matrix_categories() {
   local mock_uc="$mock_bin_dir/uc"
   local mock_scarb="$mock_bin_dir/scarb"
   local results_dir="$TEST_TMP_DIR/results"
-  mkdir -p "$mock_bin_dir" "$results_dir"
+  local corelib_dir="$TEST_TMP_DIR/fake-corelib/src"
+  mkdir -p "$mock_bin_dir" "$results_dir" "$corelib_dir"
   write_mock_uc_bin "$mock_uc"
   write_mock_scarb_bin "$mock_scarb"
   write_manifest_case "$cases_root" "supported"
@@ -437,7 +463,7 @@ test_real_repo_benchmark_records_support_matrix_categories() {
   local stdout_text
   stdout_text="$(
     PATH="$mock_bin_dir:$PATH" \
-    UC_NATIVE_CORELIB_SRC="/tmp/fake-corelib/src" \
+    UC_NATIVE_CORELIB_SRC="$corelib_dir" \
     MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/uc.args" \
     MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/scarb.args" \
     "$BENCH_SCRIPT" \
@@ -489,7 +515,9 @@ test_real_repo_benchmark_records_support_matrix_categories() {
   assert_contains "$markdown_text" "| fallback-used | fallback_used | scarb_fallback |"
   assert_contains "$markdown_text" "| unsupported | native_unsupported | <none> | 2.14.0 |"
 
-  if ! grep -q "build .*supported.* disallow=1 corelib=/tmp/fake-corelib/src report=" "$TEST_TMP_DIR/uc.args"; then
+  local canonical_corelib_dir
+  canonical_corelib_dir="$(cd "$corelib_dir" && pwd -P)"
+  if ! grep -q "build .*supported.* disallow=1 corelib=$canonical_corelib_dir report=" "$TEST_TMP_DIR/uc.args"; then
     echo "expected supported case to run strict uc benchmark build" >&2
     cat "$TEST_TMP_DIR/uc.args" >&2
     return 1
@@ -745,6 +773,8 @@ run_test "real_repo_benchmark_rejects_zero_runs_from_environment" \
   test_real_repo_benchmark_rejects_zero_runs_from_environment
 run_test "real_repo_benchmark_rejects_no_cases_with_updated_usage" \
   test_real_repo_benchmark_rejects_no_cases_with_updated_usage
+run_test "real_repo_benchmark_rejects_directory_uc_bin" \
+  test_real_repo_benchmark_rejects_directory_uc_bin
 run_test "real_repo_benchmark_accepts_cases_file" \
   test_real_repo_benchmark_accepts_cases_file
 run_test "real_repo_benchmark_canonicalizes_relative_paths" \
