@@ -121,11 +121,12 @@ Then it should export the printed helper env var and rerun support probing befor
 When a build fails, agents should preserve a replayable artifact:
 
 ```sh
-uc build --engine uc --daemon-mode off --manifest-path Scarb.toml --record-failure /tmp/uc-failure.json
-uc replay /tmp/uc-failure.json
+failure_bundle="$(mktemp -t uc-failure.XXXXXX.json)"
+uc build --engine uc --daemon-mode off --manifest-path Scarb.toml --record-failure "$failure_bundle"
+uc replay "$failure_bundle"
 ```
 
-Use `uc replay /tmp/uc-failure.json --execute` only when the agent is allowed to rerun the recorded build command. Replay reports still emit structured JSON if the command cannot spawn or exceeds capture limits.
+Use `uc replay "$failure_bundle" --execute` only when the agent is allowed to rerun the recorded build command. Replay reports still emit structured JSON if the command cannot spawn or exceeds capture limits.
 
 ## Sources
 
