@@ -40,6 +40,8 @@ Strict smoke generation commands:
 
 ```bash
 export UC_REPO_ROOT="$(pwd)"
+# The artifact directory was produced after PR #51 fixed generated claim
+# pluralization; PR #52 records that regenerated evidence in this document.
 export STRICT_EVIDENCE_ROOT="/path/to/external/uc-launch-evidence-complete-monero-20260425-pr51"
 export UC_NATIVE_TOOLCHAIN_2_14_BIN="$HOME/.uc/toolchain-helpers/uc-cairo214-helper/bin/uc"
 
@@ -101,6 +103,9 @@ Lane and conditions for this strict smoke:
 - CPU pinning: not set on this macOS host.
 - uc binary SHA-256: `3b4557707f3681ba3ebc34012adb2fe5a861ccb73f79f8e7b4948a8e4ef0bed0`.
 - Cairo 2.14 helper SHA-256: `b184a564ebd1b9761cc20ef8a11594aba2e4b355b348cfc5875a26d040ea27a3`.
+
+The speedups below are scoped only to the lane and conditions listed above
+(dataset, host, run counts, helper lane, and no CPU pinning).
 
 | Item | Cold Scarb p95 (ms) | Cold uc p95 (ms) | Cold speedup | Warm Scarb p95 (ms) | Warm uc p95 (ms) | Warm speedup |
 |---|---:|---:|---:|---:|---:|---:|
