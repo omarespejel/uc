@@ -67,7 +67,8 @@ Required evidence for that line:
 - Source-kind classification per `items[]` row:
   `deployed_contract` rows require a deployed address, while `declared_class`
   rows are class-source evidence and cannot support a deployed-contract universe
-  claim.
+  claim. Legacy rows without `source_kind` are normalized as
+  `deployed_contract`, but launch inventories should set the field explicitly.
 - Deduplication rules for repeated class hashes or reused source packages,
   recorded in `deduplication`.
 - License/source availability rules, recorded in `license_policy` or the

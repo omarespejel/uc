@@ -85,6 +85,10 @@ For launch copy that says "deployed contracts", every row must be
 evidence for class source compatibility, but they intentionally block the
 deployed-contract claim guard.
 
+Legacy rows that omit `source_kind` are normalized as `deployed_contract` so old
+corpus artifacts remain readable. New reviewed inventories should set
+`source_kind` explicitly.
+
 Treat the source inventory as the durable raw evidence input. The source index
 and generated corpus JSON are deterministic artifacts and should be regenerated
 from the reviewed inventory instead of edited by hand.
