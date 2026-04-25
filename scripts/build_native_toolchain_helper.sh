@@ -253,15 +253,39 @@ helper_cargo_registry_src_root() {
   fi
 }
 
+helper_locked_crate_version() {
+  local crate_name="$1"
+  python3 - "$LOCKFILE_PATH" "$crate_name" <<'PY'
+import sys, tomllib
+from pathlib import Path
+lock_path = Path(sys.argv[1])
+crate_name = sys.argv[2]
+lock = tomllib.loads(lock_path.read_text())
+versions = sorted(
+    {
+        package.get("version")
+        for package in lock.get("package", [])
+        if package.get("name") == crate_name and package.get("version")
+    }
+)
+if len(versions) != 1:
+    raise SystemExit(
+        f"expected exactly one locked version for {crate_name} in {lock_path}, found {len(versions)}"
+    )
+print(versions[0])
+PY
+}
+
 find_helper_crate_source() {
   local crate_name="$1"
-  local registry_src="$2"
+  local crate_version="$2"
+  local registry_src="$3"
   local -a matches=()
   while IFS= read -r candidate; do
     matches+=("$candidate")
-  done < <(find "$registry_src" -mindepth 2 -maxdepth 2 -type d -name "${crate_name}-${CAIRO_VERSION}" | sort)
+  done < <(find "$registry_src" -mindepth 2 -maxdepth 2 -type d -name "${crate_name}-${crate_version}" | sort)
   if [[ "${#matches[@]}" -ne 1 ]]; then
-    echo "expected exactly one registry source for ${crate_name}-${CAIRO_VERSION} under $registry_src, found ${#matches[@]}" >&2
+    echo "expected exactly one registry source for ${crate_name}-${crate_version} under $registry_src, found ${#matches[@]}" >&2
     return 1
   fi
   printf '%s\n' "${matches[0]}"
@@ -307,7 +331,7 @@ apply_helper_lane_patches() {
     echo "cargo registry source root not found for helper lane patches: $registry_src" >&2
     return 1
   fi
-  local patch_file crate_name crate_src crate_dst
+  local patch_file crate_name crate_version crate_src crate_dst
   for patch_file in "${patch_files[@]}"; do
     crate_name="$(basename "$patch_file" .patch)"
     case "$crate_name" in
@@ -318,7 +342,8 @@ apply_helper_lane_patches() {
         return 1
         ;;
     esac
-    crate_src="$(find_helper_crate_source "$crate_name" "$registry_src")"
+    crate_version="$(helper_locked_crate_version "$crate_name")"
+    crate_src="$(find_helper_crate_source "$crate_name" "$crate_version" "$registry_src")"
     crate_dst="$STAGING_DIR/.uc/helper-lane-patches/cairo-${LANE}/${crate_name}"
     if [[ -e "$crate_dst" ]]; then
       echo "helper lane patch destination already exists: $crate_dst" >&2
@@ -336,10 +361,22 @@ apply_helper_lane_patches() {
   append_helper_patch_section
 }
 
+refresh_helper_lockfile_if_patched() {
+  if [[ "${#PATCHED_CRATES[@]}" -eq 0 ]]; then
+    return 0
+  fi
+  (
+    cd "$STAGING_DIR"
+    cargo metadata --format-version 1 >/dev/null
+  )
+  printf 'Refreshed helper staging Cargo.lock for patched crates\n'
+}
+
 prepare_staging_tree
 rewrite_workspace_manifest
 apply_helper_lane_patches
 cp "$LOCKFILE_PATH" "$STAGING_DIR/Cargo.lock"
+refresh_helper_lockfile_if_patched
 
 if (( PREPARE_ONLY == 1 )); then
   printf 'Prepared helper staging tree: %s\n' "$STAGING_DIR"

@@ -101,9 +101,28 @@ write_helper_repo_with_lane_patch() {
   local repo_root="$1"
   local registry_src="$2"
   write_minimal_helper_repo_without_patch_section "$repo_root"
+  python3 - "$repo_root/Cargo.toml" <<'PY'
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+text = path.read_text()
+text = text.replace("members = []", 'members = ["probe"]')
+path.write_text(text)
+PY
   cat >> "$repo_root/Cargo.toml" <<'TOML'
 patch-dir = "toolchains/cairo-2.14/patches"
 TOML
+  mkdir -p "$repo_root/probe/src"
+  cat > "$repo_root/probe/Cargo.toml" <<'TOML'
+[package]
+name = "probe"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+cairo-lang-compiler = { workspace = true }
+TOML
+  printf 'pub fn probe() {}\n' > "$repo_root/probe/src/lib.rs"
   mkdir -p "$repo_root/toolchains/cairo-2.14/patches"
   cat > "$repo_root/toolchains/cairo-2.14/patches/cairo-lang-compiler.patch" <<'PATCH'
 diff --git a/README.md b/README.md
@@ -113,7 +132,14 @@ diff --git a/README.md b/README.md
 -original helper crate source
 +patched helper crate source
 PATCH
-  mkdir -p "$registry_src/fake-index/cairo-lang-compiler-2.14.0"
+  mkdir -p "$registry_src/fake-index/cairo-lang-compiler-2.14.0/src"
+  cat > "$registry_src/fake-index/cairo-lang-compiler-2.14.0/Cargo.toml" <<'TOML'
+[package]
+name = "cairo-lang-compiler"
+version = "2.14.0"
+edition = "2021"
+TOML
+  printf 'pub fn fake_compiler() {}\n' > "$registry_src/fake-index/cairo-lang-compiler-2.14.0/src/lib.rs"
   printf 'original helper crate source\n' > "$registry_src/fake-index/cairo-lang-compiler-2.14.0/README.md"
 }
 
@@ -131,11 +157,13 @@ test_prepare_only_applies_helper_lane_patches_from_registry_source() {
       --prepare-only >"$stdout_path"
 
   grep -q "Applied helper lane patch:" "$stdout_path"
+  grep -q "Refreshed helper staging Cargo.lock for patched crates" "$stdout_path"
   grep -q 'patched helper crate source' \
     "$stage_dir/.uc/helper-lane-patches/cairo-2.14/cairo-lang-compiler/README.md"
   grep -q '^\[patch\.crates-io\]' "$stage_dir/Cargo.toml"
   grep -q 'cairo-lang-compiler = { path = ".uc/helper-lane-patches/cairo-2.14/cairo-lang-compiler" }' \
     "$stage_dir/Cargo.toml"
+  (cd "$stage_dir" && cargo metadata --locked --format-version 1 >/dev/null)
 }
 
 test_prepare_only_and_check_only_are_mutually_exclusive() {
