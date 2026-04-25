@@ -162,6 +162,10 @@ def resolve_manifest_path(raw, tag):
         fail(f"manifest_path for {tag} must be relative to the source index: {manifest_path}")
     manifest_path = base_dir / manifest_path
     manifest_path = manifest_path.resolve()
+    try:
+        manifest_path.relative_to(base_dir)
+    except ValueError:
+        fail(f"manifest_path for {tag} must stay under the source index directory: {manifest_path}")
     if not manifest_path.is_file():
         fail(f"manifest_path does not exist for {tag}: {manifest_path}")
     if manifest_path.name != "Scarb.toml":

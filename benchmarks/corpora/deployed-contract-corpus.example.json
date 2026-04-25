@@ -23,8 +23,8 @@
       "contract_address": "0x0",
       "class_hash": "0x0",
       "source_ref": "local fixture",
-      "manifest_path": "../fixtures/scarb_smoke/Scarb.toml",
-      "cairo_version": "2.16.0",
+      "manifest_path": "source-fixtures/scarb_smoke/Scarb.toml",
+      "cairo_version": "2.14.0",
       "scarb_version": "2.14.0",
       "license": "fixture"
     }

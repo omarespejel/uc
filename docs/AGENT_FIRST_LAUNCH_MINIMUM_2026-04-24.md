@@ -25,8 +25,9 @@ This PR can credibly claim:
 - Manifest/lockfile-driven native lane selection.
 - Agent-grade diagnostics for native support and fallback classes.
 - Local-first support-matrix benchmark reporting.
-- A checked-in deployed-contract source-index schema, generator, corpus schema,
-  and wrapper that emit guarded support-matrix artifacts.
+- A checked-in deployed-contract source-inventory schema, source-index builder,
+  source-index schema, corpus generator, corpus schema, and wrapper that emit
+  guarded support-matrix artifacts.
 - Guardrails preventing unpublished local benchmark numbers from becoming launch copy.
 
 This PR should not claim:
@@ -35,8 +36,9 @@ This PR should not claim:
 - Flight-recorder/replay support.
 - SARIF export.
 - Deployed-contract universe coverage.
-- A real deployed-contract source index or generated corpus artifact; the
-  checked-in examples are sample shapes only and are not launch evidence.
+- A real deployed-contract source inventory, source index, or generated corpus
+  artifact; the checked-in examples are sample shapes only and are not launch
+  evidence.
 - Uniform speedups across every Cairo repo.
 
 ## Benchmark Message We Want
@@ -49,8 +51,13 @@ Do not publish that sentence until the corpus exists and the artifact is durable
 
 Required evidence for that line:
 
-- A checked-in or immutable manifest of contract sources/classes conforming to
-  `benchmarks/corpora/deployed-contract-source-index.schema.json`.
+- A checked-in or immutable raw source inventory conforming to
+  `benchmarks/corpora/deployed-contract-source-inventory.schema.json`.
+- Generated source-index JSON produced by
+  `benchmarks/scripts/build_deployed_contract_source_index.sh`; do not
+  hand-author the source index for launch evidence. Write it next to the
+  reviewed inventory so source manifest paths remain contained under the same
+  evidence directory.
 - Generated corpus JSON produced by
   `benchmarks/scripts/generate_deployed_contract_corpus.sh`; do not hand-author
   the run corpus for launch evidence.

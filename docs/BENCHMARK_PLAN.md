@@ -22,14 +22,21 @@ Measure and prove that `uc` outperforms Scarb on real workflows while maintainin
 - Reviewed baseline snapshots under `benchmarks/baselines/`.
 - Deployed-contract corpus plan/benchmark artifacts under `benchmarks/results/`,
   generated from `benchmarks/corpora/deployed-contract-corpus.schema.json`.
+
+- Deployed-contract source inventories conforming to
+  `benchmarks/corpora/deployed-contract-source-inventory.schema.json`; these
+  are the reviewed raw evidence inputs used to build source indexes.
 - Deployed-contract source indexes conforming to
   `benchmarks/corpora/deployed-contract-source-index.schema.json`; these are
-  the durable source-selection inputs used to generate corpus run artifacts.
+  deterministic outputs from reviewed inventories and are used to generate
+  corpus run artifacts.
+
 
 ## Execution Policy
 - Benchmarks are local-first. Reproduction must work from checked-in scripts plus pinned manifest paths; do not require GitHub Actions or hosted CI to verify the numbers.
 - Before comparing before/after performance claims, rerun both sides in the same binary/toolchain window on the same machine.
-- Deployed-contract claims must start from a reviewed source index, be generated
+- Deployed-contract claims must start from a reviewed source inventory, build a
+  source index with `build_deployed_contract_source_index.sh`, generate a corpus
   with `generate_deployed_contract_corpus.sh`, and then go through
   `run_deployed_contract_corpus.sh`; do not manually aggregate real-repo
   benchmark output into launch copy.
@@ -82,8 +89,12 @@ UC_NATIVE_TOOLCHAIN_2_14_BIN=/abs/path/to/uc-cairo214-helper \
   --case /abs/path/to/repo/Scarb.toml repo-tag
 
 # Pinned deployed-contract corpus support matrix and guarded claim artifact
+./benchmarks/scripts/build_deployed_contract_source_index.sh \
+  --inventory /abs/path/to/source-root/reviewed-deployed-contract-source-inventory.json \
+  --out /abs/path/to/source-root/pinned-deployed-contract-source-index.json
+
 ./benchmarks/scripts/generate_deployed_contract_corpus.sh \
-  --source-index /abs/path/to/pinned-deployed-contract-source-index.json \
+  --source-index /abs/path/to/source-root/pinned-deployed-contract-source-index.json \
   --out /abs/path/to/generated-deployed-contract-corpus.json
 
 ./benchmarks/scripts/run_deployed_contract_corpus.sh \
