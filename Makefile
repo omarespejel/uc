@@ -50,8 +50,8 @@ validate-native:
 	@$(MAKE) agent-validate
 	@$(MAKE) validate-local-ci
 	@$(MAKE) validate-scripts
-	@$(MAKE) validate-helper-lane
 	@$(MAKE) validate-bench-scripts
+	@$(MAKE) validate-helper-lane
 	@cargo test -p uc-cli main_tests::native_ -- --nocapture
 	@cargo test -p uc-cli commands::build::tests::native_ -- --nocapture
 

@@ -4,7 +4,7 @@ This document is the stable contract for machine-readable `uc` diagnostics. Huma
 
 ## Contract
 
-Every `NativeDiagnostic` emitted by `uc support native --format json`, `uc build --json`, or a build report must include:
+Every agent-facing diagnostic emitted by `uc project inspect --format json`, `uc support native --format json`, `uc build --json`, or a build report must include:
 
 - `schema_version`: integer schema version. Current version: `1`.
 - `code`: stable diagnostic code such as `UCN1004`.
@@ -87,6 +87,54 @@ Native toolchain helper lane is not productized.
 - Category: `toolchain_lane_unsupported`
 - Safe action: `manual_legacy_adapter_required`
 - Agent behavior: do not run the helper builder for this lane. Keep the workload in the support matrix as `native_unsupported` unless a reviewed compatible helper binary is explicitly supplied or a dedicated compatibility adapter lands.
+
+### UCP1000
+
+Project manifest could not be read.
+
+- Category: `manifest_read`
+- Safe action: `manual_manifest_fix_required`
+- Agent behavior: report the read failure; do not edit manifests without explicit source-edit permission.
+
+### UCP1001
+
+Project manifest TOML could not be parsed.
+
+- Category: `manifest_parse`
+- Safe action: `manual_manifest_fix_required`
+- Agent behavior: report the parser error and stop before build, metadata, or benchmark work.
+
+### UCP1002
+
+Native support probe failed during project inspection.
+
+- Category: `native_support_probe`
+- Safe action: `inspect_native_support_then_retry`
+- Agent behavior: run `uc support native --manifest-path <Scarb.toml> --format json` directly and use that result as the narrower failure surface.
+
+### UCP1003
+
+Lockfile path is not a regular file.
+
+- Category: `lockfile_shape`
+- Safe action: `manual_lockfile_fix_required`
+- Agent behavior: report the invalid lockfile path and do not derive toolchain state from it.
+
+### UCP1004
+
+Lockfile could not be parsed.
+
+- Category: `lockfile_parse`
+- Safe action: `manual_lockfile_fix_required`
+- Agent behavior: keep manifest-derived state, but do not rely on lockfile-derived toolchain selection until the lockfile is regenerated or fixed.
+
+### UCP1005
+
+Native support probe skipped for read-only project inspection.
+
+- Category: `native_support_probe`
+- Safe action: `inspect_native_support_then_retry`
+- Agent behavior: keep the inspect report as project-state evidence; run `uc support native --manifest-path <Scarb.toml> --format json` only when full native support probing is needed.
 
 ### UCN2001
 

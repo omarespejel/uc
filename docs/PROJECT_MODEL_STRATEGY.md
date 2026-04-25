@@ -33,8 +33,8 @@ If agents only see build output, they have to infer project state from command f
 
 | Surface | Current State | Next Target | Gate |
 | --- | --- | --- | --- |
-| Project manifest | `Scarb.toml` is the source of truth | `uc project inspect` reads Scarb manifests and optional `Uc.toml` overlays | supported workspaces inspect without hidden mutation |
-| Lockfile | `Scarb.lock` is consumed through compatibility paths | typed lockfile summary in stable JSON | lockfile parsing matches supported corpus |
+| Project manifest | `uc project inspect` reads `Scarb.toml` without mutation | add overlay reporting when that surface is ready | supported workspaces inspect without hidden mutation |
+| Lockfile | `uc project inspect` reports a typed `Scarb.lock` summary when present | expand lockfile parity fixtures across the corpus | lockfile parsing matches supported corpus |
 | Metadata | `uc metadata` uses compatibility behavior | metadata can be served from the project model behind a gate | metadata parity passes on corpus |
 | Build graph | build path selects native lane and records fallback | build planning consumes project model directly | artifact and diagnostic parity pass |
 | Resolver and source cache | resolver behavior remains compatibility-oriented | deterministic source/cache report | resolver parity and cache invalidation tests pass |
@@ -48,9 +48,15 @@ This document. No runtime behavior changes.
 
 ### Phase 1: Read-Only Project Model
 
-Add `uc project inspect --manifest-path <Scarb.toml> --format json`.
+Implemented: `uc project inspect --manifest-path <Scarb.toml> --format json`.
 
-It should parse `Scarb.toml`, read `Scarb.lock` when present, report package/workspace/target/dependency/toolchain metadata, classify unsupported features with stable diagnostics, and avoid mutating files.
+It parses `Scarb.toml`, reads `Scarb.lock` when present, reports package/workspace/target/dependency/toolchain metadata, embeds native support classification when manifest/lockfile data is sufficient, emits stable diagnostics, and avoids mutating files. The JSON report carries `readonly=true` and `mutation_status=none`.
+
+Next hardening for this phase:
+
+- add corpus fixtures for uncommon manifest target shapes
+- add overlay reporting when the overlay contract is ready
+- validate the report against `docs/agent/schemas/project-inspect-report.schema.json` in the local gate
 
 ### Phase 2: Metadata Parity
 
@@ -83,12 +89,11 @@ Add `uc check`, `uc test`, `uc lint`, `uc fmt`, `uc execute`, and `uc prove` one
 ## PR Sequence
 
 1. `project-model-contract`: add this strategy and align docs.
-2. `uc-project-inspect-schema`: schema and fixtures.
-3. `uc-project-inspect-command`: read-only command implementation.
-4. `metadata-from-project-model`: gated metadata parity path.
-5. `resolver-cache-readonly`: lockfile/source-cache reports.
-6. `resolver-cache-active`: gated resolver/source behavior.
-7. `command-surface-expansion`: add one command at a time.
+2. `uc-project-inspect-command`: read-only command, schema, and fixtures.
+3. `metadata-from-project-model`: gated metadata parity path.
+4. `resolver-cache-readonly`: lockfile/source-cache reports.
+5. `resolver-cache-active`: gated resolver/source behavior.
+6. `command-surface-expansion`: add one command at a time.
 
 ## Launch Messaging Boundary
 

@@ -17,6 +17,7 @@ required_files=(
   docs/PROJECT_MODEL_STRATEGY.md
   docs/AGENT_FIRST_LAUNCH_MINIMUM_2026-04-24.md
   docs/agent/schemas/native-diagnostic.schema.json
+  docs/agent/schemas/project-inspect-report.schema.json
   docs/agent/schemas/native-support-report.schema.json
   docs/agent/schemas/build-report.schema.json
   docs/agent/schemas/agent-eval-report.schema.json

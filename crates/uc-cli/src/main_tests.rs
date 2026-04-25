@@ -426,6 +426,198 @@ fn mcp_serve_cli_accepts_report_path() {
 }
 
 #[test]
+fn project_inspect_cli_accepts_json_format_and_report_path() {
+    let cli = Cli::try_parse_from([
+        "uc",
+        "project",
+        "inspect",
+        "--manifest-path",
+        "/tmp/workspace/Scarb.toml",
+        "--format",
+        "json",
+        "--report-path",
+        "/tmp/project-inspect.json",
+    ])
+    .expect("project inspect args should parse");
+    let Commands::Project(args) = cli.command else {
+        panic!("expected project command");
+    };
+    let ProjectCommand::Inspect(args) = args.command;
+    assert_eq!(
+        args.manifest_path,
+        Some(PathBuf::from("/tmp/workspace/Scarb.toml"))
+    );
+    assert_eq!(args.format, ProjectInspectFormatArg::Json);
+    assert_eq!(
+        args.report_path,
+        Some(PathBuf::from("/tmp/project-inspect.json"))
+    );
+}
+
+#[test]
+fn project_inspect_report_summarizes_manifest_lockfile_and_support_without_mutation() {
+    let dir = unique_test_dir("uc-project-inspect-report");
+    let manifest_path = dir.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+cairo-version = "2.14.0"
+
+[workspace]
+members = ["crates/*"]
+exclude = ["target"]
+
+[dependencies]
+starknet = "2.14.0"
+path_dep = { path = "../path_dep" }
+git_dep = { git = "https://example.com/repo.git", rev = "abc123" }
+
+[dev-dependencies]
+snforge_std = "0.48.0"
+
+[target.starknet-contract]
+name = "demo_contract"
+source-path = "src/lib.cairo"
+"#,
+    )
+    .expect("write manifest");
+    fs::write(
+        dir.join("Scarb.lock"),
+        r#"version = 1
+
+[[package]]
+name = "core"
+version = "2.14.0"
+
+[[package]]
+name = "starknet"
+version = "2.14.0"
+source = "registry+https://example.com"
+dependencies = ["core"]
+"#,
+    )
+    .expect("write lockfile");
+    let manifest_hash_before = hash_file_blake3(&manifest_path).expect("hash manifest before");
+    let lock_hash_before = hash_file_blake3(&dir.join("Scarb.lock")).expect("hash lock before");
+
+    let report =
+        project_inspect_report_from_manifest_path(&manifest_path).expect("inspect should succeed");
+
+    assert!(report.readonly);
+    assert_eq!(report.mutation_status, "none");
+    assert!(report.manifest.valid);
+    assert_eq!(report.package.name.as_deref(), Some("demo"));
+    assert_eq!(report.package.edition.as_deref(), Some("2024_07"));
+    assert_eq!(report.package.cairo_version.as_deref(), Some("2.14.0"));
+    assert_eq!(report.workspace.members, vec!["crates/*".to_string()]);
+    assert_eq!(report.workspace.exclude, vec!["target".to_string()]);
+    assert!(report
+        .targets
+        .iter()
+        .any(|target| target.kind == "starknet-contract"
+            && target.name.as_deref() == Some("demo_contract")
+            && target.source_path.as_deref() == Some("src/lib.cairo")));
+    assert!(report
+        .dependencies
+        .iter()
+        .any(|dep| dep.name == "path_dep" && dep.kind == "path"));
+    assert!(report
+        .dependencies
+        .iter()
+        .any(|dep| dep.name == "git_dep" && dep.kind == "git"));
+    assert!(report.lockfile.present);
+    assert!(report.lockfile.valid);
+    assert_eq!(report.lockfile.version.as_deref(), Some("1"));
+    assert!(report
+        .lockfile
+        .packages
+        .iter()
+        .any(|package| package.name == "starknet"
+            && package.version.as_deref() == Some("2.14.0")
+            && package.dependencies_count == 1));
+    assert_eq!(
+        report.toolchain.request_source,
+        Some(NativeToolchainRequestSource::PackageCairoVersion)
+    );
+    assert_eq!(
+        report.toolchain.requested_version.as_deref(),
+        Some("2.14.0")
+    );
+    assert_eq!(
+        report.toolchain.requested_major_minor.as_deref(),
+        Some("2.14")
+    );
+    assert!(report.native_support.is_some());
+    assert_eq!(
+        hash_file_blake3(&manifest_path).expect("hash manifest after"),
+        manifest_hash_before
+    );
+    assert_eq!(
+        hash_file_blake3(&dir.join("Scarb.lock")).expect("hash lock after"),
+        lock_hash_before
+    );
+    assert!(!dir.join(".uc").exists());
+    assert!(!dir.join("target").exists());
+    assert!(!dir.join("Uc.toml").exists());
+}
+
+#[test]
+fn project_inspect_report_returns_structured_diagnostic_for_invalid_manifest() {
+    let dir = unique_test_dir("uc-project-inspect-invalid-manifest");
+    let manifest_path = dir.join("Scarb.toml");
+    fs::write(&manifest_path, "[package\nname = \"broken\"\n").expect("write manifest");
+
+    let report =
+        project_inspect_report_from_manifest_path(&manifest_path).expect("inspect should succeed");
+
+    assert!(!report.manifest.valid);
+    assert!(report.native_support.is_none());
+    assert!(report
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "UCP1001"
+            && diagnostic.category == "manifest_parse"
+            && diagnostic.safe_automated_action == "manual_manifest_fix_required"));
+}
+
+#[test]
+fn project_inspect_skips_metadata_probe_to_preserve_readonly_contract() {
+    let dir = unique_test_dir("uc-project-inspect-readonly-skip");
+    let manifest_path = dir.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+
+[dependencies]
+starknet = ">=2.14.0"
+"#,
+    )
+    .expect("write manifest");
+
+    let report =
+        project_inspect_report_from_manifest_path(&manifest_path).expect("inspect should succeed");
+
+    assert!(report.readonly);
+    assert_eq!(report.mutation_status, "none");
+    assert!(report.native_support.is_none());
+    assert!(report
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "UCP1005"
+            && diagnostic.category == "native_support_probe"
+            && diagnostic.safe_automated_action == "inspect_native_support_then_retry"));
+    assert!(!dir.join(".uc").exists());
+    assert!(!dir.join("target").exists());
+    assert!(!dir.join("Uc.toml").exists());
+}
+
+#[test]
 fn replay_cli_defaults_to_dry_run() {
     let cli = Cli::try_parse_from(["uc", "replay", "/tmp/uc-failure.json"])
         .expect("replay args should parse");
