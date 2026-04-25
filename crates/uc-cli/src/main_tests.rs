@@ -1950,8 +1950,8 @@ cairo-version = "{compiler_major}.{}.0"
             .expect_err("older minor cairo-version should be rejected");
         let rendered = format!("{err:#}");
         assert!(
-            rendered.contains("helper lane") || rendered.contains("same cairo major.minor"),
-            "error should explain that native compile needs a compatible lane: {rendered}"
+            rendered.contains("helper lane"),
+            "error should explain that native compile needs an explicit helper lane: {rendered}"
         );
         assert!(
             native_error_allows_scarb_fallback(&err),
@@ -1973,8 +1973,7 @@ cairo-version = "{compiler_major}.{}.0"
         .expect_err("newer minor cairo-version should be rejected");
     let rendered = format!("{err:#}");
     assert!(
-        rendered.contains("helper lane")
-            || rendered.contains("incompatible with package cairo-version"),
+        rendered.contains("helper lane"),
         "error should describe the required native lane: {rendered}"
     );
     assert!(
@@ -2103,6 +2102,53 @@ edition = "2023_01"
             .contains("could not resolve an exact Cairo toolchain for legacy edition 2023_01"),
         "report should explain why legacy floating manifests are unsupported"
     );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_support_report_from_manifest_path_rejects_non_exact_pinned_dependency_constraint() {
+    let dir = unique_test_dir("uc-native-support-report-invalid-pinned-dependency");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let manifest_path = dir.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2023_11"
+
+[dependencies]
+starknet = "=2.5.x"
+"#,
+    )
+    .expect("write invalid dependency manifest");
+
+    let report = native_support_report_from_manifest_path(&manifest_path)
+        .expect("invalid pinned dependency should still produce a report");
+    assert_eq!(report.status, NativeSupportStatus::Unsupported);
+    assert!(!report.supported);
+    assert_eq!(
+        report.issue_kind.as_deref(),
+        Some("unsupported_manifest_constraint")
+    );
+    let json = serde_json::to_value(&report).expect("support report should serialize");
+    assert_eq!(json["diagnostics"][0]["code"], "UCN1002");
+    assert_eq!(json["diagnostics"][0]["toolchain_expected"], "=2.5.x");
+    assert_eq!(
+        json["toolchain"]["request_source"],
+        "manifest_dependency_version"
+    );
+    assert_eq!(json["toolchain"]["requested_version"], "=2.5.x");
+    assert!(
+        report
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("unsupported constraint `=2.5.x`"),
+        "report should classify malformed pinned dependency versions as unsupported constraints"
+    );
+
+    fs::remove_dir_all(&dir).ok();
 }
 
 #[cfg(feature = "native-compile")]
@@ -2678,6 +2724,8 @@ fn native_support_report_keeps_invalid_unproductized_helper_manual() {
     let requested_version = "2.5.3";
     let helper_env = native_toolchain_env_var_name_for_major_minor(requested_major_minor);
     let dir = unique_test_dir("uc-native-support-unproductized-helper-invalid");
+    fs::create_dir_all(dir.join("src")).expect("create src dir");
+    fs::write(dir.join("src/lib.cairo"), "fn main() {}\n").expect("write lib.cairo");
     let manifest_path = dir.join("Scarb.toml");
     fs::write(
         &manifest_path,
@@ -2724,6 +2772,38 @@ cairo-version = "{requested_version}"
             .unwrap_or_default()
             .contains("build_native_toolchain_helper")),
         "invalid helpers for unproductized lanes must stay on manual remediation"
+    );
+    let common = BuildCommonArgs {
+        manifest_path: Some(manifest_path.clone()),
+        package: None,
+        workspace: false,
+        features: Vec::new(),
+        offline: true,
+        release: false,
+        profile: None,
+    };
+    let err = build_native_compile_context(&common, &manifest_path, &dir)
+        .expect_err("invalid unproductized helper should fail build preflight");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("Cairo 2.5 helper lane"),
+        "build preflight should preserve the unsupported helper-lane branch: {rendered}"
+    );
+    assert!(
+        rendered.contains(&invalid_helper_path.display().to_string()),
+        "build preflight should name the invalid helper path: {rendered}"
+    );
+    assert!(
+        rendered.contains("reviewed"),
+        "build preflight should keep this path on manual reviewed-helper remediation: {rendered}"
+    );
+    assert!(
+        !rendered.contains("build_native_toolchain_helper"),
+        "build preflight must not tell agents to run the productized helper builder for unproductized lanes: {rendered}"
+    );
+    assert!(
+        native_error_allows_scarb_fallback(&err),
+        "invalid unproductized helper lane failures should remain scarb-fallback eligible"
     );
 
     fs::remove_dir_all(&dir).ok();

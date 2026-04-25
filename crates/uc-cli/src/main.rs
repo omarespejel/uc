@@ -2050,11 +2050,48 @@ fn native_toolchain_helper_lane_is_productized(major_minor: &str) -> bool {
 }
 
 #[cfg(feature = "native-compile")]
+fn is_exact_cairo_version(raw: &str) -> bool {
+    let mut parts = raw.split('.');
+    let Some(major) = parts.next() else {
+        return false;
+    };
+    let Some(minor) = parts.next() else {
+        return false;
+    };
+    let patch = parts.next();
+    if parts.next().is_some() {
+        return false;
+    }
+    let is_numeric_part = |part: &str| part.parse::<u64>().is_ok();
+    is_numeric_part(major) && is_numeric_part(minor) && patch.is_none_or(is_numeric_part)
+}
+
+#[cfg(feature = "native-compile")]
 fn manifest_exact_dependency_version(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     let exact = trimmed.strip_prefix('=').map(str::trim).unwrap_or(trimmed);
-    parse_cairo_version_major_minor(exact)?;
+    if !is_exact_cairo_version(exact) {
+        return None;
+    }
     Some(exact.to_string())
+}
+
+#[cfg(feature = "native-compile")]
+fn manifest_dependency_version_raw(manifest: &TomlValue, dependency_name: &str) -> Option<String> {
+    let dependency = manifest
+        .get("dependencies")
+        .and_then(TomlValue::as_table)
+        .and_then(|table| table.get(dependency_name))?;
+    match dependency {
+        TomlValue::String(raw) => Some(raw.trim().to_string()).filter(|value| !value.is_empty()),
+        TomlValue::Table(table) => table
+            .get("version")
+            .and_then(TomlValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        _ => None,
+    }
 }
 
 #[cfg(feature = "native-compile")]
@@ -2062,22 +2099,21 @@ fn manifest_dependency_exact_version(
     manifest: &TomlValue,
     dependency_name: &str,
 ) -> Option<String> {
-    let dependency = manifest
-        .get("dependencies")
-        .and_then(TomlValue::as_table)
-        .and_then(|table| table.get(dependency_name))?;
-    match dependency {
-        TomlValue::String(raw) => manifest_exact_dependency_version(raw),
-        TomlValue::Table(table) => {
-            let raw = table
-                .get("version")
-                .and_then(TomlValue::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())?;
-            manifest_exact_dependency_version(raw)
-        }
-        _ => None,
+    manifest_dependency_version_raw(manifest, dependency_name)
+        .as_deref()
+        .and_then(manifest_exact_dependency_version)
+}
+
+#[cfg(feature = "native-compile")]
+fn manifest_dependency_invalid_pinned_version(
+    manifest: &TomlValue,
+    dependency_name: &str,
+) -> Option<String> {
+    let raw = manifest_dependency_version_raw(manifest, dependency_name)?;
+    if raw.trim().starts_with('=') && manifest_exact_dependency_version(&raw).is_none() {
+        return Some(raw.trim().to_string());
     }
+    None
 }
 
 #[cfg(feature = "native-compile")]
@@ -2211,6 +2247,16 @@ fn resolve_native_toolchain_requirement(
             edition,
             requested_major_minor: parse_cairo_version_major_minor(&requested_version)
                 .map(format_cairo_version_major_minor),
+            requested_version: Some(requested_version),
+            request_source: Some(NativeToolchainRequestSource::ManifestDependencyVersion),
+        });
+    }
+    if let Some(requested_version) =
+        manifest_dependency_invalid_pinned_version(manifest, "starknet")
+    {
+        return Ok(NativeToolchainRequirement {
+            edition,
+            requested_major_minor: None,
             requested_version: Some(requested_version),
             request_source: Some(NativeToolchainRequestSource::ManifestDependencyVersion),
         });
