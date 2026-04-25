@@ -28,7 +28,7 @@ Already in this PR or required before launch:
 - `uc support native --format json` emits stable support reports.
 - `uc build --json` and `--report-path` carry build diagnostics.
 - `uc build --record-failure <path>` writes a redacted, replay-safe failure bundle on build errors.
-- `uc replay <bundle>` reads that bundle, strips legacy `--record-failure` arguments, and is dry-run by default.
+- `uc replay <bundle>` reads that bundle and is dry-run by default.
 - `uc agent eval --manifest-path <Scarb.toml>` returns a decision agents can act on before compiling.
 - `uc agent safe-action <action>` exposes dry-run-first remediation commands.
 - `uc mcp serve` emits the read-only command/resource catalog for MCP adapters.
@@ -36,7 +36,11 @@ Already in this PR or required before launch:
 - Diagnostics include schema version, docs URL, next commands, safe automated action, retryability, fallback status, expected toolchain, and found toolchain.
 - Real-repo benchmarks include native support classification and fallback status.
 - `scripts/doctor.sh --uc-bin <path> --manifest-path <Scarb.toml>` probes support before measurement.
-- `./scripts/build_native_toolchain_helper.sh --lane 2.14` provides the current older-Cairo helper lane.
+
+### Manual / Debug Surfaces
+
+- Agents should prefer `uc agent safe-action build-helper-lane --lane 2.14` for older-Cairo helper setup.
+- `./scripts/build_native_toolchain_helper.sh --lane 2.14` remains available for manual debugging when the agent command surface is not enough.
 
 ## Remaining PRs
 
