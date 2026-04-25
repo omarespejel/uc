@@ -29,16 +29,16 @@ without implying a complete Starknet Sepolia or mainnet universe snapshot.
 - Source kinds: `deployed_contract=1`
 - Cairo versions: `2.14.0` through `2.14.0`
 - Deduplication: `none`, `input_count=1`, `deduped_count=1`
-- Corpus benchmark JSON: `$STRICT_EVIDENCE_ROOT/results/deployed-contract-corpus-bench-20260425-221828.json`
-- Corpus benchmark Markdown: `$STRICT_EVIDENCE_ROOT/results/deployed-contract-corpus-bench-20260425-221828.md`
-- Real-repo benchmark JSON: `$STRICT_EVIDENCE_ROOT/results/real-repo-bench-20260425-221829.json`
-- Real-repo benchmark Markdown: `$STRICT_EVIDENCE_ROOT/results/real-repo-bench-20260425-221829.md`
+- Corpus benchmark JSON: `$STRICT_EVIDENCE_ROOT/results/deployed-contract-corpus-bench-20260425-232135.json`
+- Corpus benchmark Markdown: `$STRICT_EVIDENCE_ROOT/results/deployed-contract-corpus-bench-20260425-232135.md`
+- Real-repo benchmark JSON: `$STRICT_EVIDENCE_ROOT/results/real-repo-bench-20260425-232135.json`
+- Real-repo benchmark Markdown: `$STRICT_EVIDENCE_ROOT/results/real-repo-bench-20260425-232135.md`
 
 Strict smoke generation commands:
 
 ```bash
 export UC_REPO_ROOT="$(pwd)"
-export STRICT_EVIDENCE_ROOT="/path/to/external/uc-launch-evidence-complete-monero-20260425"
+export STRICT_EVIDENCE_ROOT="/path/to/external/uc-launch-evidence-complete-monero-20260425-pr51"
 export UC_NATIVE_TOOLCHAIN_2_14_BIN="$HOME/.uc/toolchain-helpers/uc-cairo214-helper/bin/uc"
 
 cd "$UC_REPO_ROOT"
@@ -62,7 +62,7 @@ cargo build -p uc-cli --release
 ```
 
 Claim guard excerpt from
-`$STRICT_EVIDENCE_ROOT/results/deployed-contract-corpus-bench-20260425-221828.json`:
+`$STRICT_EVIDENCE_ROOT/results/deployed-contract-corpus-bench-20260425-232135.json`:
 
 ```json
 {
@@ -73,8 +73,7 @@ Claim guard excerpt from
 }
 ```
 
-Guarded claim wording derived from the harness output, grammar-normalized for
-the singular one-item corpus and valid only with
+Guarded claim wording emitted by the current harness output and valid only with
 `corpus_id=starknet-sepolia-reviewed-monero-deployed-complete-2026-04-25`:
 
 > We compiled every contract in the pinned starknet-sepolia deployed-contract corpus (1 item, 1 unique class hash, Cairo 2.14.0 through 2.14.0) and published support/benchmark artifacts.
@@ -103,7 +102,7 @@ Lane and conditions for this strict smoke:
 
 | Item | Cold Scarb p95 (ms) | Cold uc p95 (ms) | Cold speedup | Warm Scarb p95 (ms) | Warm uc p95 (ms) | Warm speedup |
 |---|---:|---:|---:|---:|---:|---:|
-| `monero_atomic_lock_sepolia` | 39891.437 | 13673.705 | 2.917x | 37372.696 | 33.054 | 1130.649x |
+| `monero_atomic_lock_sepolia` | 20514.476 | 15506.941 | 1.323x | 9369.959 | 37.513 | 249.779x |
 
 This strict smoke remains diagnostic for speed because
 `summary.unstable_lane_count=3`. It is valid support and claim-guard evidence
@@ -114,12 +113,12 @@ Strict smoke artifact hashes:
 ```text
 55d9cf3149dd44acc56c236c7f1b07bd1e38a9ece7c1a828448b59c5a25cc6fd  reviewed-source-inventory.json
 6842dd82ff66ba29b54952ffce76b73ba6358f01b3e1a11b0a40918e2c83b934  pinned-source-index.json
-3e7d2613d9cabc4bea7096b3ef052f99469f6e375ba63f413947702d0bb65adc  generated-corpus.json
-dcd3234cde91a10af096df2e3dff0317606508598385a3a93c2ba7358c0795ac  results/deployed-contract-corpus-bench-20260425-221828.json
-c5b4d7adbeded33ffdd22b5039b07b4c16d967532bb24e2491dc3b8b27e15f11  results/deployed-contract-corpus-bench-20260425-221828.md
-05f089c2489fe577863a0af4c010f201418ce0bbb00b38110684e207e63fe7ff  results/real-repo-bench-20260425-221829.json
-48d1e64070cdcab45a1d6d0ebe4a989d5ba49c897a3941e64bbf6864d8d60c63  results/real-repo-bench-20260425-221829.md
-134a9f81b1f474dacaf9ddf9264a9015e2b887b834e29af2a38b80368d41c769  results/real-repo-monero_atomic_lock_sepolia-uc-auto-build-report.json
+01778f8cfc3cf6a4804cb469b7fc4dbaffd352d519bbe606449f2c5cd4999b4b  generated-corpus.json
+8e04e32d460d30cf0cc5e92a7d8da48b4a3e878c320ada18246a2d857b19a346  results/deployed-contract-corpus-bench-20260425-232135.json
+850a6c8ffaf6119a3669b6aebfe21243bd9b44e4f2ecde799467f2b1c7b13dd9  results/deployed-contract-corpus-bench-20260425-232135.md
+d66e5a60443326fcaf5040e9396eb65d4c8b26f0715bb5963601883481fe9261  results/real-repo-bench-20260425-232135.json
+31f597d7b70e59b14233720171847da314eeab4ed5a1cc9ad9e79ba2389a9896  results/real-repo-bench-20260425-232135.md
+4877273c569b85be4df52f4a67d220a4cf1694609135d7547e65d461a385e719  results/real-repo-monero_atomic_lock_sepolia-uc-auto-build-report.json
 ```
 
 To verify the strict smoke artifact hashes, set `STRICT_EVIDENCE_ROOT` to the
@@ -254,7 +253,7 @@ Also safe to say internally:
 Safe to say for the strict bounded monero corpus because
 `.claim_guard.safe_to_say_compiled_all_deployed_contracts_in_corpus=true`:
 
-> We compiled every contract in the pinned starknet-sepolia deployed-contract corpus (1 items, 1 unique class hashes, Cairo 2.14.0 through 2.14.0) and published support/benchmark artifacts.
+> We compiled every contract in the pinned starknet-sepolia deployed-contract corpus (1 item, 1 unique class hash, Cairo 2.14.0 through 2.14.0) and published support/benchmark artifacts.
 
 Not safe to say yet:
 
