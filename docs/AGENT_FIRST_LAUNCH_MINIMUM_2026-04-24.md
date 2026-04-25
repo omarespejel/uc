@@ -104,6 +104,13 @@ The demo should show the agent path, not only the human path:
 6. Agent runs the benchmark/support matrix.
 7. Agent reports supported/fallback/build-failed cases without parsing terminal prose.
 
+The demo should also show the stop state:
+
+1. A Cairo lane is requested that this release does not productize.
+2. Agent reads `UCN1006` from JSON.
+3. Agent does not run the helper builder.
+4. Agent classifies the workload as `native_unsupported` with the diagnostic reason attached.
+
 ## Source-Backed Design Basis
 
 - AGENTS.md is the repo-instructions surface for coding agents: <https://agents.md/>

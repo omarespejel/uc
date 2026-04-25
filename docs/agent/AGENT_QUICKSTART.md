@@ -38,6 +38,8 @@ If diagnostic `UCN1004` has `safe_automated_action=build_helper_lane`, run the h
 
 Then export the printed env var and rerun support probing.
 
+If diagnostic `UCN1006` has `safe_automated_action=manual_legacy_adapter_required`, do not run the helper builder for that lane. Report the workload as `native_unsupported`, or use an explicitly reviewed helper binary via the reported `UC_NATIVE_TOOLCHAIN_<major>_<minor>_BIN` env var. After setting a reviewed helper env var, rerun `UC_NATIVE_TOOLCHAIN_<major>_<minor>_BIN=/abs/path/to/helper-uc uc support native --manifest-path /abs/path/to/Scarb.toml --format json` before final classification; the rerun validates the helper and lets the lane proceed past `manual_legacy_adapter_required`.
+
 ## Build Report
 
 ```sh

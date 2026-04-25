@@ -80,6 +80,14 @@ Configured native toolchain helper is invalid.
 - Safe action: `rebuild_helper_lane`
 - Agent behavior: rebuild the helper or point the environment variable at an executable helper binary.
 
+### UCN1006
+
+Native toolchain helper lane is not productized.
+
+- Category: `toolchain_lane_unsupported`
+- Safe action: `manual_legacy_adapter_required`
+- Agent behavior: do not run the helper builder for this lane. Keep the workload in the support matrix as `native_unsupported` unless a reviewed compatible helper binary is explicitly supplied or a dedicated compatibility adapter lands.
+
 ### UCN2001
 
 Native preflight downgraded to Scarb.
@@ -114,7 +122,7 @@ Agents may perform only safe actions by default:
 - `inspect_native_support_then_retry`
 - `use_native_enabled_binary`
 
-Agents must not edit Cairo source, dependency ranges, lockfiles, or release metadata unless the user or calling tool explicitly grants source-edit permission.
+Agents must not edit Cairo source, dependency ranges, lockfiles, release metadata, or legacy toolchain adapter code unless the user or calling tool explicitly grants source-edit permission. Diagnostics with `safe_automated_action=manual_legacy_adapter_required` are stop-and-report states, not autonomous fix states.
 
 ## Compatibility Notes
 

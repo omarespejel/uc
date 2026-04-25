@@ -256,6 +256,10 @@ const CACHEABLE_ARTIFACT_SUFFIXES: [&str; 7] = [
 const UC_AGENT_JSON_SCHEMA_VERSION: u32 = 1;
 const UC_AGENT_DIAGNOSTICS_DOC_URL: &str =
     "https://github.com/omarespejel/uc/blob/main/docs/agent/AGENT_DIAGNOSTICS.md";
+#[cfg(feature = "native-compile")]
+// Keep this packaged with `uc-cli`; do not read the workspace root at compile time.
+// When adding a helper lane, update this list with the root helper-builder metadata.
+const PRODUCTIZED_NATIVE_TOOLCHAIN_HELPER_LANES: &[&str] = &["2.14"];
 
 #[derive(Parser, Debug)]
 #[command(name = "uc")]
@@ -2031,31 +2035,85 @@ fn native_toolchain_env_var_name_for_major_minor(major_minor: &str) -> String {
 }
 
 #[cfg(feature = "native-compile")]
-fn manifest_dependency_exact_version(
-    manifest: &TomlValue,
-    dependency_name: &str,
-) -> Option<String> {
+fn productized_native_toolchain_helper_lanes() -> Vec<String> {
+    PRODUCTIZED_NATIVE_TOOLCHAIN_HELPER_LANES
+        .iter()
+        .map(|lane| (*lane).to_string())
+        .collect()
+}
+
+#[cfg(feature = "native-compile")]
+fn native_toolchain_helper_lane_is_productized(major_minor: &str) -> bool {
+    PRODUCTIZED_NATIVE_TOOLCHAIN_HELPER_LANES
+        .iter()
+        .any(|lane| *lane == major_minor)
+}
+
+#[cfg(feature = "native-compile")]
+fn is_exact_cairo_version(raw: &str) -> bool {
+    let mut parts = raw.split('.');
+    let Some(major) = parts.next() else {
+        return false;
+    };
+    let Some(minor) = parts.next() else {
+        return false;
+    };
+    let patch = parts.next();
+    if parts.next().is_some() {
+        return false;
+    }
+    let is_numeric_part = |part: &str| part.parse::<u64>().is_ok();
+    is_numeric_part(major) && is_numeric_part(minor) && patch.is_none_or(is_numeric_part)
+}
+
+#[cfg(feature = "native-compile")]
+fn manifest_exact_dependency_version(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let exact = trimmed.strip_prefix('=').map(str::trim).unwrap_or(trimmed);
+    if !is_exact_cairo_version(exact) {
+        return None;
+    }
+    Some(exact.to_string())
+}
+
+#[cfg(feature = "native-compile")]
+fn manifest_dependency_version_raw(manifest: &TomlValue, dependency_name: &str) -> Option<String> {
     let dependency = manifest
         .get("dependencies")
         .and_then(TomlValue::as_table)
         .and_then(|table| table.get(dependency_name))?;
     match dependency {
-        TomlValue::String(raw) => {
-            let trimmed = raw.trim();
-            parse_cairo_version_major_minor(trimmed)?;
-            Some(trimmed.to_string())
-        }
-        TomlValue::Table(table) => {
-            let raw = table
-                .get("version")
-                .and_then(TomlValue::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())?;
-            parse_cairo_version_major_minor(raw)?;
-            Some(raw.to_string())
-        }
+        TomlValue::String(raw) => Some(raw.trim().to_string()).filter(|value| !value.is_empty()),
+        TomlValue::Table(table) => table
+            .get("version")
+            .and_then(TomlValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
         _ => None,
     }
+}
+
+#[cfg(feature = "native-compile")]
+fn manifest_dependency_exact_version(
+    manifest: &TomlValue,
+    dependency_name: &str,
+) -> Option<String> {
+    manifest_dependency_version_raw(manifest, dependency_name)
+        .as_deref()
+        .and_then(manifest_exact_dependency_version)
+}
+
+#[cfg(feature = "native-compile")]
+fn manifest_dependency_invalid_pinned_version(
+    manifest: &TomlValue,
+    dependency_name: &str,
+) -> Option<String> {
+    let raw = manifest_dependency_version_raw(manifest, dependency_name)?;
+    if raw.trim().starts_with('=') && manifest_exact_dependency_version(&raw).is_none() {
+        return Some(raw.trim().to_string());
+    }
+    None
 }
 
 #[cfg(feature = "native-compile")]
@@ -2193,6 +2251,16 @@ fn resolve_native_toolchain_requirement(
             request_source: Some(NativeToolchainRequestSource::ManifestDependencyVersion),
         });
     }
+    if let Some(requested_version) =
+        manifest_dependency_invalid_pinned_version(manifest, "starknet")
+    {
+        return Ok(NativeToolchainRequirement {
+            edition,
+            requested_major_minor: None,
+            requested_version: Some(requested_version),
+            request_source: Some(NativeToolchainRequestSource::ManifestDependencyVersion),
+        });
+    }
     if let Some(requested_version) = project_lockfile_dependency_version(manifest_path, "starknet")?
     {
         return Ok(NativeToolchainRequirement {
@@ -2243,6 +2311,12 @@ enum NativeCompileSupportIssue {
         requested: String,
         helper_env: String,
     },
+    UnsupportedToolchainHelperLane {
+        requested: String,
+        helper_env: String,
+        configured_path: Option<String>,
+        productized_lanes: Vec<String>,
+    },
     InvalidToolchainHelper {
         requested: String,
         helper_env: String,
@@ -2260,6 +2334,7 @@ impl NativeCompileSupportIssue {
             Self::UnparseableCompilerVersion { .. } => "UCN1003",
             Self::MissingToolchainHelper { .. } => "UCN1004",
             Self::InvalidToolchainHelper { .. } => "UCN1005",
+            Self::UnsupportedToolchainHelperLane { .. } => "UCN1006",
         }
     }
 
@@ -2273,6 +2348,7 @@ impl NativeCompileSupportIssue {
             Self::CompilerVersionMismatch { .. } => "compiler_version_mismatch",
             Self::MissingToolchainHelper { .. } => "missing_toolchain_helper",
             Self::InvalidToolchainHelper { .. } => "invalid_toolchain_helper",
+            Self::UnsupportedToolchainHelperLane { .. } => "unsupported_toolchain_helper_lane",
         }
     }
 
@@ -2293,6 +2369,9 @@ impl NativeCompileSupportIssue {
             Self::MissingToolchainHelper { .. } => {
                 "native compile preflight rejected missing external toolchain helper"
             }
+            Self::UnsupportedToolchainHelperLane { .. } => {
+                "native compile preflight rejected unproductized external toolchain helper lane"
+            }
             Self::InvalidToolchainHelper { .. } => {
                 "native compile preflight rejected invalid external toolchain helper"
             }
@@ -2309,6 +2388,9 @@ impl NativeCompileSupportIssue {
             Self::CompilerVersionMismatch { .. } => "Native toolchain mismatch",
             Self::MissingToolchainHelper { .. } => "Required native toolchain helper is missing",
             Self::InvalidToolchainHelper { .. } => "Configured native toolchain helper is invalid",
+            Self::UnsupportedToolchainHelperLane { .. } => {
+                "Native toolchain helper lane is not productized"
+            }
         }
     }
 
@@ -2321,6 +2403,7 @@ impl NativeCompileSupportIssue {
             Self::MissingToolchainHelper { .. } | Self::InvalidToolchainHelper { .. } => {
                 "toolchain_lane_unavailable"
             }
+            Self::UnsupportedToolchainHelperLane { .. } => "toolchain_lane_unsupported",
         }
     }
 
@@ -2344,6 +2427,21 @@ impl NativeCompileSupportIssue {
             } => format!(
                 "The project requires native Cairo {requested}, but `{helper_env}` is not configured."
             ),
+            Self::UnsupportedToolchainHelperLane {
+                requested,
+                helper_env,
+                configured_path,
+                productized_lanes,
+            } => {
+                let configured = configured_path
+                    .as_deref()
+                    .map(|path| format!("`{helper_env}` points to `{path}`, but that helper is not usable. "))
+                    .unwrap_or_else(|| format!("`{helper_env}` is unset. "));
+                format!(
+                    "The project requires native Cairo {requested}, but this uc release cannot build that helper lane automatically. {configured}The productized helper lane(s) are: {}.",
+                    format_productized_helper_lanes(productized_lanes)
+                )
+            }
             Self::InvalidToolchainHelper {
                 requested,
                 helper_env,
@@ -2357,7 +2455,7 @@ impl NativeCompileSupportIssue {
     fn reason(&self) -> String {
         match self {
             Self::LegacyEditionRequiresPinnedCairoVersion { edition } => format!(
-                "native compile could not resolve an exact Cairo toolchain for legacy edition {edition}; pin [package].cairo-version, commit a lockfile with an exact starknet version, or let `scarb metadata` resolve dependencies once before retrying"
+                "native compile could not resolve an exact Cairo toolchain for legacy edition {edition}; native compile requires an exact [package].cairo-version for legacy edition {edition}, or a committed lockfile/resolved metadata entry with an exact starknet version"
             ),
             Self::UnsupportedManifestConstraint { requested } => format!(
                 "native compile requires an exact cairo-version (major.minor[.patch]); unsupported constraint `{requested}`"
@@ -2380,6 +2478,21 @@ impl NativeCompileSupportIssue {
             } => format!(
                 "native compile requires a Cairo {requested} helper lane, but `{helper_env}` is unset; configure it to a uc binary built with cairo-lang {requested}"
             ),
+            Self::UnsupportedToolchainHelperLane {
+                requested,
+                helper_env,
+                configured_path,
+                productized_lanes,
+            } => {
+                let configured = configured_path
+                    .as_deref()
+                    .map(|path| format!("; configured `{helper_env}` helper `{path}` is not an executable uc binary"))
+                    .unwrap_or_default();
+                format!(
+                    "native compile requires a Cairo {requested} helper lane, but this release only productizes helper building for {}{configured}; provide a reviewed `{helper_env}` helper or implement the legacy compatibility adapter before marking this workload native-supported",
+                    format_productized_helper_lanes(productized_lanes)
+                )
+            }
             Self::InvalidToolchainHelper {
                 requested,
                 helper_env,
@@ -2424,6 +2537,20 @@ impl NativeCompileSupportIssue {
                     "Set `{helper_env}` to the path of a uc binary built with the required cairo-lang lane."
                 ),
             ],
+            Self::UnsupportedToolchainHelperLane {
+                helper_env,
+                productized_lanes,
+                ..
+            } => vec![
+                format!(
+                    "Do not run the helper builder for this lane; this release only productizes helper building for {}.",
+                    format_productized_helper_lanes(productized_lanes)
+                ),
+                format!(
+                    "If you already have a reviewed compatible helper, set `{helper_env}` to that executable and rerun support probing."
+                ),
+                "Otherwise keep this workload in the support matrix as native_unsupported until a dedicated legacy compatibility adapter lands.".to_string(),
+            ],
             Self::InvalidToolchainHelper { helper_env, .. } => vec![
                 "Rebuild the helper with `./scripts/build_native_toolchain_helper.sh --lane <major.minor>` if the binary is stale or missing.".to_string(),
                 format!("Point `{helper_env}` at an executable uc binary for the required Cairo lane."),
@@ -2461,6 +2588,14 @@ impl NativeCompileSupportIssue {
                     format!("{helper_env}=<helper-uc-path> uc support native --manifest-path <Scarb.toml> --format json"),
                 ]
             }
+            Self::UnsupportedToolchainHelperLane {
+                helper_env,
+                requested,
+                ..
+            } => vec![
+                "uc support native --manifest-path <Scarb.toml> --format json".to_string(),
+                format!("{helper_env}=<reviewed-cairo-{requested}-helper-uc-path> uc support native --manifest-path <Scarb.toml> --format json"),
+            ],
             Self::InvalidToolchainHelper {
                 requested,
                 helper_env,
@@ -2479,6 +2614,7 @@ impl NativeCompileSupportIssue {
         match self {
             Self::MissingToolchainHelper { .. } => "build_helper_lane",
             Self::InvalidToolchainHelper { .. } => "rebuild_helper_lane",
+            Self::UnsupportedToolchainHelperLane { .. } => "manual_legacy_adapter_required",
             Self::CompilerVersionMismatch { .. } | Self::UnparseableCompilerVersion { .. } => {
                 "select_matching_toolchain_lane"
             }
@@ -2502,6 +2638,11 @@ impl NativeCompileSupportIssue {
                 compiler,
             } => (Some(requested.clone()), Some(compiler.clone())),
             Self::MissingToolchainHelper { requested, .. } => (Some(requested.clone()), None),
+            Self::UnsupportedToolchainHelperLane {
+                requested,
+                configured_path,
+                ..
+            } => (Some(requested.clone()), configured_path.clone()),
             Self::InvalidToolchainHelper {
                 requested, path, ..
             } => (Some(requested.clone()), Some(path.clone())),
@@ -2524,6 +2665,15 @@ impl NativeCompileSupportIssue {
             toolchain_expected,
             toolchain_found,
         }
+    }
+}
+
+#[cfg(feature = "native-compile")]
+fn format_productized_helper_lanes(lanes: &[String]) -> String {
+    if lanes.is_empty() {
+        "<none>".to_string()
+    } else {
+        lanes.join(", ")
     }
 }
 
@@ -2553,6 +2703,17 @@ fn native_toolchain_report_for_issue(
 ) -> NativeToolchainReport {
     match issue {
         NativeCompileSupportIssue::MissingToolchainHelper { helper_env, .. } => {
+            NativeToolchainReport {
+                edition: requirement.edition.clone(),
+                requested_version: requirement.requested_version.clone(),
+                requested_major_minor: requirement.requested_major_minor.clone(),
+                request_source: requirement.request_source.clone(),
+                source: NativeToolchainSource::ExternalHelper,
+                binary_path: std::env::var(helper_env).ok(),
+                compiler_version: Some(native_cairo_lang_compiler_version().to_string()),
+            }
+        }
+        NativeCompileSupportIssue::UnsupportedToolchainHelperLane { helper_env, .. } => {
             NativeToolchainReport {
                 edition: requirement.edition.clone(),
                 requested_version: requirement.requested_version.clone(),
@@ -2613,10 +2774,18 @@ fn native_compile_support_issue_with_compiler(
 fn select_native_toolchain_from_requirement(
     requirement: &NativeToolchainRequirement,
 ) -> Result<std::result::Result<NativeToolchainSelection, NativeCompileSupportIssue>> {
-    if let Some(issue) = native_compile_support_issue_with_compiler(
+    select_native_toolchain_from_requirement_with_compiler(
         requirement,
         native_cairo_lang_compiler_version(),
-    ) {
+    )
+}
+
+#[cfg(feature = "native-compile")]
+fn select_native_toolchain_from_requirement_with_compiler(
+    requirement: &NativeToolchainRequirement,
+    compiler: &str,
+) -> Result<std::result::Result<NativeToolchainSelection, NativeCompileSupportIssue>> {
+    if let Some(issue) = native_compile_support_issue_with_compiler(requirement, compiler) {
         if matches!(
             issue,
             NativeCompileSupportIssue::CompilerVersionMismatch { .. }
@@ -2628,6 +2797,16 @@ fn select_native_toolchain_from_requirement(
                 .unwrap_or_else(|| requirement.requested_version.clone().unwrap_or_default());
             let helper_env = native_toolchain_env_var_name_for_major_minor(&requested_major_minor);
             let Some(helper_path_os) = std::env::var_os(&helper_env) else {
+                if !native_toolchain_helper_lane_is_productized(&requested_major_minor) {
+                    return Ok(Err(
+                        NativeCompileSupportIssue::UnsupportedToolchainHelperLane {
+                            requested: requested_major_minor,
+                            helper_env,
+                            configured_path: None,
+                            productized_lanes: productized_native_toolchain_helper_lanes(),
+                        },
+                    ));
+                }
                 return Ok(Err(NativeCompileSupportIssue::MissingToolchainHelper {
                     requested: requested_major_minor,
                     helper_env,
@@ -2635,6 +2814,16 @@ fn select_native_toolchain_from_requirement(
             };
             let helper_path = PathBuf::from(helper_path_os);
             if !native_toolchain_helper_path_is_usable(&helper_path) {
+                if !native_toolchain_helper_lane_is_productized(&requested_major_minor) {
+                    return Ok(Err(
+                        NativeCompileSupportIssue::UnsupportedToolchainHelperLane {
+                            requested: requested_major_minor,
+                            helper_env,
+                            configured_path: Some(helper_path.display().to_string()),
+                            productized_lanes: productized_native_toolchain_helper_lanes(),
+                        },
+                    ));
+                }
                 return Ok(Err(NativeCompileSupportIssue::InvalidToolchainHelper {
                     requested: requested_major_minor,
                     helper_env,
@@ -2812,9 +3001,16 @@ fn ensure_native_toolchain_requirement_supported_with_compiler(
     requirement: &NativeToolchainRequirement,
     compiler: &str,
 ) -> Result<()> {
-    let Some(issue) = native_compile_support_issue_with_compiler(requirement, compiler) else {
+    let Err(issue) = select_native_toolchain_from_requirement_with_compiler(requirement, compiler)?
+    else {
         return Ok(());
     };
+    log_native_compile_support_issue(&issue, compiler);
+    Err(native_fallback_eligible_error(issue.reason()))
+}
+
+#[cfg(feature = "native-compile")]
+fn log_native_compile_support_issue(issue: &NativeCompileSupportIssue, compiler: &str) {
     match &issue {
         NativeCompileSupportIssue::LegacyEditionRequiresPinnedCairoVersion { edition } => {
             tracing::warn!(
@@ -2828,6 +3024,7 @@ fn ensure_native_toolchain_requirement_supported_with_compiler(
         | NativeCompileSupportIssue::UnparseableCompilerVersion { requested, .. }
         | NativeCompileSupportIssue::CompilerVersionMismatch { requested, .. }
         | NativeCompileSupportIssue::MissingToolchainHelper { requested, .. }
+        | NativeCompileSupportIssue::UnsupportedToolchainHelperLane { requested, .. }
         | NativeCompileSupportIssue::InvalidToolchainHelper { requested, .. } => {
             tracing::warn!(
                 compiler = %compiler,
@@ -2837,7 +3034,6 @@ fn ensure_native_toolchain_requirement_supported_with_compiler(
             );
         }
     }
-    Err(native_fallback_eligible_error(issue.reason()))
 }
 
 #[cfg(all(feature = "native-compile", test))]
@@ -4433,20 +4629,58 @@ fn execute_daemon_build_with_backend(
     })
 }
 
+#[cfg(feature = "native-compile")]
+fn ensure_daemon_native_toolchain_request_supported(manifest_path: &Path) -> Result<()> {
+    let (_, selection) = select_native_toolchain_from_manifest_path(manifest_path)?;
+    match selection {
+        Ok(selection) => {
+            if let Some(helper_path) = selection.helper_path {
+                let message = format!(
+                    concat!(
+                        "daemon native build requires external native toolchain helper {}; ",
+                        "daemon requests cannot safely carry helper metadata yet; ",
+                        "run with --daemon-mode off or allow scarb fallback"
+                    ),
+                    helper_path.display()
+                );
+                return Err(native_fallback_eligible_error(message));
+            }
+            Ok(())
+        }
+        Err(issue) => {
+            log_native_compile_support_issue(&issue, native_cairo_lang_compiler_version());
+            Err(native_fallback_eligible_error(issue.reason()))
+        }
+    }
+}
+
+#[cfg(not(feature = "native-compile"))]
+fn ensure_daemon_native_toolchain_request_supported(_manifest_path: &Path) -> Result<()> {
+    Err(native_fallback_eligible_error(
+        "native compile backend is disabled at build time; rebuild uc with `native-compile` feature",
+    ))
+}
+
 fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildResponse> {
     validate_daemon_protocol_version(&request.protocol_version)
         .context("daemon build request protocol mismatch")?;
     let common = common_args_from_daemon_request(&request);
     let manifest_path = resolve_manifest_path(&common.manifest_path)?;
     let requested_backend = request.compile_backend.into_compile_backend();
-    let requested_compiler_version = compiler_version_for_backend(requested_backend)?;
-    match execute_daemon_build_with_backend(
-        &request,
-        &common,
-        &manifest_path,
-        requested_backend,
-        &requested_compiler_version,
-    ) {
+    let build_result = (|| -> Result<DaemonBuildResponse> {
+        if requested_backend == BuildCompileBackend::Native {
+            ensure_daemon_native_toolchain_request_supported(&manifest_path)?;
+        }
+        let requested_compiler_version = compiler_version_for_backend(requested_backend)?;
+        execute_daemon_build_with_backend(
+            &request,
+            &common,
+            &manifest_path,
+            requested_backend,
+            &requested_compiler_version,
+        )
+    })();
+    match build_result {
         Ok(response) => Ok(response),
         Err(native_err)
             if requested_backend == BuildCompileBackend::Native

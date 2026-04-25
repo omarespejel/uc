@@ -33,6 +33,9 @@ done
 if [[ "$manifest" == *"helper-missing"* ]]; then
   printf '{"manifest_path":"%s","status":"unsupported","supported":false,"reason":"native compile requires a Cairo 2.14.0 helper lane, but `UC_NATIVE_TOOLCHAIN_2_14_BIN` is unset","issue_kind":"missing_toolchain_helper","diagnostics":[{"code":"UCN1004","category":"toolchain_lane_unavailable","severity":"error","title":"Required native toolchain helper is missing","what_happened":"The project requires native Cairo 2.14.0, but `UC_NATIVE_TOOLCHAIN_2_14_BIN` is not configured.","why":"native compile requires a Cairo 2.14.0 helper lane, but `UC_NATIVE_TOOLCHAIN_2_14_BIN` is unset","how_to_fix":["Set `UC_NATIVE_TOOLCHAIN_2_14_BIN` to the path of a uc binary built with the required cairo-lang lane."],"retryable":false,"fallback_used":false,"toolchain_expected":"2.14.0","toolchain_found":null}]}
 ' "$manifest"
+elif [[ "$manifest" == *"helper-unproductized"* ]]; then
+  printf '{"manifest_path":"%s","status":"unsupported","supported":false,"reason":"native compile requires a Cairo 2.5 helper lane, but this release only productizes helper building for 2.14; keep this workload native_unsupported","issue_kind":"unsupported_toolchain_helper_lane","diagnostics":[{"code":"UCN1006","category":"toolchain_lane_unsupported","severity":"error","title":"Native toolchain helper lane is not productized","what_happened":"The project requires native Cairo 2.5, but this uc release cannot build that helper lane automatically.","why":"native compile requires a Cairo 2.5 helper lane, but this release only productizes helper building for 2.14","how_to_fix":["Keep this workload in the support matrix as native_unsupported."],"safe_automated_action":"manual_legacy_adapter_required","retryable":false,"fallback_used":false,"toolchain_expected":"2.5","toolchain_found":null}]}
+' "$manifest"
 elif [[ "$manifest" == *"/malformed-json/"* ]]; then
   printf '{"manifest_path":'
 else
@@ -74,6 +77,31 @@ test_doctor_manifest_probe_fails_for_missing_helper_lane() {
   grep -q '\[ok\] native support .*supported/Scarb.toml' "$stdout_path"
   grep -q '\[missing\] native support .*helper-missing/Scarb.toml.*UCN1004' "$stdout_path"
   grep -q 'UC_NATIVE_TOOLCHAIN_2_14_BIN' "$stdout_path"
+}
+
+test_doctor_manifest_probe_warns_for_unproductized_helper_lane() {
+  local cases_root="$TMP_DIR/unproductized-helper-cases"
+  local mock_bin_dir="$TMP_DIR/unproductized-helper-bin"
+  local mock_uc="$mock_bin_dir/uc"
+  local stdout_path="$TMP_DIR/unproductized-helper.out"
+  mkdir -p "$mock_bin_dir"
+  write_mock_uc_bin "$mock_uc"
+  write_manifest "$cases_root" supported
+  write_manifest "$cases_root" helper-unproductized
+
+  "$DOCTOR_SCRIPT" --uc-bin "$mock_uc" \
+    --manifest-path "$cases_root/supported/Scarb.toml" \
+    --manifest-path "$cases_root/helper-unproductized/Scarb.toml" >"$stdout_path" 2>&1
+  grep -q '\[ok\] native support .*supported/Scarb.toml' "$stdout_path"
+  grep -q '\[warn\] native support .*helper-unproductized/Scarb.toml.*UCN1006' "$stdout_path"
+  grep -q 'native_unsupported' "$stdout_path"
+  if grep 'helper-unproductized/Scarb.toml.*UCN1006' "$stdout_path" \
+    | grep -Eq 'build_native_toolchain_helper|build_helper_lane|safe_automated_action.*build_helper_lane'; then
+    echo "UCN1006 doctor warning must not suggest automated helper builds" >&2
+    cat "$stdout_path" >&2
+    return 1
+  fi
+  grep -q 'doctor passed' "$stdout_path"
 }
 
 test_doctor_requires_python_tomllib() {
@@ -233,6 +261,8 @@ test_doctor_manifest_probe_reports_invalid_json_without_aborting() {
 
 run_test "doctor_manifest_probe_fails_for_missing_helper_lane" \
   test_doctor_manifest_probe_fails_for_missing_helper_lane
+run_test "doctor_manifest_probe_warns_for_unproductized_helper_lane" \
+  test_doctor_manifest_probe_warns_for_unproductized_helper_lane
 run_test "doctor_requires_python_tomllib" \
   test_doctor_requires_python_tomllib
 run_test "doctor_manifest_probe_reports_missing_jq_without_aborting" \
