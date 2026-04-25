@@ -459,6 +459,266 @@ fn agent_eval_decision_runs_safe_action_for_helper_lane_failure() {
 }
 
 #[test]
+fn agent_eval_decision_selects_first_runnable_safe_action() {
+    let mut support = NativeSupportReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
+        status: NativeSupportStatus::Unsupported,
+        supported: false,
+        reason: Some("helper missing".to_string()),
+        compiler_version: Some("2.16.0".to_string()),
+        package_cairo_version: Some("2.14.0".to_string()),
+        issue_kind: Some("missing_toolchain_helper".to_string()),
+        toolchain: Some(NativeToolchainReport {
+            edition: "2024_07".to_string(),
+            requested_version: Some("2.14.0".to_string()),
+            requested_major_minor: Some("2.14".to_string()),
+            request_source: Some(NativeToolchainRequestSource::PackageCairoVersion),
+            source: NativeToolchainSource::ExternalHelper,
+            binary_path: None,
+            compiler_version: None,
+        }),
+        diagnostics: Vec::new(),
+    };
+    support.diagnostics.push(NativeDiagnostic {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        code: "UCN1001".to_string(),
+        category: "toolchain_mismatch".to_string(),
+        severity: NativeDiagnosticSeverity::Error,
+        title: "Manual manifest fix".to_string(),
+        docs_url: native_diagnostic_docs_url("UCN1001"),
+        what_happened: "manifest needs a manual fix".to_string(),
+        why: "manifest cannot be corrected by a safe action".to_string(),
+        how_to_fix: vec!["edit manifest".to_string()],
+        next_commands: Vec::new(),
+        safe_automated_action: "manual_manifest_or_lockfile_fix_required".to_string(),
+        retryable: false,
+        fallback_used: false,
+        toolchain_expected: Some("2.14.0".to_string()),
+        toolchain_found: None,
+    });
+    support.diagnostics.push(NativeDiagnostic {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        code: "UCN1004".to_string(),
+        category: "toolchain_missing".to_string(),
+        severity: NativeDiagnosticSeverity::Error,
+        title: "Missing helper".to_string(),
+        docs_url: native_diagnostic_docs_url("UCN1004"),
+        what_happened: "helper missing".to_string(),
+        why: "helper missing".to_string(),
+        how_to_fix: vec!["build helper".to_string()],
+        next_commands: Vec::new(),
+        safe_automated_action: "build_helper_lane".to_string(),
+        retryable: true,
+        fallback_used: false,
+        toolchain_expected: Some("2.14.0".to_string()),
+        toolchain_found: None,
+    });
+
+    let (decision, _, safe_actions, next_commands) = agent_eval_decision(&support);
+    assert_eq!(decision, AgentEvalDecision::RunSafeActionThenRetry);
+    assert_eq!(
+        safe_actions,
+        vec![
+            "manual_manifest_or_lockfile_fix_required".to_string(),
+            "build_helper_lane".to_string()
+        ]
+    );
+    assert!(
+        next_commands
+            .iter()
+            .any(|command| command.contains("uc agent safe-action build-helper-lane --lane 2.14")),
+        "agent eval should recommend the runnable safe action, not the first informational action: {next_commands:?}"
+    );
+    assert!(
+        !next_commands
+            .iter()
+            .any(|command| command.contains("manual-manifest-or-lockfile-fix-required")),
+        "agent eval must not print invalid safe-action commands: {next_commands:?}"
+    );
+}
+
+#[test]
+fn sanitized_failure_command_args_redacts_sensitive_values_and_strips_record_failure() {
+    let command = sanitized_failure_command_args([
+        "uc",
+        "build",
+        "--record-failure",
+        "/tmp/original-bundle.json",
+        "--manifest-path",
+        "/tmp/workspace/Scarb.toml",
+        "--api-key",
+        "secret-api-key",
+        "--token=secret-token",
+        "--password",
+        "secret-password",
+    ]);
+
+    assert_eq!(
+        command,
+        vec![
+            "uc".to_string(),
+            "build".to_string(),
+            "--manifest-path".to_string(),
+            "/tmp/workspace/Scarb.toml".to_string(),
+            "--api-key".to_string(),
+            "<redacted>".to_string(),
+            "--token=<redacted>".to_string(),
+            "--password".to_string(),
+            "<redacted>".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn replay_dry_run_reports_replay_safe_command() {
+    let dir = unique_test_dir("uc-replay-dry-run-safe-command");
+    let bundle_path = dir.join("uc-failure.json");
+    let report_path = dir.join("replay-report.json");
+    fs::create_dir_all(&dir).expect("failed to create replay dir");
+    fs::write(
+        &bundle_path,
+        serde_json::json!({
+            "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
+            "generated_at_epoch_ms": 1u64,
+            "command": [
+                "uc",
+                "build",
+                "--record-failure",
+                bundle_path.display().to_string(),
+                "--manifest-path",
+                "/tmp/workspace/Scarb.toml"
+            ],
+            "manifest_path": "/tmp/workspace/Scarb.toml",
+            "workspace_root": "/tmp/workspace",
+            "manifest_hash": null,
+            "lockfile_hash": null,
+            "selected_support": null,
+            "redacted_environment": {},
+            "error": "original failure"
+        })
+        .to_string(),
+    )
+    .expect("failed to write replay bundle");
+
+    run_replay(ReplayArgs {
+        bundle: bundle_path.clone(),
+        report_path: Some(report_path.clone()),
+        execute: false,
+    })
+    .expect("dry replay should emit a report");
+    let report: ReplayReport =
+        serde_json::from_slice(&fs::read(&report_path).expect("failed to read replay report"))
+            .expect("replay report should parse");
+    assert_eq!(
+        report.command,
+        vec![
+            "uc".to_string(),
+            "build".to_string(),
+            "--manifest-path".to_string(),
+            "/tmp/workspace/Scarb.toml".to_string(),
+        ]
+    );
+    assert!(!report.executed);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn replay_execute_emits_report_when_spawn_fails() {
+    let dir = unique_test_dir("uc-replay-execute-spawn-failure");
+    let bundle_path = dir.join("uc-failure.json");
+    let report_path = dir.join("replay-report.json");
+    fs::create_dir_all(&dir).expect("failed to create replay dir");
+    fs::write(
+        &bundle_path,
+        serde_json::json!({
+            "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
+            "generated_at_epoch_ms": 1u64,
+            "command": [dir.join("missing-uc").display().to_string()],
+            "manifest_path": null,
+            "workspace_root": null,
+            "manifest_hash": null,
+            "lockfile_hash": null,
+            "selected_support": null,
+            "redacted_environment": {},
+            "error": "original failure"
+        })
+        .to_string(),
+    )
+    .expect("failed to write replay bundle");
+
+    let err = run_replay(ReplayArgs {
+        bundle: bundle_path,
+        report_path: Some(report_path.clone()),
+        execute: true,
+    })
+    .expect_err("missing replay command should fail");
+    assert!(
+        format!("{err:#}").contains("failed to run command"),
+        "unexpected error: {err:#}"
+    );
+    let report: ReplayReport =
+        serde_json::from_slice(&fs::read(&report_path).expect("failed to read replay report"))
+            .expect("replay report should parse");
+    assert!(!report.executed);
+    assert!(
+        report
+            .blocked_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("execution failed"),
+        "replay report should preserve structured failure reason: {report:?}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn agent_safe_action_execute_emits_report_when_spawn_fails() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = unique_test_dir("uc-safe-action-spawn-failure");
+    let manifest_path = dir.join("Scarb.toml");
+    let report_path = dir.join("safe-action-report.json");
+    fs::create_dir_all(dir.join("src")).expect("failed to create src directory");
+    fs::write(
+        &manifest_path,
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n",
+    )
+    .expect("failed to write manifest");
+
+    let err = run_agent_safe_action(AgentSafeActionArgs {
+        action: AgentSafeActionKind::RefreshCache,
+        lane: None,
+        manifest_path: Some(manifest_path),
+        uc_bin: Some(dir.join("missing-uc")),
+        report_path: Some(report_path.clone()),
+        execute: true,
+    })
+    .expect_err("missing safe-action command should fail");
+    assert!(
+        format!("{err:#}").contains("failed to run command"),
+        "unexpected error: {err:#}"
+    );
+    let report: SafeActionReport =
+        serde_json::from_slice(&fs::read(&report_path).expect("failed to read safe-action report"))
+            .expect("safe-action report should parse");
+    assert!(!report.executed);
+    assert!(
+        report
+            .blocked_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("execution failed"),
+        "safe-action report should preserve structured failure reason: {report:?}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn daemon_metadata_request_roundtrip_preserves_fields() {
     let args = MetadataArgs {
         manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
@@ -6687,6 +6947,79 @@ edition = "2024_07"
     );
 
     std::env::remove_var("UC_NATIVE_CORELIB_SRC");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn build_native_compile_context_restores_self_edge_after_dev_only_surface() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = unique_test_dir("uc-native-context-dev-only-surface");
+    let manifest_path = dir.join("Scarb.toml");
+    let dev_dep_src = dir.join("deps/dev-tool/src");
+    fs::create_dir_all(dir.join("src")).expect("failed to create src directory");
+    fs::create_dir_all(&dev_dep_src).expect("failed to create dev dependency source");
+    fs::write(dir.join("src/lib.cairo"), "fn main() {}\n").expect("failed to write lib.cairo");
+    fs::write(dev_dep_src.join("lib.cairo"), "fn dev_tool() {}\n")
+        .expect("failed to write dev dependency lib.cairo");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo-native"
+version = "0.1.0"
+edition = "2024_07"
+
+[dev-dependencies]
+dev-tool = { path = "deps/dev-tool" }
+"#,
+    )
+    .expect("failed to write manifest");
+
+    let manifest_text = fs::read_to_string(&manifest_path).expect("failed to read manifest");
+    let manifest: TomlValue = toml::from_str(&manifest_text).expect("manifest should parse");
+    let surface = collect_native_dependency_surface(
+        &manifest,
+        Some(&manifest),
+        &manifest_path,
+        &dir,
+        "demo-native",
+        true,
+    );
+    assert!(
+        surface.path_dependency_roots.is_empty(),
+        "dev-only dependencies should not become native build roots"
+    );
+    assert!(
+        surface.crate_dependency_configs.iter().any(|config| {
+            config.crate_name == "demo_native" && config.dependencies.is_empty()
+        }),
+        "manifest-only dependency surface should not add a self-edge when only dev-dependencies exist"
+    );
+
+    let fake_corelib_src = dir.join("toolchain/corelib/src");
+    create_mock_native_corelib(&fake_corelib_src);
+    let _corelib = ScopedEnvVar::set_with_lock(&_guard, "UC_NATIVE_CORELIB_SRC", &fake_corelib_src);
+    let common = BuildCommonArgs {
+        manifest_path: Some(manifest_path.clone()),
+        package: None,
+        workspace: false,
+        features: Vec::new(),
+        offline: true,
+        release: false,
+        profile: None,
+    };
+    let context =
+        build_native_compile_context(&common, &manifest_path, &dir).expect("context should build");
+    let cairo_project = fs::read_to_string(context.cairo_project_dir.join("cairo_project.toml"))
+        .expect("failed to read cairo project");
+    assert!(
+        cairo_project.contains(
+            "[config.override.demo_native.dependencies]\ndemo_native = { discriminator = \"demo_native\" }"
+        ),
+        "native build context must restore the root crate self-edge used by crate-name imports: {cairo_project}"
+    );
+
     fs::remove_dir_all(&dir).ok();
 }
 
