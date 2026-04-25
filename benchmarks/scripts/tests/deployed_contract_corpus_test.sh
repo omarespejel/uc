@@ -29,6 +29,19 @@ extract_labeled_path() {
   awk -v prefix="$label: " 'index($0, prefix) == 1 {sub(prefix, ""); print}' | tail -n 1
 }
 
+assert_mock_logs_empty() {
+  local context="$1"
+  shift
+  local log_path
+  for log_path in "$@"; do
+    if [[ -s "$log_path" ]]; then
+      echo "$context should occur before uc/scarb execution" >&2
+      cat "$log_path" >&2
+      return 1
+    fi
+  done
+}
+
 write_mock_uc_bin() {
   local path="$1"
   cat > "$path" <<'MOCK'
@@ -686,6 +699,10 @@ test_complete_non_deduped_count_mismatch_blocks_deployed_contract_claim() {
     cat "$stderr_path" >&2
     return 1
   fi
+  assert_mock_logs_empty \
+    "non-deduped count validation reject" \
+    "$TEST_TMP_DIR/run-complete_deployed_contracts-none-3/uc.args" \
+    "$TEST_TMP_DIR/run-complete_deployed_contracts-none-3/scarb.args"
 }
 
 test_native_benchmark_failure_blocks_native_support_claim() {
@@ -775,6 +792,10 @@ test_complete_corpus_with_declared_class_blocks_deployed_claim() {
     cat "$stderr_path" >&2
     return 1
   fi
+  assert_mock_logs_empty \
+    "complete coverage source_kind validation reject" \
+    "$TEST_TMP_DIR/declared-class/uc.args" \
+    "$TEST_TMP_DIR/declared-class/scarb.args"
 }
 
 test_rejects_empty_declared_class_contract_address() {
