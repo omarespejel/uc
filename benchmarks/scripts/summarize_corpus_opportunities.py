@@ -31,6 +31,8 @@ GENERIC_DIAGNOSTIC_TEXT = {
     "native failed",
     "native compilation failed",
     "uc auto build failed",
+    "uc auto build failed before backend classification completed",
+    "uc auto build fell back to the scarb backend",
 }
 
 
@@ -142,13 +144,18 @@ def is_generic_diagnostic_text(value: Any) -> bool:
     if not isinstance(value, str):
         return False
     normalized = value.strip().rstrip(".").lower()
-    return normalized in GENERIC_DIAGNOSTIC_TEXT
+    return normalized in GENERIC_DIAGNOSTIC_TEXT or normalized.startswith("uc auto build failed")
 
 
 def diagnostic_quality_issues(diag: dict[str, Any]) -> list[str]:
     issues = [f"missing {field}" for field in sorted(REQUIRED_DIAGNOSTIC_FIELDS) if field not in diag]
     for field in ("what_happened", "why"):
-        text = (diag.get(field) or "").strip()
+        raw = diag.get(field)
+        if not isinstance(raw, str):
+            if field in diag:
+                issues.append(f"{field} is not a string")
+            continue
+        text = raw.strip()
         if not text or is_generic_diagnostic_text(text):
             issues.append(f"{field} is generic")
     return issues

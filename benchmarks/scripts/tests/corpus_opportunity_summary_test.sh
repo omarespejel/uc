@@ -303,8 +303,83 @@ JSON
   fi
 }
 
+test_stock_and_malformed_diagnostic_is_not_agent_grade() {
+  local fixture="$TEST_TMP_DIR/stock-malformed-diagnostic.json"
+  local out_json="$TEST_TMP_DIR/stock-malformed-diagnostic-opportunities.json"
+  cat > "$fixture" <<'JSON'
+{
+  "generated_at": "2026-04-25T00:00:00Z",
+  "summary": {
+    "support_matrix": {
+      "native_supported": 0,
+      "fallback_used": 0,
+      "native_unsupported": 0,
+      "build_failed": 1
+    },
+    "unstable_lanes": [],
+    "unstable_lane_count": 0
+  },
+  "cases": [
+    {
+      "tag": "stock-malformed-native-failure",
+      "manifest_path": "/tmp/stock-malformed/Scarb.toml",
+      "native_support": {
+        "supported": true,
+        "package_cairo_version": "2.14.0",
+        "diagnostics": []
+      },
+      "support_matrix": {
+        "classification": "build_failed",
+        "compile_backend": "uc_native_external_helper",
+        "fallback_used": false,
+        "reason": "uc auto build failed before backend classification completed",
+        "build_report": {
+          "diagnostics": [
+            {
+              "schema_version": 1,
+              "code": "UCN2002",
+              "category": "native_fallback_local_native_error",
+              "severity": "warn",
+              "title": "Native local build downgraded to Scarb",
+              "docs_url": "https://github.com/omarespejel/uc/blob/main/docs/agent/AGENT_DIAGNOSTICS.md#ucn2002",
+              "what_happened": "uc auto build failed before backend classification completed",
+              "why": {"message": "native build failed"},
+              "how_to_fix": [
+                "Review the selected native toolchain lane."
+              ],
+              "next_commands": [
+                "uc support native --manifest-path <Scarb.toml> --format json"
+              ],
+              "safe_automated_action": "inspect_native_support_then_retry",
+              "retryable": true,
+              "fallback_used": true
+            }
+          ]
+        }
+      },
+      "benchmark_status": "skipped",
+      "benchmarks": null
+    }
+  ]
+}
+JSON
+
+  "$SUMMARY_SCRIPT" --benchmark-json "$fixture" --out-json "$out_json"
+
+  local generic_gap weak_reason
+  generic_gap="$(jq -r '.cases[] | select(.tag=="stock-malformed-native-failure") | .opportunity_codes | index("UCO5001") != null' "$out_json")"
+  weak_reason="$(jq -r '.cases[] | select(.tag=="stock-malformed-native-failure") | .opportunities[] | select(.code=="UCO5001") | .why' "$out_json")"
+  assert_json_value "generic_gap" "$generic_gap" "true" "$out_json"
+  if [[ "$weak_reason" != *"what_happened is generic"* || "$weak_reason" != *"why is not a string"* ]]; then
+    echo "expected stock and malformed diagnostic fields to be named in UCO5001 reason" >&2
+    cat "$out_json" >&2
+    exit 1
+  fi
+}
+
 run_test "real_repo_summary_records_opportunities" test_real_repo_summary_records_opportunities
 run_test "deployed_wrapper_preserves_corpus_metadata" test_deployed_wrapper_preserves_corpus_metadata
 run_test "complete_but_generic_diagnostic_is_not_agent_grade" test_complete_but_generic_diagnostic_is_not_agent_grade
+run_test "stock_and_malformed_diagnostic_is_not_agent_grade" test_stock_and_malformed_diagnostic_is_not_agent_grade
 
 echo "All corpus opportunity summary tests passed."
