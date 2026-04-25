@@ -671,6 +671,36 @@ cairo-version = ">=2.14.0"
 }
 
 #[test]
+fn project_inspect_skips_invalid_dependency_pin_to_preserve_readonly_contract() {
+    let dir = unique_test_dir("uc-project-inspect-invalid-dependency-pin");
+    let _cleanup = TestDirCleanup::new(&dir);
+    let manifest_path = dir.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+
+[dependencies]
+starknet = "=foo"
+"#,
+    )
+    .expect("write manifest");
+
+    let report =
+        project_inspect_report_from_manifest_path(&manifest_path).expect("inspect should succeed");
+
+    assert!(report.native_support.is_none());
+    assert!(report
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "UCP1005"
+            && diagnostic.category == "native_support_probe"));
+    assert_project_inspect_left_no_artifacts(&dir);
+}
+
+#[test]
 fn project_inspect_uses_workspace_lockfile_for_member_manifest() {
     let workspace = unique_test_dir("uc-project-inspect-member-lockfile");
     let _cleanup = TestDirCleanup::new(&workspace);
@@ -738,6 +768,91 @@ starknet = ">=2.14.0"
         );
     }
     assert_project_inspect_left_no_artifacts(&workspace);
+    assert_project_inspect_left_no_artifacts(&member);
+}
+
+#[test]
+fn project_inspect_resolves_workspace_dependency_version_for_member_manifest() {
+    let workspace = unique_test_dir("uc-project-inspect-member-workspace-dep");
+    let _cleanup = TestDirCleanup::new(&workspace);
+    let member = workspace.join("member");
+    fs::create_dir_all(&member).expect("create member dir");
+    fs::write(
+        workspace.join("Scarb.toml"),
+        r#"[workspace]
+members = ["member"]
+
+[workspace.dependencies]
+starknet = "2.14.0"
+"#,
+    )
+    .expect("write workspace manifest");
+    let member_manifest = member.join("Scarb.toml");
+    fs::write(
+        &member_manifest,
+        r#"[package]
+name = "member"
+version = "0.1.0"
+edition = "2024_07"
+
+[dependencies]
+starknet = { workspace = true }
+"#,
+    )
+    .expect("write member manifest");
+
+    let report = project_inspect_report_from_manifest_path(&member_manifest)
+        .expect("inspect should succeed");
+
+    assert_eq!(report.workspace_root, workspace.display().to_string());
+    assert!(report.native_support.is_some());
+    assert_eq!(
+        report.toolchain.request_source,
+        Some(NativeToolchainRequestSource::ManifestDependencyVersion)
+    );
+    assert_eq!(
+        report.toolchain.requested_version.as_deref(),
+        Some("2.14.0")
+    );
+    assert!(!report
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "UCP1005"));
+    assert_project_inspect_left_no_artifacts(&workspace);
+    assert_project_inspect_left_no_artifacts(&member);
+}
+
+#[test]
+fn project_inspect_empty_workspace_summary_when_root_manifest_is_invalid() {
+    let workspace = unique_test_dir("uc-project-inspect-invalid-workspace-root");
+    let _cleanup = TestDirCleanup::new(&workspace);
+    let member = workspace.join("member");
+    fs::create_dir_all(&member).expect("create member dir");
+    fs::write(
+        workspace.join("Scarb.toml"),
+        "[workspace\nmembers = [\"member\"]\n",
+    )
+    .expect("write invalid workspace manifest");
+    fs::write(workspace.join("Scarb.lock"), "version = 1\n").expect("write workspace lockfile");
+    let member_manifest = member.join("Scarb.toml");
+    fs::write(
+        &member_manifest,
+        r#"[package]
+name = "member"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("write member manifest");
+
+    let report = project_inspect_report_from_manifest_path(&member_manifest)
+        .expect("inspect should succeed");
+
+    assert_eq!(report.workspace_root, workspace.display().to_string());
+    assert!(!report.workspace.has_workspace_table);
+    assert!(report.workspace.members.is_empty());
+    assert_project_inspect_left_no_artifacts(&workspace);
+    assert_project_inspect_left_no_artifacts(&member);
 }
 
 #[test]

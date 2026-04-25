@@ -2273,8 +2273,24 @@ fn project_inspect_report_from_manifest_path(manifest_path: &Path) -> Result<Pro
         .as_ref()
         .map(project_package_summary_from_manifest)
         .unwrap_or_default();
-    let workspace =
-        project_workspace_summary_for_report(&workspace_root, manifest_path, manifest.as_ref());
+    let workspace_manifest =
+        project_read_workspace_manifest_for_report(&workspace_root, manifest_path);
+    let workspace_manifest_path = workspace_root.join("Scarb.toml");
+    let inspecting_workspace_root = workspace_manifest_path == manifest_path;
+    let workspace_manifest_for_report = if inspecting_workspace_root {
+        manifest.as_ref()
+    } else {
+        workspace_manifest.as_ref()
+    };
+    let inspected_manifest_for_workspace = if inspecting_workspace_root {
+        manifest.as_ref()
+    } else {
+        None
+    };
+    let workspace = project_workspace_summary_for_report(
+        inspected_manifest_for_workspace,
+        workspace_manifest_for_report,
+    );
     let targets = manifest
         .as_ref()
         .map(project_targets_from_manifest)
@@ -2283,9 +2299,16 @@ fn project_inspect_report_from_manifest_path(manifest_path: &Path) -> Result<Pro
         .as_ref()
         .map(project_dependencies_from_manifest)
         .unwrap_or_default();
+    let workspace_dependencies = workspace_manifest_for_report
+        .map(project_workspace_dependencies_from_manifest)
+        .unwrap_or_default();
     let lockfile = project_lockfile_summary(&workspace_root, &mut diagnostics)?;
-    let readonly_native_source =
-        project_has_readonly_native_toolchain_source(&package, &dependencies, &lockfile);
+    let readonly_native_source = project_has_readonly_native_toolchain_source(
+        &package,
+        &dependencies,
+        &workspace_dependencies,
+        &lockfile,
+    );
     let native_support = if manifest.is_some() && readonly_native_source {
         match native_support_report_from_manifest_path(manifest_path) {
             Ok(report) => {
@@ -2362,8 +2385,13 @@ fn project_inspect_report_from_manifest_path(manifest_path: &Path) -> Result<Pro
     if let Some(support) = &native_support {
         diagnostics.extend(support.diagnostics.clone());
     }
-    let toolchain =
-        project_toolchain_summary(&package, &dependencies, &lockfile, native_support.as_ref());
+    let toolchain = project_toolchain_summary(
+        &package,
+        &dependencies,
+        &workspace_dependencies,
+        &lockfile,
+        native_support.as_ref(),
+    );
 
     Ok(ProjectInspectReport {
         schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
@@ -2391,6 +2419,7 @@ fn project_inspect_report_from_manifest_path(manifest_path: &Path) -> Result<Pro
 fn project_has_readonly_native_toolchain_source(
     package: &ProjectPackageSummary,
     dependencies: &[ProjectDependencySummary],
+    workspace_dependencies: &[ProjectDependencySummary],
     lockfile: &ProjectLockfileSummary,
 ) -> bool {
     package
@@ -2400,8 +2429,7 @@ fn project_has_readonly_native_toolchain_source(
         || dependencies.iter().any(|dependency| {
             dependency.section == "dependencies"
                 && dependency.name == "starknet"
-                && dependency
-                    .version
+                && project_dependency_resolved_version(dependency, workspace_dependencies)
                     .as_deref()
                     .is_some_and(project_version_avoids_metadata_probe)
         })
@@ -2471,11 +2499,10 @@ fn empty_project_workspace_summary() -> ProjectWorkspaceSummary {
     }
 }
 
-fn project_workspace_summary_for_report(
+fn project_read_workspace_manifest_for_report(
     workspace_root: &Path,
     manifest_path: &Path,
-    manifest: Option<&TomlValue>,
-) -> ProjectWorkspaceSummary {
+) -> Option<TomlValue> {
     let workspace_manifest_path = workspace_root.join("Scarb.toml");
     if workspace_manifest_path != manifest_path {
         match read_text_file_with_limit(&workspace_manifest_path, MAX_MANIFEST_BYTES, "manifest")
@@ -2486,18 +2513,26 @@ fn project_workspace_summary_for_report(
                     "failed to parse workspace manifest for project inspect",
                 )
             }) {
-            Ok(workspace_manifest) => {
-                return project_workspace_summary_from_manifest(&workspace_manifest);
-            }
+            Ok(workspace_manifest) => return Some(workspace_manifest),
             Err(err) => {
                 tracing::warn!(
                     manifest_path = %manifest_path.display(),
                     workspace_manifest_path = %workspace_manifest_path.display(),
                     error = %err,
-                    "project inspect could not read workspace root manifest; falling back to inspected manifest"
+                    "project inspect could not read workspace root manifest; using empty workspace summary"
                 );
             }
         }
+    }
+    None
+}
+
+fn project_workspace_summary_for_report(
+    manifest: Option<&TomlValue>,
+    workspace_manifest: Option<&TomlValue>,
+) -> ProjectWorkspaceSummary {
+    if let Some(workspace_manifest) = workspace_manifest {
+        return project_workspace_summary_from_manifest(workspace_manifest);
     }
 
     manifest
@@ -2632,6 +2667,39 @@ fn project_dependency_summary(
         tag,
         rev,
         workspace,
+    }
+}
+
+fn project_workspace_dependencies_from_manifest(
+    manifest: &TomlValue,
+) -> Vec<ProjectDependencySummary> {
+    let Some(table) = manifest
+        .get("workspace")
+        .and_then(TomlValue::as_table)
+        .and_then(|workspace| workspace.get("dependencies"))
+        .and_then(TomlValue::as_table)
+    else {
+        return Vec::new();
+    };
+    let mut dependencies = table
+        .iter()
+        .map(|(name, value)| project_dependency_summary("workspace.dependencies", name, value))
+        .collect::<Vec<_>>();
+    dependencies.sort_by(|left, right| left.name.cmp(&right.name));
+    dependencies
+}
+
+fn project_dependency_resolved_version(
+    dependency: &ProjectDependencySummary,
+    workspace_dependencies: &[ProjectDependencySummary],
+) -> Option<String> {
+    if dependency.workspace {
+        workspace_dependencies
+            .iter()
+            .find(|workspace_dependency| workspace_dependency.name == dependency.name)
+            .and_then(|workspace_dependency| workspace_dependency.version.clone())
+    } else {
+        dependency.version.clone()
     }
 }
 
@@ -2785,6 +2853,7 @@ fn project_lockfile_summary(
 fn project_toolchain_summary(
     package: &ProjectPackageSummary,
     dependencies: &[ProjectDependencySummary],
+    workspace_dependencies: &[ProjectDependencySummary],
     lockfile: &ProjectLockfileSummary,
     native_support: Option<&NativeSupportReport>,
 ) -> ProjectToolchainSummary {
@@ -2810,7 +2879,7 @@ fn project_toolchain_summary(
         if let Some(dep) = dependencies
             .iter()
             .find(|dep| dep.section == "dependencies" && dep.name == "starknet")
-            .and_then(|dep| dep.version.clone())
+            .and_then(|dep| project_dependency_resolved_version(dep, workspace_dependencies))
         {
             requested_version = Some(dep);
             request_source = Some(NativeToolchainRequestSource::ManifestDependencyVersion);
@@ -3948,6 +4017,18 @@ fn manifest_exact_dependency_version(raw: &str) -> Option<String> {
 }
 
 #[cfg(feature = "native-compile")]
+fn manifest_dependency_value_exact_version(value: &TomlValue) -> Option<String> {
+    match value {
+        TomlValue::String(raw) => manifest_exact_dependency_version(raw),
+        TomlValue::Table(table) => table
+            .get("version")
+            .and_then(TomlValue::as_str)
+            .and_then(manifest_exact_dependency_version),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "native-compile")]
 fn manifest_dependency_version_raw(manifest: &TomlValue, dependency_name: &str) -> Option<String> {
     let dependency = manifest
         .get("dependencies")
@@ -3963,6 +4044,51 @@ fn manifest_dependency_version_raw(manifest: &TomlValue, dependency_name: &str) 
             .map(str::to_string),
         _ => None,
     }
+}
+
+#[cfg(feature = "native-compile")]
+fn manifest_dependency_uses_workspace(manifest: &TomlValue, dependency_name: &str) -> bool {
+    manifest
+        .get("dependencies")
+        .and_then(TomlValue::as_table)
+        .and_then(|table| table.get(dependency_name))
+        .and_then(TomlValue::as_table)
+        .and_then(|table| table.get("workspace"))
+        .and_then(TomlValue::as_bool)
+        .unwrap_or(false)
+}
+
+#[cfg(feature = "native-compile")]
+fn manifest_workspace_dependency_exact_version(
+    manifest_path: &Path,
+    manifest: &TomlValue,
+    dependency_name: &str,
+) -> Result<Option<String>> {
+    if !manifest_dependency_uses_workspace(manifest, dependency_name) {
+        return Ok(None);
+    }
+    let workspace_root = metadata_cache_workspace_root(manifest_path)?;
+    let workspace_manifest_path = workspace_root.join("Scarb.toml");
+    let workspace_manifest;
+    let workspace_manifest_ref = if workspace_manifest_path == manifest_path {
+        manifest
+    } else {
+        let workspace_manifest_text = read_text_file_with_limit(
+            &workspace_manifest_path,
+            MAX_MANIFEST_BYTES,
+            "workspace manifest",
+        )?;
+        workspace_manifest = parse_manifest_toml(
+            &workspace_manifest_text,
+            &workspace_manifest_path,
+            "failed to parse workspace manifest for native support probe",
+        )?;
+        &workspace_manifest
+    };
+    Ok(
+        native_workspace_dependency_entry_from_manifest(workspace_manifest_ref, dependency_name)
+            .and_then(manifest_dependency_value_exact_version),
+    )
 }
 
 #[cfg(feature = "native-compile")]
@@ -4126,6 +4252,17 @@ fn resolve_native_toolchain_requirement(
         return Ok(NativeToolchainRequirement {
             edition,
             requested_major_minor: None,
+            requested_version: Some(requested_version),
+            request_source: Some(NativeToolchainRequestSource::ManifestDependencyVersion),
+        });
+    }
+    if let Some(requested_version) =
+        manifest_workspace_dependency_exact_version(manifest_path, manifest, "starknet")?
+    {
+        return Ok(NativeToolchainRequirement {
+            edition,
+            requested_major_minor: parse_cairo_version_major_minor(&requested_version)
+                .map(format_cairo_version_major_minor),
             requested_version: Some(requested_version),
             request_source: Some(NativeToolchainRequestSource::ManifestDependencyVersion),
         });
