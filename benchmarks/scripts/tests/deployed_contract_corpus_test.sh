@@ -743,6 +743,11 @@ test_native_benchmark_failure_blocks_native_support_claim() {
     cat "$json_path" >&2
     return 1
   fi
+  if ! grep -q "build .*fails-bench.* disallow=1" "$TEST_TMP_DIR/native-bench-fail/uc.args"; then
+    echo "expected fails-bench to fail during strict native benchmark build" >&2
+    cat "$TEST_TMP_DIR/native-bench-fail/uc.args" >&2
+    return 1
+  fi
   assert_contains "$reason" "one or more native-supported benchmark cases failed"
   assert_contains "$markdown_text" "Native-supported claim: <not safe for this artifact>"
 }
