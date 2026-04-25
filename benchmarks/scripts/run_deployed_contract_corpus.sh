@@ -427,7 +427,7 @@ jq -n \
      and ($corpus[0].deduplication.key == "none")
      and (($corpus[0].deduplication.input_count // 0) == item_count);
    def native_all:
-     all_items_native_supported;
+     all_items_native_supported and (failed_native_benchmarks == 0);
    def deduplication_phrase:
      if $corpus[0].deduplication.key == "none" then
        "without deduplication"

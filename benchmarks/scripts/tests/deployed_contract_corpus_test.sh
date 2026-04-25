@@ -93,6 +93,10 @@ if [[ "$1" == "build" ]]; then
         ;;
     esac
   done
+  if [[ "$manifest" == *"fails-bench"* && "${UC_NATIVE_DISALLOW_SCARB_FALLBACK:-}" == "1" ]]; then
+    printf 'build %s disallow=%s report=%s\n' "$manifest" "${UC_NATIVE_DISALLOW_SCARB_FALLBACK:-}" "$report_path" >> "$args_log"
+    exit 17
+  fi
   if [[ "$seen_offline" -ne 1 ]]; then
     echo "missing uc --offline" >&2
     exit 23
@@ -676,23 +680,71 @@ test_complete_non_deduped_count_mismatch_blocks_deployed_contract_claim() {
   [[ -f "$json_path" ]] || { echo "missing corpus benchmark json: $json_path" >&2; return 1; }
   [[ -f "$md_path" ]] || { echo "missing corpus benchmark markdown: $md_path" >&2; return 1; }
 
-  local safe selected_safe all_supported claim selected_claim reason markdown_text
+  local safe selected_safe all_supported claim selected_claim native_claim reason markdown_text
   safe="$(jq -r '.claim_guard.safe_to_say_compiled_all_deployed_contracts_in_corpus' "$json_path")"
   selected_safe="$(jq -r '.claim_guard.safe_to_say_compiled_all_selected_deployed_units_in_corpus' "$json_path")"
   all_supported="$(jq -r '.claim_guard.safe_to_say_all_items_native_supported' "$json_path")"
   claim="$(jq -r '.claim_guard.compiled_all_claim_text // ""' "$json_path")"
   selected_claim="$(jq -r '.claim_guard.selected_units_claim_text // ""' "$json_path")"
+  native_claim="$(jq -r '.claim_guard.native_supported_claim_text // ""' "$json_path")"
   reason="$(jq -r '.claim_guard.reason' "$json_path")"
   markdown_text="$(cat "$md_path")"
-  if [[ "$safe" != "false" || "$selected_safe" != "false" || "$all_supported" != "true" || -n "$claim" || -n "$selected_claim" ]]; then
+  if [[ "$safe" != "false" || "$selected_safe" != "false" || "$all_supported" != "true" || -n "$claim" || -n "$selected_claim" || -z "$native_claim" ]]; then
     echo "non-deduped corpus with mismatched counts should not emit deployed-address or selected-unit claims" >&2
     cat "$json_path" >&2
     return 1
   fi
   assert_contains "$reason" "deduplication.input_count does not equal item_count"
   assert_contains "$reason" "address coverage is incomplete"
+  assert_contains "$native_claim" "Every item in the pinned"
   assert_contains "$markdown_text" "Compiled-all claim: <not safe for this artifact>"
   assert_contains "$markdown_text" "Selected-unit claim: <not safe for this artifact>"
+  assert_contains "$markdown_text" "Native-supported claim: Every item in the pinned"
+}
+
+test_native_benchmark_failure_blocks_native_support_claim() {
+  local corpus_dir="$TEST_TMP_DIR/native-bench-fail/corpora"
+  local case_root="$TEST_TMP_DIR/native-bench-fail/cases"
+  local results_dir="$TEST_TMP_DIR/native-bench-fail/results"
+  local mock_bin_dir="$TEST_TMP_DIR/native-bench-fail/mock-bin"
+  mkdir -p "$corpus_dir" "$case_root" "$results_dir" "$mock_bin_dir"
+  write_manifest_case "$case_root" "fails-bench"
+  write_mock_uc_bin "$mock_bin_dir/uc"
+  write_mock_scarb_bin "$mock_bin_dir/scarb"
+
+  local item stdout_text json_path md_path safe selected_safe all_supported reason native_claim markdown_text benchmark_status
+  item="$(item_json fails-bench "../cases/fails-bench/Scarb.toml" "0xfailsbench" "2.14.0")"
+  write_corpus_file "$corpus_dir/corpus.json" complete_deployed_contracts none "$item"
+
+  stdout_text="$(
+    PATH="$mock_bin_dir:$PATH" \
+    MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/native-bench-fail/uc.args" \
+    MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/native-bench-fail/scarb.args" \
+    "$CORPUS_SCRIPT" \
+      --uc-bin "$mock_bin_dir/uc" \
+      --results-dir "$results_dir" \
+      --runs 1 \
+      --cold-runs 1 \
+      --warm-settle-seconds 0 \
+      --corpus "$corpus_dir/corpus.json"
+  )"
+
+  json_path="$(extract_labeled_path "Corpus Benchmark JSON" <<<"$stdout_text")"
+  md_path="$(extract_labeled_path "Corpus Benchmark Markdown" <<<"$stdout_text")"
+  safe="$(jq -r '.claim_guard.safe_to_say_compiled_all_deployed_contracts_in_corpus' "$json_path")"
+  selected_safe="$(jq -r '.claim_guard.safe_to_say_compiled_all_selected_deployed_units_in_corpus' "$json_path")"
+  all_supported="$(jq -r '.claim_guard.safe_to_say_all_items_native_supported' "$json_path")"
+  reason="$(jq -r '.claim_guard.reason' "$json_path")"
+  native_claim="$(jq -r '.claim_guard.native_supported_claim_text // ""' "$json_path")"
+  benchmark_status="$(jq -r '.benchmark.cases[] | select(.tag=="fails-bench") | .benchmark_status' "$json_path")"
+  markdown_text="$(cat "$md_path")"
+  if [[ "$safe" != "false" || "$selected_safe" != "false" || "$all_supported" != "false" || "$benchmark_status" != "failed" || -n "$native_claim" ]]; then
+    echo "native benchmark failure should block all safe claims" >&2
+    cat "$json_path" >&2
+    return 1
+  fi
+  assert_contains "$reason" "one or more native-supported benchmark cases failed"
+  assert_contains "$markdown_text" "Native-supported claim: <not safe for this artifact>"
 }
 
 test_complete_corpus_with_declared_class_blocks_deployed_claim() {
@@ -806,6 +858,8 @@ run_test "complete_non_deduped_corpus_emits_deployed_contract_claim" \
   test_complete_non_deduped_corpus_emits_deployed_contract_claim
 run_test "complete_non_deduped_count_mismatch_blocks_deployed_contract_claim" \
   test_complete_non_deduped_count_mismatch_blocks_deployed_contract_claim
+run_test "native_benchmark_failure_blocks_native_support_claim" \
+  test_native_benchmark_failure_blocks_native_support_claim
 run_test "complete_corpus_with_declared_class_blocks_deployed_claim" \
   test_complete_corpus_with_declared_class_blocks_deployed_claim
 run_test "rejects_empty_declared_class_contract_address" \
