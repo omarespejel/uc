@@ -139,12 +139,17 @@ Keep same-window reruns for before/after comparisons. Do not compare a new helpe
 
 After adding the helper-lane patch surface, a local Cairo `2.14` helper patch changed `cairo_lang_lowering::db::estimate_size` from a plain helper function into a `#[salsa::tracked]` query. The hypothesis was that repeated inlining size checks would reuse per-function dummy Sierra/CASM size estimates without changing generated Sierra/CASM.
 
-Validation result:
+Historical local validation result. These bullets describe a removed local experiment; the patch file and generated helpers are not present in-tree:
 
-- The patch applied cleanly through `toolchains/cairo-2.14/patches/cairo-lang-lowering.patch`.
-- `./scripts/build_native_toolchain_helper.sh --lane 2.14 --check-only` passed all four targeted helper tests.
-- A release helper built successfully.
-- Same-window monero harness reruns did not produce a clean win:
+- A local helper-lane patch applied cleanly when placed in the Cairo `2.14` lane `patch-dir`.
+- `./scripts/build_native_toolchain_helper.sh --lane 2.14 --check-only` passed all four targeted helper tests with that local patch present.
+- A local release helper built successfully from that patched staging tree.
+- Same-window monero harness reruns did not produce a clean win under this local lane:
+  - suite: `benchmarks/scripts/run_real_repo_benchmarks.sh`
+  - workload: `/Users/espejelomar/StarkNet/monero-starknet-atomic-swap/cairo/Scarb.toml`
+  - host: Apple M3 Pro, arm64, 18 GiB RAM, macOS 26.4.1
+  - samples: `--cold-runs 3`, `--runs 3`, `--warm-settle-seconds 1.0`, `--timeout-secs 240`
+  - flags/env: helper binaries were used directly as `--uc-bin`; `UC_PHASE_TIMING=1`; offline builds; daemon mode off inside the harness
   - reference helper `uc` cold p95: `7085.773 ms`
   - patched helper `uc` cold p95: `12392.042 ms`
   - reference helper `uc` warm no-op p95: `48.570 ms`
