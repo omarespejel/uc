@@ -93,10 +93,6 @@ if [[ "$1" == "build" ]]; then
         ;;
     esac
   done
-  if [[ "$manifest" == *"fails-bench"* && "${UC_NATIVE_DISALLOW_SCARB_FALLBACK:-}" == "1" ]]; then
-    printf 'build %s disallow=%s report=%s\n' "$manifest" "${UC_NATIVE_DISALLOW_SCARB_FALLBACK:-}" "$report_path" >> "$args_log"
-    exit 17
-  fi
   if [[ "$seen_offline" -ne 1 ]]; then
     echo "missing uc --offline" >&2
     exit 23
@@ -104,6 +100,10 @@ if [[ "$1" == "build" ]]; then
   if [[ "$seen_daemon_off" -ne 1 ]]; then
     echo "missing uc --daemon-mode off" >&2
     exit 24
+  fi
+  if [[ "$manifest" == *"fails-bench"* && "${UC_NATIVE_DISALLOW_SCARB_FALLBACK:-}" == "1" ]]; then
+    printf 'build %s disallow=%s report=%s\n' "$manifest" "${UC_NATIVE_DISALLOW_SCARB_FALLBACK:-}" "$report_path" >> "$args_log"
+    exit 17
   fi
   printf 'build %s disallow=%s report=%s\n' "$manifest" "${UC_NATIVE_DISALLOW_SCARB_FALLBACK:-}" "$report_path" >> "$args_log"
   compile_backend="uc_native"
