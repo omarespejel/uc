@@ -8,6 +8,9 @@ Use this path when you are debugging `uc` directly.
 uc project inspect --manifest-path Scarb.toml --format json | jq
 ```
 
+Raw inspect reports can include absolute local paths and manifest/lockfile
+hashes. Redact them before posting outside the host.
+
 ## Probe Native Support
 
 ```sh

@@ -2199,6 +2199,11 @@ fn project_inspect_report_from_manifest_path(manifest_path: &Path) -> Result<Pro
         match read_text_file_with_limit(manifest_path, MAX_MANIFEST_BYTES, "manifest") {
             Ok(text) => Some(text),
             Err(err) => {
+                tracing::warn!(
+                    manifest_path = %manifest_path.display(),
+                    error = %err,
+                    "project inspect manifest read failed"
+                );
                 diagnostics.push(project_agent_diagnostic(
                     "UCP1000",
                     "manifest_read",
@@ -2230,6 +2235,11 @@ fn project_inspect_report_from_manifest_path(manifest_path: &Path) -> Result<Pro
         ) {
             Ok(value) => Some(value),
             Err(err) => {
+                tracing::warn!(
+                    manifest_path = %manifest_path.display(),
+                    error = %err,
+                    "project inspect manifest parse failed"
+                );
                 diagnostics.push(project_agent_diagnostic(
                     "UCP1001",
                     "manifest_parse",
@@ -2284,8 +2294,23 @@ fn project_inspect_report_from_manifest_path(manifest_path: &Path) -> Result<Pro
         project_has_readonly_native_toolchain_source(&package, &dependencies, &lockfile);
     let native_support = if manifest.is_some() && readonly_native_source {
         match native_support_report_from_manifest_path(manifest_path) {
-            Ok(report) => Some(report),
+            Ok(report) => {
+                tracing::info!(
+                    manifest_path = %manifest_path.display(),
+                    workspace_root = %workspace_root.display(),
+                    status = ?report.status,
+                    supported = report.supported,
+                    "project inspect included native support report"
+                );
+                Some(report)
+            }
             Err(err) => {
+                tracing::warn!(
+                    manifest_path = %manifest_path.display(),
+                    workspace_root = %workspace_root.display(),
+                    error = %err,
+                    "project inspect native support probe failed"
+                );
                 diagnostics.push(project_agent_diagnostic(
                     "UCP1002",
                     "native_support_probe",
@@ -2311,6 +2336,11 @@ fn project_inspect_report_from_manifest_path(manifest_path: &Path) -> Result<Pro
             }
         }
     } else if manifest.is_some() {
+        tracing::info!(
+            manifest_path = %manifest_path.display(),
+            workspace_root = %workspace_root.display(),
+            "project inspect skipped native support probe to preserve read-only contract"
+        );
         diagnostics.push(project_agent_diagnostic(
             "UCP1005",
             "native_support_probe",
@@ -2588,10 +2618,19 @@ fn project_lockfile_summary(
             });
         }
         Err(err) => {
+            tracing::warn!(
+                lockfile_path = %lock_path.display(),
+                error = %err,
+                "project inspect failed to stat lockfile"
+            );
             return Err(err).with_context(|| format!("failed to stat {}", lock_path.display()));
         }
     };
     if !metadata.is_file() {
+        tracing::warn!(
+            lockfile_path = %lock_path.display(),
+            "project inspect lockfile path is not a regular file"
+        );
         diagnostics.push(project_agent_diagnostic(
             "UCP1003",
             "lockfile_shape",
@@ -2660,6 +2699,11 @@ fn project_lockfile_summary(
         }
         Err(err) => {
             valid = false;
+            tracing::warn!(
+                lockfile_path = %lock_path.display(),
+                error = %err,
+                "project inspect lockfile parse failed"
+            );
             diagnostics.push(project_agent_diagnostic(
                 "UCP1004",
                 "lockfile_parse",

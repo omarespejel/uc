@@ -22,6 +22,10 @@ Read:
 - `.toolchain.native_status`
 - `.diagnostics[].code`
 
+Treat the raw report as local evidence. It can include absolute paths and
+BLAKE3 hashes for `Scarb.toml` / `Scarb.lock`; do not forward it to telemetry,
+public logs, or issue comments unless that sharing is intentional.
+
 ## Native Support Probe
 
 ```sh
