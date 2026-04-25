@@ -10,6 +10,8 @@ PREPARE_ONLY=0
 CHECK_ONLY=0
 KEEP_STAGING=0
 STAGING_CREATED=0
+PATCH_DIR_REL=""
+PATCHED_CRATES=()
 
 usage() {
   cat <<'USAGE'
@@ -136,9 +138,28 @@ except KeyError:
 PY
 }
 
+read_metadata_field_optional() {
+  local field="$1"
+  python3 - "$ROOT/Cargo.toml" "$LANE" "$field" <<'PY'
+import sys, tomllib
+from pathlib import Path
+cargo_path = Path(sys.argv[1])
+lane = sys.argv[2]
+field = sys.argv[3]
+doc = tomllib.loads(cargo_path.read_text())
+helpers = doc.get("workspace", {}).get("metadata", {}).get("uc-native-toolchain-helpers", {})
+if not isinstance(helpers, dict):
+    raise SystemExit(0)
+entry = helpers.get(lane, {})
+if isinstance(entry, dict) and field in entry:
+    print(entry[field])
+PY
+}
+
 CAIRO_VERSION="$(read_metadata_field cairo-version)"
 SALSA_VERSION="$(read_metadata_field salsa-version)"
 LOCKFILE_REL="$(read_metadata_field lockfile)"
+PATCH_DIR_REL="$(read_metadata_field_optional patch-dir)"
 LOCKFILE_PATH="$ROOT/$LOCKFILE_REL"
 if [[ ! -f "$LOCKFILE_PATH" ]]; then
   echo "Missing helper lockfile: $LOCKFILE_PATH" >&2
@@ -222,8 +243,102 @@ path.write_text(text)
 PY
 }
 
+helper_cargo_registry_src_root() {
+  if [[ -n "${UC_HELPER_CARGO_REGISTRY_SRC:-}" ]]; then
+    printf '%s\n' "$UC_HELPER_CARGO_REGISTRY_SRC"
+  elif [[ -n "${CARGO_HOME:-}" ]]; then
+    printf '%s\n' "$CARGO_HOME/registry/src"
+  else
+    printf '%s\n' "$HOME/.cargo/registry/src"
+  fi
+}
+
+find_helper_crate_source() {
+  local crate_name="$1"
+  local registry_src="$2"
+  local -a matches=()
+  while IFS= read -r candidate; do
+    matches+=("$candidate")
+  done < <(find "$registry_src" -mindepth 2 -maxdepth 2 -type d -name "${crate_name}-${CAIRO_VERSION}" | sort)
+  if [[ "${#matches[@]}" -ne 1 ]]; then
+    echo "expected exactly one registry source for ${crate_name}-${CAIRO_VERSION} under $registry_src, found ${#matches[@]}" >&2
+    return 1
+  fi
+  printf '%s\n' "${matches[0]}"
+}
+
+append_helper_patch_section() {
+  if [[ "${#PATCHED_CRATES[@]}" -eq 0 ]]; then
+    return 0
+  fi
+  {
+    printf '\n[patch.crates-io]\n'
+    local crate_name
+    for crate_name in "${PATCHED_CRATES[@]}"; do
+      printf '%s = { path = ".uc/helper-lane-patches/cairo-%s/%s" }\n' \
+        "$crate_name" "$LANE" "$crate_name"
+    done
+  } >> "$STAGING_DIR/Cargo.toml"
+}
+
+apply_helper_lane_patches() {
+  if [[ -z "$PATCH_DIR_REL" ]]; then
+    return 0
+  fi
+  local patch_dir="$ROOT/$PATCH_DIR_REL"
+  if [[ ! -d "$patch_dir" ]]; then
+    echo "helper lane $LANE patch-dir does not exist: $patch_dir" >&2
+    return 1
+  fi
+  local -a patch_files=()
+  while IFS= read -r patch_file; do
+    patch_files+=("$patch_file")
+  done < <(find "$patch_dir" -maxdepth 1 -type f -name '*.patch' | sort)
+  if [[ "${#patch_files[@]}" -eq 0 ]]; then
+    return 0
+  fi
+  if ! command -v patch >/dev/null 2>&1; then
+    echo "patch is required to apply helper lane patches" >&2
+    return 1
+  fi
+  local registry_src
+  registry_src="$(helper_cargo_registry_src_root)"
+  if [[ ! -d "$registry_src" ]]; then
+    echo "cargo registry source root not found for helper lane patches: $registry_src" >&2
+    return 1
+  fi
+  local patch_file crate_name crate_src crate_dst
+  for patch_file in "${patch_files[@]}"; do
+    crate_name="$(basename "$patch_file" .patch)"
+    case "$crate_name" in
+      cairo-lang-compiler|cairo-lang-defs|cairo-lang-filesystem|cairo-lang-lowering|cairo-lang-semantic|cairo-lang-starknet|cairo-lang-starknet-classes|cairo-lang-sierra-generator)
+        ;;
+      *)
+        echo "unsupported helper lane patch crate: $crate_name" >&2
+        return 1
+        ;;
+    esac
+    crate_src="$(find_helper_crate_source "$crate_name" "$registry_src")"
+    crate_dst="$STAGING_DIR/.uc/helper-lane-patches/cairo-${LANE}/${crate_name}"
+    if [[ -e "$crate_dst" ]]; then
+      echo "helper lane patch destination already exists: $crate_dst" >&2
+      return 1
+    fi
+    mkdir -p "$crate_dst"
+    tar -C "$crate_src" -cf - . | tar -C "$crate_dst" -xf -
+    if ! (cd "$crate_dst" && patch -p1 --batch < "$patch_file"); then
+      echo "failed to apply helper lane patch $patch_file to $crate_name" >&2
+      return 1
+    fi
+    PATCHED_CRATES+=("$crate_name")
+    printf 'Applied helper lane patch: %s -> %s\n' "$patch_file" "$crate_dst"
+  done
+  append_helper_patch_section
+}
+
 prepare_staging_tree
 rewrite_workspace_manifest
+apply_helper_lane_patches
 cp "$LOCKFILE_PATH" "$STAGING_DIR/Cargo.lock"
 
 if (( PREPARE_ONLY == 1 )); then

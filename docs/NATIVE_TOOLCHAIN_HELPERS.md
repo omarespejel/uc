@@ -24,12 +24,23 @@ The helper builder:
 - stages an isolated copy of the current repo
 - rewrites the workspace Cairo dependencies to exact `2.14.0`
 - removes the local `third_party` Cairo patches that only apply to the main lane's cairo-lang version
+- applies reviewed lane-specific patch files from `toolchains/cairo-2.14/patches/*.patch`, when present, to exact crate sources copied from the local Cargo registry
 - builds the current `uc` command surface with the lane-specific helper compatibility feature enabled
 - runs targeted `uc-cli` regression tests for the helper-only compatibility paths
 
 ## Compatibility Guardrails
 
 The helper rewriter is fail-closed: it rewrites only the current workspace dependency shape and exits if a required Cairo dependency line cannot be rewritten exactly once. A `[patch.crates-io]` section is optional; when present, the helper staging tree drops it because the main-lane `third_party` Cairo patches are not compatible with the helper lane.
+
+Lane-specific Cairo patches are applied only after the main-lane patch section is removed:
+
+- the lane metadata can set `patch-dir = "toolchains/cairo-2.14/patches"`
+- patch files must be named after the patched crate, such as `cairo-lang-compiler.patch`
+- the builder copies the matching exact version from `$UC_HELPER_CARGO_REGISTRY_SRC`, `$CARGO_HOME/registry/src`, or `$HOME/.cargo/registry/src`
+- patched sources live only in the staging tree under `.uc/helper-lane-patches/cairo-2.14/`
+- the staging manifest receives a fresh `[patch.crates-io]` section pointing at those patched copies
+
+This keeps helper-lane Cairo experiments auditable as small checked-in patch files without vendoring whole `cairo-lang` crates into this repo.
 
 The helper-lane compatibility shims are covered by targeted regressions for:
 
