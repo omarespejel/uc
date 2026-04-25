@@ -672,9 +672,15 @@ fn redacted_agent_environment_masks_common_token_names() {
 
 #[test]
 fn write_failure_bundle_preserves_missing_manifest_cli_path() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _cwd_guard = CurrentDirRestore::capture();
     let dir = unique_test_dir("uc-failure-bundle-missing-manifest");
     let bundle_path = dir.join("uc-failure.json");
     let missing_manifest = dir.join("missing").join("Scarb.toml");
+    std::env::set_current_dir(&dir).expect("failed to set failure bundle cwd");
+    let expected_cwd = std::env::current_dir().expect("failed to read expected cwd");
     let args = BuildArgs {
         common: BuildCommonArgs {
             manifest_path: Some(missing_manifest.clone()),
@@ -702,8 +708,14 @@ fn write_failure_bundle_preserves_missing_manifest_cli_path() {
         Some(missing_manifest.display().to_string())
     );
     assert_eq!(bundle.workspace_root, None);
+    assert_eq!(
+        bundle.original_cwd,
+        Some(expected_cwd.display().to_string()),
+        "missing-manifest bundles should preserve the cwd used for the original invocation"
+    );
     assert_eq!(bundle.selected_support, None);
 
+    std::env::set_current_dir(&_cwd_guard.original).expect("failed to restore cwd");
     fs::remove_dir_all(&dir).ok();
 }
 
@@ -814,6 +826,57 @@ fn replay_execute_uses_bundle_workspace_root() {
 }
 
 #[test]
+#[cfg(unix)]
+fn replay_execute_uses_original_cwd_when_workspace_root_missing() {
+    let dir = unique_test_dir("uc-replay-original-cwd");
+    let original_cwd = dir.join("invocation-cwd");
+    let bundle_path = dir.join("uc-failure.json");
+    let report_path = dir.join("replay-report.json");
+    fs::create_dir_all(&original_cwd).expect("failed to create original cwd");
+    fs::write(
+        &bundle_path,
+        serde_json::json!({
+            "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
+            "generated_at_epoch_ms": 1u64,
+            "command": ["/bin/sh", "-c", "pwd"],
+            "manifest_path": "missing/Scarb.toml",
+            "workspace_root": null,
+            "original_cwd": original_cwd.display().to_string(),
+            "manifest_hash": null,
+            "lockfile_hash": null,
+            "selected_support": null,
+            "redacted_environment": {},
+            "error": "original failure"
+        })
+        .to_string(),
+    )
+    .expect("failed to write replay bundle");
+
+    run_replay(ReplayArgs {
+        bundle: bundle_path,
+        report_path: Some(report_path.clone()),
+        execute: true,
+    })
+    .expect("original-cwd replay should succeed");
+    let report: ReplayReport =
+        serde_json::from_slice(&fs::read(&report_path).expect("failed to read replay report"))
+            .expect("replay report should parse");
+    assert!(report.executed);
+    assert_eq!(report.exit_code, Some(0));
+    let replay_cwd = PathBuf::from(report.stdout.trim())
+        .canonicalize()
+        .expect("replay cwd should canonicalize");
+    assert_eq!(
+        replay_cwd,
+        original_cwd
+            .canonicalize()
+            .expect("original cwd should canonicalize")
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn repo_relative_command_resolves_from_stable_repo_anchor() {
     let _guard = integration_env_lock()
         .lock()
@@ -885,6 +948,40 @@ fn replay_execute_emits_report_when_spawn_fails() {
 }
 
 #[test]
+fn replay_parse_failure_emits_structured_report() {
+    let dir = unique_test_dir("uc-replay-parse-failure");
+    let bundle_path = dir.join("uc-failure.json");
+    let report_path = dir.join("replay-report.json");
+    fs::write(&bundle_path, "{not valid json").expect("failed to write malformed bundle");
+
+    let err = run_replay(ReplayArgs {
+        bundle: bundle_path,
+        report_path: Some(report_path.clone()),
+        execute: false,
+    })
+    .expect_err("malformed bundle should fail");
+    assert!(
+        format!("{err:#}").contains("failed to parse replay bundle"),
+        "unexpected error: {err:#}"
+    );
+    let report: ReplayReport =
+        serde_json::from_slice(&fs::read(&report_path).expect("failed to read replay report"))
+            .expect("replay report should parse");
+    assert!(!report.executed);
+    assert!(report.command.is_empty());
+    assert!(
+        report
+            .blocked_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("preparation failed"),
+        "replay report should preserve structured preparation failure: {report:?}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn agent_safe_action_execute_emits_report_when_spawn_fails() {
     let _guard = integration_env_lock()
         .lock()
@@ -923,6 +1020,41 @@ fn agent_safe_action_execute_emits_report_when_spawn_fails() {
             .unwrap_or_default()
             .contains("execution failed"),
         "safe-action report should preserve structured failure reason: {report:?}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn agent_safe_action_preparation_failure_emits_report() {
+    let dir = unique_test_dir("uc-safe-action-preparation-failure");
+    let report_path = dir.join("safe-action-report.json");
+
+    let err = run_agent_safe_action(AgentSafeActionArgs {
+        action: AgentSafeActionKind::BuildHelperLane,
+        lane: None,
+        manifest_path: None,
+        uc_bin: None,
+        report_path: Some(report_path.clone()),
+        execute: false,
+    })
+    .expect_err("missing lane should fail");
+    assert!(
+        format!("{err:#}").contains("--lane is required"),
+        "unexpected error: {err:#}"
+    );
+    let report: SafeActionReport =
+        serde_json::from_slice(&fs::read(&report_path).expect("failed to read safe-action report"))
+            .expect("safe-action report should parse");
+    assert!(!report.executed);
+    assert!(report.command.is_empty());
+    assert!(
+        report
+            .blocked_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("preparation failed"),
+        "safe-action report should preserve structured preparation failure: {report:?}"
     );
 
     fs::remove_dir_all(&dir).ok();
@@ -7221,6 +7353,27 @@ dev-tool = { path = "deps/dev-tool" }
     };
     let context =
         build_native_compile_context(&common, &manifest_path, &dir).expect("context should build");
+    assert!(
+        context.path_dependency_roots.is_empty(),
+        "native build context should not reintroduce dev-only dependency roots: {:?}",
+        context.path_dependency_roots
+    );
+    assert!(
+        context.external_non_starknet_dependencies.is_empty(),
+        "native build context should not reintroduce dev-only external dependencies: {:?}",
+        context.external_non_starknet_dependencies
+    );
+    assert!(
+        context.crate_dependency_configs.iter().all(|config| {
+            config.crate_name != "dev_tool"
+                && !config
+                    .dependencies
+                    .iter()
+                    .any(|dependency| dependency == "dev_tool")
+        }),
+        "native build context should exclude dev-only dependency configs: {:?}",
+        context.crate_dependency_configs
+    );
     let cairo_project = fs::read_to_string(context.cairo_project_dir.join("cairo_project.toml"))
         .expect("failed to read cairo project");
     assert!(

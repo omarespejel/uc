@@ -6,7 +6,7 @@
   "additionalProperties": true,
   "required": ["schema_version", "summary", "cases"],
   "properties": {
-    "schema_version": { "type": "number" },
+    "schema_version": { "const": 1 },
     "summary": {
       "type": "object",
       "additionalProperties": true,
