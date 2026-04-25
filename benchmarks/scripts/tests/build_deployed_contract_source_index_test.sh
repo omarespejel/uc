@@ -118,7 +118,7 @@ mutate_inventory() {
 expect_builder_failure() {
   local inventory_path="$1"
   local expected="$2"
-  local out_path="${3:-$TEST_TMP_DIR/failure-source-index.json}"
+  local out_path="${3:-$(dirname "$inventory_path")/failure-source-index.json}"
   local stderr_path="$TEST_TMP_DIR/failure.err"
   if "$BUILDER_SCRIPT" --inventory "$inventory_path" --out "$out_path" >"$TEST_TMP_DIR/failure.out" 2>"$stderr_path"; then
     echo "expected builder to fail" >&2
@@ -243,14 +243,25 @@ test_rejects_null_source_package_id_when_present() {
   record="$(inventory_record_json a "cases/a/Scarb.toml" "0x01" "2.14.0")"
   write_inventory_file "$inventory_dir/inventory.json" sample class_hash "$record"
   mutate_inventory "$inventory_dir/inventory.json" '.records[0].source_package_id = null'
-  expect_builder_failure "$inventory_dir/inventory.json" "inventory.records[0].source_package_id must be a string"
+  expect_builder_failure "$inventory_dir/inventory.json" "inventory.records[0].source_package_id must be a non-empty string"
+}
+
+test_rejects_outside_output_directory() {
+  local inventory_dir="$TEST_TMP_DIR/outside-out/inventory"
+  local case_root="$inventory_dir/cases"
+  local out_dir="$TEST_TMP_DIR/outside-out/out"
+  mkdir -p "$inventory_dir" "$out_dir"
+  write_manifest_case "$case_root" "a"
+  local record
+  record="$(inventory_record_json a "cases/a/Scarb.toml" "0x01" "2.14.0")"
+  write_inventory_file "$inventory_dir/inventory.json" sample class_hash "$record"
+  expect_builder_failure "$inventory_dir/inventory.json" "--out must be written next to --inventory" "$out_dir/source-index.json"
 }
 
 test_rejects_inventory_output_overwrite_aliases() {
   local inventory_dir="$TEST_TMP_DIR/overwrite/inventory"
   local case_root="$inventory_dir/cases"
-  local out_dir="$TEST_TMP_DIR/overwrite/out"
-  mkdir -p "$inventory_dir" "$out_dir"
+  mkdir -p "$inventory_dir"
   write_manifest_case "$case_root" "a"
   local record inventory_path out_path stderr_path exit_code
   record="$(inventory_record_json a "cases/a/Scarb.toml" "0x01" "2.14.0")"
@@ -258,7 +269,7 @@ test_rejects_inventory_output_overwrite_aliases() {
   write_inventory_file "$inventory_path" sample class_hash "$record"
   expect_builder_failure "$inventory_path" "Refusing to overwrite source inventory with generated source index" "$inventory_path"
 
-  out_path="$out_dir/inventory-alias.json"
+  out_path="$inventory_dir/inventory-alias.json"
   ln -s "$inventory_path" "$out_path"
   stderr_path="$TEST_TMP_DIR/overwrite-symlink.err"
   set +e
@@ -284,6 +295,7 @@ run_test "rejects duplicate tags and absolute manifest" test_rejects_duplicate_t
 run_test "rejects manifest path traversal" test_rejects_manifest_path_traversal
 run_test "rejects source_package dedupe without id" test_rejects_source_package_dedupe_without_id
 run_test "rejects null source_package_id when present" test_rejects_null_source_package_id_when_present
+run_test "rejects outside output directory" test_rejects_outside_output_directory
 run_test "rejects inventory output overwrite aliases" test_rejects_inventory_output_overwrite_aliases
 
 echo "build_deployed_contract_source_index_test.sh: ok"

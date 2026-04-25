@@ -31,7 +31,10 @@
         "properties": {
           "records": {
             "items": {
-              "required": ["source_package_id"]
+              "required": ["source_package_id"],
+              "properties": {
+                "source_package_id": { "type": "string", "minLength": 1 }
+              }
             }
           }
         }
@@ -95,6 +98,7 @@
           "cairo_version": { "type": "string", "minLength": 1 },
           "source_package_id": {
             "type": "string",
+            "minLength": 1,
             "description": "Required when deduplication.key is source_package. Omitted from generated source-index items."
           },
           "scarb_version": { "type": "string" },

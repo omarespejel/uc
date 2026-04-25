@@ -69,9 +69,19 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-INVENTORY_ABS="$(cd "$(dirname "$INVENTORY_PATH")" && pwd -P)/$(basename "$INVENTORY_PATH")"
-mkdir -p "$(dirname "$OUT_PATH")"
-OUT_ABS="$(cd "$(dirname "$OUT_PATH")" && pwd -P)/$(basename "$OUT_PATH")"
+INVENTORY_DIR_ABS="$(cd "$(dirname "$INVENTORY_PATH")" && pwd -P)"
+INVENTORY_ABS="$INVENTORY_DIR_ABS/$(basename "$INVENTORY_PATH")"
+OUT_DIR_RAW="$(dirname "$OUT_PATH")"
+if [[ ! -d "$OUT_DIR_RAW" ]]; then
+  echo "--out parent directory must exist and match the inventory directory: $OUT_DIR_RAW" >&2
+  exit 2
+fi
+OUT_DIR_ABS="$(cd "$OUT_DIR_RAW" && pwd -P)"
+if [[ "$OUT_DIR_ABS" != "$INVENTORY_DIR_ABS" ]]; then
+  echo "--out must be written next to --inventory so generated manifest paths stay confined: $OUT_PATH" >&2
+  exit 2
+fi
+OUT_ABS="$OUT_DIR_ABS/$(basename "$OUT_PATH")"
 if [[ "$INVENTORY_ABS" == "$OUT_ABS" ]] || [[ -e "$OUT_ABS" && "$INVENTORY_ABS" -ef "$OUT_ABS" ]]; then
   echo "Refusing to overwrite source inventory with generated source index: $INVENTORY_ABS" >&2
   exit 2
@@ -261,7 +271,7 @@ for index, raw_record in enumerate(records):
     if dedupe_key == "source_package" and (not isinstance(source_package_id, str) or not source_package_id):
         fail(f"inventory.records[{index}].source_package_id must be a non-empty string when deduplication.key is source_package")
     if "source_package_id" in record:
-        optional_str(record, "source_package_id", f"inventory.records[{index}]")
+        require_str(record, "source_package_id", f"inventory.records[{index}]")
 
     normalized = {key: record[key] for key in SOURCE_INDEX_ITEM_KEYS if key in record}
     normalized["manifest_path"] = os.path.relpath(manifest_path, out_dir)

@@ -54,7 +54,7 @@ If `.diagnostics[].fallback_used` is true, classify the result as fallback-used 
   --out /abs/path/to/source-root/pinned-deployed-contract-source-index.json
 
 ./benchmarks/scripts/generate_deployed_contract_corpus.sh \
-  --source-index /abs/path/to/pinned-deployed-contract-source-index.json \
+  --source-index /abs/path/to/source-root/pinned-deployed-contract-source-index.json \
   --out /abs/path/to/generated-deployed-contract-corpus.json
 
 ./benchmarks/scripts/run_deployed_contract_corpus.sh \

@@ -129,7 +129,7 @@ the exact inventory and generated source index used for any public claim.
 ```bash
 # Shape-only sample: validates generated source-index input and writes a generated corpus.
 ./benchmarks/scripts/generate_deployed_contract_corpus.sh \
-  --source-index benchmarks/corpora/deployed-contract-source-index.example.json \
+  --source-index benchmarks/corpora/generated-deployed-contract-source-index.sample.json \
   --out benchmarks/results/generated-deployed-contract-corpus.sample.json
 ```
 
