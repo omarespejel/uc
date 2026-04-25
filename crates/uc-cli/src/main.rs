@@ -2393,14 +2393,17 @@ fn project_has_readonly_native_toolchain_source(
     dependencies: &[ProjectDependencySummary],
     lockfile: &ProjectLockfileSummary,
 ) -> bool {
-    package.cairo_version.is_some()
+    package
+        .cairo_version
+        .as_deref()
+        .is_some_and(project_version_avoids_metadata_probe)
         || dependencies.iter().any(|dependency| {
             dependency.section == "dependencies"
                 && dependency.name == "starknet"
                 && dependency
                     .version
                     .as_deref()
-                    .is_some_and(project_manifest_dependency_version_avoids_metadata_probe)
+                    .is_some_and(project_version_avoids_metadata_probe)
         })
         || lockfile
             .packages
@@ -2408,24 +2411,22 @@ fn project_has_readonly_native_toolchain_source(
             .any(|package| package.name == "starknet" && package.version.is_some())
 }
 
-fn project_manifest_dependency_version_avoids_metadata_probe(raw: &str) -> bool {
+fn project_version_avoids_metadata_probe(raw: &str) -> bool {
     let trimmed = raw.trim();
-    trimmed.starts_with('=')
-        || project_parse_cairo_version_major_minor(trimmed).is_some_and(|_| {
-            let exact = trimmed.strip_prefix('=').map(str::trim).unwrap_or(trimmed);
-            let mut parts = exact.split('.');
-            let Some(major) = parts.next() else {
-                return false;
-            };
-            let Some(minor) = parts.next() else {
-                return false;
-            };
-            let patch = parts.next();
-            parts.next().is_none()
-                && major.parse::<u64>().is_ok()
-                && minor.parse::<u64>().is_ok()
-                && patch.is_none_or(|part| part.parse::<u64>().is_ok())
-        })
+    let exact = trimmed.strip_prefix('=').map(str::trim).unwrap_or(trimmed);
+    let mut parts = exact.split('.');
+    let Some(major) = parts.next() else {
+        return false;
+    };
+    let Some(minor) = parts.next() else {
+        return false;
+    };
+    let patch = parts.next();
+    // Read-only inspection may probe native support only when the version is fully pinned.
+    parts.next().is_none()
+        && major.parse::<u64>().is_ok()
+        && minor.parse::<u64>().is_ok()
+        && patch.is_none_or(|part| part.parse::<u64>().is_ok())
 }
 
 fn project_package_summary_from_manifest(manifest: &TomlValue) -> ProjectPackageSummary {

@@ -640,6 +640,37 @@ starknet = ">=2.14.0"
 }
 
 #[test]
+fn project_inspect_skips_package_cairo_version_range_to_preserve_readonly_contract() {
+    let dir = unique_test_dir("uc-project-inspect-package-cairo-range");
+    let _cleanup = TestDirCleanup::new(&dir);
+    let manifest_path = dir.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+cairo-version = ">=2.14.0"
+"#,
+    )
+    .expect("write manifest");
+
+    let report =
+        project_inspect_report_from_manifest_path(&manifest_path).expect("inspect should succeed");
+
+    assert!(report.readonly);
+    assert_eq!(report.mutation_status, "none");
+    assert!(report.native_support.is_none());
+    assert!(report
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "UCP1005"
+            && diagnostic.category == "native_support_probe"
+            && diagnostic.safe_automated_action == "inspect_native_support_then_retry"));
+    assert_project_inspect_left_no_artifacts(&dir);
+}
+
+#[test]
 fn project_inspect_uses_workspace_lockfile_for_member_manifest() {
     let workspace = unique_test_dir("uc-project-inspect-member-lockfile");
     let _cleanup = TestDirCleanup::new(&workspace);
