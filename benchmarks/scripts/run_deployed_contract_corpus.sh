@@ -406,7 +406,7 @@ jq -n \
      ([ $corpus[0].items[] | select(.source_kind != "deployed_contract") ] | length);
    def failed_native_benchmarks:
      ([ $bench[0].cases[] | select(.benchmark_status == "failed") ] | length);
-   def compiled_selected_units:
+   def compiled_without_dedup_guard:
      ($corpus[0].selection.coverage == "complete_deployed_contracts")
      and (non_deployed_item_count == 0)
      and ((counts.native_supported // 0) == item_count)
@@ -414,8 +414,13 @@ jq -n \
      and ((counts.native_unsupported // 0) == 0)
      and ((counts.build_failed // 0) == 0)
      and (failed_native_benchmarks == 0);
+   def valid_selected_unit_accounting:
+     ($corpus[0].deduplication.key != "none")
+     or (($corpus[0].deduplication.input_count // 0) == item_count);
+   def compiled_selected_units:
+     compiled_without_dedup_guard and valid_selected_unit_accounting;
    def compiled_all_contracts:
-     compiled_selected_units
+     compiled_without_dedup_guard
      and ($corpus[0].deduplication.key == "none")
      and (($corpus[0].deduplication.input_count // 0) == item_count);
    def native_all:
@@ -446,10 +451,10 @@ jq -n \
            "corpus selection coverage is sample, not complete_deployed_contracts"
          elif non_deployed_item_count != 0 then
            "corpus contains non-deployed source_kind rows"
+         elif compiled_without_dedup_guard and ($corpus[0].deduplication.key == "none") and (($corpus[0].deduplication.input_count // 0) != item_count) then
+           "corpus uses deduplication.key=none but deduplication.input_count does not equal item_count; address coverage is incomplete"
          elif compiled_selected_units and ($corpus[0].deduplication.key != "none") then
            "corpus is deduplicated by \($corpus[0].deduplication.key); safe only for selected deduped deployed units, not every deployed contract address"
-         elif compiled_selected_units and (($corpus[0].deduplication.input_count // 0) != item_count) then
-           "corpus input_count does not equal item_count; safe only for selected deduped deployed units, not every deployed contract address"
          elif (counts.fallback_used // 0) != 0 then
            "one or more corpus items used fallback"
          elif (counts.native_unsupported // 0) != 0 then

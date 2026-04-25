@@ -187,7 +187,8 @@ a combined JSON/Markdown artifact with:
     this requires `coverage=complete_deployed_contracts`, every item classified
     as `source_kind=deployed_contract` and `native_supported`, no fallback, no
     unsupported rows, no build failures, no failed native benchmark cases, and
-    `deduplication.key=none`
+    `deduplication.key=none` with `deduplication.input_count == item_count`.
+    Only use `.claim_guard.compiled_all_claim_text` when that equality holds.
   - `.claim_guard.selected_units_claim_text` only when
     `.claim_guard.safe_to_say_compiled_all_selected_deployed_units_in_corpus=true`;
     this is the safe wording for corpora deduplicated by `class_hash` or

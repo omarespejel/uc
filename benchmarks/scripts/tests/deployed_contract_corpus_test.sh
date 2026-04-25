@@ -458,6 +458,7 @@ test_rejects_non_string_optional_fields() {
 run_corpus_benchmark() {
   local coverage="$1"
   local dedupe_key="${2:-class_hash}"
+  local input_count_override="${3:-}"
   local run_id="$coverage-$dedupe_key"
   local corpus_dir="$TEST_TMP_DIR/run-$run_id/corpora"
   local case_root="$TEST_TMP_DIR/run-$run_id/cases"
@@ -473,6 +474,12 @@ run_corpus_benchmark() {
   item_a="$(item_json cairo214 "../cases/cairo214/Scarb.toml" "0x214" "2.14.0")"
   item_b="$(item_json cairo216 "../cases/cairo216/Scarb.toml" "0x216" "2.16.0")"
   write_corpus_file "$corpus_dir/corpus.json" "$coverage" "$dedupe_key" "$item_a" "$item_b"
+  if [[ -n "$input_count_override" ]]; then
+    jq --argjson input_count "$input_count_override" \
+      '.deduplication.input_count = $input_count' \
+      "$corpus_dir/corpus.json" > "$corpus_dir/corpus.tmp"
+    mv "$corpus_dir/corpus.tmp" "$corpus_dir/corpus.json"
+  fi
 
   PATH="$mock_bin_dir:$PATH" \
   MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/run-$run_id/uc.args" \
@@ -653,6 +660,34 @@ test_complete_non_deduped_corpus_emits_deployed_contract_claim() {
   assert_contains "$markdown_text" "Compiled-all claim: We compiled every contract"
 }
 
+test_complete_non_deduped_count_mismatch_blocks_deployed_contract_claim() {
+  local stdout_text
+  stdout_text="$(run_corpus_benchmark complete_deployed_contracts none 3)"
+  local json_path md_path
+  json_path="$(extract_labeled_path "Corpus Benchmark JSON" <<<"$stdout_text")"
+  md_path="$(extract_labeled_path "Corpus Benchmark Markdown" <<<"$stdout_text")"
+  [[ -f "$json_path" ]] || { echo "missing corpus benchmark json: $json_path" >&2; return 1; }
+  [[ -f "$md_path" ]] || { echo "missing corpus benchmark markdown: $md_path" >&2; return 1; }
+
+  local safe selected_safe all_supported claim selected_claim reason markdown_text
+  safe="$(jq -r '.claim_guard.safe_to_say_compiled_all_deployed_contracts_in_corpus' "$json_path")"
+  selected_safe="$(jq -r '.claim_guard.safe_to_say_compiled_all_selected_deployed_units_in_corpus' "$json_path")"
+  all_supported="$(jq -r '.claim_guard.safe_to_say_all_items_native_supported' "$json_path")"
+  claim="$(jq -r '.claim_guard.compiled_all_claim_text // ""' "$json_path")"
+  selected_claim="$(jq -r '.claim_guard.selected_units_claim_text // ""' "$json_path")"
+  reason="$(jq -r '.claim_guard.reason' "$json_path")"
+  markdown_text="$(cat "$md_path")"
+  if [[ "$safe" != "false" || "$selected_safe" != "false" || "$all_supported" != "false" || -n "$claim" || -n "$selected_claim" ]]; then
+    echo "non-deduped corpus with mismatched counts should not emit deployed-address or selected-unit claims" >&2
+    cat "$json_path" >&2
+    return 1
+  fi
+  assert_contains "$reason" "deduplication.input_count does not equal item_count"
+  assert_contains "$reason" "address coverage is incomplete"
+  assert_contains "$markdown_text" "Compiled-all claim: <not safe for this artifact>"
+  assert_contains "$markdown_text" "Selected-unit claim: <not safe for this artifact>"
+}
+
 test_complete_corpus_with_declared_class_blocks_deployed_claim() {
   local corpus_dir="$TEST_TMP_DIR/declared-class/corpora"
   local case_root="$TEST_TMP_DIR/declared-class/cases"
@@ -760,6 +795,8 @@ run_test "complete_class_deduped_corpus_emits_selected_unit_claim_only" \
   test_complete_class_deduped_corpus_emits_selected_unit_claim_only
 run_test "complete_non_deduped_corpus_emits_deployed_contract_claim" \
   test_complete_non_deduped_corpus_emits_deployed_contract_claim
+run_test "complete_non_deduped_count_mismatch_blocks_deployed_contract_claim" \
+  test_complete_non_deduped_count_mismatch_blocks_deployed_contract_claim
 run_test "complete_corpus_with_declared_class_blocks_deployed_claim" \
   test_complete_corpus_with_declared_class_blocks_deployed_claim
 run_test "rejects_empty_declared_class_contract_address" \

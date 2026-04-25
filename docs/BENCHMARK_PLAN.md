@@ -43,7 +43,8 @@ Measure and prove that `uc` outperforms Scarb on real workflows while maintainin
 - Deployed-contract claim wording must respect deduplication. A corpus deduped
   by `class_hash` or `source_package` can prove every selected deduped deployed
   unit was compiled. It cannot prove every deployed contract address was
-  compiled. The contract-address claim requires `deduplication.key=none`.
+  compiled. The contract-address claim requires `deduplication.key=none` and
+  `deduplication.input_count == item_count`.
 
 ## Baseline Rule
 Before changing `uc` engine behavior, rerun baseline against current Scarb and snapshot results.
