@@ -41,6 +41,7 @@
 - Build deployed-contract source index: `benchmarks/scripts/build_deployed_contract_source_index.sh --inventory /abs/path/to/source-inventory.json --out /abs/path/to/pinned-deployed-contract-source-index.json`
 - Generate deployed-contract corpus: `benchmarks/scripts/generate_deployed_contract_corpus.sh --source-index /abs/path/to/source-index.json --out /abs/path/to/generated-corpus.json`
 - Run deployed-contract corpus evidence: `benchmarks/scripts/run_deployed_contract_corpus.sh --corpus /abs/path/to/generated-corpus.json`
+- Summarize corpus opportunities: `benchmarks/scripts/summarize_corpus_opportunities.py --input /abs/path/to/benchmark.json --output /abs/path/to/opportunities.json --markdown /abs/path/to/opportunities.md`
 
 ## High-Risk Areas
 - `crates/uc-cli/src/main.rs`: native compile session state, cache restore, daemon, build execution.
@@ -70,3 +71,4 @@
 - For Cairo `2.14` frontend hot-path diagnosis, run the helper with `UC_CAIRO214_SIZE_TRACE=/abs/path/to/trace.tsv`; the trace records bounded size-estimation and dummy-Sierra TSV counter samples and is for local diagnostics only.
 - Probe helper-lane readiness before measuring a repo with `./scripts/doctor.sh --uc-bin /abs/path/to/uc --manifest-path /abs/path/to/Scarb.toml`.
 - For deployed-contract launch claims, build the source index from a reviewed source inventory with `benchmarks/scripts/build_deployed_contract_source_index.sh`, generate the run corpus with `benchmarks/scripts/generate_deployed_contract_corpus.sh`, then use `benchmarks/scripts/run_deployed_contract_corpus.sh`; only quote generated claim text when the artifact's `claim_guard` marks it safe.
+- After corpus or real-repo benchmark runs, use `benchmarks/scripts/summarize_corpus_opportunities.py` to turn support gaps, fallback use, unstable lanes, diagnostics gaps, and phase hotspots into UCO-coded follow-up work.
