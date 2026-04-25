@@ -144,11 +144,23 @@ def is_generic_diagnostic_text(value: Any) -> bool:
     if not isinstance(value, str):
         return False
     normalized = value.strip().rstrip(".").lower()
-    return normalized in GENERIC_DIAGNOSTIC_TEXT or normalized.startswith("uc auto build failed")
+    return normalized in GENERIC_DIAGNOSTIC_TEXT
 
 
 def diagnostic_quality_issues(diag: dict[str, Any]) -> list[str]:
     issues = [f"missing {field}" for field in sorted(REQUIRED_DIAGNOSTIC_FIELDS) if field not in diag]
+    for field in ("severity", "title", "docs_url", "safe_automated_action"):
+        value = diag.get(field)
+        if field in diag and (not isinstance(value, str) or not value.strip()):
+            issues.append(f"{field} is empty")
+    for field in ("how_to_fix", "next_commands"):
+        value = diag.get(field)
+        if field in diag and (
+            not isinstance(value, list)
+            or not value
+            or any(not isinstance(item, str) or not item.strip() for item in value)
+        ):
+            issues.append(f"{field} is empty")
     for field in ("what_happened", "why"):
         raw = diag.get(field)
         if not isinstance(raw, str):

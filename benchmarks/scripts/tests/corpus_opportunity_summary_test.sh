@@ -377,9 +377,114 @@ JSON
   fi
 }
 
+test_remediation_fields_are_validated_without_overmatching() {
+  local fixture="$TEST_TMP_DIR/remediation-field-quality.json"
+  local out_json="$TEST_TMP_DIR/remediation-field-quality-opportunities.json"
+  cat > "$fixture" <<'JSON'
+{
+  "generated_at": "2026-04-25T00:00:00Z",
+  "summary": {
+    "support_matrix": {
+      "native_supported": 2,
+      "fallback_used": 0,
+      "native_unsupported": 0,
+      "build_failed": 0
+    },
+    "unstable_lanes": [],
+    "unstable_lane_count": 0
+  },
+  "cases": [
+    {
+      "tag": "detailed-prefixed-native-failure",
+      "manifest_path": "/tmp/detailed/Scarb.toml",
+      "native_support": {
+        "supported": true,
+        "package_cairo_version": "2.14.0",
+        "diagnostics": [
+          {
+            "schema_version": 1,
+            "code": "UCN2002",
+            "category": "native_fallback_local_native_error",
+            "severity": "warn",
+            "title": "Native build failed with Cairo diagnostic E0002",
+            "docs_url": "https://github.com/omarespejel/uc/blob/main/docs/agent/AGENT_DIAGNOSTICS.md#ucn2002",
+            "what_happened": "uc auto build failed: error[E0002] Method span could not be called.",
+            "why": "The selected Cairo helper emitted E0002 while compiling a dependency.",
+            "how_to_fix": [
+              "Open the recorded native build log and inspect E0002."
+            ],
+            "next_commands": [
+              "uc replay /tmp/uc-failure.json"
+            ],
+            "safe_automated_action": "record_failure_bundle",
+            "retryable": true,
+            "fallback_used": false
+          }
+        ]
+      },
+      "support_matrix": {
+        "classification": "native_supported",
+        "compile_backend": "uc_native_external_helper",
+        "fallback_used": false
+      },
+      "benchmark_status": "skipped",
+      "benchmarks": null
+    },
+    {
+      "tag": "empty-remediation-fields",
+      "manifest_path": "/tmp/empty-remediation/Scarb.toml",
+      "native_support": {
+        "supported": true,
+        "package_cairo_version": "2.14.0",
+        "diagnostics": [
+          {
+            "schema_version": 1,
+            "code": "UCN2002",
+            "category": "native_fallback_local_native_error",
+            "severity": "warn",
+            "title": "Native build failed with Cairo diagnostic E0002",
+            "docs_url": " ",
+            "what_happened": "The Cairo helper emitted error E0002 while compiling a dependency.",
+            "why": "The dependency calls a method that is unavailable for the selected core type.",
+            "how_to_fix": [],
+            "next_commands": [],
+            "safe_automated_action": "",
+            "retryable": true,
+            "fallback_used": false
+          }
+        ]
+      },
+      "support_matrix": {
+        "classification": "native_supported",
+        "compile_backend": "uc_native_external_helper",
+        "fallback_used": false
+      },
+      "benchmark_status": "skipped",
+      "benchmarks": null
+    }
+  ]
+}
+JSON
+
+  "$SUMMARY_SCRIPT" --benchmark-json "$fixture" --out-json "$out_json"
+
+  local detailed_gap remediation_gap remediation_reason
+  detailed_gap="$(jq -r '.cases[] | select(.tag=="detailed-prefixed-native-failure") | .opportunity_codes | index("UCO5001") != null' "$out_json")"
+  remediation_gap="$(jq -r '.cases[] | select(.tag=="empty-remediation-fields") | .opportunity_codes | index("UCO5001") != null' "$out_json")"
+  remediation_reason="$(jq -r '.cases[] | select(.tag=="empty-remediation-fields") | .opportunities[] | select(.code=="UCO5001") | .why' "$out_json")"
+  assert_json_value "detailed_gap" "$detailed_gap" "false" "$out_json"
+  assert_json_value "remediation_gap" "$remediation_gap" "true" "$out_json"
+  if [[ "$remediation_reason" != *"docs_url is empty"* || "$remediation_reason" != *"how_to_fix is empty"* || "$remediation_reason" != *"next_commands is empty"* || "$remediation_reason" != *"safe_automated_action is empty"* ]]; then
+    echo "expected empty remediation fields to be named in UCO5001 reason" >&2
+    cat "$out_json" >&2
+    exit 1
+  fi
+}
+
 run_test "real_repo_summary_records_opportunities" test_real_repo_summary_records_opportunities
 run_test "deployed_wrapper_preserves_corpus_metadata" test_deployed_wrapper_preserves_corpus_metadata
 run_test "complete_but_generic_diagnostic_is_not_agent_grade" test_complete_but_generic_diagnostic_is_not_agent_grade
 run_test "stock_and_malformed_diagnostic_is_not_agent_grade" test_stock_and_malformed_diagnostic_is_not_agent_grade
+run_test "remediation_fields_are_validated_without_overmatching" test_remediation_fields_are_validated_without_overmatching
 
 echo "All corpus opportunity summary tests passed."
