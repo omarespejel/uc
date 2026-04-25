@@ -69,6 +69,43 @@ validate_timeout_secs() {
   fi
 }
 
+canonical_existing_file_path() {
+  local label="$1"
+  local path="$2"
+  if [[ ! -f "$path" ]]; then
+    echo "$label is missing or not a regular file: $path" >&2
+    exit 1
+  fi
+  local dir base
+  dir="$(cd "$(dirname "$path")" && pwd -P)"
+  base="$(basename "$path")"
+  if [[ "$dir" == "/" ]]; then
+    printf '/%s\n' "$base"
+  else
+    printf '%s/%s\n' "${dir%/}" "$base"
+  fi
+}
+
+canonical_existing_dir_path() {
+  local label="$1"
+  local path="$2"
+  if [[ ! -d "$path" ]]; then
+    echo "$label is missing or not a directory: $path" >&2
+    exit 1
+  fi
+  (cd "$path" && pwd -P)
+}
+
+canonical_dir_path() {
+  local label="$1"
+  local path="$2"
+  if ! mkdir -p "$path"; then
+    echo "Failed to create $label: $path" >&2
+    exit 1
+  fi
+  (cd "$path" && pwd -P)
+}
+
 validate_case_tag() {
   local tag="$1"
   if [[ ! "$tag" =~ ^[A-Za-z0-9._-]+$ ]]; then
@@ -197,6 +234,7 @@ if [[ "${#CASE_MANIFESTS[@]}" -eq 0 ]]; then
   exit 2
 fi
 
+UC_BIN="$(canonical_existing_file_path "UC binary" "$UC_BIN")"
 if [[ ! -x "$UC_BIN" ]]; then
   echo "UC binary is missing or not executable: $UC_BIN" >&2
   exit 1
@@ -215,7 +253,12 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-mkdir -p "$RESULTS_DIR"
+if [[ -n "${UC_NATIVE_CORELIB_SRC:-}" ]]; then
+  UC_NATIVE_CORELIB_SRC="$(canonical_existing_dir_path "UC_NATIVE_CORELIB_SRC" "$UC_NATIVE_CORELIB_SRC")"
+  export UC_NATIVE_CORELIB_SRC
+fi
+
+RESULTS_DIR="$(canonical_dir_path "results directory" "$RESULTS_DIR")"
 
 measure_command_ms() {
   local cwd="$1"
