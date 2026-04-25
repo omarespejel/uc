@@ -385,7 +385,7 @@ test_remediation_fields_are_validated_without_overmatching() {
   "generated_at": "2026-04-25T00:00:00Z",
   "summary": {
     "support_matrix": {
-      "native_supported": 2,
+      "native_supported": 3,
       "fallback_used": 0,
       "native_unsupported": 0,
       "build_failed": 0
@@ -461,6 +461,42 @@ test_remediation_fields_are_validated_without_overmatching() {
       },
       "benchmark_status": "skipped",
       "benchmarks": null
+    },
+    {
+      "tag": "wrong-required-types",
+      "manifest_path": "/tmp/wrong-types/Scarb.toml",
+      "native_support": {
+        "supported": true,
+        "package_cairo_version": "2.14.0",
+        "diagnostics": [
+          {
+            "schema_version": "1",
+            "code": [],
+            "category": {},
+            "severity": "warn",
+            "title": "Native build failed with Cairo diagnostic E0002",
+            "docs_url": "https://github.com/omarespejel/uc/blob/main/docs/agent/AGENT_DIAGNOSTICS.md#ucn2002",
+            "what_happened": "The Cairo helper emitted error E0002 while compiling a dependency.",
+            "why": "The dependency calls a method that is unavailable for the selected core type.",
+            "how_to_fix": [
+              "Open the recorded native build log and inspect E0002."
+            ],
+            "next_commands": [
+              "uc replay /tmp/uc-failure.json"
+            ],
+            "safe_automated_action": "record_failure_bundle",
+            "retryable": "true",
+            "fallback_used": 1
+          }
+        ]
+      },
+      "support_matrix": {
+        "classification": "native_supported",
+        "compile_backend": "uc_native_external_helper",
+        "fallback_used": false
+      },
+      "benchmark_status": "skipped",
+      "benchmarks": null
     }
   ]
 }
@@ -468,14 +504,22 @@ JSON
 
   "$SUMMARY_SCRIPT" --benchmark-json "$fixture" --out-json "$out_json"
 
-  local detailed_gap remediation_gap remediation_reason
+  local detailed_gap remediation_gap remediation_reason type_gap type_reason
   detailed_gap="$(jq -r '.cases[] | select(.tag=="detailed-prefixed-native-failure") | .opportunity_codes | index("UCO5001") != null' "$out_json")"
   remediation_gap="$(jq -r '.cases[] | select(.tag=="empty-remediation-fields") | .opportunity_codes | index("UCO5001") != null' "$out_json")"
   remediation_reason="$(jq -r '.cases[] | select(.tag=="empty-remediation-fields") | .opportunities[] | select(.code=="UCO5001") | .why' "$out_json")"
+  type_gap="$(jq -r '.cases[] | select(.tag=="wrong-required-types") | .opportunity_codes | index("UCO5001") != null' "$out_json")"
+  type_reason="$(jq -r '.cases[] | select(.tag=="wrong-required-types") | .opportunities[] | select(.code=="UCO5001") | .why' "$out_json")"
   assert_json_value "detailed_gap" "$detailed_gap" "false" "$out_json"
   assert_json_value "remediation_gap" "$remediation_gap" "true" "$out_json"
+  assert_json_value "type_gap" "$type_gap" "true" "$out_json"
   if [[ "$remediation_reason" != *"docs_url is empty"* || "$remediation_reason" != *"how_to_fix is empty"* || "$remediation_reason" != *"next_commands is empty"* || "$remediation_reason" != *"safe_automated_action is empty"* ]]; then
     echo "expected empty remediation fields to be named in UCO5001 reason" >&2
+    cat "$out_json" >&2
+    exit 1
+  fi
+  if [[ "$type_reason" != *"schema_version is not an integer"* || "$type_reason" != *"code is empty"* || "$type_reason" != *"category is empty"* || "$type_reason" != *"retryable is not a boolean"* || "$type_reason" != *"fallback_used is not a boolean"* ]]; then
+    echo "expected wrong required field types to be named in UCO5001 reason" >&2
     cat "$out_json" >&2
     exit 1
   fi
