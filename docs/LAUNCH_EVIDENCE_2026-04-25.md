@@ -25,6 +25,8 @@ without implying a complete Starknet Sepolia or mainnet universe snapshot.
 - Chain label: `starknet-sepolia`
 - Coverage: `complete_deployed_contracts`
 - Snapshot id: `local-monero-deployed-contract-complete-2026-04-25-pr49`
+- Regenerated evidence root: `uc-launch-evidence-complete-monero-20260425-pr51`
+  over the same `pr49` selection snapshot, after the claim-plural harness fix.
 - Items: `1`
 - Source kinds: `deployed_contract=1`
 - Cairo versions: `2.14.0` through `2.14.0`
