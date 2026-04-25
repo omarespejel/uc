@@ -5,6 +5,33 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "corpus_id", "chain", "selection", "deduplication", "items"],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "selection": {
+            "properties": {
+              "coverage": { "const": "complete_deployed_contracts" }
+            },
+            "required": ["coverage"]
+          }
+        },
+        "required": ["selection"]
+      },
+      "then": {
+        "properties": {
+          "items": {
+            "items": {
+              "required": ["source_kind", "contract_address"],
+              "properties": {
+                "source_kind": { "const": "deployed_contract" }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
   "properties": {
     "schema_version": { "const": 1 },
     "corpus_id": { "type": "string", "minLength": 1 },

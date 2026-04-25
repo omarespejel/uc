@@ -675,34 +675,17 @@ test_complete_non_deduped_corpus_emits_deployed_contract_claim() {
 }
 
 test_complete_non_deduped_count_mismatch_blocks_deployed_contract_claim() {
-  local stdout_text
-  stdout_text="$(run_corpus_benchmark complete_deployed_contracts none 3)"
-  local json_path md_path
-  json_path="$(extract_labeled_path "Corpus Benchmark JSON" <<<"$stdout_text")"
-  md_path="$(extract_labeled_path "Corpus Benchmark Markdown" <<<"$stdout_text")"
-  [[ -f "$json_path" ]] || { echo "missing corpus benchmark json: $json_path" >&2; return 1; }
-  [[ -f "$md_path" ]] || { echo "missing corpus benchmark markdown: $md_path" >&2; return 1; }
-
-  local safe selected_safe all_supported claim selected_claim native_claim reason markdown_text
-  safe="$(jq -r '.claim_guard.safe_to_say_compiled_all_deployed_contracts_in_corpus' "$json_path")"
-  selected_safe="$(jq -r '.claim_guard.safe_to_say_compiled_all_selected_deployed_units_in_corpus' "$json_path")"
-  all_supported="$(jq -r '.claim_guard.safe_to_say_all_items_native_supported' "$json_path")"
-  claim="$(jq -r '.claim_guard.compiled_all_claim_text // ""' "$json_path")"
-  selected_claim="$(jq -r '.claim_guard.selected_units_claim_text // ""' "$json_path")"
-  native_claim="$(jq -r '.claim_guard.native_supported_claim_text // ""' "$json_path")"
-  reason="$(jq -r '.claim_guard.reason' "$json_path")"
-  markdown_text="$(cat "$md_path")"
-  if [[ "$safe" != "false" || "$selected_safe" != "false" || "$all_supported" != "true" || -n "$claim" || -n "$selected_claim" || -z "$native_claim" ]]; then
-    echo "non-deduped corpus with mismatched counts should not emit deployed-address or selected-unit claims" >&2
-    cat "$json_path" >&2
+  local stderr_path="$TEST_TMP_DIR/non-deduped-count-mismatch.err"
+  if run_corpus_benchmark complete_deployed_contracts none 3 >"$TEST_TMP_DIR/non-deduped-count-mismatch.out" 2>"$stderr_path"; then
+    echo "expected non-deduped corpus with mismatched counts to be rejected" >&2
+    cat "$TEST_TMP_DIR/non-deduped-count-mismatch.out" >&2
     return 1
   fi
-  assert_contains "$reason" "deduplication.input_count does not equal item_count"
-  assert_contains "$reason" "address coverage is incomplete"
-  assert_contains "$native_claim" "Every item in the pinned"
-  assert_contains "$markdown_text" "Compiled-all claim: <not safe for this artifact>"
-  assert_contains "$markdown_text" "Selected-unit claim: <not safe for this artifact>"
-  assert_contains "$markdown_text" "Native-supported claim: Every item in the pinned"
+  if ! grep -Fq "corpus.deduplication.input_count must equal deduped_count when deduplication.key is none" "$stderr_path"; then
+    echo "expected non-deduped count mismatch validation error" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
 }
 
 test_native_benchmark_failure_blocks_native_support_claim() {
@@ -767,13 +750,13 @@ test_complete_corpus_with_declared_class_blocks_deployed_claim() {
   write_mock_uc_bin "$mock_bin_dir/uc"
   write_mock_scarb_bin "$mock_bin_dir/scarb"
 
-  local item stdout_text json_path md_path safe selected_safe all_supported reason source_kind_count claim selected_claim markdown_text native_claim
+  local item stderr_path
   item="$(item_json class-only "../cases/class-only/Scarb.toml" "0xclass" "2.14.0")"
   item="$(jq '.source_kind = "declared_class" | del(.contract_address)' <<<"$item")"
   write_corpus_file "$corpus_dir/corpus.json" complete_deployed_contracts class_hash "$item"
 
-  stdout_text="$(
-    PATH="$mock_bin_dir:$PATH" \
+  stderr_path="$TEST_TMP_DIR/declared-class.err"
+  if PATH="$mock_bin_dir:$PATH" \
     MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/declared-class/uc.args" \
     MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/declared-class/scarb.args" \
     "$CORPUS_SCRIPT" \
@@ -782,27 +765,16 @@ test_complete_corpus_with_declared_class_blocks_deployed_claim() {
       --runs 1 \
       --cold-runs 1 \
       --warm-settle-seconds 0 \
-      --corpus "$corpus_dir/corpus.json"
-  )"
-
-  json_path="$(extract_labeled_path "Corpus Benchmark JSON" <<<"$stdout_text")"
-  md_path="$(extract_labeled_path "Corpus Benchmark Markdown" <<<"$stdout_text")"
-  safe="$(jq -r '.claim_guard.safe_to_say_compiled_all_deployed_contracts_in_corpus' "$json_path")"
-  selected_safe="$(jq -r '.claim_guard.safe_to_say_compiled_all_selected_deployed_units_in_corpus' "$json_path")"
-  all_supported="$(jq -r '.claim_guard.safe_to_say_all_items_native_supported' "$json_path")"
-  reason="$(jq -r '.claim_guard.reason' "$json_path")"
-  source_kind_count="$(jq -r '.summary.source_kind_counts.declared_class' "$json_path")"
-  claim="$(jq -r '.claim_guard.compiled_all_claim_text // ""' "$json_path")"
-  selected_claim="$(jq -r '.claim_guard.selected_units_claim_text // ""' "$json_path")"
-  native_claim="$(jq -r '.claim_guard.native_supported_claim_text // ""' "$json_path")"
-  markdown_text="$(cat "$md_path")"
-  if [[ "$safe" != "false" || "$selected_safe" != "false" || "$all_supported" != "true" || "$reason" != "corpus contains non-deployed source_kind rows" || "$source_kind_count" != "1" || -n "$claim" || -n "$selected_claim" || -z "$native_claim" ]]; then
-    echo "declared_class corpus item should block deployed-contract and selected-unit launch claims" >&2
-    cat "$json_path" >&2
+      --corpus "$corpus_dir/corpus.json" >"$TEST_TMP_DIR/declared-class.out" 2>"$stderr_path"; then
+    echo "expected complete corpus with declared_class row to be rejected" >&2
+    cat "$TEST_TMP_DIR/declared-class.out" >&2
     return 1
   fi
-  assert_contains "$markdown_text" "Selected-unit claim: <not safe for this artifact>"
-  assert_contains "$markdown_text" "| class-only | declared_class | declared-class:0xclass |"
+  if ! grep -Fq "corpus.items[0].source_kind must be explicitly deployed_contract when corpus.selection.coverage is complete_deployed_contracts" "$stderr_path"; then
+    echo "expected complete corpus source_kind validation error" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
 }
 
 test_rejects_empty_declared_class_contract_address() {

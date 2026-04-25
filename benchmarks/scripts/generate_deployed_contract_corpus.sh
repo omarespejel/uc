@@ -227,6 +227,8 @@ if deduped_count != len(items):
     fail(f"source_index.deduplication.deduped_count ({deduped_count}) must equal items length ({len(items)})")
 if input_count < deduped_count:
     fail("source_index.deduplication.input_count must be >= deduped_count")
+if dedupe_key == "none" and input_count != deduped_count:
+    fail("source_index.deduplication.input_count must equal deduped_count when deduplication.key is none")
 
 tag_re = re.compile(r"^[A-Za-z0-9._-]+$")
 seen_tags = set()
@@ -243,11 +245,19 @@ for index, raw_item in enumerate(items):
     seen_tags.add(tag)
 
     class_hash = require_str(item, "class_hash", f"source_index.items[{index}]")
+    source_kind_present = "source_kind" in item
     source_kind = item.get("source_kind", "deployed_contract")
     if not isinstance(source_kind, str) or not source_kind:
         fail(f"source_index.items[{index}].source_kind must be deployed_contract or declared_class")
     if source_kind not in {"deployed_contract", "declared_class"}:
         fail(f"source_index.items[{index}].source_kind must be deployed_contract or declared_class")
+    if coverage == "complete_deployed_contracts" and (
+        not source_kind_present or source_kind != "deployed_contract"
+    ):
+        fail(
+            f"source_index.items[{index}].source_kind must be explicitly deployed_contract "
+            "when source_index.selection.coverage is complete_deployed_contracts"
+        )
     if source_kind == "deployed_contract":
         require_str(item, "contract_address", f"source_index.items[{index}]")
     else:

@@ -274,11 +274,19 @@ for index, raw_record in enumerate(records):
     seen_tags.add(tag)
 
     class_hash = require_str(record, "class_hash", f"inventory.records[{index}]")
+    source_kind_present = "source_kind" in record
     source_kind = record.get("source_kind", "deployed_contract")
     if not isinstance(source_kind, str) or not source_kind:
         fail(f"inventory.records[{index}].source_kind must be deployed_contract or declared_class")
     if source_kind not in {"deployed_contract", "declared_class"}:
         fail(f"inventory.records[{index}].source_kind must be deployed_contract or declared_class")
+    if coverage == "complete_deployed_contracts" and (
+        not source_kind_present or source_kind != "deployed_contract"
+    ):
+        fail(
+            f"inventory.records[{index}].source_kind must be explicitly deployed_contract "
+            "when inventory.selection.coverage is complete_deployed_contracts"
+        )
     if source_kind == "deployed_contract":
         require_str(record, "contract_address", f"inventory.records[{index}]")
     else:

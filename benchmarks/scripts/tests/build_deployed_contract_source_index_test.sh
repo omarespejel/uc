@@ -297,6 +297,22 @@ test_normalizes_legacy_missing_source_kind_as_deployed_contract() {
   fi
 }
 
+test_complete_coverage_requires_deployed_contract_rows() {
+  local inventory_dir="$TEST_TMP_DIR/complete-source-kind/inventory"
+  local case_root="$inventory_dir/cases"
+  mkdir -p "$inventory_dir"
+  write_manifest_case "$case_root" "a"
+  local record
+  record="$(inventory_record_json class_only "cases/a/Scarb.toml" "0xclass" "2.14.0")"
+  write_inventory_file "$inventory_dir/declared.json" complete_deployed_contracts class_hash "$record"
+  mutate_inventory "$inventory_dir/declared.json" '.records[0].source_kind = "declared_class" | del(.records[0].contract_address)'
+  expect_builder_failure "$inventory_dir/declared.json" "inventory.records[0].source_kind must be explicitly deployed_contract when inventory.selection.coverage is complete_deployed_contracts"
+
+  write_inventory_file "$inventory_dir/missing.json" complete_deployed_contracts class_hash "$record"
+  mutate_inventory "$inventory_dir/missing.json" 'del(.records[0].source_kind)'
+  expect_builder_failure "$inventory_dir/missing.json" "inventory.records[0].source_kind must be explicitly deployed_contract when inventory.selection.coverage is complete_deployed_contracts"
+}
+
 test_rejects_outside_output_directory() {
   local inventory_dir="$TEST_TMP_DIR/outside-out/inventory"
   local case_root="$inventory_dir/cases"
@@ -349,6 +365,7 @@ run_test "rejects null source_package_id when present" test_rejects_null_source_
 run_test "accepts declared_class without contract_address" test_accepts_declared_class_without_contract_address
 run_test "rejects empty declared_class contract_address" test_rejects_empty_declared_class_contract_address
 run_test "normalizes legacy missing source_kind as deployed_contract" test_normalizes_legacy_missing_source_kind_as_deployed_contract
+run_test "complete coverage requires deployed_contract rows" test_complete_coverage_requires_deployed_contract_rows
 run_test "rejects outside output directory" test_rejects_outside_output_directory
 run_test "rejects inventory output overwrite aliases" test_rejects_inventory_output_overwrite_aliases
 

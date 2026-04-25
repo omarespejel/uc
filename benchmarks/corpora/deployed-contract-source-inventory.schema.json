@@ -18,6 +18,31 @@
     {
       "if": {
         "properties": {
+          "selection": {
+            "properties": {
+              "coverage": { "const": "complete_deployed_contracts" }
+            },
+            "required": ["coverage"]
+          }
+        },
+        "required": ["selection"]
+      },
+      "then": {
+        "properties": {
+          "records": {
+            "items": {
+              "required": ["source_kind", "contract_address"],
+              "properties": {
+                "source_kind": { "const": "deployed_contract" }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
           "deduplication": {
             "properties": {
               "key": { "const": "source_package" }
