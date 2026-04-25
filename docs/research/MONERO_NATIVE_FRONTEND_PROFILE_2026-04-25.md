@@ -13,6 +13,7 @@ The monero Cairo `2.14` lane is now native-supported and fast in the measured ha
 - Cairo lane: `2.14.0`
 - Native helper source: external Cairo `2.14` helper via `UC_NATIVE_TOOLCHAIN_2_14_BIN`
 - Run mode: local-first, offline, daemon off, same-window Scarb vs `uc` harness rerun
+- Host class: Apple M3 Pro, arm64, 18 GiB RAM, macOS 26.4.1
 - Sample counts: 3 cold, 3 warm-noop
 
 This is a local engineering profile note, not a public launch benchmark claim. The raw benchmark artifacts were written under `benchmarks/results/`, which is ignored by git. Before quoting these numbers externally, publish or commit an immutable benchmark artifact that records the host, binary, repo revision, manifest, helper path, flags, and sample counts.
@@ -27,10 +28,10 @@ benchmarks/results/monero-hotspot-baseline-20260425-083622/
 
 Summary from `real-repo-bench-20260425-083623.json`:
 
-| Lane | Scarb p95 | uc p95 | p95 speedup | Stability |
-| --- | ---: | ---: | ---: | --- |
-| Cold build | 23423.016 ms | 5762.864 ms | 4.06x | stable |
-| Warm no-op | 6427.190 ms | 37.462 ms | 171.57x | stable |
+| Lane | Conditions | Scarb p95 | uc p95 | p95 speedup | Stability |
+| --- | --- | ---: | ---: | ---: | --- |
+| Cold build | Apple M3 Pro, arm64, 18 GiB RAM, macOS 26.4.1, offline, daemon off, 3 cold runs | 23423.016 ms | 5762.864 ms | 4.06x | stable |
+| Warm no-op | Apple M3 Pro, arm64, 18 GiB RAM, macOS 26.4.1, offline, daemon off, 3 warm-noop runs | 6427.190 ms | 37.462 ms | 171.57x | stable |
 
 Support matrix:
 
