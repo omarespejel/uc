@@ -1,14 +1,17 @@
 # Product Charter
 
 ## Product
-`uc`: Cairo build cache and session manager that accelerates Scarb-backed workflows.
+`uc`: agent-first Cairo compiler and Scarb-compatible project tool.
 
 ## Vision
 By default, Cairo developers and CI should run `uc` for package resolution, build, test, execute, prove, lint, and format workflows with better speed, stronger observability, and deterministic outputs.
 
+The next product step is a first-party project model that can read existing Scarb manifests and lockfiles while preserving compatibility gates.
+
 ## Why Now
 - Warm-path build latency is a direct productivity tax.
 - Existing workflows duplicate work across commands and sessions.
+- Agents need structured project state before they can safely fix, retry, benchmark, or stop.
 - Teams need a cloud-ready cache model for shared CI acceleration.
 
 ## Product Principles
@@ -17,6 +20,7 @@ By default, Cairo developers and CI should run `uc` for package resolution, buil
 3. Correctness gates are enforced before rollout.
 4. Observability is required for every subsystem.
 5. Migration should be measurable and reversible.
+6. Project state should be typed and machine-readable before command defaults change.
 
 ## Success Outcomes
 - Warm rebuild p95: at least 40% faster than Scarb baseline on target matrix.
@@ -27,6 +31,8 @@ By default, Cairo developers and CI should run `uc` for package resolution, buil
 ## Scope
 - In scope:
   - Resolver/source engine.
+  - Scarb-compatible project import.
+  - `uc` project and lockfile model.
   - Build graph planner.
   - Compiler session manager/daemon.
   - Local + remote content-addressed cache.
@@ -34,6 +40,7 @@ By default, Cairo developers and CI should run `uc` for package resolution, buil
 - Out of scope for initial proof:
   - LSP-native implementation.
   - Advanced STWO proof caching beyond baseline hooks.
+  - Changing defaults before parity gates pass.
 
 ## Stakeholders
 - Developer productivity owners.

@@ -10,6 +10,8 @@ The launch wedge is not just speed. The launch wedge is:
 
 > A Cairo compiler agents can operate reliably: structured diagnostics, native multi-toolchain support, reproducible failure bundles, and benchmark claims anyone can verify.
 
+The longer-term boundary is wider than build acceleration. `uc` should expose a typed project model that agents can inspect before build, metadata, benchmark, or safe-action work.
+
 ## Product Principles
 
 1. Do not make agents parse prose.
@@ -20,6 +22,7 @@ The launch wedge is not just speed. The launch wedge is:
 6. Safe automated actions are explicit and reversible by default.
 7. Source edits require explicit permission.
 8. Repo policy comes from checked-in files like `AGENTS.md`, `.codex/START_HERE.md`, and `docs/agent/*`.
+9. Project-model state should be explicit before command defaults change.
 
 ## Launch-Minimum Agent Surfaces
 
@@ -64,6 +67,14 @@ Already in this PR or required before launch:
    - Keep source edits behind an explicit `--allow-source-edits` gate.
    - Require failure-bundle replay evidence before allowing source-modifying actions.
 
+6. `uc-project-inspect`
+   - Add `uc project inspect --manifest-path <Scarb.toml> --format json`.
+   - Emit package/workspace/target/dependency/toolchain metadata and stable diagnostics without mutating files.
+
+7. `metadata-from-project-model`
+   - Serve `uc metadata` from the project model behind an explicit gate.
+   - Keep Scarb metadata as the comparison oracle until parity passes on the support corpus.
+
 ## MCP Shape
 
 Read-only MCP tools should eventually expose:
@@ -104,10 +115,13 @@ uc build --engine uc --daemon-mode off --json | jq
 Agents should start with support probing, not build-and-guess:
 
 ```sh
+uc project inspect --manifest-path Scarb.toml --format json
 uc support native --manifest-path Scarb.toml --format json
 uc agent eval --manifest-path Scarb.toml
 ./scripts/doctor.sh --uc-bin ./target/release/uc --manifest-path /abs/path/to/Scarb.toml
 ```
+
+Until `uc project inspect` exists, agents should treat `uc support native` and `uc agent eval` as the stable pre-build surfaces.
 
 If the diagnostic says `safe_automated_action=build_helper_lane`, the agent may run:
 

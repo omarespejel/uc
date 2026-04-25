@@ -224,8 +224,8 @@ Result: **double the memory, double the parsing, zero shared work.**
 
 | Alternative | Why Not |
 |---|---|
-| **Fork Scarb** | Scarb is 78.9% Rust, 50+ crates, active development. Forking = maintenance burden. |
-| **Replace Scarb** | PubGrub, plugin system, manifest parsing all work fine. No need to rewrite. |
+| **Fork upstream tooling** | Scarb is 78.9% Rust, 50+ crates, active development. Forking = maintenance burden. |
+| **Rebuild package tooling** | PubGrub, plugin system, manifest parsing all work fine. No need to rewrite. |
 | **Modify Cairo compiler** | Salsa support is already there. The compiler doesn't need changes. |
 | **Just add remote cache to Scarb** | Helps CI but doesn't fix the cold-database problem for local dev. |
 

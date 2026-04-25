@@ -14,6 +14,7 @@ required_files=(
   docs/agent/AGENT_DIAGNOSTICS.md
   docs/agent/AGENT_QUICKSTART.md
   docs/agent/HUMAN_QUICKSTART.md
+  docs/PROJECT_MODEL_STRATEGY.md
   docs/AGENT_FIRST_LAUNCH_MINIMUM_2026-04-24.md
   docs/agent/schemas/native-diagnostic.schema.json
   docs/agent/schemas/native-support-report.schema.json
