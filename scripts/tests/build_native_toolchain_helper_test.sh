@@ -40,7 +40,7 @@ test_prepare_only_rewrites_workspace_manifest_for_cairo214() {
     "$stage_dir/.uc/helper-lane-patches/cairo-2.14/cairo-lang-sierra-generator/src/program_generator.rs"
   grep -qF 'UC_CAIRO214_SIZE_TRACE_WRITE_LOCK' \
     "$stage_dir/.uc/helper-lane-patches/cairo-2.14/cairo-lang-sierra-generator/src/program_generator.rs"
-  grep -qF 'format!("{:p}:{:?}", db as *const dyn Database as *const (), function_id.get_internal_id())' \
+  grep -qF 'format!("{:p}:{:?}", db as *const dyn Database as *const (), function_id)' \
     "$stage_dir/.uc/helper-lane-patches/cairo-2.14/cairo-lang-sierra-generator/src/program_generator.rs"
 }
 

@@ -11,6 +11,7 @@
   - `--engine scarb`: direct Scarb execution path.
 - `--json` emits the same execution report JSON on stdout and suppresses normal build log replay so the payload stays machine-readable.
 - Optional `--report-path` writes the execution report JSON to disk; it can be combined with `--json`.
+- Optional `--record-failure <path>` writes a redacted failure bundle when the build exits with an error.
 - Build report JSON now includes:
   - `compile_backend`: `scarb`, `uc_scarb`, `scarb_fallback`, `uc_native`, or `uc_native_external_helper`
   - `native_toolchain`: requested lane, selected source, resolved compiler version, and helper binary path when applicable
@@ -47,7 +48,27 @@
 - Analyzes `Scarb.toml` and emits a migration readiness report.
 - Optional `--emit-uc-toml <path>` generates a starter `Uc.toml` scaffold.
 
-8. `uc daemon`
+8. `uc agent eval`
+- Probes a manifest and returns an agent decision: proceed to build/benchmark, run a safe action and retry, or stop as native-unsupported.
+- Always emits JSON and can also write it with `--report-path`.
+- Includes the nested native support report, safe actions, next commands, and required launch fixtures (`monero`, `braavos`).
+
+9. `uc agent safe-action`
+- Dry-run-first remediation surface.
+- Supports `build-helper-lane`, `rebuild-helper-lane`, `refresh-cache`, `rerun-doctor`, and `regenerate-support-matrix`.
+- Does not execute unless `--execute` is supplied.
+- Emits a structured safe-action report with command, dry-run status, execution status, exit code, stdout, and stderr.
+
+10. `uc replay <bundle>`
+- Reads a `uc build --record-failure` bundle and emits a replay report.
+- Dry-run by default; `--execute` replays the recorded command.
+
+11. `uc mcp serve`
+- Emits the read-only MCP command/resource catalog as JSON.
+- Covers `doctor`, `support_native`, `explain_diagnostic`, `select_toolchain`, `benchmark_report`, and `profile_native_frontend`.
+- This is intentionally read-only: mutable actions stay behind `uc agent safe-action --execute`.
+
+12. `uc daemon`
 - `start`: launches local background daemon (`~/.uc/daemon/uc.sock` by default).
 - `status`: checks daemon reachability and reports pid/start timestamp.
 - `stop`: requests graceful shutdown.

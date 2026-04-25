@@ -18,6 +18,12 @@ required_files=(
   docs/agent/schemas/native-diagnostic.schema.json
   docs/agent/schemas/native-support-report.schema.json
   docs/agent/schemas/build-report.schema.json
+  docs/agent/schemas/agent-eval-report.schema.json
+  docs/agent/schemas/failure-bundle.schema.json
+  docs/agent/schemas/replay-report.schema.json
+  docs/agent/schemas/mcp-catalog.schema.json
+  docs/agent/schemas/safe-action-report.schema.json
+  docs/agent/schemas/benchmark-report.schema.json
   .coderabbit.yaml
   .pr_agent.toml
   best_practices.md

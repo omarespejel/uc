@@ -27,34 +27,38 @@ Already in this PR or required before launch:
 
 - `uc support native --format json` emits stable support reports.
 - `uc build --json` and `--report-path` carry build diagnostics.
+- `uc build --record-failure <path>` writes a redacted failure bundle on build errors.
+- `uc replay <bundle>` reads that bundle and is dry-run by default.
+- `uc agent eval --manifest-path <Scarb.toml>` returns a decision agents can act on before compiling.
+- `uc agent safe-action <action>` exposes dry-run-first remediation commands.
+- `uc mcp serve` emits the read-only command/resource catalog for MCP adapters.
 - Native support reports include toolchain selection metadata.
 - Diagnostics include schema version, docs URL, next commands, safe automated action, retryability, fallback status, expected toolchain, and found toolchain.
 - Real-repo benchmarks include native support classification and fallback status.
 - `scripts/doctor.sh --uc-bin <path> --manifest-path <Scarb.toml>` probes support before measurement.
 - `./scripts/build_native_toolchain_helper.sh --lane 2.14` provides the current older-Cairo helper lane.
 
-## Next PRs
+## Remaining PRs
 
-1. `agent-flight-recorder`
-   - Add `uc build --record-failure`.
-   - Produce a redacted repro bundle with manifest metadata, lockfile metadata, selected lane, helper path/version, normalized environment, command, diagnostics, timing spans, and source graph hashes.
-   - Add `uc replay <bundle>`.
+1. `agent-flight-recorder-hardening`
+   - Extend the failure bundle with timing spans and source graph hashes.
+   - Add bundle schema validation in the replay path.
 
-2. `uc-mcp-readonly`
-   - Add `uc mcp serve` with read-only tools first: `doctor`, `support_matrix`, `explain_diagnostic`, `select_toolchain`, `benchmark_report`, and `profile_native_frontend`.
-   - Return MCP structured content matching checked-in JSON schemas.
+2. `uc-mcp-stdio`
+   - Wrap the read-only catalog in a real stdio MCP JSON-RPC server.
+   - Keep mutable actions out of MCP until permission gates are explicit.
 
-3. `agent-eval-harness`
-   - Add scenarios where an agent must fix missing helper lanes, unsupported manifests, fallback activation, stale cache, and benchmark unsupported cases.
-   - Include `monero` and `braavos` as required evaluation fixtures.
+3. `agent-eval-fixtures`
+   - Check in fixture manifests for missing helper lanes, unsupported manifests, fallback activation, stale cache, and benchmark unsupported cases.
+   - Add real `monero` and `braavos` fixture runners, not just required-fixture markers.
 
 4. `sarif-and-lsp`
    - Map diagnostics to SARIF for GitHub/code-scanning ingestion.
    - Reuse the same stable codes for LSP diagnostics and code actions.
 
-5. `safe-fix`
-   - Add dry-run-first safe remediation for helper install/rebuild, cache refresh, support-matrix regeneration, and doctor reruns.
+5. `safe-source-edits`
    - Keep source edits behind an explicit `--allow-source-edits` gate.
+   - Require failure-bundle replay evidence before allowing source-modifying actions.
 
 ## MCP Shape
 
@@ -97,16 +101,25 @@ Agents should start with support probing, not build-and-guess:
 
 ```sh
 uc support native --manifest-path Scarb.toml --format json
+uc agent eval --manifest-path Scarb.toml
 ./scripts/doctor.sh --uc-bin ./target/release/uc --manifest-path /abs/path/to/Scarb.toml
 ```
 
 If the diagnostic says `safe_automated_action=build_helper_lane`, the agent may run:
 
 ```sh
-./scripts/build_native_toolchain_helper.sh --lane 2.14
+uc agent safe-action build-helper-lane --lane 2.14
+uc agent safe-action build-helper-lane --lane 2.14 --execute
 ```
 
 Then it should export the printed helper env var and rerun support probing before benchmarking.
+
+When a build fails, agents should preserve a replayable artifact:
+
+```sh
+uc build --engine uc --daemon-mode off --manifest-path Scarb.toml --record-failure /tmp/uc-failure.json
+uc replay /tmp/uc-failure.json
+```
 
 ## Sources
 

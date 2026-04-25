@@ -95,7 +95,7 @@ The Cairo `2.14` helper now has an opt-in local trace for size-estimation work. 
 
 The default trace uses a cheap DB discriminator plus Salsa internal ids. The DB discriminator keeps long-lived helper processes from mixing counters across compiler DB instances. Do not enable `UC_CAIRO214_SIZE_TRACE_NAMES=1` during timed benchmark runs; full function names for heavily generic Cairo code are expensive to compute and are intended only for short diagnostic reproductions. Name previews are capped per row, but total trace size still depends on sampled row count.
 
-Local monero diagnostic smoke after the trace hardening changes:
+Local monero diagnostic smoke after the trace hardening changes. This smoke invoked a direct debug helper binary, so the support probe correctly reported `toolchain.source=builtin`; the benchmark section above is the external-helper lane evidence.
 
 ```text
 helper=/tmp/uc-cairo214-reviewfix-helper/uc

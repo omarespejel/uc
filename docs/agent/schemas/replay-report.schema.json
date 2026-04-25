@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/omarespejel/uc/docs/agent/schemas/replay-report.schema.json",
+  "title": "uc ReplayReport",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "generated_at_epoch_ms",
+    "bundle_path",
+    "execute_requested",
+    "executed",
+    "command",
+    "original_error",
+    "stdout",
+    "stderr"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "generated_at_epoch_ms": { "type": "number" },
+    "bundle_path": { "type": "string" },
+    "execute_requested": { "type": "boolean" },
+    "executed": { "type": "boolean" },
+    "command": { "type": "array", "items": { "type": "string" } },
+    "manifest_path": { "type": "string" },
+    "original_error": { "type": "string" },
+    "selected_support": { "$ref": "native-support-report.schema.json" },
+    "exit_code": { "type": "integer" },
+    "stdout": { "type": "string" },
+    "stderr": { "type": "string" },
+    "blocked_reason": { "type": "string" }
+  }
+}
