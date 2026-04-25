@@ -23,6 +23,7 @@
 - Native validation: `make validate-native`
 - Helper-lane validation: `make validate-helper-lane`
 - Refresh repo map: `make agent-map`
+- Read-only project inspection: `uc project inspect --manifest-path /abs/path/to/Scarb.toml --format json`
 - Agent support decision: `uc agent eval --manifest-path /abs/path/to/Scarb.toml`
 - Dry-run safe remediation: `uc agent safe-action build-helper-lane --lane 2.14`
 - Replayable build failure capture: `uc build --engine uc --daemon-mode off --manifest-path /abs/path/to/Scarb.toml --record-failure /abs/path/to/uc-failure.json`

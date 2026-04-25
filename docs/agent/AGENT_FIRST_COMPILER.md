@@ -35,7 +35,8 @@ Already in this PR or required before launch:
 - `uc agent eval --manifest-path <Scarb.toml>` returns a decision agents can act on before compiling.
 - `uc agent safe-action <action>` exposes dry-run-first remediation commands.
 - `uc mcp serve` emits the read-only command/resource catalog for MCP adapters.
-- `uc project inspect --manifest-path <Scarb.toml> --format json` emits read-only package, workspace, target, dependency, lockfile, toolchain, and native support state.
+- `uc project inspect --manifest-path <Scarb.toml> --format json` emits read-only package, workspace, target, dependency, lockfile, and toolchain state.
+- Native support details are included only when exact lane data is available; if read-only inspect skips native probing, use `UCP1005` as the signal to run `uc support native` for full probing.
 - Native support reports include toolchain selection metadata.
 - Diagnostics include schema version, docs URL, next commands, safe automated action, retryability, fallback status, expected toolchain, and found toolchain.
 - Real-repo benchmarks include native support classification and fallback status.
