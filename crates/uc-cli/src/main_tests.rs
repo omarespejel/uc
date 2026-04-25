@@ -2103,6 +2103,33 @@ cairo-version = "{requested_major_minor}.0"
     );
 }
 
+#[cfg(feature = "native-compile")]
+#[test]
+fn productized_native_toolchain_helper_lanes_match_workspace_metadata() {
+    let workspace_manifest_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml");
+    let workspace_manifest = fs::read_to_string(&workspace_manifest_path)
+        .expect("workspace Cargo.toml should be readable");
+    let workspace_manifest: TomlValue =
+        toml::from_str(&workspace_manifest).expect("workspace Cargo.toml should parse");
+    let helpers = workspace_manifest
+        .get("workspace")
+        .and_then(TomlValue::as_table)
+        .and_then(|workspace| workspace.get("metadata"))
+        .and_then(TomlValue::as_table)
+        .and_then(|metadata| metadata.get("uc-native-toolchain-helpers"))
+        .and_then(TomlValue::as_table)
+        .expect("workspace helper-builder metadata should exist");
+    let mut metadata_lanes = helpers.keys().cloned().collect::<Vec<_>>();
+    metadata_lanes.sort();
+    let mut packaged_lanes = productized_native_toolchain_helper_lanes();
+    packaged_lanes.sort();
+    assert_eq!(
+        packaged_lanes, metadata_lanes,
+        "PRODUCTIZED_NATIVE_TOOLCHAIN_HELPER_LANES must stay in sync with workspace.metadata.uc-native-toolchain-helpers"
+    );
+}
+
 #[cfg(all(feature = "native-compile", unix))]
 #[test]
 fn select_native_toolchain_from_manifest_path_uses_lockfile_lane_helper() {
