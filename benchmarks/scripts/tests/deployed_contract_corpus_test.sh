@@ -596,21 +596,24 @@ test_sample_corpus_blocks_compiled_all_claim() {
   json_path="$(extract_labeled_path "Corpus Benchmark JSON" <<<"$stdout_text")"
   [[ -f "$json_path" ]] || { echo "missing corpus benchmark json: $json_path" >&2; return 1; }
 
-  local safe reason native_supported all_supported claim native_claim markdown_text md_path
+  local safe selected_safe reason native_supported all_supported claim selected_claim native_claim markdown_text md_path
   md_path="$(extract_labeled_path "Corpus Benchmark Markdown" <<<"$stdout_text")"
   safe="$(jq -r '.claim_guard.safe_to_say_compiled_all_deployed_contracts_in_corpus' "$json_path")"
+  selected_safe="$(jq -r '.claim_guard.safe_to_say_compiled_all_selected_deployed_units_in_corpus' "$json_path")"
   reason="$(jq -r '.claim_guard.reason' "$json_path")"
   native_supported="$(jq -r '.summary.support_matrix.native_supported' "$json_path")"
   all_supported="$(jq -r '.claim_guard.safe_to_say_all_items_native_supported' "$json_path")"
   claim="$(jq -r '.claim_guard.compiled_all_claim_text // ""' "$json_path")"
+  selected_claim="$(jq -r '.claim_guard.selected_units_claim_text // ""' "$json_path")"
   native_claim="$(jq -r '.claim_guard.native_supported_claim_text // ""' "$json_path")"
   markdown_text="$(cat "$md_path")"
-  if [[ "$safe" != "false" || "$reason" != *"coverage is sample"* || "$native_supported" != "2" || "$all_supported" != "true" || -n "$claim" || -z "$native_claim" ]]; then
+  if [[ "$safe" != "false" || "$selected_safe" != "false" || "$reason" != *"coverage is sample"* || "$native_supported" != "2" || "$all_supported" != "true" || -n "$claim" || -n "$selected_claim" || -z "$native_claim" ]]; then
     echo "sample corpus should not emit launch claim" >&2
     cat "$json_path" >&2
     return 1
   fi
   assert_contains "$native_claim" "Every item in the pinned"
+  assert_contains "$markdown_text" "Selected-unit claim: <not safe for this artifact>"
   assert_contains "$markdown_text" "Native-supported claim: Every item in the pinned"
 }
 
@@ -764,7 +767,7 @@ test_complete_corpus_with_declared_class_blocks_deployed_claim() {
   write_mock_uc_bin "$mock_bin_dir/uc"
   write_mock_scarb_bin "$mock_bin_dir/scarb"
 
-  local item stdout_text json_path md_path safe all_supported reason source_kind_count claim markdown_text native_claim
+  local item stdout_text json_path md_path safe selected_safe all_supported reason source_kind_count claim selected_claim markdown_text native_claim
   item="$(item_json class-only "../cases/class-only/Scarb.toml" "0xclass" "2.14.0")"
   item="$(jq '.source_kind = "declared_class" | del(.contract_address)' <<<"$item")"
   write_corpus_file "$corpus_dir/corpus.json" complete_deployed_contracts class_hash "$item"
@@ -785,17 +788,20 @@ test_complete_corpus_with_declared_class_blocks_deployed_claim() {
   json_path="$(extract_labeled_path "Corpus Benchmark JSON" <<<"$stdout_text")"
   md_path="$(extract_labeled_path "Corpus Benchmark Markdown" <<<"$stdout_text")"
   safe="$(jq -r '.claim_guard.safe_to_say_compiled_all_deployed_contracts_in_corpus' "$json_path")"
+  selected_safe="$(jq -r '.claim_guard.safe_to_say_compiled_all_selected_deployed_units_in_corpus' "$json_path")"
   all_supported="$(jq -r '.claim_guard.safe_to_say_all_items_native_supported' "$json_path")"
   reason="$(jq -r '.claim_guard.reason' "$json_path")"
   source_kind_count="$(jq -r '.summary.source_kind_counts.declared_class' "$json_path")"
   claim="$(jq -r '.claim_guard.compiled_all_claim_text // ""' "$json_path")"
+  selected_claim="$(jq -r '.claim_guard.selected_units_claim_text // ""' "$json_path")"
   native_claim="$(jq -r '.claim_guard.native_supported_claim_text // ""' "$json_path")"
   markdown_text="$(cat "$md_path")"
-  if [[ "$safe" != "false" || "$all_supported" != "true" || "$reason" != "corpus contains non-deployed source_kind rows" || "$source_kind_count" != "1" || -n "$claim" || -z "$native_claim" ]]; then
-    echo "declared_class corpus item should block deployed-contract launch claim" >&2
+  if [[ "$safe" != "false" || "$selected_safe" != "false" || "$all_supported" != "true" || "$reason" != "corpus contains non-deployed source_kind rows" || "$source_kind_count" != "1" || -n "$claim" || -n "$selected_claim" || -z "$native_claim" ]]; then
+    echo "declared_class corpus item should block deployed-contract and selected-unit launch claims" >&2
     cat "$json_path" >&2
     return 1
   fi
+  assert_contains "$markdown_text" "Selected-unit claim: <not safe for this artifact>"
   assert_contains "$markdown_text" "| class-only | declared_class | declared-class:0xclass |"
 }
 
