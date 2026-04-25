@@ -462,7 +462,7 @@ run_corpus_benchmark() {
   local run_id="$coverage-$dedupe_key"
   local corpus_dir="$TEST_TMP_DIR/run-$run_id/corpora"
   local case_root="$TEST_TMP_DIR/run-$run_id/cases"
-  local results_dir="$TEST_TMP_DIR/run-$run_id/results: dir"
+  local results_dir="$TEST_TMP_DIR/run-$run_id/results"
   local mock_bin_dir="$TEST_TMP_DIR/run-$run_id/mock-bin"
   mkdir -p "$corpus_dir" "$case_root" "$results_dir" "$mock_bin_dir"
   write_manifest_case "$case_root" "cairo214"
@@ -656,7 +656,7 @@ test_complete_non_deduped_corpus_emits_deployed_contract_claim() {
   fi
   assert_contains "$reason" "bounded to this pinned corpus artifact"
   assert_contains "$claim" "Cairo 2.14.0 through 2.16.0"
-  assert_contains "$selected_claim" "after none deduplication"
+  assert_contains "$selected_claim" "without deduplication"
   assert_contains "$markdown_text" "Compiled-all claim: We compiled every contract"
 }
 

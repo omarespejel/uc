@@ -425,6 +425,12 @@ jq -n \
      and (($corpus[0].deduplication.input_count // 0) == item_count);
    def native_all:
      compiled_selected_units;
+   def deduplication_phrase:
+     if $corpus[0].deduplication.key == "none" then
+       "without deduplication"
+     else
+       "after \($corpus[0].deduplication.key) deduplication"
+     end;
    {
      schema_version: 1,
      generated_at: $generated_at,
@@ -476,7 +482,7 @@ jq -n \
        ),
        selected_units_claim_text: (
          if compiled_selected_units then
-           "We compiled every selected deployed unit in the pinned \($corpus[0].chain) deployed-contract corpus after \($corpus[0].deduplication.key) deduplication (\($corpus[0].summary.item_count) items from \($corpus[0].deduplication.input_count) input records, \($corpus[0].summary.unique_class_hash_count) unique class hashes, Cairo \($corpus[0].summary.cairo_version_min) through \($corpus[0].summary.cairo_version_max)) and published support/benchmark artifacts."
+           "We compiled every selected deployed unit in the pinned \($corpus[0].chain) deployed-contract corpus \(deduplication_phrase) (\($corpus[0].summary.item_count) items from \($corpus[0].deduplication.input_count) input records, \($corpus[0].summary.unique_class_hash_count) unique class hashes, Cairo \($corpus[0].summary.cairo_version_min) through \($corpus[0].summary.cairo_version_max)) and published support/benchmark artifacts."
          else null end
        ),
        native_supported_claim_text: (
