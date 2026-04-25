@@ -344,6 +344,57 @@ test_real_repo_benchmark_accepts_cases_file() {
   fi
 }
 
+test_real_repo_benchmark_canonicalizes_relative_paths() {
+  local work_dir="$TEST_TMP_DIR/relative-paths-work"
+  local cases_root="$work_dir/cases"
+  local mock_bin_dir="$work_dir/bin"
+  local results_dir="$work_dir/results"
+  mkdir -p "$mock_bin_dir" "$results_dir"
+  write_mock_uc_bin "$mock_bin_dir/uc"
+  write_mock_scarb_bin "$mock_bin_dir/scarb"
+  write_manifest_case "$cases_root" "supported"
+
+  local stdout_text
+  stdout_text="$(
+    cd "$work_dir"
+    PATH="$mock_bin_dir:$PATH" \
+    MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/relative-paths-uc.args" \
+    MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/relative-paths-scarb.args" \
+    "$BENCH_SCRIPT" \
+      --uc-bin bin/uc \
+      --results-dir results \
+      --runs 1 \
+      --cold-runs 1 \
+      --warm-settle-seconds 0 \
+      --case cases/supported/Scarb.toml supported
+  )"
+
+  local json_path
+  json_path="$(awk -F': ' '/Benchmark JSON:/ {print $2}' <<<"$stdout_text")"
+  [[ -f "$json_path" ]] || { echo "missing json report: $json_path" >&2; return 1; }
+
+  local classification
+  classification="$(jq -r '.cases[] | select(.tag=="supported") | .support_matrix.classification' "$json_path")"
+  if [[ "$classification" != "native_supported" ]]; then
+    echo "expected relative paths to preserve native-supported classification" >&2
+    cat "$json_path" >&2
+    return 1
+  fi
+
+  if grep -q 'report=results/' "$TEST_TMP_DIR/relative-paths-uc.args"; then
+    echo "expected uc auto-build report path to be canonicalized before cwd changes" >&2
+    cat "$TEST_TMP_DIR/relative-paths-uc.args" >&2
+    return 1
+  fi
+  local canonical_results_dir
+  canonical_results_dir="$(cd "$results_dir" && pwd -P)"
+  if ! grep -q "report=$canonical_results_dir/real-repo-supported-uc-auto-build-report.json" "$TEST_TMP_DIR/relative-paths-uc.args"; then
+    echo "expected absolute report path under the requested results directory" >&2
+    cat "$TEST_TMP_DIR/relative-paths-uc.args" >&2
+    return 1
+  fi
+}
+
 test_real_repo_benchmark_rejects_malformed_cases_file_rows() {
   local cases_file="$TEST_TMP_DIR/malformed-cases-file.tsv"
   local stderr_path="$TEST_TMP_DIR/malformed-cases-file.err"
@@ -696,6 +747,8 @@ run_test "real_repo_benchmark_rejects_no_cases_with_updated_usage" \
   test_real_repo_benchmark_rejects_no_cases_with_updated_usage
 run_test "real_repo_benchmark_accepts_cases_file" \
   test_real_repo_benchmark_accepts_cases_file
+run_test "real_repo_benchmark_canonicalizes_relative_paths" \
+  test_real_repo_benchmark_canonicalizes_relative_paths
 run_test "real_repo_benchmark_rejects_malformed_cases_file_rows" \
   test_real_repo_benchmark_rejects_malformed_cases_file_rows
 run_test "real_repo_benchmark_records_support_matrix_categories" \
