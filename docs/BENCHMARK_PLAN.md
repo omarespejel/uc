@@ -57,6 +57,10 @@ Benchmark reports must separate:
 - `native_unsupported`: native support probe rejected the repo before timed execution
 - `build_failed`: auto-build failed before backend classification completed
 
+The generated `native_supported` claim is scoped to the pinned corpus items. It
+can be true for a sample corpus, but it must not be reused as a complete
+deployed-contract coverage claim.
+
 Examples of native-ineligible reasons that should be reported explicitly:
 - exact `cairo-version` mismatch against the native compiler
 - legacy package editions (`2023_01`, `2023_10`, `2023_11`) without an exact `[package].cairo-version`

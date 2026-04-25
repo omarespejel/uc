@@ -85,6 +85,9 @@ Required evidence for that line:
 - Support matrix with every excluded case explained.
 - Host metadata, binary SHA, helper lane SHA, flags, and sample counts inherited
   from the embedded real-repo benchmark artifact.
+- If `claim_guard.safe_to_say_all_items_native_supported=true`, the support
+  claim is bounded to the pinned corpus items. It is useful for agent routing,
+  but it is not a deployed-contract universe claim.
 - `claim_guard.safe_to_say_compiled_all_deployed_contracts_in_corpus=true` in
   the generated corpus artifact. This requires a complete deployed-contract
   snapshot and no `declared_class` rows.

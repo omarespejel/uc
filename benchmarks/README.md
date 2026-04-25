@@ -194,7 +194,10 @@ a combined JSON/Markdown artifact with:
     this is the safe wording for corpora deduplicated by `class_hash` or
     `source_package`
   - `.claim_guard.native_supported_claim_text` only when
-    `.claim_guard.safe_to_say_all_items_native_supported=true`
+    `.claim_guard.safe_to_say_all_items_native_supported=true`; this support
+    claim is scoped to the pinned corpus items and is independent of complete
+    deployed-contract coverage. It does not imply a compiled-all deployed
+    address claim or a stable benchmark claim.
 
 Do not turn sample-corpus output into launch copy. A `coverage=sample` corpus is
 valid for smoke testing the artifact path, but the generated claim guard will

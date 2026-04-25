@@ -406,13 +406,16 @@ jq -n \
      ([ $corpus[0].items[] | select(.source_kind != "deployed_contract") ] | length);
    def failed_native_benchmarks:
      ([ $bench[0].cases[] | select(.benchmark_status == "failed") ] | length);
-   def compiled_without_dedup_guard:
-     ($corpus[0].selection.coverage == "complete_deployed_contracts")
-     and (non_deployed_item_count == 0)
+   def all_items_native_supported:
+     (item_count > 0)
      and ((counts.native_supported // 0) == item_count)
      and ((counts.fallback_used // 0) == 0)
      and ((counts.native_unsupported // 0) == 0)
-     and ((counts.build_failed // 0) == 0)
+     and ((counts.build_failed // 0) == 0);
+   def compiled_without_dedup_guard:
+     ($corpus[0].selection.coverage == "complete_deployed_contracts")
+     and (non_deployed_item_count == 0)
+     and all_items_native_supported
      and (failed_native_benchmarks == 0);
    def valid_selected_unit_accounting:
      ($corpus[0].deduplication.key != "none")
@@ -424,7 +427,7 @@ jq -n \
      and ($corpus[0].deduplication.key == "none")
      and (($corpus[0].deduplication.input_count // 0) == item_count);
    def native_all:
-     compiled_selected_units;
+     all_items_native_supported;
    def deduplication_phrase:
      if $corpus[0].deduplication.key == "none" then
        "without deduplication"
@@ -487,7 +490,7 @@ jq -n \
        ),
        native_supported_claim_text: (
          if native_all then
-           "Every item in the pinned \($corpus[0].chain) deployed-contract corpus was native-supported in this run."
+           "Every item in the pinned \($corpus[0].chain) corpus was native-supported in this run."
          else null end
        )
      }
