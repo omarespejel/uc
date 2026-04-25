@@ -450,7 +450,7 @@ def build_summary(source_path: Path, data: dict[str, Any]) -> dict[str, Any]:
     launch_candidates = sum(1 for case in cases if "UCO4001" in case.get("opportunity_codes", []))
     return {
         "schema_version": SCHEMA_VERSION,
-        "generated_at": dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "generated_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "source_json": str(source_path),
         "source_kind": source_kind,
         "corpus": {
