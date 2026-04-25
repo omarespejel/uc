@@ -382,6 +382,35 @@ fn agent_safe_action_cli_defaults_to_dry_run() {
     };
     assert_eq!(args.action, AgentSafeActionKind::BuildHelperLane);
     assert_eq!(args.lane.as_deref(), Some("2.14"));
+    assert_eq!(args.report_path, None);
+    assert!(!args.execute);
+}
+
+#[test]
+fn agent_safe_action_cli_accepts_report_path() {
+    let cli = Cli::try_parse_from([
+        "uc",
+        "agent",
+        "safe-action",
+        "build-helper-lane",
+        "--lane",
+        "2.14",
+        "--report-path",
+        "/tmp/safe-action.json",
+    ])
+    .expect("agent safe-action args should parse");
+    let Commands::Agent(args) = cli.command else {
+        panic!("expected agent command");
+    };
+    let AgentCommand::SafeAction(args) = args.command else {
+        panic!("expected agent safe-action command");
+    };
+    assert_eq!(args.action, AgentSafeActionKind::BuildHelperLane);
+    assert_eq!(args.lane.as_deref(), Some("2.14"));
+    assert_eq!(
+        args.report_path,
+        Some(PathBuf::from("/tmp/safe-action.json"))
+    );
     assert!(!args.execute);
 }
 
