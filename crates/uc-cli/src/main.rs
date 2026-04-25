@@ -649,6 +649,8 @@ struct FailureBundle {
     command: Vec<String>,
     manifest_path: Option<String>,
     workspace_root: Option<String>,
+    #[serde(default)]
+    original_cwd: Option<String>,
     manifest_hash: Option<String>,
     lockfile_hash: Option<String>,
     selected_support: Option<NativeSupportReport>,
@@ -2044,7 +2046,7 @@ fn run_agent_eval(args: AgentEvalArgs) -> Result<()> {
         recommended_action,
         safe_automated_actions,
         next_commands,
-        required_fixtures: vec!["monero".to_string(), "braavos".to_string()],
+        required_fixtures: Vec::new(),
         support,
     };
     emit_json_value(args.report_path.as_deref(), &report)
@@ -2143,20 +2145,30 @@ fn shell_escape_command_arg(value: &str) -> String {
 
 fn run_agent_safe_action(args: AgentSafeActionArgs) -> Result<()> {
     let action = args.action;
-    let command_vec = safe_action_command(&args)?;
     let dry_run = !args.execute;
     let mut report = SafeActionReport {
         schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
         generated_at_epoch_ms: epoch_ms_u64()?,
         action: action.as_str().to_string(),
         dry_run,
-        command: command_vec.clone(),
+        command: Vec::new(),
         executed: false,
         exit_code: None,
         stdout: String::new(),
         stderr: String::new(),
         blocked_reason: None,
     };
+    let command_vec = match safe_action_command(&args) {
+        Ok(command_vec) => command_vec,
+        Err(err) => {
+            let message = format!("preparation failed: {err:#}");
+            report.blocked_reason = Some(message.clone());
+            report.stderr = message;
+            emit_json_value(args.report_path.as_deref(), &report)?;
+            return Err(err);
+        }
+    };
+    report.command = command_vec.clone();
 
     if dry_run {
         report.blocked_reason =
@@ -2479,6 +2491,9 @@ fn write_failure_bundle(path: &Path, args: &BuildArgs, error: &str) -> Result<()
         workspace_root: workspace_root
             .as_ref()
             .map(|path| path.display().to_string()),
+        original_cwd: std::env::current_dir()
+            .ok()
+            .map(|path| path.display().to_string()),
         manifest_hash,
         lockfile_hash,
         selected_support: support,
@@ -2610,26 +2625,50 @@ fn is_sensitive_normalized_name(normalized: &str) -> bool {
 }
 
 fn run_replay(args: ReplayArgs) -> Result<()> {
-    let bytes = fs::read(&args.bundle)
-        .with_context(|| format!("failed to read replay bundle {}", args.bundle.display()))?;
-    let bundle: FailureBundle = serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed to parse replay bundle {}", args.bundle.display()))?;
-    let replay_command = sanitized_failure_command_args(bundle.command.clone());
     let mut report = ReplayReport {
         schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
         generated_at_epoch_ms: epoch_ms_u64()?,
         bundle_path: args.bundle.display().to_string(),
         execute_requested: args.execute,
         executed: false,
-        command: replay_command.clone(),
-        manifest_path: bundle.manifest_path.clone(),
-        original_error: bundle.error.clone(),
-        selected_support: bundle.selected_support.clone(),
+        command: Vec::new(),
+        manifest_path: None,
+        original_error: String::new(),
+        selected_support: None,
         exit_code: None,
         stdout: String::new(),
         stderr: String::new(),
         blocked_reason: None,
     };
+    let bytes = match fs::read(&args.bundle)
+        .with_context(|| format!("failed to read replay bundle {}", args.bundle.display()))
+    {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let message = format!("preparation failed: {err:#}");
+            report.blocked_reason = Some(message.clone());
+            report.stderr = message;
+            emit_json_value(args.report_path.as_deref(), &report)?;
+            return Err(err);
+        }
+    };
+    let bundle: FailureBundle = match serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse replay bundle {}", args.bundle.display()))
+    {
+        Ok(bundle) => bundle,
+        Err(err) => {
+            let message = format!("preparation failed: {err:#}");
+            report.blocked_reason = Some(message.clone());
+            report.stderr = message;
+            emit_json_value(args.report_path.as_deref(), &report)?;
+            return Err(err);
+        }
+    };
+    let replay_command = sanitized_failure_command_args(bundle.command.clone());
+    report.command = replay_command.clone();
+    report.manifest_path = bundle.manifest_path.clone();
+    report.original_error = bundle.error.clone();
+    report.selected_support = bundle.selected_support.clone();
     if !args.execute {
         report.blocked_reason =
             Some("dry run only; pass --execute to replay the recorded command".to_string());
@@ -2651,6 +2690,12 @@ fn run_replay(args: ReplayArgs) -> Result<()> {
         .filter(|workspace_root| !workspace_root.is_empty())
     {
         command.current_dir(workspace_root);
+    } else if let Some(original_cwd) = bundle
+        .original_cwd
+        .as_deref()
+        .filter(|original_cwd| !original_cwd.is_empty())
+    {
+        command.current_dir(original_cwd);
     }
     let run = match run_command_capture(command, command_vec) {
         Ok(run) => run,
