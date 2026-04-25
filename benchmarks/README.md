@@ -186,7 +186,12 @@ a combined JSON/Markdown artifact with:
     `.claim_guard.safe_to_say_compiled_all_deployed_contracts_in_corpus=true`;
     this requires `coverage=complete_deployed_contracts`, every item classified
     as `source_kind=deployed_contract` and `native_supported`, no fallback, no
-    unsupported rows, no build failures, and no failed native benchmark cases
+    unsupported rows, no build failures, no failed native benchmark cases, and
+    `deduplication.key=none`
+  - `.claim_guard.selected_units_claim_text` only when
+    `.claim_guard.safe_to_say_compiled_all_selected_deployed_units_in_corpus=true`;
+    this is the safe wording for corpora deduplicated by `class_hash` or
+    `source_package`
   - `.claim_guard.native_supported_claim_text` only when
     `.claim_guard.safe_to_say_all_items_native_supported=true`
 
