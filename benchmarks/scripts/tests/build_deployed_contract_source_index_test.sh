@@ -186,6 +186,10 @@ test_rejects_unknown_keys_and_boolean_ints() {
   mutate_inventory "$inventory_dir/inventory.json" '.unexpected = true'
   expect_builder_failure "$inventory_dir/inventory.json" "inventory has unsupported field(s): unexpected"
 
+  write_inventory_file "$inventory_dir/inventory-schema-bool.json" sample class_hash "$record"
+  mutate_inventory "$inventory_dir/inventory-schema-bool.json" '.schema_version = true'
+  expect_builder_failure "$inventory_dir/inventory-schema-bool.json" "inventory.schema_version must be 1"
+
   write_inventory_file "$inventory_dir/inventory-bool.json" sample class_hash "$record"
   mutate_inventory "$inventory_dir/inventory-bool.json" '.selection.from_block = true'
   expect_builder_failure "$inventory_dir/inventory-bool.json" "inventory.selection.from_block must be a non-negative integer"

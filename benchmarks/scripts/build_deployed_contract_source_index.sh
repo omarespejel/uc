@@ -197,7 +197,8 @@ except json.JSONDecodeError as exc:
     fail(f"inventory is not valid JSON: {exc}")
 
 reject_unknown_keys(doc, TOP_KEYS, "inventory")
-if doc.get("schema_version") != 1:
+schema_version = doc.get("schema_version")
+if type(schema_version) is not int or schema_version != 1:
     fail("inventory.schema_version must be 1")
 corpus_id = require_str(doc, "corpus_id", "inventory")
 chain = require_str(doc, "chain", "inventory")

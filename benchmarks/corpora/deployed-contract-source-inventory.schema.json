@@ -14,6 +14,30 @@
     "source_availability",
     "records"
   ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "deduplication": {
+            "properties": {
+              "key": { "const": "source_package" }
+            },
+            "required": ["key"]
+          }
+        },
+        "required": ["deduplication"]
+      },
+      "then": {
+        "properties": {
+          "records": {
+            "items": {
+              "required": ["source_package_id"]
+            }
+          }
+        }
+      }
+    }
+  ],
   "properties": {
     "schema_version": { "const": 1 },
     "corpus_id": { "type": "string", "minLength": 1 },

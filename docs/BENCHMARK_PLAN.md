@@ -22,6 +22,7 @@ Measure and prove that `uc` outperforms Scarb on real workflows while maintainin
 - Reviewed baseline snapshots under `benchmarks/baselines/`.
 - Deployed-contract corpus plan/benchmark artifacts under `benchmarks/results/`,
   generated from `benchmarks/corpora/deployed-contract-corpus.schema.json`.
+
 - Deployed-contract source inventories conforming to
   `benchmarks/corpora/deployed-contract-source-inventory.schema.json`; these
   are the reviewed raw evidence inputs used to build source indexes.
@@ -29,6 +30,7 @@ Measure and prove that `uc` outperforms Scarb on real workflows while maintainin
   `benchmarks/corpora/deployed-contract-source-index.schema.json`; these are
   deterministic outputs from reviewed inventories and are used to generate
   corpus run artifacts.
+
 
 ## Execution Policy
 - Benchmarks are local-first. Reproduction must work from checked-in scripts plus pinned manifest paths; do not require GitHub Actions or hosted CI to verify the numbers.
