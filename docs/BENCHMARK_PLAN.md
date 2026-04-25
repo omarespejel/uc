@@ -40,6 +40,10 @@ Measure and prove that `uc` outperforms Scarb on real workflows while maintainin
   with `generate_deployed_contract_corpus.sh`, and then go through
   `run_deployed_contract_corpus.sh`; do not manually aggregate real-repo
   benchmark output into launch copy.
+- `selection.coverage=complete_deployed_contracts` is strict: source inventory,
+  source-index, and corpus rows must explicitly use
+  `source_kind=deployed_contract` and include a deployed address. Use sample
+  coverage for declared-class-only source evidence.
 - Deployed-contract claim wording must respect deduplication. A corpus deduped
   by `class_hash` or `source_package` can prove every selected deduped deployed
   unit was compiled. It cannot prove every deployed contract address was

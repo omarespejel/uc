@@ -115,6 +115,10 @@ deduplication. The builder enforces the constraints mirrored in
 that every manifest path points at a local `Scarb.toml`, deduplicates by the
 configured key, and writes source-index JSON that conforms to
 `benchmarks/corpora/deployed-contract-source-index.schema.json`.
+When `selection.coverage=complete_deployed_contracts`, every record must set
+`source_kind=deployed_contract` explicitly and include a deployed
+`contract_address`. Declared-class-only rows are valid in sample inventories,
+but they are not valid evidence for complete deployed-contract coverage.
 
 Write the generated source index next to the reviewed inventory. Source paths
 are intentionally confined under the inventory/source-index directory so a
@@ -141,6 +145,10 @@ contract or deduped class. The generator enforces the constraints mirrored in
 relative manifest paths to absolute paths, and writes corpus JSON that conforms
 to `benchmarks/corpora/deployed-contract-corpus.schema.json` for the benchmark
 runner.
+For address-complete evidence, `deduplication.key=none` is a strict invariant:
+`input_count`, `deduped_count`, and generated item count must match. If the
+source index is deduplicated by `class_hash` or `source_package`, the resulting
+artifact can only support a selected-unit claim, not an every-address claim.
 
 Do not hand-author launch corpus JSON. Keep the source inventory and generated
 source index as the reviewed inputs, generate the corpus from them, and commit
@@ -177,6 +185,10 @@ a combined JSON/Markdown artifact with:
   - legacy rows without `source_kind` are read as `deployed_contract` for
     backward compatibility, but new reviewed inventories should set it
     explicitly
+- strict complete-coverage validation:
+  - `coverage=complete_deployed_contracts` rejects missing `source_kind` and
+    rejects `declared_class` rows before benchmark execution
+  - `deduplication.key=none` rejects mismatched input/deduped/item counts
 - deduplication and source/license policy metadata,
 - Cairo version min/max across the corpus,
 - a support matrix for `native_supported`, `native_unsupported`,

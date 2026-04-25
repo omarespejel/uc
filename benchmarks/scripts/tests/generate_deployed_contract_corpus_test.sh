@@ -312,6 +312,23 @@ test_normalizes_legacy_missing_source_kind_as_deployed_contract() {
   fi
 }
 
+test_complete_coverage_requires_deployed_contract_rows() {
+  local index_dir="$TEST_TMP_DIR/complete-source-kind/index"
+  local case_root="$index_dir/cases"
+  mkdir -p "$index_dir"
+  write_manifest_case "$case_root" "a"
+  local item
+  item="$(source_item_json class_only "cases/a/Scarb.toml" "0xclass" "2.14.0")"
+  item="$(jq '.source_kind = "declared_class" | del(.contract_address)' <<<"$item")"
+  write_source_index_file "$index_dir/declared.json" complete_deployed_contracts class_hash "$item"
+  expect_generator_failure "$index_dir/declared.json" "source_index.items[0].source_kind must be explicitly deployed_contract when source_index.selection.coverage is complete_deployed_contracts"
+
+  item="$(source_item_json missing "cases/a/Scarb.toml" "0xclass" "2.14.0")"
+  item="$(jq 'del(.source_kind)' <<<"$item")"
+  write_source_index_file "$index_dir/missing.json" complete_deployed_contracts class_hash "$item"
+  expect_generator_failure "$index_dir/missing.json" "source_index.items[0].source_kind must be explicitly deployed_contract when source_index.selection.coverage is complete_deployed_contracts"
+}
+
 test_rejects_missing_manifest_path() {
   local index_dir="$TEST_TMP_DIR/missing-manifest/index"
   mkdir -p "$index_dir"
@@ -383,6 +400,18 @@ test_rejects_input_count_less_than_deduped() {
   write_source_index_file "$index_dir/source-index.json" sample class_hash "$item_a" "$item_b"
   mutate_source_index "$index_dir/source-index.json" '.deduplication.input_count = 1'
   expect_generator_failure "$index_dir/source-index.json" "source_index.deduplication.input_count must be >= deduped_count"
+}
+
+test_rejects_none_dedupe_count_mismatch() {
+  local index_dir="$TEST_TMP_DIR/none-count-mismatch/index"
+  local case_root="$index_dir/cases"
+  mkdir -p "$index_dir"
+  write_manifest_case "$case_root" "a"
+  local item
+  item="$(source_item_json a "cases/a/Scarb.toml" "0x01" "2.14.0")"
+  write_source_index_file "$index_dir/source-index.json" complete_deployed_contracts none "$item"
+  mutate_source_index "$index_dir/source-index.json" '.deduplication.input_count = 2'
+  expect_generator_failure "$index_dir/source-index.json" "source_index.deduplication.input_count must equal deduped_count when deduplication.key is none"
 }
 
 test_rejects_source_index_output_overwrite() {
@@ -459,6 +488,8 @@ run_test "rejects_empty_declared_class_contract_address" \
   test_rejects_empty_declared_class_contract_address
 run_test "normalizes_legacy_missing_source_kind_as_deployed_contract" \
   test_normalizes_legacy_missing_source_kind_as_deployed_contract
+run_test "complete_coverage_requires_deployed_contract_rows" \
+  test_complete_coverage_requires_deployed_contract_rows
 run_test "rejects_missing_manifest_path" \
   test_rejects_missing_manifest_path
 run_test "rejects_absolute_manifest_path" \
@@ -471,6 +502,8 @@ run_test "rejects_deduped_count_mismatch" \
   test_rejects_deduped_count_mismatch
 run_test "rejects_input_count_less_than_deduped" \
   test_rejects_input_count_less_than_deduped
+run_test "rejects_none_dedupe_count_mismatch" \
+  test_rejects_none_dedupe_count_mismatch
 run_test "rejects_source_index_output_overwrite" \
   test_rejects_source_index_output_overwrite
 run_test "rejects_source_index_output_symlink_overwrite" \
