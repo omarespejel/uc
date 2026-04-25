@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/omarespejel/uc/docs/agent/schemas/agent-eval-report.schema.json",
+  "title": "uc AgentEvalReport",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "generated_at_epoch_ms",
+    "manifest_path",
+    "decision",
+    "recommended_action",
+    "safe_automated_actions",
+    "next_commands",
+    "required_fixtures",
+    "support"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "generated_at_epoch_ms": { "type": "number" },
+    "manifest_path": { "type": "string", "minLength": 1 },
+    "decision": {
+      "enum": [
+        "proceed_to_build_and_benchmark",
+        "run_safe_action_then_retry",
+        "stop_native_unsupported"
+      ]
+    },
+    "recommended_action": { "type": "string" },
+    "safe_automated_actions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "next_commands": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "required_fixtures": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "support": { "$ref": "native-support-report.schema.json" }
+  }
+}

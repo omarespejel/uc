@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/omarespejel/uc/docs/agent/schemas/failure-bundle.schema.json",
+  "title": "uc FailureBundle",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "generated_at_epoch_ms",
+    "command",
+    "redacted_environment",
+    "error"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "generated_at_epoch_ms": { "type": "number" },
+    "command": { "type": "array", "items": { "type": "string" } },
+    "manifest_path": { "type": "string" },
+    "workspace_root": { "type": "string" },
+    "manifest_hash": { "type": "string" },
+    "lockfile_hash": { "type": "string" },
+    "selected_support": { "$ref": "native-support-report.schema.json" },
+    "redacted_environment": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "error": { "type": "string" }
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/omarespejel/uc/docs/agent/schemas/benchmark-report.schema.json",
+  "title": "uc BenchmarkReport",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": { "type": "number" },
+    "summary": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "support_matrix": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "native_supported": { "type": "integer" },
+            "native_unsupported": { "type": "integer" },
+            "fallback_used": { "type": "integer" },
+            "build_failed": { "type": "integer" }
+          }
+        }
+      }
+    },
+    "cases": {
+      "type": "array",
+      "items": { "type": "object", "additionalProperties": true }
+    }
+  }
+}

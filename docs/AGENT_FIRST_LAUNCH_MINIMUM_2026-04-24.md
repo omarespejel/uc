@@ -10,6 +10,7 @@ Launch only when all of these are true:
 - `monero` and `braavos` are measured as supported workloads, not excluded workloads.
 - `uc support native --format json` emits stable diagnostics and toolchain fields.
 - `uc build --json` and `--report-path` include diagnostics and fallback status.
+- `uc build --record-failure`, `uc replay`, `uc agent eval`, `uc agent safe-action`, and `uc mcp serve` exist with checked-in schemas.
 - `scripts/doctor.sh` can detect missing helper lanes before compile/benchmark starts.
 - Real-repo benchmark reports include `native_supported`, `native_unsupported`, `fallback_used`, and `build_failed` classifications.
 - Same-window reruns are used for before/after speed comparisons.
@@ -25,6 +26,7 @@ This PR can credibly claim:
 - Manifest/lockfile-driven native lane selection.
 - Agent-grade diagnostics for native support and fallback classes.
 - Local-first support-matrix benchmark reporting.
+- Dry-run-first agent eval, failure-recording/replay, read-only MCP catalog, and safe-action command surfaces.
 - A checked-in deployed-contract source-inventory schema, source-index builder,
   source-index schema, corpus generator, corpus schema, and wrapper that emit
   guarded support-matrix artifacts.
@@ -32,8 +34,8 @@ This PR can credibly claim:
 
 This PR should not claim:
 
-- Full MCP server support.
-- Flight-recorder/replay support.
+- Full stdio MCP JSON-RPC server support.
+- Complete flight-recorder/replay hardening with timing spans and source graph hashes.
 - SARIF export.
 - Deployed-contract universe coverage.
 - A real deployed-contract source inventory, source index, or generated corpus

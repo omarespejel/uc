@@ -311,6 +311,19 @@ fn build_cli_accepts_json_flag() {
 }
 
 #[test]
+fn build_cli_accepts_record_failure_path() {
+    let cli = Cli::try_parse_from(["uc", "build", "--record-failure", "/tmp/uc-failure.json"])
+        .expect("build args should parse");
+    let Commands::Build(args) = cli.command else {
+        panic!("expected build command");
+    };
+    assert_eq!(
+        args.record_failure,
+        Some(PathBuf::from("/tmp/uc-failure.json"))
+    );
+}
+
+#[test]
 fn support_native_cli_accepts_json_alias_flag() {
     let cli = Cli::try_parse_from(["uc", "support", "native", "--json"])
         .expect("support native args should parse");
@@ -320,6 +333,129 @@ fn support_native_cli_accepts_json_alias_flag() {
     let SupportCommand::Native(args) = args.command;
     assert!(args.json);
     assert_eq!(args.format as u8, SupportFormatArg::Text as u8);
+}
+
+#[test]
+fn agent_eval_cli_accepts_report_path() {
+    let cli = Cli::try_parse_from([
+        "uc",
+        "agent",
+        "eval",
+        "--manifest-path",
+        "/tmp/workspace/Scarb.toml",
+        "--report-path",
+        "/tmp/agent-eval.json",
+    ])
+    .expect("agent eval args should parse");
+    let Commands::Agent(args) = cli.command else {
+        panic!("expected agent command");
+    };
+    let AgentCommand::Eval(args) = args.command else {
+        panic!("expected agent eval command");
+    };
+    assert_eq!(
+        args.manifest_path,
+        Some(PathBuf::from("/tmp/workspace/Scarb.toml"))
+    );
+    assert_eq!(
+        args.report_path,
+        Some(PathBuf::from("/tmp/agent-eval.json"))
+    );
+}
+
+#[test]
+fn agent_safe_action_cli_defaults_to_dry_run() {
+    let cli = Cli::try_parse_from([
+        "uc",
+        "agent",
+        "safe-action",
+        "build-helper-lane",
+        "--lane",
+        "2.14",
+    ])
+    .expect("agent safe-action args should parse");
+    let Commands::Agent(args) = cli.command else {
+        panic!("expected agent command");
+    };
+    let AgentCommand::SafeAction(args) = args.command else {
+        panic!("expected agent safe-action command");
+    };
+    assert_eq!(args.action, AgentSafeActionKind::BuildHelperLane);
+    assert_eq!(args.lane.as_deref(), Some("2.14"));
+    assert!(!args.execute);
+}
+
+#[test]
+fn mcp_serve_cli_accepts_report_path() {
+    let cli = Cli::try_parse_from(["uc", "mcp", "serve", "--report-path", "/tmp/mcp.json"])
+        .expect("mcp serve args should parse");
+    let Commands::Mcp(args) = cli.command else {
+        panic!("expected mcp command");
+    };
+    let McpCommand::Serve(args) = args.command;
+    assert_eq!(args.report_path, Some(PathBuf::from("/tmp/mcp.json")));
+}
+
+#[test]
+fn replay_cli_defaults_to_dry_run() {
+    let cli = Cli::try_parse_from(["uc", "replay", "/tmp/uc-failure.json"])
+        .expect("replay args should parse");
+    let Commands::Replay(args) = cli.command else {
+        panic!("expected replay command");
+    };
+    assert_eq!(args.bundle, PathBuf::from("/tmp/uc-failure.json"));
+    assert!(!args.execute);
+}
+
+#[test]
+fn agent_eval_decision_runs_safe_action_for_helper_lane_failure() {
+    let support = NativeSupportReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
+        status: NativeSupportStatus::Unsupported,
+        supported: false,
+        reason: Some("helper missing".to_string()),
+        compiler_version: Some("2.16.0".to_string()),
+        package_cairo_version: Some("2.14.0".to_string()),
+        issue_kind: Some("missing_toolchain_helper".to_string()),
+        toolchain: Some(NativeToolchainReport {
+            edition: "2024_07".to_string(),
+            requested_version: Some("2.14.0".to_string()),
+            requested_major_minor: Some("2.14".to_string()),
+            request_source: Some(NativeToolchainRequestSource::PackageCairoVersion),
+            source: NativeToolchainSource::ExternalHelper,
+            binary_path: None,
+            compiler_version: None,
+        }),
+        diagnostics: vec![NativeDiagnostic {
+            schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+            code: "UCN1004".to_string(),
+            category: "toolchain_missing".to_string(),
+            severity: NativeDiagnosticSeverity::Error,
+            title: "Missing helper".to_string(),
+            docs_url: native_diagnostic_docs_url("UCN1004"),
+            what_happened: "helper missing".to_string(),
+            why: "helper missing".to_string(),
+            how_to_fix: vec!["build helper".to_string()],
+            next_commands: Vec::new(),
+            safe_automated_action: "build_helper_lane".to_string(),
+            retryable: true,
+            fallback_used: false,
+            toolchain_expected: Some("2.14.0".to_string()),
+            toolchain_found: None,
+        }],
+    };
+
+    let (decision, recommended_action, safe_actions, next_commands) = agent_eval_decision(&support);
+    assert_eq!(decision, AgentEvalDecision::RunSafeActionThenRetry);
+    assert_eq!(
+        recommended_action,
+        "run_safe_action_then_retry_support_probe"
+    );
+    assert_eq!(safe_actions, vec!["build_helper_lane".to_string()]);
+    assert!(next_commands
+        .iter()
+        .any(|command| { command.contains("uc agent safe-action build-helper-lane --lane 2.14") }));
 }
 
 #[test]

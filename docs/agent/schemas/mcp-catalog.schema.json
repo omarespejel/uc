@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/omarespejel/uc/docs/agent/schemas/mcp-catalog.schema.json",
+  "title": "uc McpCatalogReport",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "generated_at_epoch_ms",
+    "readonly",
+    "protocol_note",
+    "tools",
+    "resources"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "generated_at_epoch_ms": { "type": "number" },
+    "readonly": { "type": "boolean" },
+    "protocol_note": { "type": "string" },
+    "tools": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "description", "command", "mutates_state", "schema"],
+        "properties": {
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "command": { "type": "array", "items": { "type": "string" } },
+          "mutates_state": { "type": "boolean" },
+          "schema": { "type": "string" }
+        }
+      }
+    },
+    "resources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["uri", "description", "schema"],
+        "properties": {
+          "uri": { "type": "string" },
+          "description": { "type": "string" },
+          "schema": { "type": "string" }
+        }
+      }
+    }
+  }
+}

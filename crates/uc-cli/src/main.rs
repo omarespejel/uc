@@ -275,13 +275,96 @@ enum Commands {
     #[cfg(feature = "dev-benchmark-command")]
     #[command(hide = true)]
     Benchmark(benchmark_cmd::BenchmarkArgs),
+    Agent(AgentArgs),
     Cache(CacheArgs),
+    Mcp(McpArgs),
     Support(SupportArgs),
     SessionKey(SessionKeyArgs),
     Build(BuildArgs),
     Metadata(MetadataArgs),
     CompareBuild(CompareBuildArgs),
     Migrate(MigrateArgs),
+    Replay(ReplayArgs),
+}
+
+#[derive(Args, Debug)]
+struct AgentArgs {
+    #[command(subcommand)]
+    command: AgentCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum AgentCommand {
+    Eval(AgentEvalArgs),
+    SafeAction(AgentSafeActionArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct AgentEvalArgs {
+    #[arg(long)]
+    manifest_path: Option<PathBuf>,
+
+    #[arg(long)]
+    report_path: Option<PathBuf>,
+}
+
+#[derive(Args, Debug, Clone)]
+struct AgentSafeActionArgs {
+    #[arg(value_enum)]
+    action: AgentSafeActionKind,
+
+    #[arg(long)]
+    lane: Option<String>,
+
+    #[arg(long)]
+    manifest_path: Option<PathBuf>,
+
+    #[arg(long)]
+    uc_bin: Option<PathBuf>,
+
+    #[arg(long)]
+    report_path: Option<PathBuf>,
+
+    #[arg(long)]
+    execute: bool,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum AgentSafeActionKind {
+    BuildHelperLane,
+    RebuildHelperLane,
+    RefreshCache,
+    RerunDoctor,
+    RegenerateSupportMatrix,
+}
+
+impl AgentSafeActionKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BuildHelperLane => "build_helper_lane",
+            Self::RebuildHelperLane => "rebuild_helper_lane",
+            Self::RefreshCache => "refresh_cache",
+            Self::RerunDoctor => "rerun_doctor",
+            Self::RegenerateSupportMatrix => "regenerate_support_matrix",
+        }
+    }
+}
+
+#[derive(Args, Debug)]
+struct McpArgs {
+    #[command(subcommand)]
+    command: McpCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum McpCommand {
+    Serve(McpServeArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct McpServeArgs {
+    #[arg(long)]
+    report_path: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -515,6 +598,103 @@ struct NativeSupportReport {
     diagnostics: Vec<NativeDiagnostic>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AgentEvalDecision {
+    ProceedToBuildAndBenchmark,
+    RunSafeActionThenRetry,
+    StopNativeUnsupported,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AgentEvalReport {
+    #[serde(default = "uc_agent_json_schema_version")]
+    schema_version: u32,
+    generated_at_epoch_ms: u64,
+    manifest_path: String,
+    decision: AgentEvalDecision,
+    recommended_action: String,
+    safe_automated_actions: Vec<String>,
+    next_commands: Vec<String>,
+    required_fixtures: Vec<String>,
+    support: NativeSupportReport,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FailureBundle {
+    #[serde(default = "uc_agent_json_schema_version")]
+    schema_version: u32,
+    generated_at_epoch_ms: u64,
+    command: Vec<String>,
+    manifest_path: Option<String>,
+    workspace_root: Option<String>,
+    manifest_hash: Option<String>,
+    lockfile_hash: Option<String>,
+    selected_support: Option<NativeSupportReport>,
+    redacted_environment: BTreeMap<String, String>,
+    error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReplayReport {
+    #[serde(default = "uc_agent_json_schema_version")]
+    schema_version: u32,
+    generated_at_epoch_ms: u64,
+    bundle_path: String,
+    execute_requested: bool,
+    executed: bool,
+    command: Vec<String>,
+    manifest_path: Option<String>,
+    original_error: String,
+    selected_support: Option<NativeSupportReport>,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    blocked_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct McpCatalogReport {
+    #[serde(default = "uc_agent_json_schema_version")]
+    schema_version: u32,
+    generated_at_epoch_ms: u64,
+    readonly: bool,
+    protocol_note: String,
+    tools: Vec<McpToolDescriptor>,
+    resources: Vec<McpResourceDescriptor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct McpToolDescriptor {
+    name: String,
+    description: String,
+    command: Vec<String>,
+    mutates_state: bool,
+    schema: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct McpResourceDescriptor {
+    uri: String,
+    description: String,
+    schema: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SafeActionReport {
+    #[serde(default = "uc_agent_json_schema_version")]
+    schema_version: u32,
+    generated_at_epoch_ms: u64,
+    action: String,
+    dry_run: bool,
+    command: Vec<String>,
+    executed: bool,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    blocked_reason: Option<String>,
+}
+
 #[derive(Debug)]
 struct NativeFallbackEligibleTag;
 
@@ -627,7 +807,7 @@ struct BuildCommonArgs {
     profile: Option<String>,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 struct BuildArgs {
     #[command(flatten)]
     common: BuildCommonArgs,
@@ -643,6 +823,9 @@ struct BuildArgs {
 
     #[arg(long)]
     report_path: Option<PathBuf>,
+
+    #[arg(long)]
+    record_failure: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -691,6 +874,17 @@ struct MigrateArgs {
 
     #[arg(long)]
     emit_uc_toml: Option<PathBuf>,
+}
+
+#[derive(Args, Debug, Clone)]
+struct ReplayArgs {
+    bundle: PathBuf,
+
+    #[arg(long)]
+    report_path: Option<PathBuf>,
+
+    #[arg(long)]
+    execute: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1767,13 +1961,16 @@ fn main() -> Result<()> {
         Commands::Daemon(args) => run_daemon(args),
         #[cfg(feature = "dev-benchmark-command")]
         Commands::Benchmark(args) => benchmark_cmd::run(args),
+        Commands::Agent(args) => run_agent(args),
         Commands::Cache(args) => run_cache(args),
+        Commands::Mcp(args) => run_mcp(args),
         Commands::Support(args) => run_support(args),
         Commands::SessionKey(args) => run_session_key(args),
-        Commands::Build(args) => run_build(args),
+        Commands::Build(args) => run_build_entry(args),
         Commands::Metadata(args) => run_metadata(args),
         Commands::CompareBuild(args) => run_compare_build(args),
         Commands::Migrate(args) => run_migrate(args),
+        Commands::Replay(args) => run_replay(args),
     }
 }
 
@@ -1793,6 +1990,478 @@ fn init_observability() {
             .without_time()
             .try_init();
     });
+}
+
+fn emit_json_value<T: Serialize>(report_path: Option<&Path>, value: &T) -> Result<()> {
+    if let Some(path) = report_path {
+        write_json_report(path, value)?;
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).context("failed to serialize JSON report")?
+    );
+    Ok(())
+}
+
+fn run_agent(args: AgentArgs) -> Result<()> {
+    match args.command {
+        AgentCommand::Eval(args) => run_agent_eval(args),
+        AgentCommand::SafeAction(args) => run_agent_safe_action(args),
+    }
+}
+
+fn run_agent_eval(args: AgentEvalArgs) -> Result<()> {
+    let manifest_path = resolve_manifest_path(&args.manifest_path)?;
+    let support = native_support_report_from_manifest_path(&manifest_path)?;
+    let (decision, recommended_action, safe_automated_actions, next_commands) =
+        agent_eval_decision(&support);
+    let report = AgentEvalReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        generated_at_epoch_ms: epoch_ms_u64()?,
+        manifest_path: manifest_path.display().to_string(),
+        decision,
+        recommended_action,
+        safe_automated_actions,
+        next_commands,
+        required_fixtures: vec!["monero".to_string(), "braavos".to_string()],
+        support,
+    };
+    emit_json_value(args.report_path.as_deref(), &report)
+}
+
+fn agent_eval_decision(
+    support: &NativeSupportReport,
+) -> (AgentEvalDecision, String, Vec<String>, Vec<String>) {
+    let safe_actions = native_report_safe_actions(support);
+    let mut next_commands = Vec::new();
+    next_commands.push(format!(
+        "uc support native --manifest-path {} --format json",
+        support.manifest_path
+    ));
+    if support.supported {
+        next_commands.push(format!(
+            "uc build --engine uc --daemon-mode off --manifest-path {} --json",
+            support.manifest_path
+        ));
+        return (
+            AgentEvalDecision::ProceedToBuildAndBenchmark,
+            "proceed_to_build_and_benchmark".to_string(),
+            safe_actions,
+            next_commands,
+        );
+    }
+
+    if safe_actions.iter().any(|action| {
+        matches!(
+            action.as_str(),
+            "build_helper_lane" | "rebuild_helper_lane" | "refresh_cache" | "rerun_doctor"
+        )
+    }) {
+        if let Some(action) = safe_actions.first() {
+            let lane = support
+                .toolchain
+                .as_ref()
+                .and_then(|toolchain| {
+                    toolchain
+                        .requested_major_minor
+                        .clone()
+                        .or_else(|| toolchain.requested_version.clone())
+                })
+                .unwrap_or_else(|| "<lane>".to_string());
+            next_commands.push(format!(
+                "uc agent safe-action {} --lane {}",
+                action.replace('_', "-"),
+                lane
+            ));
+        }
+        return (
+            AgentEvalDecision::RunSafeActionThenRetry,
+            "run_safe_action_then_retry_support_probe".to_string(),
+            safe_actions,
+            next_commands,
+        );
+    }
+
+    (
+        AgentEvalDecision::StopNativeUnsupported,
+        "record_native_unsupported_in_support_matrix".to_string(),
+        safe_actions,
+        next_commands,
+    )
+}
+
+fn native_report_safe_actions(support: &NativeSupportReport) -> Vec<String> {
+    let mut actions = Vec::new();
+    for diagnostic in &support.diagnostics {
+        if diagnostic.safe_automated_action.is_empty()
+            || diagnostic.safe_automated_action == "none"
+            || actions
+                .iter()
+                .any(|existing| existing == &diagnostic.safe_automated_action)
+        {
+            continue;
+        }
+        actions.push(diagnostic.safe_automated_action.clone());
+    }
+    actions
+}
+
+fn run_agent_safe_action(args: AgentSafeActionArgs) -> Result<()> {
+    let action = args.action;
+    let command_vec = safe_action_command(&args)?;
+    let dry_run = !args.execute;
+    let mut report = SafeActionReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        generated_at_epoch_ms: epoch_ms_u64()?,
+        action: action.as_str().to_string(),
+        dry_run,
+        command: command_vec.clone(),
+        executed: false,
+        exit_code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        blocked_reason: None,
+    };
+
+    if dry_run {
+        report.blocked_reason =
+            Some("dry run only; pass --execute to run this safe action".to_string());
+        return emit_json_value(args.report_path.as_deref(), &report);
+    }
+
+    let (command, command_vec) = command_from_vec(&command_vec)?;
+    let run = run_command_capture(command, command_vec)?;
+    report.executed = true;
+    report.exit_code = Some(run.exit_code);
+    report.stdout = run.stdout;
+    report.stderr = run.stderr;
+    emit_json_value(args.report_path.as_deref(), &report)?;
+    if let Some(exit_code) = report.exit_code {
+        if exit_code != 0 {
+            bail!("safe action failed with exit code {exit_code}");
+        }
+    }
+    Ok(())
+}
+
+fn safe_action_command(args: &AgentSafeActionArgs) -> Result<Vec<String>> {
+    match args.action {
+        AgentSafeActionKind::BuildHelperLane | AgentSafeActionKind::RebuildHelperLane => {
+            let lane = args
+                .lane
+                .as_deref()
+                .context("--lane is required for helper lane safe actions")?;
+            let script = repo_relative_command("scripts/build_native_toolchain_helper.sh")?;
+            Ok(vec![
+                script.display().to_string(),
+                "--lane".to_string(),
+                lane.to_string(),
+            ])
+        }
+        AgentSafeActionKind::RefreshCache => {
+            let manifest_path = resolve_manifest_path(&args.manifest_path)?;
+            let uc_bin = resolve_uc_bin(args.uc_bin.as_ref())?;
+            Ok(vec![
+                uc_bin.display().to_string(),
+                "cache".to_string(),
+                "clean".to_string(),
+                "--manifest-path".to_string(),
+                manifest_path.display().to_string(),
+            ])
+        }
+        AgentSafeActionKind::RerunDoctor => {
+            let manifest_path = resolve_manifest_path(&args.manifest_path)?;
+            let uc_bin = resolve_uc_bin(args.uc_bin.as_ref())?;
+            let script = repo_relative_command("scripts/doctor.sh")?;
+            Ok(vec![
+                script.display().to_string(),
+                "--uc-bin".to_string(),
+                uc_bin.display().to_string(),
+                "--manifest-path".to_string(),
+                manifest_path.display().to_string(),
+            ])
+        }
+        AgentSafeActionKind::RegenerateSupportMatrix => {
+            let manifest_path = resolve_manifest_path(&args.manifest_path)?;
+            let uc_bin = resolve_uc_bin(args.uc_bin.as_ref())?;
+            let script = repo_relative_command("benchmarks/scripts/run_real_repo_benchmarks.sh")?;
+            Ok(vec![
+                script.display().to_string(),
+                "--uc-bin".to_string(),
+                uc_bin.display().to_string(),
+                "--runs".to_string(),
+                "1".to_string(),
+                "--cold-runs".to_string(),
+                "1".to_string(),
+                "--case".to_string(),
+                manifest_path.display().to_string(),
+                "agent-safe-action".to_string(),
+            ])
+        }
+    }
+}
+
+fn repo_relative_command(relative: &str) -> Result<PathBuf> {
+    let cwd = std::env::current_dir()?.canonicalize()?;
+    let path = cwd.join(relative);
+    if path.is_file() {
+        return Ok(path);
+    }
+    Ok(PathBuf::from(relative))
+}
+
+fn resolve_uc_bin(path: Option<&PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = path {
+        return Ok(path.clone());
+    }
+    std::env::current_exe().context("failed to resolve current uc binary path")
+}
+
+fn run_mcp(args: McpArgs) -> Result<()> {
+    match args.command {
+        McpCommand::Serve(args) => run_mcp_serve(args),
+    }
+}
+
+fn run_mcp_serve(args: McpServeArgs) -> Result<()> {
+    let report = McpCatalogReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        generated_at_epoch_ms: epoch_ms_u64()?,
+        readonly: true,
+        protocol_note: "read-only command catalog; external MCP adapters can map these commands to structured tools without parsing prose".to_string(),
+        tools: vec![
+            McpToolDescriptor {
+                name: "uc.doctor".to_string(),
+                description: "Run the checked-in doctor support probe for a Scarb manifest.".to_string(),
+                command: vec![
+                    "scripts/doctor.sh".to_string(),
+                    "--uc-bin".to_string(),
+                    "<uc>".to_string(),
+                    "--manifest-path".to_string(),
+                    "<Scarb.toml>".to_string(),
+                ],
+                mutates_state: false,
+                schema: "docs/agent/schemas/native-support-report.schema.json".to_string(),
+            },
+            McpToolDescriptor {
+                name: "uc.support_native".to_string(),
+                description: "Classify native support and selected toolchain lane.".to_string(),
+                command: vec![
+                    "uc".to_string(),
+                    "support".to_string(),
+                    "native".to_string(),
+                    "--manifest-path".to_string(),
+                    "<Scarb.toml>".to_string(),
+                    "--format".to_string(),
+                    "json".to_string(),
+                ],
+                mutates_state: false,
+                schema: "docs/agent/schemas/native-support-report.schema.json".to_string(),
+            },
+            McpToolDescriptor {
+                name: "uc.explain_diagnostic".to_string(),
+                description: "Resolve a stable diagnostic code to docs and safe next steps.".to_string(),
+                command: vec!["docs/agent/AGENT_DIAGNOSTICS.md".to_string()],
+                mutates_state: false,
+                schema: "docs/agent/schemas/native-diagnostic.schema.json".to_string(),
+            },
+            McpToolDescriptor {
+                name: "uc.select_toolchain".to_string(),
+                description: "Select the native lane from manifest and lockfile metadata before compiling.".to_string(),
+                command: vec![
+                    "uc".to_string(),
+                    "agent".to_string(),
+                    "eval".to_string(),
+                    "--manifest-path".to_string(),
+                    "<Scarb.toml>".to_string(),
+                ],
+                mutates_state: false,
+                schema: "docs/agent/schemas/agent-eval-report.schema.json".to_string(),
+            },
+            McpToolDescriptor {
+                name: "uc.benchmark_report".to_string(),
+                description: "Read benchmark reports with native-supported, unsupported, fallback-used, and build-failed classification.".to_string(),
+                command: vec!["benchmarks/results/<report>.json".to_string()],
+                mutates_state: false,
+                schema: "docs/agent/schemas/benchmark-report.schema.json".to_string(),
+            },
+            McpToolDescriptor {
+                name: "uc.profile_native_frontend".to_string(),
+                description: "Profile native frontend timing artifacts generated by local benchmark runs.".to_string(),
+                command: vec!["docs/research/MONERO_NATIVE_FRONTEND_PROFILE_2026-04-25.md".to_string()],
+                mutates_state: false,
+                schema: "docs/agent/schemas/build-report.schema.json".to_string(),
+            },
+        ],
+        resources: vec![
+            McpResourceDescriptor {
+                uri: "uc://diagnostics/catalog".to_string(),
+                description: "Stable diagnostic code catalog.".to_string(),
+                schema: "docs/agent/AGENT_DIAGNOSTICS.md".to_string(),
+            },
+            McpResourceDescriptor {
+                uri: "uc://support/native-matrix/latest".to_string(),
+                description: "Latest support matrix from local benchmark artifacts.".to_string(),
+                schema: "docs/agent/schemas/benchmark-report.schema.json".to_string(),
+            },
+            McpResourceDescriptor {
+                uri: "uc://benchmarks/latest".to_string(),
+                description: "Latest local benchmark summary.".to_string(),
+                schema: "docs/agent/schemas/benchmark-report.schema.json".to_string(),
+            },
+            McpResourceDescriptor {
+                uri: "uc://toolchains/native".to_string(),
+                description: "Productized native helper lanes and selection policy.".to_string(),
+                schema: "docs/NATIVE_TOOLCHAIN_HELPERS.md".to_string(),
+            },
+            McpResourceDescriptor {
+                uri: "uc://repo/policy".to_string(),
+                description: "Checked-in agent and PR policy.".to_string(),
+                schema: "AGENTS.md".to_string(),
+            },
+        ],
+    };
+    emit_json_value(args.report_path.as_deref(), &report)
+}
+
+fn run_build_entry(args: BuildArgs) -> Result<()> {
+    let record_failure = args.record_failure.clone();
+    let bundle_args = args.clone();
+    match run_build(args) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if let Some(path) = record_failure.as_ref() {
+                if let Err(record_err) =
+                    write_failure_bundle(path, &bundle_args, &format!("{err:#}"))
+                {
+                    eprintln!(
+                        "uc: warning: failed to write failure bundle {}: {record_err:#}",
+                        path.display()
+                    );
+                }
+            }
+            Err(err)
+        }
+    }
+}
+
+fn write_failure_bundle(path: &Path, args: &BuildArgs, error: &str) -> Result<()> {
+    let manifest_path = resolve_manifest_path(&args.common.manifest_path).ok();
+    let workspace_root = manifest_path
+        .as_ref()
+        .and_then(|manifest| metadata_cache_workspace_root(manifest).ok());
+    let support = manifest_path
+        .as_ref()
+        .and_then(|manifest| native_support_report_from_manifest_path(manifest).ok());
+    let manifest_hash = manifest_path.as_ref().and_then(|manifest| {
+        hash_file_blake3(manifest)
+            .ok()
+            .map(|hash| format!("blake3:{hash}"))
+    });
+    let lockfile_hash = workspace_root.as_ref().and_then(|root| {
+        let lockfile = root.join("Scarb.lock");
+        if lockfile.is_file() {
+            hash_file_blake3(&lockfile)
+                .ok()
+                .map(|hash| format!("blake3:{hash}"))
+        } else {
+            None
+        }
+    });
+    let bundle = FailureBundle {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        generated_at_epoch_ms: epoch_ms_u64()?,
+        command: std::env::args().collect(),
+        manifest_path: manifest_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        workspace_root: workspace_root
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        manifest_hash,
+        lockfile_hash,
+        selected_support: support,
+        redacted_environment: redacted_agent_environment(),
+        error: error.to_string(),
+    };
+    write_json_report(path, &bundle)
+}
+
+fn redacted_agent_environment() -> BTreeMap<String, String> {
+    let allowed_prefixes = ["UC_", "CAIRO_", "SCARB_", "STARKNET_", "RUST_LOG"];
+    let mut values = BTreeMap::new();
+    for (key, value) in std::env::vars() {
+        if !allowed_prefixes
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+        {
+            continue;
+        }
+        let upper = key.to_ascii_uppercase();
+        let redacted = upper.contains("SECRET")
+            || upper.contains("TOKEN")
+            || upper.contains("PASSWORD")
+            || upper.ends_with("_KEY")
+            || upper.contains("PRIVATE_KEY");
+        values.insert(
+            key,
+            if redacted {
+                "<redacted>".to_string()
+            } else {
+                value
+            },
+        );
+    }
+    values
+}
+
+fn run_replay(args: ReplayArgs) -> Result<()> {
+    let bytes = fs::read(&args.bundle)
+        .with_context(|| format!("failed to read replay bundle {}", args.bundle.display()))?;
+    let bundle: FailureBundle = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse replay bundle {}", args.bundle.display()))?;
+    let mut report = ReplayReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        generated_at_epoch_ms: epoch_ms_u64()?,
+        bundle_path: args.bundle.display().to_string(),
+        execute_requested: args.execute,
+        executed: false,
+        command: bundle.command.clone(),
+        manifest_path: bundle.manifest_path.clone(),
+        original_error: bundle.error.clone(),
+        selected_support: bundle.selected_support.clone(),
+        exit_code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        blocked_reason: None,
+    };
+    if !args.execute {
+        report.blocked_reason =
+            Some("dry run only; pass --execute to replay the recorded command".to_string());
+        return emit_json_value(args.report_path.as_deref(), &report);
+    }
+    let (command, command_vec) = command_from_vec(&bundle.command)?;
+    let run = run_command_capture(command, command_vec)?;
+    report.executed = true;
+    report.exit_code = Some(run.exit_code);
+    report.stdout = run.stdout;
+    report.stderr = run.stderr;
+    emit_json_value(args.report_path.as_deref(), &report)?;
+    if let Some(exit_code) = report.exit_code {
+        if exit_code != 0 {
+            bail!("replay failed with exit code {exit_code}");
+        }
+    }
+    Ok(())
+}
+
+fn command_from_vec(command_vec: &[String]) -> Result<(Command, Vec<String>)> {
+    let program = command_vec
+        .first()
+        .context("recorded command is empty and cannot be executed")?;
+    let mut command = Command::new(program);
+    command.args(&command_vec[1..]);
+    Ok((command, command_vec.to_vec()))
 }
 
 fn run_support(args: SupportArgs) -> Result<()> {
@@ -6537,11 +7206,14 @@ fn collect_native_dependency_surface(
         );
     }
 
+    let has_manifest_external_dependencies = !manifest_external.is_empty();
     let mut external = manifest_external;
     let root_crate_name = normalize_package_name_for_cairo_crate(root_package_name);
     let (root_cairo_edition, _) = resolve_manifest_cairo_settings_from_manifest(manifest);
     let mut root_dependencies = path_roots.keys().cloned().collect::<BTreeSet<_>>();
-    root_dependencies.insert(root_crate_name.clone());
+    if !root_dependencies.is_empty() || has_manifest_external_dependencies {
+        root_dependencies.insert(root_crate_name.clone());
+    }
     let mut crate_dependency_configs =
         BTreeMap::<String, (Option<String>, BTreeSet<String>)>::new();
     crate_dependency_configs.insert(root_crate_name, (root_cairo_edition, root_dependencies));
@@ -6744,7 +7416,7 @@ fn build_native_compile_context_uncached(
     );
     let external_non_starknet_dependencies = dependency_surface.external_non_starknet_dependencies;
     let path_dependency_roots = dependency_surface.path_dependency_roots;
-    let crate_dependency_configs = dependency_surface.crate_dependency_configs;
+    let mut crate_dependency_configs = dependency_surface.crate_dependency_configs;
     if !path_dependency_roots.is_empty() {
         tracing::debug!(
             roots = ?path_dependency_roots
@@ -6820,6 +7492,25 @@ fn build_native_compile_context_uncached(
         })
         .collect::<Vec<_>>();
     let (cairo_edition, _) = resolve_manifest_cairo_settings_from_manifest(&manifest);
+    if let Some(root_config) = crate_dependency_configs
+        .iter_mut()
+        .find(|config| config.crate_name == crate_name)
+    {
+        if !root_config
+            .dependencies
+            .iter()
+            .any(|dependency| dependency == &crate_name)
+        {
+            root_config.dependencies.push(crate_name.clone());
+            root_config.dependencies.sort();
+        }
+    } else {
+        crate_dependency_configs.push(NativeCrateDependencyConfig {
+            crate_name: crate_name.clone(),
+            cairo_edition: cairo_edition.clone(),
+            dependencies: vec![crate_name.clone()],
+        });
+    }
     let cairo_project_toml = native_cairo_project_toml(
         &escaped_crate_roots,
         &crate_dependency_configs,
