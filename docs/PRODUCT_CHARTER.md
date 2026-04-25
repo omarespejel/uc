@@ -16,11 +16,11 @@ The next product step is a first-party project model that can read existing Scar
 
 ## Product Principles
 1. Performance is a first-class feature.
-2. Determinism is non-negotiable.
-3. Correctness gates are enforced before rollout.
-4. Observability is required for every subsystem.
-5. Migration should be measurable and reversible.
-6. Project state should be typed and machine-readable before command defaults change.
+1. Determinism is non-negotiable.
+1. Correctness gates are enforced before rollout.
+1. Observability is required for every subsystem.
+1. Migration should be measurable and reversible.
+1. Project state should be typed and machine-readable before command defaults change.
 
 ## Success Outcomes
 - Warm rebuild p95: at least 40% faster than Scarb baseline on target matrix.
