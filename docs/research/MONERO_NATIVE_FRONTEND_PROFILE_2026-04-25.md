@@ -134,3 +134,25 @@ export UC_PHASE_TIMING=1
 ```
 
 Keep same-window reruns for before/after comparisons. Do not compare a new helper patch against older local artifacts from a different time window.
+
+## Rejected Experiment: Tracked `estimate_size` Query
+
+After adding the helper-lane patch surface, a local Cairo `2.14` helper patch changed `cairo_lang_lowering::db::estimate_size` from a plain helper function into a `#[salsa::tracked]` query. The hypothesis was that repeated inlining size checks would reuse per-function dummy Sierra/CASM size estimates without changing generated Sierra/CASM.
+
+Validation result:
+
+- The patch applied cleanly through `toolchains/cairo-2.14/patches/cairo-lang-lowering.patch`.
+- `./scripts/build_native_toolchain_helper.sh --lane 2.14 --check-only` passed all four targeted helper tests.
+- A release helper built successfully.
+- Same-window monero harness reruns did not produce a clean win:
+  - reference helper `uc` cold p95: `7085.773 ms`
+  - patched helper `uc` cold p95: `12392.042 ms`
+  - reference helper `uc` warm no-op p95: `48.570 ms`
+  - patched helper `uc` warm no-op p95: `43.530 ms`
+
+The patched run window was noisy: Scarb cold p95 in the same harness moved from `11821.282 ms` to `39337.630 ms`, so the numbers are not suitable as public benchmark evidence. The important engineering decision is still clear: this patch did not produce a clean real-harness improvement, so it was removed and should not be shipped as a perf PR.
+
+Artifacts from the rejected local run were written under ignored paths:
+
+- `benchmarks/results/cairo214-estimate-size-reference-20260425-100237/`
+- `benchmarks/results/cairo214-estimate-size-patched-20260425-100442/`
