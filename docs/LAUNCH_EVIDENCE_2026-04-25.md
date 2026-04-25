@@ -70,7 +70,7 @@ Lane and conditions:
 | `monero_atomic_lock_sepolia` | 14365.929 | 7173.073 | 2.003x | 8027.459 | 33.547 | 239.288x |
 | `braavos_account_v1_2_0_class` | 5121.310 | 4225.745 | 1.212x | 5465.849 | 56.151 | 97.343x |
 
-The monero Scarb warm-noop lane was marked unstable by the harness: p50 `6586.095ms`, p95 `8027.459ms`, max `8187.611ms`, p95/p50 `1.219`.
+The monero Scarb warm-noop lane was marked unstable by the harness: p50 `6586.095ms`, p95 `8027.459ms`, max `8187.611ms`, p95/p50 ratio `1.219`.
 
 ## Native Frontend Profile
 
@@ -93,6 +93,14 @@ b2a470abe9ed1082e39527848f426ebb476367ef0492524733df533121f0a0cb  real-repo-benc
 9b4f86866dc9d896bc8848d84174632478b28565cdf46d6e85e0a15f8c7c0f42  generated-corpus.json
 fbb75e2284a08cc2b6e96d4e7be4abc739af85506354490da66097a9170e9205  pinned-source-index.json
 b62d46619e475bb5ca3a6f7d45a551bc93d10fe3cdebfb819823959611479493  reviewed-source-inventory.json
+```
+
+To verify the artifact hashes, set `EVIDENCE_ROOT` to the evidence directory or
+run from that directory, copy the lines above into `checksums.txt`, then run:
+
+```bash
+cd "$EVIDENCE_ROOT"
+shasum -a 256 -c checksums.txt
 ```
 
 ## Claim Boundary
