@@ -22,12 +22,17 @@
     "execute_requested": { "type": "boolean" },
     "executed": { "type": "boolean" },
     "command": { "type": "array", "items": { "type": "string" } },
-    "manifest_path": { "type": "string" },
+    "manifest_path": { "type": ["string", "null"] },
     "original_error": { "type": "string" },
-    "selected_support": { "$ref": "native-support-report.schema.json" },
-    "exit_code": { "type": "integer" },
+    "selected_support": {
+      "anyOf": [
+        { "$ref": "native-support-report.schema.json" },
+        { "type": "null" }
+      ]
+    },
+    "exit_code": { "type": ["integer", "null"] },
     "stdout": { "type": "string" },
     "stderr": { "type": "string" },
-    "blocked_reason": { "type": "string" }
+    "blocked_reason": { "type": ["string", "null"] }
   }
 }

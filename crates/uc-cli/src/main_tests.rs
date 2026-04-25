@@ -475,6 +475,91 @@ fn project_inspect_cli_accepts_json_format_and_report_path() {
 }
 
 #[test]
+fn required_agent_arrays_serialize_when_empty() {
+    let diagnostic = NativeDiagnostic {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        code: "UCN0001".to_string(),
+        category: "internal_error".to_string(),
+        severity: NativeDiagnosticSeverity::Error,
+        title: "Internal error".to_string(),
+        docs_url: native_diagnostic_docs_url("UCN0001"),
+        what_happened: "an internal error occurred".to_string(),
+        why: "the compiler could not complete the requested action".to_string(),
+        how_to_fix: Vec::new(),
+        next_commands: Vec::new(),
+        safe_automated_action: "none".to_string(),
+        retryable: false,
+        fallback_used: false,
+        toolchain_expected: None,
+        toolchain_found: None,
+    };
+    let diagnostic_json = serde_json::to_value(&diagnostic).expect("diagnostic should serialize");
+    assert_eq!(diagnostic_json["how_to_fix"], serde_json::json!([]));
+    assert_eq!(diagnostic_json["next_commands"], serde_json::json!([]));
+
+    let report = BuildReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        generated_at_epoch_ms: 1,
+        engine: "uc".to_string(),
+        daemon_used: false,
+        manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
+        workspace_root: "/tmp/workspace".to_string(),
+        profile: "dev".to_string(),
+        session_key: "test-session".to_string(),
+        command: vec!["uc".to_string(), "build".to_string()],
+        exit_code: 0,
+        elapsed_ms: 1.0,
+        cache_hit: false,
+        fingerprint: "test-fingerprint".to_string(),
+        artifact_count: 0,
+        phase_telemetry: None,
+        compile_backend: None,
+        native_toolchain: None,
+        diagnostics: Vec::new(),
+    };
+    let report_json = serde_json::to_value(&report).expect("build report should serialize");
+    assert_eq!(report_json["diagnostics"], serde_json::json!([]));
+}
+
+#[test]
+fn report_schemas_match_nullable_option_output() {
+    let replay_schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../docs/agent/schemas/replay-report.schema.json"
+    ))
+    .expect("replay report schema should parse");
+    assert_eq!(
+        replay_schema["properties"]["manifest_path"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    assert_eq!(
+        replay_schema["properties"]["exit_code"]["type"],
+        serde_json::json!(["integer", "null"])
+    );
+    assert_eq!(
+        replay_schema["properties"]["blocked_reason"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    assert!(replay_schema["properties"]["selected_support"]["anyOf"]
+        .as_array()
+        .expect("selected_support should use anyOf")
+        .iter()
+        .any(|entry| entry == &serde_json::json!({"type": "null"})));
+
+    let safe_action_schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../docs/agent/schemas/safe-action-report.schema.json"
+    ))
+    .expect("safe-action report schema should parse");
+    assert_eq!(
+        safe_action_schema["properties"]["exit_code"]["type"],
+        serde_json::json!(["integer", "null"])
+    );
+    assert_eq!(
+        safe_action_schema["properties"]["blocked_reason"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+}
+
+#[test]
 fn project_inspect_report_summarizes_manifest_lockfile_and_support_without_mutation() {
     let dir = unique_test_dir("uc-project-inspect-report");
     let _cleanup = TestDirCleanup::new(&dir);
