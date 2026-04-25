@@ -2273,14 +2273,8 @@ fn project_inspect_report_from_manifest_path(manifest_path: &Path) -> Result<Pro
         .as_ref()
         .map(project_package_summary_from_manifest)
         .unwrap_or_default();
-    let workspace = manifest
-        .as_ref()
-        .map(project_workspace_summary_from_manifest)
-        .unwrap_or_else(|| ProjectWorkspaceSummary {
-            has_workspace_table: false,
-            members: Vec::new(),
-            exclude: Vec::new(),
-        });
+    let workspace =
+        project_workspace_summary_for_report(&workspace_root, manifest_path, manifest.as_ref());
     let targets = manifest
         .as_ref()
         .map(project_targets_from_manifest)
@@ -2466,6 +2460,48 @@ fn project_workspace_summary_from_manifest(manifest: &TomlValue) -> ProjectWorks
             .map(project_toml_string_array)
             .unwrap_or_default(),
     }
+}
+
+fn empty_project_workspace_summary() -> ProjectWorkspaceSummary {
+    ProjectWorkspaceSummary {
+        has_workspace_table: false,
+        members: Vec::new(),
+        exclude: Vec::new(),
+    }
+}
+
+fn project_workspace_summary_for_report(
+    workspace_root: &Path,
+    manifest_path: &Path,
+    manifest: Option<&TomlValue>,
+) -> ProjectWorkspaceSummary {
+    let workspace_manifest_path = workspace_root.join("Scarb.toml");
+    if workspace_manifest_path != manifest_path {
+        match read_text_file_with_limit(&workspace_manifest_path, MAX_MANIFEST_BYTES, "manifest")
+            .and_then(|text| {
+                parse_manifest_toml(
+                    &text,
+                    &workspace_manifest_path,
+                    "failed to parse workspace manifest for project inspect",
+                )
+            }) {
+            Ok(workspace_manifest) => {
+                return project_workspace_summary_from_manifest(&workspace_manifest);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    manifest_path = %manifest_path.display(),
+                    workspace_manifest_path = %workspace_manifest_path.display(),
+                    error = %err,
+                    "project inspect could not read workspace root manifest; falling back to inspected manifest"
+                );
+            }
+        }
+    }
+
+    manifest
+        .map(project_workspace_summary_from_manifest)
+        .unwrap_or_else(empty_project_workspace_summary)
 }
 
 fn project_targets_from_manifest(manifest: &TomlValue) -> Vec<ProjectTargetSummary> {
@@ -3955,10 +3991,8 @@ fn project_lockfile_dependency_version(
     manifest_path: &Path,
     dependency_name: &str,
 ) -> Result<Option<String>> {
-    let lock_path = manifest_path
-        .parent()
-        .context("manifest path has no parent")?
-        .join("Scarb.lock");
+    let workspace_root = metadata_cache_workspace_root(manifest_path)?;
+    let lock_path = workspace_root.join("Scarb.lock");
     let lock_text = match fs::read_to_string(&lock_path) {
         Ok(text) => text,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),

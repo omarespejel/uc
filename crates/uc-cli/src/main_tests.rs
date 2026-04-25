@@ -31,6 +31,12 @@ impl Drop for TestDirCleanup {
     }
 }
 
+fn assert_project_inspect_left_no_artifacts(dir: &Path) {
+    assert!(!dir.join(".uc").exists());
+    assert!(!dir.join("target").exists());
+    assert!(!dir.join("Uc.toml").exists());
+}
+
 #[cfg(feature = "native-compile")]
 fn unique_platform_absolute_fixture_path(prefix: &str) -> String {
     normalize_fingerprint_path(
@@ -574,9 +580,7 @@ dependencies = ["core"]
         hash_file_blake3(&dir.join("Scarb.lock")).expect("hash lock after"),
         lock_hash_before
     );
-    assert!(!dir.join(".uc").exists());
-    assert!(!dir.join("target").exists());
-    assert!(!dir.join("Uc.toml").exists());
+    assert_project_inspect_left_no_artifacts(&dir);
 }
 
 #[test]
@@ -597,6 +601,9 @@ fn project_inspect_report_returns_structured_diagnostic_for_invalid_manifest() {
         .any(|diagnostic| diagnostic.code == "UCP1001"
             && diagnostic.category == "manifest_parse"
             && diagnostic.safe_automated_action == "manual_manifest_fix_required"));
+    assert!(report.readonly);
+    assert_eq!(report.mutation_status, "none");
+    assert_project_inspect_left_no_artifacts(&dir);
 }
 
 #[test]
@@ -629,9 +636,7 @@ starknet = ">=2.14.0"
         .any(|diagnostic| diagnostic.code == "UCP1005"
             && diagnostic.category == "native_support_probe"
             && diagnostic.safe_automated_action == "inspect_native_support_then_retry"));
-    assert!(!dir.join(".uc").exists());
-    assert!(!dir.join("target").exists());
-    assert!(!dir.join("Uc.toml").exists());
+    assert_project_inspect_left_no_artifacts(&dir);
 }
 
 #[test]
@@ -675,6 +680,8 @@ starknet = ">=2.14.0"
         .expect("inspect should succeed");
 
     assert_eq!(report.workspace_root, workspace.display().to_string());
+    assert!(report.workspace.has_workspace_table);
+    assert_eq!(report.workspace.members, vec!["member".to_string()]);
     assert!(report.lockfile.present);
     let lock_path = workspace.join("Scarb.lock").display().to_string();
     assert_eq!(report.lockfile.path.as_deref(), Some(lock_path.as_str()));
@@ -683,6 +690,23 @@ starknet = ">=2.14.0"
         .packages
         .iter()
         .any(|package| package.name == "starknet" && package.version.as_deref() == Some("2.14.0")));
+    #[cfg(feature = "native-compile")]
+    {
+        let native_toolchain = report
+            .native_support
+            .as_ref()
+            .and_then(|support| support.toolchain.as_ref())
+            .expect("workspace lockfile should provide native toolchain metadata");
+        assert_eq!(
+            native_toolchain.request_source,
+            Some(NativeToolchainRequestSource::LockfileDependencyVersion)
+        );
+        assert_eq!(
+            native_toolchain.requested_version.as_deref(),
+            Some("2.14.0")
+        );
+    }
+    assert_project_inspect_left_no_artifacts(&workspace);
 }
 
 #[test]
@@ -702,6 +726,7 @@ fn project_inspect_does_not_hash_files_above_inspect_size_limits() {
         .diagnostics
         .iter()
         .any(|diagnostic| diagnostic.code == "UCP1000" && diagnostic.category == "manifest_read"));
+    assert_project_inspect_left_no_artifacts(&dir);
 
     let dir = unique_test_dir("uc-project-inspect-lock-size-limits");
     let _cleanup = TestDirCleanup::new(&dir);
@@ -731,6 +756,7 @@ starknet = ">=2.14.0"
         .diagnostics
         .iter()
         .any(|diagnostic| diagnostic.code == "UCP1004" && diagnostic.category == "lockfile_parse"));
+    assert_project_inspect_left_no_artifacts(&dir);
 }
 
 #[test]
