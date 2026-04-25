@@ -4,20 +4,20 @@ This checkpoint records the current local evidence for the agent-first Cairo com
 
 ## Evidence Bundle
 
-- Evidence root: `/Users/espejelomar/StarkNet/uc-launch-evidence-20260425`
-- Source inventory: `/Users/espejelomar/StarkNet/uc-launch-evidence-20260425/reviewed-source-inventory.json`
-- Source index: `/Users/espejelomar/StarkNet/uc-launch-evidence-20260425/pinned-source-index.json`
-- Generated corpus: `/Users/espejelomar/StarkNet/uc-launch-evidence-20260425/generated-corpus.json`
-- Corpus benchmark JSON: `/Users/espejelomar/StarkNet/uc-launch-evidence-20260425/results/deployed-contract-corpus-bench-20260425-180015.json`
-- Corpus benchmark Markdown: `/Users/espejelomar/StarkNet/uc-launch-evidence-20260425/results/deployed-contract-corpus-bench-20260425-180015.md`
-- Real-repo benchmark JSON: `/Users/espejelomar/StarkNet/uc-launch-evidence-20260425/results/real-repo-bench-20260425-180015.json`
-- Real-repo benchmark Markdown: `/Users/espejelomar/StarkNet/uc-launch-evidence-20260425/results/real-repo-bench-20260425-180015.md`
+- Evidence root: `$EVIDENCE_ROOT`
+- Source inventory: `$EVIDENCE_ROOT/reviewed-source-inventory.json`
+- Source index: `$EVIDENCE_ROOT/pinned-source-index.json`
+- Generated corpus: `$EVIDENCE_ROOT/generated-corpus.json`
+- Corpus benchmark JSON: `$EVIDENCE_ROOT/results/deployed-contract-corpus-bench-20260425-180015.json`
+- Corpus benchmark Markdown: `$EVIDENCE_ROOT/results/deployed-contract-corpus-bench-20260425-180015.md`
+- Real-repo benchmark JSON: `$EVIDENCE_ROOT/results/real-repo-bench-20260425-180015.json`
+- Real-repo benchmark Markdown: `$EVIDENCE_ROOT/results/real-repo-bench-20260425-180015.md`
 
 ## Generation Commands
 
 ```bash
-export UC_REPO_ROOT="/Users/espejelomar/StarkNet/uc-launch-evidence-pr-20260425"
-export EVIDENCE_ROOT="/Users/espejelomar/StarkNet/uc-launch-evidence-20260425"
+export UC_REPO_ROOT="$(pwd)"
+export EVIDENCE_ROOT="/path/to/external/uc-launch-evidence-20260425"
 export UC_NATIVE_TOOLCHAIN_2_14_BIN="$HOME/.uc/toolchain-helpers/uc-cairo214-helper/bin/uc"
 
 cd "$UC_REPO_ROOT"
