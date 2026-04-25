@@ -2265,6 +2265,7 @@ enum NativeCompileSupportIssue {
     UnsupportedToolchainHelperLane {
         requested: String,
         helper_env: String,
+        configured_path: Option<String>,
         productized_lanes: Vec<String>,
     },
     InvalidToolchainHelper {
@@ -2380,11 +2381,18 @@ impl NativeCompileSupportIssue {
             Self::UnsupportedToolchainHelperLane {
                 requested,
                 helper_env,
+                configured_path,
                 productized_lanes,
-            } => format!(
-                "The project requires native Cairo {requested}, but this uc release cannot build that helper lane automatically. `{helper_env}` is unset, and the productized helper lane(s) are: {}.",
-                format_productized_helper_lanes(productized_lanes)
-            ),
+            } => {
+                let configured = configured_path
+                    .as_deref()
+                    .map(|path| format!("`{helper_env}` points to `{path}`, but that helper is not usable. "))
+                    .unwrap_or_else(|| format!("`{helper_env}` is unset. "));
+                format!(
+                    "The project requires native Cairo {requested}, but this uc release cannot build that helper lane automatically. {configured}The productized helper lane(s) are: {}.",
+                    format_productized_helper_lanes(productized_lanes)
+                )
+            }
             Self::InvalidToolchainHelper {
                 requested,
                 helper_env,
@@ -2424,11 +2432,18 @@ impl NativeCompileSupportIssue {
             Self::UnsupportedToolchainHelperLane {
                 requested,
                 helper_env,
+                configured_path,
                 productized_lanes,
-            } => format!(
-                "native compile requires a Cairo {requested} helper lane, but this release only productizes helper building for {}; provide a reviewed `{helper_env}` helper or implement the legacy compatibility adapter before marking this workload native-supported",
-                format_productized_helper_lanes(productized_lanes)
-            ),
+            } => {
+                let configured = configured_path
+                    .as_deref()
+                    .map(|path| format!("; configured `{helper_env}` helper `{path}` is not an executable uc binary"))
+                    .unwrap_or_default();
+                format!(
+                    "native compile requires a Cairo {requested} helper lane, but this release only productizes helper building for {}{configured}; provide a reviewed `{helper_env}` helper or implement the legacy compatibility adapter before marking this workload native-supported",
+                    format_productized_helper_lanes(productized_lanes)
+                )
+            }
             Self::InvalidToolchainHelper {
                 requested,
                 helper_env,
@@ -2574,9 +2589,11 @@ impl NativeCompileSupportIssue {
                 compiler,
             } => (Some(requested.clone()), Some(compiler.clone())),
             Self::MissingToolchainHelper { requested, .. } => (Some(requested.clone()), None),
-            Self::UnsupportedToolchainHelperLane { requested, .. } => {
-                (Some(requested.clone()), None)
-            }
+            Self::UnsupportedToolchainHelperLane {
+                requested,
+                configured_path,
+                ..
+            } => (Some(requested.clone()), configured_path.clone()),
             Self::InvalidToolchainHelper {
                 requested, path, ..
             } => (Some(requested.clone()), Some(path.clone())),
@@ -2736,6 +2753,7 @@ fn select_native_toolchain_from_requirement_with_compiler(
                         NativeCompileSupportIssue::UnsupportedToolchainHelperLane {
                             requested: requested_major_minor,
                             helper_env,
+                            configured_path: None,
                             productized_lanes: productized_native_toolchain_helper_lanes(),
                         },
                     ));
@@ -2747,6 +2765,16 @@ fn select_native_toolchain_from_requirement_with_compiler(
             };
             let helper_path = PathBuf::from(helper_path_os);
             if !native_toolchain_helper_path_is_usable(&helper_path) {
+                if !native_toolchain_helper_lane_is_productized(&requested_major_minor) {
+                    return Ok(Err(
+                        NativeCompileSupportIssue::UnsupportedToolchainHelperLane {
+                            requested: requested_major_minor,
+                            helper_env,
+                            configured_path: Some(helper_path.display().to_string()),
+                            productized_lanes: productized_native_toolchain_helper_lanes(),
+                        },
+                    ));
+                }
                 return Ok(Err(NativeCompileSupportIssue::InvalidToolchainHelper {
                     requested: requested_major_minor,
                     helper_env,

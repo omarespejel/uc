@@ -2544,8 +2544,17 @@ starknet = "={requested_version}"
         json["diagnostics"][0]["toolchain_expected"],
         requested_major_minor
     );
+    let diagnostic_json = json["diagnostics"][0]
+        .as_object()
+        .expect("diagnostic should serialize as an object");
     assert!(
-        json["diagnostics"][0]["toolchain_found"].is_null(),
+        diagnostic_json.contains_key("toolchain_found"),
+        "unproductized lane diagnostics should serialize toolchain_found explicitly"
+    );
+    assert!(
+        diagnostic_json
+            .get("toolchain_found")
+            .is_some_and(serde_json::Value::is_null),
         "unproductized lane diagnostics should explicitly expose no found helper"
     );
     let commands = json["diagnostics"][0]["next_commands"]
@@ -2582,6 +2591,65 @@ starknet = "={requested_version}"
         requested_major_minor
     );
     assert_eq!(json["toolchain"]["requested_version"], requested_version);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_support_report_keeps_invalid_unproductized_helper_manual() {
+    let _guard = integration_env_lock().lock().unwrap();
+    let requested_major_minor = "2.5";
+    let requested_version = "2.5.3";
+    let helper_env = native_toolchain_env_var_name_for_major_minor(requested_major_minor);
+    let dir = unique_test_dir("uc-native-support-unproductized-helper-invalid");
+    let manifest_path = dir.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2023_11"
+cairo-version = "{requested_version}"
+"#
+        ),
+    )
+    .expect("write manifest");
+    let invalid_helper_path = dir.join("missing-reviewed-helper");
+    let _helper =
+        ScopedDynamicEnvVar::set_with_lock(&_guard, helper_env.clone(), &invalid_helper_path);
+
+    let report = native_support_report_from_manifest_path(&manifest_path)
+        .expect("invalid unproductized helper should still return support JSON");
+    assert_eq!(report.status, NativeSupportStatus::Unsupported);
+    assert_eq!(
+        report.issue_kind.as_deref(),
+        Some("unsupported_toolchain_helper_lane")
+    );
+    let json = serde_json::to_value(&report).expect("support report should serialize");
+    assert_eq!(json["diagnostics"][0]["code"], "UCN1006");
+    assert_eq!(
+        json["diagnostics"][0]["safe_automated_action"],
+        "manual_legacy_adapter_required"
+    );
+    assert_eq!(
+        json["diagnostics"][0]["toolchain_found"],
+        invalid_helper_path.display().to_string()
+    );
+    let fixes = json["diagnostics"][0]["how_to_fix"]
+        .as_array()
+        .expect("how_to_fix should stay an array");
+    let commands = json["diagnostics"][0]["next_commands"]
+        .as_array()
+        .expect("next_commands should stay an array");
+    assert!(
+        fixes.iter().chain(commands.iter()).all(|entry| !entry
+            .as_str()
+            .unwrap_or_default()
+            .contains("build_native_toolchain_helper")),
+        "invalid helpers for unproductized lanes must stay on manual remediation"
+    );
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -2663,6 +2731,8 @@ fn native_support_report_from_manifest_path_allows_reviewed_unproductized_helper
 
     let dir = unique_test_dir("uc-native-support-unproductized-helper-env");
     fs::create_dir_all(&dir).expect("create temp dir");
+    fs::create_dir_all(dir.join("src")).expect("create src dir");
+    fs::write(dir.join("src/lib.cairo"), "fn main() {}\n").expect("write lib.cairo");
     let manifest_path = dir.join("Scarb.toml");
     fs::write(
         &manifest_path,
@@ -2708,6 +2778,22 @@ cairo-version = "{requested_version}"
         toolchain.compiler_version.as_deref(),
         Some(requested_version)
     );
+    let fake_corelib_src = dir.join("toolchain/corelib/src");
+    create_mock_native_corelib(&fake_corelib_src);
+    let _corelib = ScopedEnvVar::set_with_lock(&_guard, "UC_NATIVE_CORELIB_SRC", &fake_corelib_src);
+    let common = BuildCommonArgs {
+        manifest_path: Some(manifest_path.clone()),
+        package: None,
+        workspace: false,
+        features: Vec::new(),
+        offline: true,
+        release: false,
+        profile: None,
+    };
+    let context = build_native_compile_context(&common, &manifest_path, &dir)
+        .expect("reviewed helper env should let build preflight pass");
+    assert_eq!(context.package_name, "demo");
+    assert_eq!(context.crate_name, "demo");
 
     fs::remove_dir_all(&dir).ok();
 }
