@@ -1,0 +1,89 @@
+diff -ruN a/src/db.rs b/src/db.rs
+--- a/src/db.rs	2026-04-25 10:53:29
++++ b/src/db.rs	2026-04-25 10:53:29
+@@ -1,8 +1,12 @@
++use std::io::Write;
++use std::sync::{Mutex, OnceLock};
++
+ use cairo_lang_debug::DebugWithDb;
+ use cairo_lang_defs as defs;
+ use cairo_lang_defs::db::DefsGroup;
+ use cairo_lang_defs::ids::{
+     ExternFunctionId, LanguageElementId, ModuleId, ModuleItemId, NamedLanguageElementLongId,
++    UnstableSalsaId,
+ };
+ use cairo_lang_diagnostics::{Diagnostics, DiagnosticsBuilder, Maybe, MaybeAsRef};
+ use cairo_lang_filesystem::ids::{FileId, Tracked};
+@@ -57,6 +58,64 @@
+     LoweringGroupInput::new(db, None, None)
+ }
+ 
++static UC_CAIRO214_SIZE_TRACE_COUNTS: OnceLock<Mutex<UnorderedHashMap<String, u64>>> =
++    OnceLock::new();
++
++fn uc_cairo214_size_trace_hash(text: &str) -> u64 {
++    let mut hash = 0xcbf29ce484222325u64;
++    for byte in text.as_bytes() {
++        hash ^= u64::from(*byte);
++        hash = hash.wrapping_mul(0x100000001b3);
++    }
++    hash
++}
++
++fn uc_cairo214_size_trace_preview(text: &str) -> String {
++    let mut preview = text.chars().take(160).collect::<String>();
++    if preview.len() < text.len() {
++        preview.push_str("...");
++    }
++    preview
++}
++
++fn uc_cairo214_size_trace_event(
++    db: &dyn Database,
++    event: &str,
++    function_id: ConcreteFunctionWithBodyId<'_>,
++) {
++    let Some(path) = std::env::var_os("UC_CAIRO214_SIZE_TRACE") else {
++        return;
++    };
++    let function_key = format!("{:?}", function_id.get_internal_id());
++    let key = format!("{event}\t{function_key}");
++    let counts = UC_CAIRO214_SIZE_TRACE_COUNTS
++        .get_or_init(|| Mutex::new(UnorderedHashMap::default()));
++    let Ok(mut counts) = counts.lock() else {
++        return;
++    };
++    let count = counts.entry(key).or_insert(0);
++    *count = count.saturating_add(1);
++    let count = *count;
++    drop(counts);
++    if count != 1 && !count.is_power_of_two() {
++        return;
++    }
++    let function_label = if std::env::var_os("UC_CAIRO214_SIZE_TRACE_NAMES").is_some() {
++        let function_path = function_id.full_path(db);
++        format!(
++            "{:016x}:{}",
++            uc_cairo214_size_trace_hash(&function_path),
++            uc_cairo214_size_trace_preview(&function_path)
++        )
++    } else {
++        function_key.clone()
++    };
++    let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
++        return;
++    };
++    let _ = writeln!(file, "{event}\t{count}\t{function_key}\t{function_label}");
++}
++
+ /// Trait for information over the lowering.
+ pub trait LoweringGroup: Database {
+     /// Computes the lowered representation of a function with a body, along with all it generated
+@@ -829,6 +888,7 @@
+     db: &'db dyn Database,
+     function_id: ConcreteFunctionWithBodyId<'db>,
+ ) -> Maybe<isize> {
++    uc_cairo214_size_trace_event(db, "estimate_size", function_id);
+     let code_size_estimator = lowering_group_input(db).code_size_estimator(db);
+     if let Some(estimator) = code_size_estimator {
+         estimator(db, function_id)

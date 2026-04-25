@@ -86,6 +86,62 @@ cairo_lang_sierra_generator::program_generator::get_dummy_program_for_size_estim
 
 This points to repeated lowering/optimization work during inlining size estimation, not to wrapper I/O or benchmark harness overhead.
 
+## Bounded Size-Estimation Trace
+
+The Cairo `2.14` helper now has an opt-in local trace for size-estimation work. The trace is disabled by default. When `UC_CAIRO214_SIZE_TRACE=/abs/path/to/trace.tsv` is set, the helper records bounded counter samples for:
+
+- `cairo_lang_lowering::db::estimate_size`
+- `cairo_lang_sierra_generator::program_generator::get_dummy_program_for_size_estimation`
+
+The default trace uses cheap Salsa internal ids. Do not enable `UC_CAIRO214_SIZE_TRACE_NAMES=1` during timed benchmark runs; full function names for heavily generic Cairo code are expensive to compute and are intended only for short diagnostic reproductions.
+
+Local monero diagnostic run:
+
+```text
+helper=/Users/espejelomar/StarkNet/uc-cairo214-instrument-size-20260425/.uc/toolchain-helper-targets/cairo-2.14/debug/uc
+manifest=/tmp/uc-monero-trace-id-20260425-105729/Scarb.toml
+trace=/tmp/uc-cairo214-monero-size-trace-id-20260425-105729.tsv
+env=UC_CAIRO214_SIZE_TRACE=<trace> UC_PHASE_TIMING=1 UC_NATIVE_DISALLOW_SCARB_FALLBACK=1
+flags=--engine uc --daemon-mode off --offline
+```
+
+Support probe:
+
+```text
+status=supported
+compiler_version=2.14.0
+package_cairo_version=2.14.0
+toolchain.source=builtin
+```
+
+Trace result:
+
+| Event | Sample rows |
+| --- | ---: |
+| `estimate_size` | 2069 |
+| `dummy_program_for_size_estimation` | 2069 |
+
+Trace file size was `194 KiB` for `4138` rows. The hottest sampled ids reached count `32` for both event types:
+
+```text
+estimate_size                      Id(1d6e49)  count=32
+estimate_size                      Id(1d6e3e)  count=32
+estimate_size                      Id(1c20af)  count=32
+dummy_program_for_size_estimation  Id(1d6e49)  count=32
+dummy_program_for_size_estimation  Id(1d6e3e)  count=32
+dummy_program_for_size_estimation  Id(1c20af)  count=32
+```
+
+The debug helper run completed successfully with fallback disallowed. Phase timings are not comparable to release-helper benchmark timings because this used the debug helper binary, but they confirm the remaining work is still inside `native_frontend_compile`:
+
+```text
+compile=60351.028 ms
+native_session_prepare=3027.453 ms
+native_frontend_compile=54861.296 ms
+native_casm=2187.656 ms
+native_artifact_write=274.081 ms
+```
+
 ## Rejected Experiment
 
 A temporary local-only experiment exposed `UC_NATIVE_INLINING_STRATEGY` and rebuilt an isolated Cairo `2.14` helper. It was reverted and not committed.

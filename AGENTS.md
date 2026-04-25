@@ -61,5 +61,6 @@
 - When debugging hard native stalls, prefer `--engine uc --daemon-mode off --offline` first to remove daemon noise.
 - Build older native lanes with `./scripts/build_native_toolchain_helper.sh --lane 2.14`, then export the printed `UC_NATIVE_TOOLCHAIN_2_14_BIN` value.
 - Helper-lane patch experiments are configured by lane metadata `patch-dir`; patches must live under `toolchains/cairo-2.14/patches/*.patch`, are applied only in the staging tree, and can read registry sources from `UC_HELPER_CARGO_REGISTRY_SRC` when the default Cargo registry cache is not suitable.
+- For Cairo `2.14` frontend hot-path diagnosis, run the helper with `UC_CAIRO214_SIZE_TRACE=/abs/path/to/trace.tsv`; the trace records bounded size-estimation and dummy-Sierra TSV counter samples and is for local diagnostics only.
 - Probe helper-lane readiness before measuring a repo with `./scripts/doctor.sh --uc-bin /abs/path/to/uc --manifest-path /abs/path/to/Scarb.toml`.
 - For deployed-contract launch claims, build the source index from a reviewed source inventory with `benchmarks/scripts/build_deployed_contract_source_index.sh`, generate the run corpus with `benchmarks/scripts/generate_deployed_contract_corpus.sh`, then use `benchmarks/scripts/run_deployed_contract_corpus.sh`; only quote generated claim text when the artifact's `claim_guard` marks it safe.
