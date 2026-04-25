@@ -123,9 +123,21 @@ The generated build reports carried structured `UCN2002` diagnostics, but the
 generic for an agent to remediate, so the opportunity summarizer now treats
 generic diagnostic text as `UCO5001` even when all required fields are present.
 
-Low-sample same-window speed ratios for native-supported rows:
+Low-sample same-window observed ratios for native-supported rows:
 
-| Tag | Cold p95 speedup | Warm no-op p95 speedup | Launch-use status |
+- Benchmark lane: `benchmarks/scripts/run_real_repo_benchmarks.sh` real-repo
+  lane, comparing `scarb build` against `uc build --engine uc --daemon-mode off
+  --offline`.
+- Stages: `build.cold` p95 and `build.warm_noop` p95.
+- Sample settings: `--runs 1`, `--cold-runs 1`,
+  `--warm-settle-seconds 0`, `--timeout-secs 180`.
+- Host condition: local ad hoc macOS developer workstation run; no pinned CPU,
+  no strict host-noise preflight, and no recorded hardware claim metadata.
+- Claim-guard status: no deployed-contract `claim_guard` was produced for this
+  real-repo diagnostic sweep. The ratios below are backlog triage signals only,
+  not launch speed claims.
+
+| Tag | Cold p95 observed ratio | Warm no-op p95 observed ratio | Launch-use status |
 |---|---:|---:|---|
 | `braavos_account` | 1.196x | 34.334x | Diagnostic only; cold speedup weak. |
 | `monero_atomic_swap` | 1.211x | 135.222x | Diagnostic only; cold speedup weak. |
