@@ -45,6 +45,7 @@
 - Add tests before or with risky code changes.
 - Re-run focused validation before broader benchmarks.
 - For older Cairo native repos, build the helper with `./scripts/build_native_toolchain_helper.sh --lane 2.14` and export the printed `UC_NATIVE_TOOLCHAIN_2_14_BIN`.
+- For helper-lane patch experiments, use lane metadata `patch-dir`; keep patch files in `toolchains/cairo-2.14/patches/*.patch`. The helper applies them only in staging and honors `UC_HELPER_CARGO_REGISTRY_SRC` for an alternate Cargo registry source cache.
 - Before measuring a real manifest, run `./scripts/doctor.sh --uc-bin /abs/path/to/uc --manifest-path /abs/path/to/Scarb.toml` to catch missing helper lanes early.
 - For deployed-contract corpus claims, build the source index from a reviewed source inventory with `benchmarks/scripts/build_deployed_contract_source_index.sh`, generate the run corpus with `benchmarks/scripts/generate_deployed_contract_corpus.sh`, then run `benchmarks/scripts/run_deployed_contract_corpus.sh` and only quote `.claim_guard.compiled_all_claim_text` when the guard is true.
 - Update `docs/agent/REPO_MAP.md` with `make agent-map` when repo entrypoints change.
