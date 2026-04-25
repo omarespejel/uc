@@ -61,16 +61,16 @@ UC_CAIRO214_SIZE_TRACE=/tmp/uc-cairo214-size-trace.tsv \
   uc build --engine uc --daemon-mode off --offline --manifest-path /abs/path/to/Scarb.toml
 ```
 
-When the variable is unset, the patched helper is silent. When set, the helper appends bounded TSV counter samples. Each `(event, function)` emits its first call and later powers of two:
+When the variable is unset, the patched helper is silent and only checks a cached `OnceLock` config. When set, the helper appends bounded TSV counter samples. Each `(event, function)` emits its first call and later powers of two:
 
 ```text
-estimate_size	1	salsa_internal_id	salsa_internal_id
-estimate_size	2	salsa_internal_id	salsa_internal_id
-estimate_size	4	salsa_internal_id	salsa_internal_id
-dummy_program_for_size_estimation	1	salsa_internal_id	salsa_internal_id
+estimate_size	1	db_discriminator:salsa_internal_id	db_discriminator:salsa_internal_id
+estimate_size	2	db_discriminator:salsa_internal_id	db_discriminator:salsa_internal_id
+estimate_size	4	db_discriminator:salsa_internal_id	db_discriminator:salsa_internal_id
+dummy_program_for_size_estimation	1	db_discriminator:salsa_internal_id	db_discriminator:salsa_internal_id
 ```
 
-Use this only for local diagnostics. The default label is the cheap Salsa internal id so tracing does not make hot Cairo paths materially slower. If a named preview is needed, also set `UC_CAIRO214_SIZE_TRACE_NAMES=1`; the fourth column becomes `fnv1a64_hash:function_preview`, with the preview capped so heavily generic Cairo names do not create unbounded trace files.
+Use this only for local diagnostics. The default label is a cheap DB discriminator plus Salsa internal id so tracing does not make hot Cairo paths materially slower and long-lived helper processes do not mix counters across compiler DB instances. The trace keeps at most 65,536 counter keys per patched crate and serializes file appends under a write lock. If a named preview is needed, also set `UC_CAIRO214_SIZE_TRACE_NAMES=1`; the fourth column becomes `fnv1a64_hash:function_preview`, with each preview capped. That cap bounds each row's label width, not total file size; large projects can still produce many sampled rows.
 
 ## Preflight A Real Manifest
 

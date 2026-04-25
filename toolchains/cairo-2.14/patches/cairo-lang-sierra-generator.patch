@@ -1,10 +1,11 @@
 diff -ruN a/src/program_generator.rs b/src/program_generator.rs
 --- a/src/program_generator.rs	2026-04-25 10:53:29
 +++ b/src/program_generator.rs	2026-04-25 10:53:29
-@@ -1,7 +1,10 @@
+@@ -1,7 +1,11 @@
 -use std::collections::VecDeque;
 +use std::collections::{HashMap, VecDeque};
 +use std::io::Write;
++use std::path::PathBuf;
 +use std::sync::{Mutex, OnceLock};
  
  use cairo_lang_debug::DebugWithDb;
@@ -13,12 +14,28 @@ diff -ruN a/src/program_generator.rs b/src/program_generator.rs
  use cairo_lang_diagnostics::Maybe;
  use cairo_lang_filesystem::ids::{CrateId, Tracked};
  use cairo_lang_filesystem::location_marks::get_location_marks;
-@@ -419,6 +422,64 @@
+@@ -419,6 +422,92 @@
      Ok(requested_function_ids)
  }
  
++const UC_CAIRO214_SIZE_TRACE_MAX_KEYS: usize = 65_536;
++
++struct UcCairo214SizeTraceConfig {
++    path: Option<PathBuf>,
++    names: bool,
++}
++
++static UC_CAIRO214_SIZE_TRACE_CONFIG: OnceLock<UcCairo214SizeTraceConfig> = OnceLock::new();
 +static UC_CAIRO214_SIZE_TRACE_COUNTS: OnceLock<Mutex<HashMap<String, u64>>> =
 +    OnceLock::new();
++static UC_CAIRO214_SIZE_TRACE_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
++
++fn uc_cairo214_size_trace_config() -> &'static UcCairo214SizeTraceConfig {
++    UC_CAIRO214_SIZE_TRACE_CONFIG.get_or_init(|| UcCairo214SizeTraceConfig {
++        path: std::env::var_os("UC_CAIRO214_SIZE_TRACE").map(PathBuf::from),
++        names: std::env::var_os("UC_CAIRO214_SIZE_TRACE_NAMES").is_some(),
++    })
++}
 +
 +fn uc_cairo214_size_trace_hash(text: &str) -> u64 {
 +    let mut hash = 0xcbf29ce484222325u64;
@@ -42,24 +59,32 @@ diff -ruN a/src/program_generator.rs b/src/program_generator.rs
 +    event: &str,
 +    function_id: ConcreteFunctionWithBodyId<'_>,
 +) {
-+    let Some(path) = std::env::var_os("UC_CAIRO214_SIZE_TRACE") else {
++    let config = uc_cairo214_size_trace_config();
++    let Some(path) = config.path.as_ref() else {
 +        return;
 +    };
-+    let function_key = format!("{:?}", function_id.get_internal_id());
++    let function_key = format!("{:p}:{:?}", db as *const dyn Database as *const (), function_id.get_internal_id());
 +    let key = format!("{event}\t{function_key}");
 +    let counts = UC_CAIRO214_SIZE_TRACE_COUNTS
 +        .get_or_init(|| Mutex::new(HashMap::new()));
 +    let Ok(mut counts) = counts.lock() else {
 +        return;
 +    };
-+    let count = counts.entry(key).or_insert(0);
-+    *count = count.saturating_add(1);
-+    let count = *count;
++    let count = if let Some(count) = counts.get_mut(&key) {
++        *count = count.saturating_add(1);
++        *count
++    } else {
++        if counts.len() >= UC_CAIRO214_SIZE_TRACE_MAX_KEYS {
++            return;
++        }
++        counts.insert(key, 1);
++        1
++    };
 +    drop(counts);
 +    if count != 1 && !count.is_power_of_two() {
 +        return;
 +    }
-+    let function_label = if std::env::var_os("UC_CAIRO214_SIZE_TRACE_NAMES").is_some() {
++    let function_label = if config.names {
 +        let function_path = function_id.full_path(db);
 +        format!(
 +            "{:016x}:{}",
@@ -68,6 +93,10 @@ diff -ruN a/src/program_generator.rs b/src/program_generator.rs
 +        )
 +    } else {
 +        function_key.clone()
++    };
++    let write_lock = UC_CAIRO214_SIZE_TRACE_WRITE_LOCK.get_or_init(|| Mutex::new(()));
++    let Ok(_write_guard) = write_lock.lock() else {
++        return;
 +    };
 +    let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
 +        return;

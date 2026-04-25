@@ -18,17 +18,29 @@ test_prepare_only_rewrites_workspace_manifest_for_cairo214() {
   local stdout_path="$TMP_DIR/prepare.out"
   "$HELPER_SCRIPT" --lane 2.14 --staging-dir "$stage_dir" --prepare-only >"$stdout_path"
 
-  grep -q "Prepared helper staging tree:" "$stdout_path"
-  grep -q 'cairo-lang-compiler = "=2.14.0"' "$stage_dir/Cargo.toml"
-  grep -q 'salsa = "0.24.0"' "$stage_dir/Cargo.toml"
-  grep -q '^\[patch\.crates-io\]' "$stage_dir/Cargo.toml"
-  grep -q 'cairo-lang-lowering = { path = ".uc/helper-lane-patches/cairo-2.14/cairo-lang-lowering" }' \
+  grep -qF "Prepared helper staging tree:" "$stdout_path"
+  grep -qF 'cairo-lang-compiler = "=2.14.0"' "$stage_dir/Cargo.toml"
+  grep -qF 'salsa = "0.24.0"' "$stage_dir/Cargo.toml"
+  grep -qF '[patch.crates-io]' "$stage_dir/Cargo.toml"
+  grep -qF 'cairo-lang-lowering = { path = ".uc/helper-lane-patches/cairo-2.14/cairo-lang-lowering" }' \
     "$stage_dir/Cargo.toml"
-  grep -q 'cairo-lang-sierra-generator = { path = ".uc/helper-lane-patches/cairo-2.14/cairo-lang-sierra-generator" }' \
+  grep -qF 'cairo-lang-sierra-generator = { path = ".uc/helper-lane-patches/cairo-2.14/cairo-lang-sierra-generator" }' \
     "$stage_dir/Cargo.toml"
-  grep -q 'UC_CAIRO214_SIZE_TRACE' \
+  grep -qF 'UC_CAIRO214_SIZE_TRACE_CONFIG' \
     "$stage_dir/.uc/helper-lane-patches/cairo-2.14/cairo-lang-lowering/src/db.rs"
-  grep -q 'UC_CAIRO214_SIZE_TRACE' \
+  grep -qF 'UC_CAIRO214_SIZE_TRACE_MAX_KEYS' \
+    "$stage_dir/.uc/helper-lane-patches/cairo-2.14/cairo-lang-lowering/src/db.rs"
+  grep -qF 'UC_CAIRO214_SIZE_TRACE_WRITE_LOCK' \
+    "$stage_dir/.uc/helper-lane-patches/cairo-2.14/cairo-lang-lowering/src/db.rs"
+  grep -qF 'format!("{:p}:{:?}", db as *const dyn Database as *const (), function_id.get_internal_id())' \
+    "$stage_dir/.uc/helper-lane-patches/cairo-2.14/cairo-lang-lowering/src/db.rs"
+  grep -qF 'UC_CAIRO214_SIZE_TRACE_CONFIG' \
+    "$stage_dir/.uc/helper-lane-patches/cairo-2.14/cairo-lang-sierra-generator/src/program_generator.rs"
+  grep -qF 'UC_CAIRO214_SIZE_TRACE_MAX_KEYS' \
+    "$stage_dir/.uc/helper-lane-patches/cairo-2.14/cairo-lang-sierra-generator/src/program_generator.rs"
+  grep -qF 'UC_CAIRO214_SIZE_TRACE_WRITE_LOCK' \
+    "$stage_dir/.uc/helper-lane-patches/cairo-2.14/cairo-lang-sierra-generator/src/program_generator.rs"
+  grep -qF 'format!("{:p}:{:?}", db as *const dyn Database as *const (), function_id.get_internal_id())' \
     "$stage_dir/.uc/helper-lane-patches/cairo-2.14/cairo-lang-sierra-generator/src/program_generator.rs"
 }
 
@@ -70,10 +82,10 @@ test_prepare_only_accepts_workspace_manifest_without_patch_section() {
     --staging-dir "$stage_dir" \
     --prepare-only >"$stdout_path"
 
-  grep -q "Prepared helper staging tree:" "$stdout_path"
-  grep -q 'cairo-lang-compiler = "=2.14.0"' "$stage_dir/Cargo.toml"
-  grep -q 'salsa = "0.24.0"' "$stage_dir/Cargo.toml"
-  if grep -q '^\[patch\.crates-io\]' "$stage_dir/Cargo.toml"; then
+  grep -qF "Prepared helper staging tree:" "$stdout_path"
+  grep -qF 'cairo-lang-compiler = "=2.14.0"' "$stage_dir/Cargo.toml"
+  grep -qF 'salsa = "0.24.0"' "$stage_dir/Cargo.toml"
+  if grep -qF '[patch.crates-io]' "$stage_dir/Cargo.toml"; then
     echo "unexpected [patch.crates-io] section in no-patch helper staging Cargo.toml" >&2
     return 1
   fi
@@ -89,7 +101,7 @@ test_prepare_only_excludes_in_repo_staging_dir_from_archive() {
     return 1
   fi
 
-  if ! grep -q "Prepared helper staging tree:" "$stdout_path"; then
+  if ! grep -qF "Prepared helper staging tree:" "$stdout_path"; then
     rm -rf "$stage_dir"
     return 1
   fi
@@ -160,12 +172,12 @@ test_prepare_only_applies_helper_lane_patches_from_registry_source() {
       --staging-dir "$stage_dir" \
       --prepare-only >"$stdout_path"
 
-  grep -q "Applied helper lane patch:" "$stdout_path"
-  grep -q "Refreshed helper staging Cargo.lock for patched crates" "$stdout_path"
-  grep -q 'patched helper crate source' \
+  grep -qF "Applied helper lane patch:" "$stdout_path"
+  grep -qF "Refreshed helper staging Cargo.lock for patched crates" "$stdout_path"
+  grep -qF 'patched helper crate source' \
     "$stage_dir/.uc/helper-lane-patches/cairo-2.14/cairo-lang-compiler/README.md"
-  grep -q '^\[patch\.crates-io\]' "$stage_dir/Cargo.toml"
-  grep -q 'cairo-lang-compiler = { path = ".uc/helper-lane-patches/cairo-2.14/cairo-lang-compiler" }' \
+  grep -qF '[patch.crates-io]' "$stage_dir/Cargo.toml"
+  grep -qF 'cairo-lang-compiler = { path = ".uc/helper-lane-patches/cairo-2.14/cairo-lang-compiler" }' \
     "$stage_dir/Cargo.toml"
   (cd "$stage_dir" && cargo metadata --locked --format-version 1 >/dev/null)
 }
@@ -176,7 +188,7 @@ test_prepare_only_and_check_only_are_mutually_exclusive() {
     echo "expected mutually exclusive helper modes to fail" >&2
     return 1
   fi
-  grep -q -- '--prepare-only and --check-only cannot be used together' "$stdout_path"
+  grep -qF -- '--prepare-only and --check-only cannot be used together' "$stdout_path"
 }
 
 test_unsupported_lane_reports_actionable_error() {
@@ -185,9 +197,9 @@ test_unsupported_lane_reports_actionable_error() {
     echo "expected unsupported helper lane to fail" >&2
     return 1
   fi
-  grep -q 'unsupported helper lane: 9.99' "$stdout_path"
-  grep -q 'Available lanes: 2.14' "$stdout_path"
-  if grep -q 'Traceback' "$stdout_path"; then
+  grep -qF 'unsupported helper lane: 9.99' "$stdout_path"
+  grep -qF 'Available lanes: 2.14' "$stdout_path"
+  if grep -qF 'Traceback' "$stdout_path"; then
     echo "unsupported helper lane should not emit a Python traceback" >&2
     cat "$stdout_path" >&2
     return 1
@@ -204,7 +216,7 @@ test_existing_staging_dir_is_not_removed_on_failure() {
     echo "expected pre-existing staging dir to fail" >&2
     return 1
   fi
-  grep -q 'staging dir already exists:' "$stdout_path"
+  grep -qF 'staging dir already exists:' "$stdout_path"
   if [[ ! -f "$stage_dir/sentinel.txt" ]]; then
     echo "pre-existing staging dir was removed by cleanup trap" >&2
     return 1
