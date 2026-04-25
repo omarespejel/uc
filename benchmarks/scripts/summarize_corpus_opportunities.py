@@ -149,6 +149,18 @@ def is_generic_diagnostic_text(value: Any) -> bool:
 
 def diagnostic_quality_issues(diag: dict[str, Any]) -> list[str]:
     issues = [f"missing {field}" for field in sorted(REQUIRED_DIAGNOSTIC_FIELDS) if field not in diag]
+    if "schema_version" in diag:
+        schema_version = diag.get("schema_version")
+        if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+            issues.append("schema_version is not an integer")
+    for field in ("code", "category"):
+        value = diag.get(field)
+        if field in diag and (not isinstance(value, str) or not value.strip()):
+            issues.append(f"{field} is empty")
+    for field in ("retryable", "fallback_used"):
+        value = diag.get(field)
+        if field in diag and not isinstance(value, bool):
+            issues.append(f"{field} is not a boolean")
     for field in ("severity", "title", "docs_url", "safe_automated_action"):
         value = diag.get(field)
         if field in diag and (not isinstance(value, str) or not value.strip()):
