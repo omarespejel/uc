@@ -54,7 +54,23 @@ It should parse `Scarb.toml`, read `Scarb.lock` when present, report package/wor
 
 ### Phase 2: Metadata Parity
 
-Make `uc metadata` capable of serving from the project model behind an explicit gate. Scarb metadata remains the comparison oracle while parity is measured.
+Make `uc metadata` capable of serving from the project model behind the `UC_METADATA_SOURCE` gate. Scarb metadata remains the comparison oracle while parity is measured.
+
+The operational contract for this gate is:
+
+- default/off: unset `UC_METADATA_SOURCE` or set `UC_METADATA_SOURCE=compatibility`
+- enable project-model metadata: set `UC_METADATA_SOURCE=project-model`
+- disable project-model metadata: unset `UC_METADATA_SOURCE` or set `UC_METADATA_SOURCE=compatibility`
+- unsupported values must fail closed with a stable diagnostic before metadata is emitted
+
+Example operator flow:
+
+```sh
+UC_METADATA_SOURCE=project-model uc metadata --manifest-path Scarb.toml --report-path /tmp/uc-metadata-project-model.json
+UC_METADATA_SOURCE=compatibility uc metadata --manifest-path Scarb.toml --report-path /tmp/uc-metadata-compatibility.json
+```
+
+The gate can become default only after project-model metadata matches the compatibility output on the supported corpus and the rollout owner records the comparator evidence.
 
 ### Phase 3: Resolver And Source Cache
 

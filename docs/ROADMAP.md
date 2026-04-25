@@ -19,7 +19,7 @@
 - Add `check`, `test`, `lint`, `metadata` on `uc` core path.
 - Add read-only `uc project inspect --manifest-path <Scarb.toml> --format json`.
 - Resolver and source-fetch fast path (lockfile-first, bounded concurrency).
-- Metadata can be served from the project model behind an explicit gate.
+- Metadata can be served from the project model behind `UC_METADATA_SOURCE=project-model`; see `docs/PROJECT_MODEL_STRATEGY.md`.
 - Error taxonomy and troubleshooting docs.
 
 ## Milestone 3: CI and Proving Acceleration (6 weeks)
