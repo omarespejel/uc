@@ -34,14 +34,14 @@
 5. `uc session-key`
 - Generates deterministic session key from normalized input fields.
 
-1. `uc project inspect`
+6. `uc project inspect`
 - Reads a `Scarb.toml` and optional sibling `Scarb.lock` without mutating files.
 - Supports: `--manifest-path`, `--format json`, `--json`, `--report-path`.
 - Emits package, workspace, target, dependency, lockfile, requested toolchain, read-only native support when determinable, and stable diagnostics in one JSON report.
 - The report includes `readonly=true` and `mutation_status=none`; use this as the agent pre-build project-state surface.
 - The raw report is local evidence and can include absolute paths plus manifest/lockfile hashes; redact or avoid forwarding it when sharing outside the host.
 
-1. `uc support native`
+7. `uc support native`
 - Probes whether a manifest is eligible for native compile in the current `uc` binary.
 - Supports: `--manifest-path`, `--format text|json`, `--json`.
 - Returns a structured reason for ineligible manifests so scripts and local benchmark harnesses can classify cases before measuring them.
@@ -51,31 +51,31 @@
   - missing or invalid external helper lanes
   - unparseable compiler versions
 
-1. `uc migrate`
+8. `uc migrate`
 - Analyzes `Scarb.toml` and emits a migration readiness report.
 - Optional `--emit-uc-toml <path>` generates a starter `Uc.toml` scaffold.
 
-1. `uc agent eval`
+9. `uc agent eval`
 - Probes a manifest and returns an agent decision: proceed to build/benchmark, run a safe action and retry, or stop as native-unsupported.
 - Always emits JSON and can also write it with `--report-path`.
 - Includes the nested native support report, safe actions, manifest-specific next commands, and fallback/toolchain state.
 
-1. `uc agent safe-action`
+10. `uc agent safe-action`
 - Dry-run-first remediation surface.
 - Supports `build-helper-lane`, `rebuild-helper-lane`, `refresh-cache`, `rerun-doctor`, and `regenerate-support-matrix`.
 - Does not execute unless `--execute` is supplied.
 - Emits a structured safe-action report with command, dry-run status, execution status, exit code, stdout, and stderr.
 
-1. `uc replay <bundle>`
+11. `uc replay <bundle>`
 - Reads a `uc build --record-failure` bundle and emits a replay report.
 - Dry-run by default; `--execute` replays the recorded command after stripping legacy `--record-failure` arguments so replay cannot overwrite the original evidence bundle.
 
-1. `uc mcp serve`
+12. `uc mcp serve`
 - Emits the read-only MCP command/resource catalog as JSON.
 - Covers `doctor`, `project_inspect`, `support_native`, `explain_diagnostic`, `select_toolchain`, `benchmark_report`, and `profile_native_frontend`.
 - This is intentionally read-only: mutable actions stay behind `uc agent safe-action --execute`.
 
-1. `uc daemon`
+13. `uc daemon`
 - `start`: launches local background daemon (`~/.uc/daemon/uc.sock` by default).
 - `status`: checks daemon reachability and reports pid/start timestamp.
 - `stop`: requests graceful shutdown.

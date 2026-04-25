@@ -2470,7 +2470,8 @@ fn project_package_summary_from_manifest(manifest: &TomlValue) -> ProjectPackage
     ProjectPackageSummary {
         name: get_package_string("name"),
         version: get_package_string("version"),
-        edition: get_package_string("edition").or_else(|| Some(DEFAULT_CAIRO_EDITION.to_string())),
+        edition: get_package_string("edition")
+            .or_else(|| package.is_some().then(|| DEFAULT_CAIRO_EDITION.to_string())),
         cairo_version: get_package_string("cairo-version")
             .or_else(|| get_package_string("cairo_version")),
     }

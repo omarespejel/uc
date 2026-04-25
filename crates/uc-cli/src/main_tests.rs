@@ -607,6 +607,33 @@ fn project_inspect_report_returns_structured_diagnostic_for_invalid_manifest() {
 }
 
 #[test]
+fn project_inspect_workspace_only_manifest_leaves_package_empty() {
+    let dir = unique_test_dir("uc-project-inspect-workspace-only");
+    let _cleanup = TestDirCleanup::new(&dir);
+    let manifest_path = dir.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        r#"[workspace]
+members = ["crates/*"]
+"#,
+    )
+    .expect("write manifest");
+
+    let report =
+        project_inspect_report_from_manifest_path(&manifest_path).expect("inspect should succeed");
+
+    assert_eq!(report.package.name, None);
+    assert_eq!(report.package.version, None);
+    assert_eq!(report.package.edition, None);
+    assert_eq!(report.package.cairo_version, None);
+    assert!(report.workspace.has_workspace_table);
+    assert_eq!(report.workspace.members, vec!["crates/*".to_string()]);
+    assert!(report.readonly);
+    assert_eq!(report.mutation_status, "none");
+    assert_project_inspect_left_no_artifacts(&dir);
+}
+
+#[test]
 fn project_inspect_skips_metadata_probe_to_preserve_readonly_contract() {
     let dir = unique_test_dir("uc-project-inspect-readonly-skip");
     let _cleanup = TestDirCleanup::new(&dir);
@@ -868,6 +895,9 @@ fn project_inspect_does_not_hash_files_above_inspect_size_limits() {
 
     assert!(!report.manifest.valid);
     assert_eq!(report.manifest.hash, None);
+    assert!(report.readonly);
+    assert_eq!(report.mutation_status, "none");
+    assert!(report.native_support.is_none());
     assert!(report
         .diagnostics
         .iter()
@@ -898,6 +928,9 @@ starknet = ">=2.14.0"
     assert!(report.lockfile.present);
     assert!(!report.lockfile.valid);
     assert_eq!(report.lockfile.hash, None);
+    assert!(report.readonly);
+    assert_eq!(report.mutation_status, "none");
+    assert!(report.native_support.is_none());
     assert!(report
         .diagnostics
         .iter()
