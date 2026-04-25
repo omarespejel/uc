@@ -13,6 +13,28 @@ run_test() {
   "$@"
 }
 
+assert_json_value() {
+  local name="$1"
+  local actual="$2"
+  local expected="$3"
+  local json_path="$4"
+  if [[ "$actual" != "$expected" ]]; then
+    echo "unexpected $name: got '$actual', expected '$expected'" >&2
+    cat "$json_path" >&2
+    exit 1
+  fi
+}
+
+assert_markdown_contains() {
+  local needle="$1"
+  local markdown_path="$2"
+  if ! grep -Fq "$needle" "$markdown_path"; then
+    echo "markdown summary is missing expected substring: $needle" >&2
+    cat "$markdown_path" >&2
+    exit 1
+  fi
+}
+
 write_real_repo_fixture() {
   local path="$1"
   cat > "$path" <<'JSON'
@@ -138,7 +160,7 @@ test_real_repo_summary_records_opportunities() {
 
   "$SUMMARY_SCRIPT" --benchmark-json "$fixture" --out-json "$out_json" --out-md "$out_md"
 
-  local source_kind blocker_count fallback_gap unsupported_gap hotspot unstable weak_speedup diag_gap warm_opportunity markdown_text
+  local source_kind blocker_count fallback_gap unsupported_gap hotspot unstable weak_speedup diag_gap warm_opportunity
   source_kind="$(jq -r '.source_kind' "$out_json")"
   blocker_count="$(jq -r '.summary.blocker_opportunity_count' "$out_json")"
   fallback_gap="$(jq -r '.cases[] | select(.tag=="fallback-case") | .opportunity_codes | index("UCO1002") != null' "$out_json")"
@@ -148,18 +170,20 @@ test_real_repo_summary_records_opportunities() {
   weak_speedup="$(jq -r '.cases[] | select(.tag=="supported-hotspot") | .opportunity_codes | index("UCO3006") != null' "$out_json")"
   diag_gap="$(jq -r '.cases[] | select(.tag=="fallback-case") | .opportunity_codes | index("UCO5001") != null' "$out_json")"
   warm_opportunity="$(jq -r '.cases[] | select(.tag=="supported-hotspot") | .opportunity_codes | index("UCO4002") != null' "$out_json")"
-  markdown_text="$(cat "$out_md")"
 
-  if [[ "$source_kind" != "real_repo_benchmark" || "$blocker_count" != "2" || "$fallback_gap" != "true" || "$unsupported_gap" != "true" || "$hotspot" != "true" || "$unstable" != "true" || "$weak_speedup" != "true" || "$diag_gap" != "true" || "$warm_opportunity" != "true" ]]; then
-    echo "unexpected opportunity summary" >&2
-    cat "$out_json" >&2
-    exit 1
-  fi
-  if [[ "$markdown_text" != *"Corpus Opportunity Summary"* || "$markdown_text" != *"UCO3001"* || "$markdown_text" != *"fallback-case"* ]]; then
-    echo "markdown summary is missing expected content" >&2
-    cat "$out_md" >&2
-    exit 1
-  fi
+  assert_json_value "source_kind" "$source_kind" "real_repo_benchmark" "$out_json"
+  assert_json_value "blocker_count" "$blocker_count" "2" "$out_json"
+  assert_json_value "fallback_gap" "$fallback_gap" "true" "$out_json"
+  assert_json_value "unsupported_gap" "$unsupported_gap" "true" "$out_json"
+  assert_json_value "hotspot" "$hotspot" "true" "$out_json"
+  assert_json_value "unstable" "$unstable" "true" "$out_json"
+  assert_json_value "weak_speedup" "$weak_speedup" "true" "$out_json"
+  assert_json_value "diag_gap" "$diag_gap" "true" "$out_json"
+  assert_json_value "warm_opportunity" "$warm_opportunity" "true" "$out_json"
+
+  assert_markdown_contains "Corpus Opportunity Summary" "$out_md"
+  assert_markdown_contains "UCO3001" "$out_md"
+  assert_markdown_contains "fallback-case" "$out_md"
 }
 
 test_deployed_wrapper_preserves_corpus_metadata() {
