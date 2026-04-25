@@ -3,7 +3,7 @@
   "$id": "https://github.com/omarespejel/uc/docs/agent/schemas/failure-bundle.schema.json",
   "title": "uc FailureBundle",
   "type": "object",
-  "additionalProperties": true,
+  "additionalProperties": false,
   "required": [
     "schema_version",
     "generated_at_epoch_ms",
@@ -15,15 +15,24 @@
     "schema_version": { "const": 1 },
     "generated_at_epoch_ms": { "type": "number" },
     "command": { "type": "array", "items": { "type": "string" } },
-    "manifest_path": { "type": "string" },
-    "workspace_root": { "type": "string" },
-    "manifest_hash": { "type": "string" },
-    "lockfile_hash": { "type": "string" },
-    "selected_support": { "$ref": "native-support-report.schema.json" },
+    "manifest_path": { "type": ["string", "null"] },
+    "workspace_root": { "type": ["string", "null"] },
+    "manifest_hash": { "type": ["string", "null"] },
+    "lockfile_hash": { "type": ["string", "null"] },
+    "selected_support": {
+      "anyOf": [
+        { "$ref": "native-support-report.schema.json" },
+        { "type": "null" }
+      ]
+    },
     "redacted_environment": {
       "type": "object",
       "additionalProperties": { "type": "string" }
     },
-    "error": { "type": "string" }
+    "error": { "type": "string" },
+    "extensions": {
+      "type": "object",
+      "additionalProperties": true
+    }
   }
 }
