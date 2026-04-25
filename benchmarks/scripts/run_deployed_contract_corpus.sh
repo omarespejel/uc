@@ -444,6 +444,8 @@ jq -n \
      else
        "after \($corpus[0].deduplication.key) deduplication"
      end;
+   def quantity($n; $singular; $plural):
+     "\($n) \(if (($n // 0) | tonumber) == 1 then $singular else $plural end)";
    {
      schema_version: 1,
      generated_at: $generated_at,
@@ -490,12 +492,12 @@ jq -n \
        ),
        compiled_all_claim_text: (
          if compiled_all_contracts then
-           "We compiled every contract in the pinned \($corpus[0].chain) deployed-contract corpus (\($corpus[0].summary.item_count) items, \($corpus[0].summary.unique_class_hash_count) unique class hashes, Cairo \($corpus[0].summary.cairo_version_min) through \($corpus[0].summary.cairo_version_max)) and published support/benchmark artifacts."
+           "We compiled every contract in the pinned \($corpus[0].chain) deployed-contract corpus (\(quantity($corpus[0].summary.item_count; "item"; "items")), \(quantity($corpus[0].summary.unique_class_hash_count; "unique class hash"; "unique class hashes")), Cairo \($corpus[0].summary.cairo_version_min) through \($corpus[0].summary.cairo_version_max)) and published support/benchmark artifacts."
          else null end
        ),
        selected_units_claim_text: (
          if compiled_selected_units then
-           "We compiled every selected deployed unit in the pinned \($corpus[0].chain) deployed-contract corpus \(deduplication_phrase) (\($corpus[0].summary.item_count) items from \($corpus[0].deduplication.input_count) input records, \($corpus[0].summary.unique_class_hash_count) unique class hashes, Cairo \($corpus[0].summary.cairo_version_min) through \($corpus[0].summary.cairo_version_max)) and published support/benchmark artifacts."
+           "We compiled every selected deployed unit in the pinned \($corpus[0].chain) deployed-contract corpus \(deduplication_phrase) (\(quantity($corpus[0].summary.item_count; "item"; "items")) from \(quantity($corpus[0].deduplication.input_count; "input record"; "input records")), \(quantity($corpus[0].summary.unique_class_hash_count; "unique class hash"; "unique class hashes")), Cairo \($corpus[0].summary.cairo_version_min) through \($corpus[0].summary.cairo_version_max)) and published support/benchmark artifacts."
          else null end
        ),
        native_supported_claim_text: (
