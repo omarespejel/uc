@@ -77,12 +77,14 @@ expand coverage, surface blockers, and produce an agent-readable backlog.
 
 Artifacts:
 
-- Cases file: `/Users/espejelomar/StarkNet/uc-20-contract-experiment-20260425/cases.tsv`
-- Benchmark JSON: `/Users/espejelomar/StarkNet/uc-20-contract-experiment-20260425/results/real-repo-bench-20260426-011206.json`
-- Benchmark Markdown: `/Users/espejelomar/StarkNet/uc-20-contract-experiment-20260425/results/real-repo-bench-20260426-011206.md`
-- Opportunity JSON: `/Users/espejelomar/StarkNet/uc-20-contract-experiment-20260425/corpus-opportunities.json`
-- Opportunity Markdown: `/Users/espejelomar/StarkNet/uc-20-contract-experiment-20260425/corpus-opportunities.md`
-- Cairo 2.14 helper: `/Users/espejelomar/.uc/toolchain-helpers/uc-cairo214-helper/bin/uc`
+- Evidence root: `<abs/path>/uc-20-contract-experiment-20260425`
+- Cases file: `<evidence-root>/cases.tsv`
+- Benchmark JSON: `<evidence-root>/results/real-repo-bench-20260426-011206.json`
+- Benchmark Markdown: `<evidence-root>/results/real-repo-bench-20260426-011206.md`
+- Opportunity JSON: `<evidence-root>/corpus-opportunities.json`
+- Opportunity Markdown: `<evidence-root>/corpus-opportunities.md`
+- Cairo 2.14 helper: `${UC_NATIVE_TOOLCHAIN_2_14_BIN}`, produced by
+  `./scripts/build_native_toolchain_helper.sh --lane 2.14`
 
 Support matrix:
 

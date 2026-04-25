@@ -260,7 +260,7 @@ test_complete_but_generic_diagnostic_is_not_agent_grade() {
             {
               "code": "UCN2002",
               "category": "native_fallback_local_native_error",
-              "what_happened": "Compilation failed.",
+              "what_happened": "   ",
               "why": "Compilation failed.",
               "how_to_fix": [
                 "Review the selected native toolchain lane."

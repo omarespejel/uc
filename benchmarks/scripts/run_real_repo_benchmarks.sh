@@ -377,15 +377,16 @@ prefetch_manifest_dependencies() {
   if [[ -n "${PREFETCHED_MANIFESTS[$manifest_path]:-}" ]]; then
     return
   fi
+  local fetch_exit_code=0
   if [[ -n "$log_path" ]]; then
     mkdir -p "$(dirname "$log_path")"
-    if ! scarb --manifest-path "$manifest_path" --offline fetch >"$log_path" 2>&1; then
-      echo "scarb fetch failed for manifest_path=$manifest_path (log: $log_path)" >&2
-      return 1
-    fi
-  elif ! scarb --manifest-path "$manifest_path" --offline fetch >/dev/null; then
-    echo "scarb fetch failed for manifest_path=$manifest_path" >&2
-    return 1
+    scarb --manifest-path "$manifest_path" --offline fetch >"$log_path" 2>&1 || fetch_exit_code=$?
+  else
+    scarb --manifest-path "$manifest_path" --offline fetch >/dev/null || fetch_exit_code=$?
+  fi
+  if [[ "$fetch_exit_code" -ne 0 ]]; then
+    echo "scarb fetch failed for manifest_path=$manifest_path${log_path:+ (log: $log_path)} exit_code=$fetch_exit_code" >&2
+    return "$fetch_exit_code"
   fi
   PREFETCHED_MANIFESTS["$manifest_path"]=1
 }
@@ -426,16 +427,19 @@ classify_support_matrix_case() {
   mkdir -p "$classify_dir"
   cp -PR "$source_dir/." "$classify_dir"
   reset_workload_outputs "$classify_dir"
-  if ! prefetch_manifest_dependencies "$manifest_path" "$prefetch_log_path"; then
+  local prefetch_exit_code=0
+  prefetch_manifest_dependencies "$manifest_path" "$prefetch_log_path" || prefetch_exit_code=$?
+  if [[ "$prefetch_exit_code" -ne 0 ]]; then
     rm -rf "$classify_dir"
     jq -n \
       --argjson native_support "$support_json" \
       --arg log_path "$prefetch_log_path" \
+      --argjson exit_code "$prefetch_exit_code" \
       '{
         classification: "build_failed",
         compile_backend: null,
         fallback_used: false,
-        exit_code: 1,
+        exit_code: $exit_code,
         elapsed_ms: null,
         log_path: $log_path,
         report_path: null,
@@ -655,9 +659,11 @@ benchmark_supported_case() {
   local source_dir
   source_dir="$(cd "$(dirname "$manifest_path")" && pwd -P)"
   local prefetch_log_path="$RESULTS_DIR/real-repo-${tag}-prefetch.log"
-  if ! prefetch_manifest_dependencies "$manifest_path" "$prefetch_log_path"; then
+  local prefetch_exit_code=0
+  prefetch_manifest_dependencies "$manifest_path" "$prefetch_log_path" || prefetch_exit_code=$?
+  if [[ "$prefetch_exit_code" -ne 0 ]]; then
     local prefetch_failure_json
-    prefetch_failure_json="$(measurement_failure_json "prefetch" 1 "$prefetch_log_path")"
+    prefetch_failure_json="$(measurement_failure_json "prefetch" "$prefetch_exit_code" "$prefetch_log_path")"
     jq -n \
       --arg tag "$tag" \
       --arg manifest_path "$manifest_path" \
