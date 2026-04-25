@@ -105,7 +105,6 @@ Monero remains the right next profiling target: most cold `uc` time is still in 
 1fe7c1a777dc565cb918c4c72bb6aaf63f2a79427871ff1e126e710bd4cbfb42  reviewed-source-inventory.json
 4b55caa829353f6b0c5fb56a0f2175db975716774652614f86a0940c6f4b17e3  pinned-source-index.json
 2eb32ce9c2d1c57a279388bf3eae1982b74decf1c329c991c741ba7aa9f3d921  generated-corpus.json
-3b4557707f3681ba3ebc34012adb2fe5a861ccb73f79f8e7b4948a8e4ef0bed0  target/release/uc
 d67bcf16d83a8b5140188f405b42d5e68d3cd4a40d3d6565eeea1d9f234a810a  results-current-final/deployed-contract-corpus-bench-20260425-201850.json
 26982507475eb5ba1c544963f106f3ddd890a88f311bce4961408f8c454392ab  results-current-final/real-repo-bench-20260425-201850.json
 cec9bfbdbdd2ee8a74f2b622882b9eb04e159a6bfd67e4a3a1811f2ff9e345e3  results-current-final/real-repo-braavos_account_v1_2_0_class-uc-auto-build-report.json
