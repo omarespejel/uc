@@ -10,6 +10,8 @@ The launch wedge is not just speed. The launch wedge is:
 
 > A Cairo compiler agents can operate reliably: structured diagnostics, native multi-toolchain support, reproducible failure bundles, and benchmark claims anyone can verify.
 
+The longer-term product boundary is wider than `scarb build` acceleration. `uc` should become the agent-first project tool that owns manifest import, lockfile interpretation, metadata, resolver/source-cache behavior, build/test/check/lint/fmt commands, diagnostics, and failure replay. Scarb remains a compatibility bridge until parity gates pass.
+
 ## Product Principles
 
 1. Do not make agents parse prose.
@@ -20,6 +22,7 @@ The launch wedge is not just speed. The launch wedge is:
 6. Safe automated actions are explicit and reversible by default.
 7. Source edits require explicit permission.
 8. Repo policy comes from checked-in files like `AGENTS.md`, `.codex/START_HERE.md`, and `docs/agent/*`.
+9. Scarb compatibility is a migration path, not the final control plane.
 
 ## Launch-Minimum Agent Surfaces
 
@@ -64,6 +67,14 @@ Already in this PR or required before launch:
    - Keep source edits behind an explicit `--allow-source-edits` gate.
    - Require failure-bundle replay evidence before allowing source-modifying actions.
 
+6. `uc-project-inspect`
+   - Add read-only Scarb manifest/lockfile import as `uc project inspect --manifest-path <Scarb.toml> --format json`.
+   - Emit a stable project-model schema for agents before replacing metadata/resolver behavior.
+
+7. `metadata-from-project-model`
+   - Move `uc metadata` onto the `uc` project model behind an explicit gate.
+   - Keep Scarb as comparator until metadata parity passes.
+
 ## MCP Shape
 
 Read-only MCP tools should eventually expose:
@@ -107,6 +118,12 @@ Agents should start with support probing, not build-and-guess:
 uc support native --manifest-path Scarb.toml --format json
 uc agent eval --manifest-path Scarb.toml
 ./scripts/doctor.sh --uc-bin ./target/release/uc --manifest-path /abs/path/to/Scarb.toml
+```
+
+After the project-inspect surface exists, agents should run it before build or metadata work:
+
+```sh
+uc project inspect --manifest-path Scarb.toml --format json
 ```
 
 If the diagnostic says `safe_automated_action=build_helper_lane`, the agent may run:

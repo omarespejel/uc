@@ -1,7 +1,9 @@
 # Product Charter
 
 ## Product
-`uc`: Cairo build cache and session manager that accelerates Scarb-backed workflows.
+`uc`: agent-first Cairo compiler and project tool.
+
+`uc` starts as a Scarb-compatible acceleration and observability layer. The end state is to own the Cairo project/package/build/test workflow directly and sunset Scarb from default workflows once parity gates pass.
 
 ## Vision
 By default, Cairo developers and CI should run `uc` for package resolution, build, test, execute, prove, lint, and format workflows with better speed, stronger observability, and deterministic outputs.
@@ -26,12 +28,15 @@ By default, Cairo developers and CI should run `uc` for package resolution, buil
 
 ## Scope
 - In scope:
+  - Scarb-compatible project import.
+  - `uc`-owned project and lockfile model.
   - Resolver/source engine.
   - Build graph planner.
   - Compiler session manager/daemon.
   - Local + remote content-addressed cache.
   - Core command surface (`build/check/test/execute/prove/lint/fmt/metadata`).
 - Out of scope for initial proof:
+  - Removing Scarb fallback before parity gates pass.
   - LSP-native implementation.
   - Advanced STWO proof caching beyond baseline hooks.
 

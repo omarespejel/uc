@@ -9,6 +9,7 @@ This directory is the checked-in handoff layer for humans, coding agents, and PR
 - `PR_BOT_POLICY.md`: how CodeRabbit and Qodo should be configured and interpreted.
 - `REPO_MAP.md`: generated map of the current repo entrypoints and hot files.
 - `AGENT_FIRST_COMPILER.md`: product and architecture direction for agent-operable compiler workflows.
+- `../SCARB_SUNSET_STRATEGY.md`: Scarb compatibility, replacement, and sunset boundary.
 - `AGENT_DIAGNOSTICS.md`: stable diagnostic-code contract for agent JSON consumers.
 - `AGENT_QUICKSTART.md`: command sequence agents should prefer before build, fix, or benchmark work.
 - `HUMAN_QUICKSTART.md`: human-oriented command sequence for the same support/build surfaces.

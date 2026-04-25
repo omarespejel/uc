@@ -15,6 +15,7 @@ required_files=(
   docs/agent/AGENT_QUICKSTART.md
   docs/agent/HUMAN_QUICKSTART.md
   docs/AGENT_FIRST_LAUNCH_MINIMUM_2026-04-24.md
+  docs/SCARB_SUNSET_STRATEGY.md
   docs/agent/schemas/native-diagnostic.schema.json
   docs/agent/schemas/native-support-report.schema.json
   docs/agent/schemas/build-report.schema.json
