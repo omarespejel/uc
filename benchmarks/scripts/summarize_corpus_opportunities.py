@@ -12,15 +12,19 @@ from typing import Any
 
 SCHEMA_VERSION = 1
 REQUIRED_DIAGNOSTIC_FIELDS = {
+    "schema_version",
     "code",
     "category",
+    "severity",
+    "title",
+    "docs_url",
     "what_happened",
     "why",
     "how_to_fix",
+    "next_commands",
+    "safe_automated_action",
     "retryable",
     "fallback_used",
-    "toolchain_expected",
-    "toolchain_found",
 }
 GENERIC_DIAGNOSTIC_TEXT = {
     "compilation failed",

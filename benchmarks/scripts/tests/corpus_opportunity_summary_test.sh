@@ -258,13 +258,21 @@ test_complete_but_generic_diagnostic_is_not_agent_grade() {
         "build_report": {
           "diagnostics": [
             {
+              "schema_version": 1,
               "code": "UCN2002",
               "category": "native_fallback_local_native_error",
+              "severity": "warn",
+              "title": "Native local build downgraded to Scarb",
+              "docs_url": "https://github.com/omarespejel/uc/blob/main/docs/agent/AGENT_DIAGNOSTICS.md#ucn2002",
               "what_happened": "   ",
               "why": "Compilation failed.",
               "how_to_fix": [
                 "Review the selected native toolchain lane."
               ],
+              "next_commands": [
+                "uc support native --manifest-path <Scarb.toml> --format json"
+              ],
+              "safe_automated_action": "inspect_native_support_then_retry",
               "retryable": true,
               "fallback_used": true,
               "toolchain_expected": "2.14.0",
