@@ -39,6 +39,7 @@ Lane-specific Cairo patches are applied only after the main-lane patch section i
 - the builder copies the matching exact version from `$UC_HELPER_CARGO_REGISTRY_SRC`, `$CARGO_HOME/registry/src`, or `$HOME/.cargo/registry/src`
 - patched sources live only in the staging tree under `.uc/helper-lane-patches/cairo-2.14/`
 - the staging manifest receives a fresh `[patch.crates-io]` section pointing at those patched copies
+- when patches are present, the staging `Cargo.lock` is refreshed before any subsequent `--locked` helper build or test
 
 This keeps helper-lane Cairo experiments auditable as small checked-in patch files without vendoring whole `cairo-lang` crates into this repo.
 
