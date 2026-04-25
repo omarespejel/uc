@@ -215,6 +215,33 @@ Do not turn sample-corpus output into launch copy. A `coverage=sample` corpus is
 valid for smoke testing the artifact path, but the generated claim guard will
 mark the “compiled every deployed contract” sentence unsafe.
 
+## Summarize Corpus Opportunities
+
+After every real-repo or deployed-contract corpus run, generate an opportunity
+summary before deciding what to optimize:
+
+```bash
+./benchmarks/scripts/summarize_corpus_opportunities.py \
+  --benchmark-json /abs/path/to/deployed-contract-corpus-bench.json \
+  --out-json /abs/path/to/corpus-opportunities.json \
+  --out-md /abs/path/to/corpus-opportunities.md
+```
+
+The summary is intentionally agent-readable. It converts support classifications,
+fallback diagnostics, benchmark failures, unstable lanes, speed ratios, and
+phase telemetry into stable `UCO*` opportunity codes. Use it as the experiment
+backlog for larger corpora:
+
+- `UCO1001` / `UCO1002` / `UCO1003`: native support, fallback, or build blockers.
+- `UCO2001` / `UCO2002`: failed or unstable benchmark lanes.
+- `UCO3001` through `UCO3007`: phase-level acceleration targets.
+- `UCO4001` / `UCO4002`: bounded launch-evidence candidates.
+- `UCO5001`: diagnostics that are not yet complete enough for agent remediation.
+
+Do not use the opportunity summary as a launch claim by itself. It is an
+experiment-control artifact. Public claims still come only from the benchmark
+artifact's claim guard and from same-window benchmark comparisons.
+
 ## Fast Iteration Loop (Developer Lane)
 ```bash
 ./benchmarks/scripts/run_fast_perf_check.sh
