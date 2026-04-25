@@ -406,7 +406,7 @@ jq -n \
      ([ $corpus[0].items[] | select(.source_kind != "deployed_contract") ] | length);
    def failed_native_benchmarks:
      ([ $bench[0].cases[] | select(.benchmark_status == "failed") ] | length);
-   def compiled_all:
+   def compiled_selected_units:
      ($corpus[0].selection.coverage == "complete_deployed_contracts")
      and (non_deployed_item_count == 0)
      and ((counts.native_supported // 0) == item_count)
@@ -414,8 +414,12 @@ jq -n \
      and ((counts.native_unsupported // 0) == 0)
      and ((counts.build_failed // 0) == 0)
      and (failed_native_benchmarks == 0);
+   def compiled_all_contracts:
+     compiled_selected_units
+     and ($corpus[0].deduplication.key == "none")
+     and (($corpus[0].deduplication.input_count // 0) == item_count);
    def native_all:
-     compiled_all;
+     compiled_selected_units;
    {
      schema_version: 1,
      generated_at: $generated_at,
@@ -434,13 +438,18 @@ jq -n \
        unstable_lane_count: ($bench[0].summary.unstable_lane_count // 0)
      },
      claim_guard: {
-       safe_to_say_compiled_all_deployed_contracts_in_corpus: compiled_all,
+       safe_to_say_compiled_all_deployed_contracts_in_corpus: compiled_all_contracts,
+       safe_to_say_compiled_all_selected_deployed_units_in_corpus: compiled_selected_units,
        safe_to_say_all_items_native_supported: native_all,
        reason: (
          if $corpus[0].selection.coverage != "complete_deployed_contracts" then
            "corpus selection coverage is sample, not complete_deployed_contracts"
          elif non_deployed_item_count != 0 then
            "corpus contains non-deployed source_kind rows"
+         elif compiled_selected_units and ($corpus[0].deduplication.key != "none") then
+           "corpus is deduplicated by \($corpus[0].deduplication.key); safe only for selected deduped deployed units, not every deployed contract address"
+         elif compiled_selected_units and (($corpus[0].deduplication.input_count // 0) != item_count) then
+           "corpus input_count does not equal item_count; safe only for selected deduped deployed units, not every deployed contract address"
          elif (counts.fallback_used // 0) != 0 then
            "one or more corpus items used fallback"
          elif (counts.native_unsupported // 0) != 0 then
@@ -456,8 +465,13 @@ jq -n \
          end
        ),
        compiled_all_claim_text: (
-         if compiled_all then
+         if compiled_all_contracts then
            "We compiled every contract in the pinned \($corpus[0].chain) deployed-contract corpus (\($corpus[0].summary.item_count) items, \($corpus[0].summary.unique_class_hash_count) unique class hashes, Cairo \($corpus[0].summary.cairo_version_min) through \($corpus[0].summary.cairo_version_max)) and published support/benchmark artifacts."
+         else null end
+       ),
+       selected_units_claim_text: (
+         if compiled_selected_units then
+           "We compiled every selected deployed unit in the pinned \($corpus[0].chain) deployed-contract corpus after \($corpus[0].deduplication.key) deduplication (\($corpus[0].summary.item_count) items from \($corpus[0].deduplication.input_count) input records, \($corpus[0].summary.unique_class_hash_count) unique class hashes, Cairo \($corpus[0].summary.cairo_version_min) through \($corpus[0].summary.cairo_version_max)) and published support/benchmark artifacts."
          else null end
        ),
        native_supported_claim_text: (
@@ -489,9 +503,11 @@ jq -n \
   echo
   jq -r '
     "- Safe to say compiled every deployed contract in this corpus: \(.claim_guard.safe_to_say_compiled_all_deployed_contracts_in_corpus)",
+    "- Safe to say compiled every selected deployed unit in this corpus: \(.claim_guard.safe_to_say_compiled_all_selected_deployed_units_in_corpus)",
     "- Safe to say every item was native-supported: \(.claim_guard.safe_to_say_all_items_native_supported)",
     "- Reason: \(.claim_guard.reason)",
     (if .claim_guard.compiled_all_claim_text then "- Compiled-all claim: \(.claim_guard.compiled_all_claim_text)" else "- Compiled-all claim: <not safe for this artifact>" end),
+    (if .claim_guard.selected_units_claim_text then "- Selected-unit claim: \(.claim_guard.selected_units_claim_text)" else "- Selected-unit claim: <not safe for this artifact>" end),
     (if .claim_guard.native_supported_claim_text then "- Native-supported claim: \(.claim_guard.native_supported_claim_text)" else "- Native-supported claim: <not safe for this artifact>" end)
   ' "$OUT_JSON"
   echo

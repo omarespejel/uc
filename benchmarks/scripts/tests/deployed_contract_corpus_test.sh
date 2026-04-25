@@ -457,10 +457,12 @@ test_rejects_non_string_optional_fields() {
 
 run_corpus_benchmark() {
   local coverage="$1"
-  local corpus_dir="$TEST_TMP_DIR/run-$coverage/corpora"
-  local case_root="$TEST_TMP_DIR/run-$coverage/cases"
-  local results_dir="$TEST_TMP_DIR/run-$coverage/results: dir"
-  local mock_bin_dir="$TEST_TMP_DIR/run-$coverage/mock-bin"
+  local dedupe_key="${2:-class_hash}"
+  local run_id="$coverage-$dedupe_key"
+  local corpus_dir="$TEST_TMP_DIR/run-$run_id/corpora"
+  local case_root="$TEST_TMP_DIR/run-$run_id/cases"
+  local results_dir="$TEST_TMP_DIR/run-$run_id/results: dir"
+  local mock_bin_dir="$TEST_TMP_DIR/run-$run_id/mock-bin"
   mkdir -p "$corpus_dir" "$case_root" "$results_dir" "$mock_bin_dir"
   write_manifest_case "$case_root" "cairo214"
   write_manifest_case "$case_root" "cairo216"
@@ -470,11 +472,11 @@ run_corpus_benchmark() {
   local item_a item_b
   item_a="$(item_json cairo214 "../cases/cairo214/Scarb.toml" "0x214" "2.14.0")"
   item_b="$(item_json cairo216 "../cases/cairo216/Scarb.toml" "0x216" "2.16.0")"
-  write_corpus_file "$corpus_dir/corpus.json" "$coverage" class_hash "$item_a" "$item_b"
+  write_corpus_file "$corpus_dir/corpus.json" "$coverage" "$dedupe_key" "$item_a" "$item_b"
 
   PATH="$mock_bin_dir:$PATH" \
-  MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/run-$coverage/uc.args" \
-  MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/run-$coverage/scarb.args" \
+  MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/run-$run_id/uc.args" \
+  MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/run-$run_id/scarb.args" \
   "$CORPUS_SCRIPT" \
     --uc-bin "$mock_bin_dir/uc" \
     --results-dir "$results_dir" \
@@ -594,7 +596,7 @@ test_sample_corpus_blocks_compiled_all_claim() {
   fi
 }
 
-test_complete_supported_corpus_emits_bounded_claim() {
+test_complete_class_deduped_corpus_emits_selected_unit_claim_only() {
   local stdout_text
   stdout_text="$(run_corpus_benchmark complete_deployed_contracts)"
   local json_path md_path
@@ -603,17 +605,51 @@ test_complete_supported_corpus_emits_bounded_claim() {
   [[ -f "$json_path" ]] || { echo "missing corpus benchmark json: $json_path" >&2; return 1; }
   [[ -f "$md_path" ]] || { echo "missing corpus benchmark markdown: $md_path" >&2; return 1; }
 
-  local safe all_supported claim markdown_text
+  local safe selected_safe all_supported claim selected_claim reason markdown_text
   safe="$(jq -r '.claim_guard.safe_to_say_compiled_all_deployed_contracts_in_corpus' "$json_path")"
+  selected_safe="$(jq -r '.claim_guard.safe_to_say_compiled_all_selected_deployed_units_in_corpus' "$json_path")"
   all_supported="$(jq -r '.claim_guard.safe_to_say_all_items_native_supported' "$json_path")"
   claim="$(jq -r '.claim_guard.compiled_all_claim_text // ""' "$json_path")"
+  selected_claim="$(jq -r '.claim_guard.selected_units_claim_text // ""' "$json_path")"
+  reason="$(jq -r '.claim_guard.reason' "$json_path")"
   markdown_text="$(cat "$md_path")"
-  if [[ "$safe" != "true" || "$all_supported" != "true" ]]; then
-    echo "complete supported corpus should emit guarded claim" >&2
+  if [[ "$safe" != "false" || "$selected_safe" != "true" || "$all_supported" != "true" || -n "$claim" ]]; then
+    echo "class-deduped complete corpus should not emit deployed-address claim" >&2
     cat "$json_path" >&2
     return 1
   fi
+  assert_contains "$reason" "deduplicated by class_hash"
+  assert_contains "$selected_claim" "after class_hash deduplication"
+  assert_contains "$selected_claim" "Cairo 2.14.0 through 2.16.0"
+  assert_contains "$markdown_text" "Compiled-all claim: <not safe for this artifact>"
+  assert_contains "$markdown_text" "Selected-unit claim: We compiled every selected deployed unit"
+}
+
+test_complete_non_deduped_corpus_emits_deployed_contract_claim() {
+  local stdout_text
+  stdout_text="$(run_corpus_benchmark complete_deployed_contracts none)"
+  local json_path md_path
+  json_path="$(extract_labeled_path "Corpus Benchmark JSON" <<<"$stdout_text")"
+  md_path="$(extract_labeled_path "Corpus Benchmark Markdown" <<<"$stdout_text")"
+  [[ -f "$json_path" ]] || { echo "missing corpus benchmark json: $json_path" >&2; return 1; }
+  [[ -f "$md_path" ]] || { echo "missing corpus benchmark markdown: $md_path" >&2; return 1; }
+
+  local safe selected_safe all_supported claim selected_claim reason markdown_text
+  safe="$(jq -r '.claim_guard.safe_to_say_compiled_all_deployed_contracts_in_corpus' "$json_path")"
+  selected_safe="$(jq -r '.claim_guard.safe_to_say_compiled_all_selected_deployed_units_in_corpus' "$json_path")"
+  all_supported="$(jq -r '.claim_guard.safe_to_say_all_items_native_supported' "$json_path")"
+  claim="$(jq -r '.claim_guard.compiled_all_claim_text // ""' "$json_path")"
+  selected_claim="$(jq -r '.claim_guard.selected_units_claim_text // ""' "$json_path")"
+  reason="$(jq -r '.claim_guard.reason' "$json_path")"
+  markdown_text="$(cat "$md_path")"
+  if [[ "$safe" != "true" || "$selected_safe" != "true" || "$all_supported" != "true" ]]; then
+    echo "non-deduped complete corpus should emit guarded deployed-contract claim" >&2
+    cat "$json_path" >&2
+    return 1
+  fi
+  assert_contains "$reason" "bounded to this pinned corpus artifact"
   assert_contains "$claim" "Cairo 2.14.0 through 2.16.0"
+  assert_contains "$selected_claim" "after none deduplication"
   assert_contains "$markdown_text" "Compiled-all claim: We compiled every contract"
 }
 
@@ -720,8 +756,10 @@ run_test "complete_corpus_with_fallback_blocks_compiled_all_claim" \
   test_complete_corpus_with_fallback_blocks_compiled_all_claim
 run_test "complete_corpus_with_unsupported_blocks_compiled_all_claim" \
   test_complete_corpus_with_unsupported_blocks_compiled_all_claim
-run_test "complete_supported_corpus_emits_bounded_claim" \
-  test_complete_supported_corpus_emits_bounded_claim
+run_test "complete_class_deduped_corpus_emits_selected_unit_claim_only" \
+  test_complete_class_deduped_corpus_emits_selected_unit_claim_only
+run_test "complete_non_deduped_corpus_emits_deployed_contract_claim" \
+  test_complete_non_deduped_corpus_emits_deployed_contract_claim
 run_test "complete_corpus_with_declared_class_blocks_deployed_claim" \
   test_complete_corpus_with_declared_class_blocks_deployed_claim
 run_test "rejects_empty_declared_class_contract_address" \
