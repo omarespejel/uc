@@ -2050,6 +2050,14 @@ fn native_toolchain_helper_lane_is_productized(major_minor: &str) -> bool {
 }
 
 #[cfg(feature = "native-compile")]
+fn manifest_exact_dependency_version(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let exact = trimmed.strip_prefix('=').map(str::trim).unwrap_or(trimmed);
+    parse_cairo_version_major_minor(exact)?;
+    Some(exact.to_string())
+}
+
+#[cfg(feature = "native-compile")]
 fn manifest_dependency_exact_version(
     manifest: &TomlValue,
     dependency_name: &str,
@@ -2059,19 +2067,14 @@ fn manifest_dependency_exact_version(
         .and_then(TomlValue::as_table)
         .and_then(|table| table.get(dependency_name))?;
     match dependency {
-        TomlValue::String(raw) => {
-            let trimmed = raw.trim();
-            parse_cairo_version_major_minor(trimmed)?;
-            Some(trimmed.to_string())
-        }
+        TomlValue::String(raw) => manifest_exact_dependency_version(raw),
         TomlValue::Table(table) => {
             let raw = table
                 .get("version")
                 .and_then(TomlValue::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())?;
-            parse_cairo_version_major_minor(raw)?;
-            Some(raw.to_string())
+            manifest_exact_dependency_version(raw)
         }
         _ => None,
     }
@@ -4580,20 +4583,58 @@ fn execute_daemon_build_with_backend(
     })
 }
 
+#[cfg(feature = "native-compile")]
+fn ensure_daemon_native_toolchain_request_supported(manifest_path: &Path) -> Result<()> {
+    let (_, selection) = select_native_toolchain_from_manifest_path(manifest_path)?;
+    match selection {
+        Ok(selection) => {
+            if let Some(helper_path) = selection.helper_path {
+                let message = format!(
+                    concat!(
+                        "daemon native build requires external native toolchain helper {}; ",
+                        "daemon requests cannot safely carry helper metadata yet; ",
+                        "run with --daemon-mode off or allow scarb fallback"
+                    ),
+                    helper_path.display()
+                );
+                return Err(native_fallback_eligible_error(message));
+            }
+            Ok(())
+        }
+        Err(issue) => {
+            log_native_compile_support_issue(&issue, native_cairo_lang_compiler_version());
+            Err(native_fallback_eligible_error(issue.reason()))
+        }
+    }
+}
+
+#[cfg(not(feature = "native-compile"))]
+fn ensure_daemon_native_toolchain_request_supported(_manifest_path: &Path) -> Result<()> {
+    Err(native_fallback_eligible_error(
+        "native compile backend is disabled at build time; rebuild uc with `native-compile` feature",
+    ))
+}
+
 fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildResponse> {
     validate_daemon_protocol_version(&request.protocol_version)
         .context("daemon build request protocol mismatch")?;
     let common = common_args_from_daemon_request(&request);
     let manifest_path = resolve_manifest_path(&common.manifest_path)?;
     let requested_backend = request.compile_backend.into_compile_backend();
-    let requested_compiler_version = compiler_version_for_backend(requested_backend)?;
-    match execute_daemon_build_with_backend(
-        &request,
-        &common,
-        &manifest_path,
-        requested_backend,
-        &requested_compiler_version,
-    ) {
+    let build_result = (|| -> Result<DaemonBuildResponse> {
+        if requested_backend == BuildCompileBackend::Native {
+            ensure_daemon_native_toolchain_request_supported(&manifest_path)?;
+        }
+        let requested_compiler_version = compiler_version_for_backend(requested_backend)?;
+        execute_daemon_build_with_backend(
+            &request,
+            &common,
+            &manifest_path,
+            requested_backend,
+            &requested_compiler_version,
+        )
+    })();
+    match build_result {
         Ok(response) => Ok(response),
         Err(native_err)
             if requested_backend == BuildCompileBackend::Native

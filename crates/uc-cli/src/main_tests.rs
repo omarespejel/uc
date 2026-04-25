@@ -388,6 +388,81 @@ fn daemon_build_request_roundtrip_preserves_async_cache_persist() {
     assert!(request.native_fallback_to_scarb);
 }
 
+#[cfg(all(feature = "native-compile", unix))]
+#[test]
+fn execute_daemon_build_rejects_external_helper_native_request() {
+    let _guard = integration_env_lock().lock().unwrap();
+    let requested_major_minor = "2.5";
+    let requested_version = "2.5.3";
+    let helper_env = native_toolchain_env_var_name_for_major_minor(requested_major_minor);
+    let dir = unique_test_dir("uc-daemon-native-external-helper");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let manifest_path = dir.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2023_11"
+
+[dependencies]
+starknet = "={requested_version}"
+"#
+        ),
+    )
+    .expect("write manifest");
+    let helper_path = dir.join("uc-cairo25-helper.sh");
+    write_fake_uc_support_helper(
+        &helper_path,
+        &NativeSupportReport {
+            schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+            manifest_path: manifest_path.display().to_string(),
+            status: NativeSupportStatus::Supported,
+            supported: true,
+            reason: None,
+            compiler_version: Some(requested_version.to_string()),
+            package_cairo_version: None,
+            issue_kind: None,
+            toolchain: None,
+            diagnostics: Vec::new(),
+        },
+    );
+    let _helper = ScopedDynamicEnvVar::set_with_lock(&_guard, helper_env, &helper_path);
+
+    let request = DaemonBuildRequest {
+        protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+        manifest_path: manifest_path.display().to_string(),
+        package: None,
+        workspace: false,
+        features: Vec::new(),
+        offline: true,
+        release: false,
+        profile: None,
+        async_cache_persist: false,
+        capture_output: true,
+        compile_backend: DaemonBuildBackend::Native,
+        native_fallback_to_scarb: false,
+    };
+    let err = execute_daemon_build(request)
+        .expect_err("daemon native build should reject external helper requests");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("daemon native build requires external native toolchain helper"),
+        "error should reject daemon helper routing: {rendered}"
+    );
+    assert!(
+        rendered.contains(&helper_path.display().to_string()),
+        "error should name the helper that cannot be carried into the daemon request: {rendered}"
+    );
+    assert!(
+        native_error_allows_scarb_fallback(&err),
+        "daemon helper rejection should remain scarb-fallback eligible"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_compile_session_heap_estimate_scales_with_tracked_source_bytes() {
@@ -2741,7 +2816,9 @@ fn native_support_report_from_manifest_path_allows_reviewed_unproductized_helper
 name = "demo"
 version = "0.1.0"
 edition = "2023_11"
-cairo-version = "{requested_version}"
+
+[dependencies]
+starknet = "={requested_version}"
 "#
         ),
     )
@@ -2756,7 +2833,7 @@ cairo-version = "{requested_version}"
             supported: true,
             reason: None,
             compiler_version: Some(requested_version.to_string()),
-            package_cairo_version: Some(requested_version.to_string()),
+            package_cairo_version: None,
             issue_kind: None,
             toolchain: None,
             diagnostics: Vec::new(),
@@ -2777,6 +2854,14 @@ cairo-version = "{requested_version}"
     assert_eq!(
         toolchain.compiler_version.as_deref(),
         Some(requested_version)
+    );
+    assert_eq!(
+        toolchain.request_source,
+        Some(NativeToolchainRequestSource::ManifestDependencyVersion)
+    );
+    assert_eq!(
+        toolchain.requested_major_minor.as_deref(),
+        Some(requested_major_minor)
     );
     let fake_corelib_src = dir.join("toolchain/corelib/src");
     create_mock_native_corelib(&fake_corelib_src);
