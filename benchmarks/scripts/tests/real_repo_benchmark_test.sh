@@ -609,7 +609,8 @@ test_real_repo_benchmark_reports_prefetch_failure_context() {
   write_mock_scarb_bin "$mock_scarb"
   write_manifest_case "$cases_root" "fails-fetch"
 
-  if PATH="$mock_bin_dir:$PATH" \
+  local stdout_text
+  stdout_text="$(PATH="$mock_bin_dir:$PATH" \
     MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/prefetch-uc.args" \
     MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/prefetch-scarb.args" \
     "$BENCH_SCRIPT" \
@@ -619,21 +620,42 @@ test_real_repo_benchmark_reports_prefetch_failure_context() {
       --cold-runs 1 \
       --warm-settle-seconds 0 \
       --case "$cases_root/fails-fetch/Scarb.toml" fails-fetch \
-      >"$TEST_TMP_DIR/prefetch.out" 2>"$stderr_path"; then
-    echo "expected prefetch failure to fail the benchmark run" >&2
-    return 1
-  fi
+      2>"$stderr_path")"
 
-  if ! grep -q "forced scarb fetch failure" "$stderr_path"; then
-    echo "expected underlying scarb fetch failure in stderr" >&2
-    cat "$stderr_path" >&2
-    return 1
-  fi
+  local json_path
+  json_path="$(awk -F': ' '/Benchmark JSON:/ {print $2}' <<<"$stdout_text")"
+  local md_path
+  md_path="$(awk -F': ' '/Benchmark Markdown:/ {print $2}' <<<"$stdout_text")"
   local expected_manifest
   expected_manifest="$(cd "$cases_root/fails-fetch" && pwd -P)/Scarb.toml"
+  local classification
+  classification="$(jq -r '.cases[] | select(.tag=="fails-fetch") | .support_matrix.classification' "$json_path")"
+  local benchmark_status
+  benchmark_status="$(jq -r '.cases[] | select(.tag=="fails-fetch") | .benchmark_status' "$json_path")"
+  local log_path
+  log_path="$(jq -r '.cases[] | select(.tag=="fails-fetch") | .support_matrix.log_path' "$json_path")"
+  local reason
+  reason="$(jq -r '.cases[] | select(.tag=="fails-fetch") | .support_matrix.reason' "$json_path")"
+  if [[ "$classification" != "build_failed" || "$benchmark_status" != "skipped" || "$reason" != "scarb offline fetch failed before uc auto build classification" ]]; then
+    echo "expected prefetch failure to be recorded as a per-case build_failed support classification" >&2
+    cat "$json_path" >&2
+    return 1
+  fi
+  if [[ ! -f "$log_path" ]] || ! grep -q "forced scarb fetch failure" "$log_path"; then
+    echo "expected underlying scarb fetch failure in per-case log" >&2
+    cat "${log_path:-/dev/null}" >&2 || true
+    return 1
+  fi
   if ! grep -q "scarb fetch failed for manifest_path=$expected_manifest" "$stderr_path"; then
-    echo "expected manifest-scoped scarb fetch failure context" >&2
+    echo "expected manifest-scoped scarb fetch failure context on stderr" >&2
     cat "$stderr_path" >&2
+    return 1
+  fi
+  local markdown_text
+  markdown_text="$(cat "$md_path")"
+  if [[ "$markdown_text" != *"| fails-fetch | 1 | $log_path | scarb offline fetch failed before uc auto build classification |"* ]]; then
+    echo "expected markdown auto-build classification row for prefetch failure" >&2
+    cat "$md_path" >&2
     return 1
   fi
 }

@@ -63,8 +63,89 @@ The summary script emits stable `UCO*` codes:
 | `UCO3007` | Native session prepare is material | Inspect helper/session setup overhead. |
 | `UCO4001` | Launch evidence candidate | Keep only if benchmark claim guards also pass. |
 | `UCO4002` | Strong warm no-op speedup | Quote only with sample, lane, host, and stability caveats. |
-| `UCO5001` | Diagnostic is not agent-grade | Extend diagnostic fields before automated remediation. |
+| `UCO5001` | Diagnostic is not agent-grade | Extend missing or generic diagnostic detail before automated remediation. |
 
 ## Launch Boundary
 
 The 20-contract corpus is an experiment harness first. It becomes launch evidence only after support and claim guards are true for the exact artifact being quoted.
+
+## 2026-04-26 Local 20-Case Sweep
+
+This sweep is diagnostic evidence, not launch copy. It used `--runs 1`,
+`--cold-runs 1`, and no pinned-host strict stability window. The purpose was to
+expand coverage, surface blockers, and produce an agent-readable backlog.
+
+Artifacts:
+
+- Cases file: `/Users/espejelomar/StarkNet/uc-20-contract-experiment-20260425/cases.tsv`
+- Benchmark JSON: `/Users/espejelomar/StarkNet/uc-20-contract-experiment-20260425/results/real-repo-bench-20260426-011206.json`
+- Benchmark Markdown: `/Users/espejelomar/StarkNet/uc-20-contract-experiment-20260425/results/real-repo-bench-20260426-011206.md`
+- Opportunity JSON: `/Users/espejelomar/StarkNet/uc-20-contract-experiment-20260425/corpus-opportunities.json`
+- Opportunity Markdown: `/Users/espejelomar/StarkNet/uc-20-contract-experiment-20260425/corpus-opportunities.md`
+- Cairo 2.14 helper: `/Users/espejelomar/.uc/toolchain-helpers/uc-cairo214-helper/bin/uc`
+
+Support matrix:
+
+| Classification | Count |
+|---|---:|
+| `native_supported` | 12 |
+| `native_unsupported` | 6 |
+| `fallback_used` | 0 |
+| `build_failed` | 2 |
+
+Benchmark status:
+
+| Status | Count |
+|---|---:|
+| `ok` | 12 |
+| `skipped` | 8 |
+
+Opportunity counts after applying the generic-diagnostic quality rule:
+
+| Code | Count | Meaning |
+|---|---:|---|
+| `UCO1001` | 6 | Native support gap. |
+| `UCO1003` | 2 | Auto-build classification failed. |
+| `UCO3001` | 12 | Native frontend compile dominates. |
+| `UCO3006` | 2 | Cold speedup is weak. |
+| `UCO4001` | 12 | Bounded launch-evidence candidate after stricter validation. |
+| `UCO4002` | 2 | Strong warm no-op speedup. |
+| `UCO5001` | 4 | Diagnostic is not agent-grade. |
+
+The two `build_failed` rows were `accounts_workshop` and
+`starknetpy_contracts`. Both selected the Cairo 2.14 external helper and failed
+inside a cached `cairo-contracts` dependency with a Cairo diagnostic shaped like
+`error[E0002]: Method span could not be called on type core::array::Span::<core::felt252>`.
+The generated build reports carried structured `UCN2002` diagnostics, but the
+`what_happened` and `why` fields were only `Compilation failed.`. That is too
+generic for an agent to remediate, so the opportunity summarizer now treats
+generic diagnostic text as `UCO5001` even when all required fields are present.
+
+Low-sample same-window speed ratios for native-supported rows:
+
+| Tag | Cold p95 speedup | Warm no-op p95 speedup | Launch-use status |
+|---|---:|---:|---|
+| `braavos_account` | 1.196x | 34.334x | Diagnostic only; cold speedup weak. |
+| `monero_atomic_swap` | 1.211x | 135.222x | Diagnostic only; cold speedup weak. |
+| `agentic_session` | 1.821x | 4.819x | Needs strict rerun. |
+| `agentic_agent` | 2.089x | 4.530x | Needs strict rerun. |
+| `agentic_erc8004` | 1.789x | 8.791x | Needs strict rerun. |
+| `agentic_huginn` | 1.562x | 2.102x | Needs strict rerun. |
+| `book_ownable` | 1.290x | 0.544x | Warm regression target. |
+| `book_vote_contracts` | 1.693x | 6.109x | Needs strict rerun. |
+| `book_ownable_components` | 1.918x | 6.284x | Needs strict rerun. |
+| `token_factory` | 1.287x | 0.977x | Warm parity/regression target. |
+| `zcash_relay` | 1.747x | 1.058x | Needs strict rerun. |
+| `glint_contracts` | 2.132x | 3.123x | Needs strict rerun. |
+
+Next blockers from this sweep:
+
+1. Add or select helper lanes for the remaining unsupported Cairo versions
+   before counting those rows as solved.
+2. Turn generic native compile failures into agent-grade diagnostics with the
+   original Cairo error code, source span, expected/found toolchain, retryability,
+   fallback state, and replay/log path.
+3. Rerun only native-supported cases under strict same-window sample settings
+   before using any speed ratio externally.
+4. Profile `native_frontend_compile_ms` on supported repos first; this was the
+   dominant hotspot across all 12 supported rows.

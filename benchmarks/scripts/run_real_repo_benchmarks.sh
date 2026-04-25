@@ -373,10 +373,17 @@ measurement_failure_json() {
 
 prefetch_manifest_dependencies() {
   local manifest_path="$1"
+  local log_path="${2:-}"
   if [[ -n "${PREFETCHED_MANIFESTS[$manifest_path]:-}" ]]; then
     return
   fi
-  if ! scarb --manifest-path "$manifest_path" --offline fetch >/dev/null; then
+  if [[ -n "$log_path" ]]; then
+    mkdir -p "$(dirname "$log_path")"
+    if ! scarb --manifest-path "$manifest_path" --offline fetch >"$log_path" 2>&1; then
+      echo "scarb fetch failed for manifest_path=$manifest_path (log: $log_path)" >&2
+      return 1
+    fi
+  elif ! scarb --manifest-path "$manifest_path" --offline fetch >/dev/null; then
     echo "scarb fetch failed for manifest_path=$manifest_path" >&2
     return 1
   fi
@@ -412,13 +419,31 @@ classify_support_matrix_case() {
   local source_dir
   source_dir="$(cd "$(dirname "$manifest_path")" && pwd -P)"
   local classify_dir="$TMP_DIR/${tag}-uc-auto-classify"
+  local prefetch_log_path="$RESULTS_DIR/real-repo-${tag}-prefetch.log"
   local log_path="$RESULTS_DIR/real-repo-${tag}-uc-auto-build.log"
   local report_path="$RESULTS_DIR/real-repo-${tag}-uc-auto-build-report.json"
   rm -rf "$classify_dir"
   mkdir -p "$classify_dir"
   cp -PR "$source_dir/." "$classify_dir"
   reset_workload_outputs "$classify_dir"
-  prefetch_manifest_dependencies "$manifest_path"
+  if ! prefetch_manifest_dependencies "$manifest_path" "$prefetch_log_path"; then
+    rm -rf "$classify_dir"
+    jq -n \
+      --argjson native_support "$support_json" \
+      --arg log_path "$prefetch_log_path" \
+      '{
+        classification: "build_failed",
+        compile_backend: null,
+        fallback_used: false,
+        exit_code: 1,
+        elapsed_ms: null,
+        log_path: $log_path,
+        report_path: null,
+        build_report: null,
+        reason: "scarb offline fetch failed before uc auto build classification"
+      }'
+    return 0
+  fi
 
   local -a uc_auto_cmd=(env "UC_NATIVE_BUILD=auto")
   if [[ -n "${UC_NATIVE_CORELIB_SRC:-}" ]]; then
@@ -629,7 +654,29 @@ benchmark_supported_case() {
   local support_matrix_json="$4"
   local source_dir
   source_dir="$(cd "$(dirname "$manifest_path")" && pwd -P)"
-  prefetch_manifest_dependencies "$manifest_path"
+  local prefetch_log_path="$RESULTS_DIR/real-repo-${tag}-prefetch.log"
+  if ! prefetch_manifest_dependencies "$manifest_path" "$prefetch_log_path"; then
+    local prefetch_failure_json
+    prefetch_failure_json="$(measurement_failure_json "prefetch" 1 "$prefetch_log_path")"
+    jq -n \
+      --arg tag "$tag" \
+      --arg manifest_path "$manifest_path" \
+      --argjson native_support "$support_json" \
+      --argjson support_matrix "$support_matrix_json" \
+      --argjson prefetch_failure "$prefetch_failure_json" \
+      '{
+        tag: $tag,
+        manifest_path: $manifest_path,
+        native_support: $native_support,
+        support_matrix: $support_matrix,
+        benchmark_status: "failed",
+        benchmarks: {
+          scarb: { build: { cold: $prefetch_failure, warm_noop: $prefetch_failure } },
+          uc: { build: { cold: $prefetch_failure, warm_noop: $prefetch_failure } }
+        }
+      }'
+    return 0
+  fi
 
   local -a scarb_cmd=(scarb --manifest-path "$manifest_path" --offline build)
   local -a uc_cmd=(env "UC_NATIVE_DISALLOW_SCARB_FALLBACK=1")

@@ -225,7 +225,78 @@ test_deployed_wrapper_preserves_corpus_metadata() {
   fi
 }
 
+test_complete_but_generic_diagnostic_is_not_agent_grade() {
+  local fixture="$TEST_TMP_DIR/generic-diagnostic.json"
+  local out_json="$TEST_TMP_DIR/generic-diagnostic-opportunities.json"
+  cat > "$fixture" <<'JSON'
+{
+  "generated_at": "2026-04-25T00:00:00Z",
+  "summary": {
+    "support_matrix": {
+      "native_supported": 0,
+      "fallback_used": 0,
+      "native_unsupported": 0,
+      "build_failed": 1
+    },
+    "unstable_lanes": [],
+    "unstable_lane_count": 0
+  },
+  "cases": [
+    {
+      "tag": "generic-native-failure",
+      "manifest_path": "/tmp/generic/Scarb.toml",
+      "native_support": {
+        "supported": true,
+        "package_cairo_version": "2.14.0",
+        "diagnostics": []
+      },
+      "support_matrix": {
+        "classification": "build_failed",
+        "compile_backend": "uc_native_external_helper",
+        "fallback_used": false,
+        "reason": "Compilation failed.",
+        "build_report": {
+          "diagnostics": [
+            {
+              "code": "UCN2002",
+              "category": "native_fallback_local_native_error",
+              "what_happened": "Compilation failed.",
+              "why": "Compilation failed.",
+              "how_to_fix": [
+                "Review the selected native toolchain lane."
+              ],
+              "retryable": true,
+              "fallback_used": true,
+              "toolchain_expected": "2.14.0",
+              "toolchain_found": "2.14.0"
+            }
+          ]
+        }
+      },
+      "benchmark_status": "skipped",
+      "benchmarks": null
+    }
+  ]
+}
+JSON
+
+  "$SUMMARY_SCRIPT" --benchmark-json "$fixture" --out-json "$out_json"
+
+  local generic_gap weak_reason build_blocker
+  generic_gap="$(jq -r '.cases[] | select(.tag=="generic-native-failure") | .opportunity_codes | index("UCO5001") != null' "$out_json")"
+  weak_reason="$(jq -r '.cases[] | select(.tag=="generic-native-failure") | .opportunities[] | select(.code=="UCO5001") | .why' "$out_json")"
+  build_blocker="$(jq -r '.cases[] | select(.tag=="generic-native-failure") | .opportunity_codes | index("UCO1003") != null' "$out_json")"
+  assert_json_value "generic_gap" "$generic_gap" "true" "$out_json"
+  assert_json_value "build_blocker" "$build_blocker" "true" "$out_json"
+  if [[ "$weak_reason" != *"what_happened is generic"* || "$weak_reason" != *"why is generic"* ]]; then
+    echo "expected generic diagnostic fields to be named in UCO5001 reason" >&2
+    cat "$out_json" >&2
+    exit 1
+  fi
+}
+
 run_test "real_repo_summary_records_opportunities" test_real_repo_summary_records_opportunities
 run_test "deployed_wrapper_preserves_corpus_metadata" test_deployed_wrapper_preserves_corpus_metadata
+run_test "complete_but_generic_diagnostic_is_not_agent_grade" test_complete_but_generic_diagnostic_is_not_agent_grade
 
 echo "All corpus opportunity summary tests passed."
