@@ -257,7 +257,9 @@ const UC_AGENT_JSON_SCHEMA_VERSION: u32 = 1;
 const UC_AGENT_DIAGNOSTICS_DOC_URL: &str =
     "https://github.com/omarespejel/uc/blob/main/docs/agent/AGENT_DIAGNOSTICS.md";
 #[cfg(feature = "native-compile")]
-const WORKSPACE_CARGO_TOML: &str = include_str!("../../../Cargo.toml");
+// Keep this packaged with `uc-cli`; do not read the workspace root at compile time.
+// When adding a helper lane, update this list with the root helper-builder metadata.
+const PRODUCTIZED_NATIVE_TOOLCHAIN_HELPER_LANES: &[&str] = &["2.14"];
 
 #[derive(Parser, Debug)]
 #[command(name = "uc")]
@@ -2034,25 +2036,17 @@ fn native_toolchain_env_var_name_for_major_minor(major_minor: &str) -> String {
 
 #[cfg(feature = "native-compile")]
 fn productized_native_toolchain_helper_lanes() -> Vec<String> {
-    let Ok(manifest) = toml::from_str::<TomlValue>(WORKSPACE_CARGO_TOML) else {
-        return Vec::new();
-    };
-    let Some(table) = manifest
-        .get("workspace")
-        .and_then(|value| value.get("metadata"))
-        .and_then(|value| value.get("uc-native-toolchain-helpers"))
-        .and_then(TomlValue::as_table)
-    else {
-        return Vec::new();
-    };
-    table.keys().cloned().collect()
+    PRODUCTIZED_NATIVE_TOOLCHAIN_HELPER_LANES
+        .iter()
+        .map(|lane| (*lane).to_string())
+        .collect()
 }
 
 #[cfg(feature = "native-compile")]
 fn native_toolchain_helper_lane_is_productized(major_minor: &str) -> bool {
-    productized_native_toolchain_helper_lanes()
+    PRODUCTIZED_NATIVE_TOOLCHAIN_HELPER_LANES
         .iter()
-        .any(|lane| lane == major_minor)
+        .any(|lane| *lane == major_minor)
 }
 
 #[cfg(feature = "native-compile")]

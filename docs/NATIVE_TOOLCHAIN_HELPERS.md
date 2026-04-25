@@ -5,6 +5,7 @@
 - The active binary provides the builtin lane for its baked-in `cairo-lang` version.
 - Older lanes, such as Cairo `2.14`, are supplied via external helper binaries.
 - Only lanes listed under `workspace.metadata.uc-native-toolchain-helpers` in `Cargo.toml` are productized for automatic helper building.
+- `uc-cli` also keeps a packaged productized-lane list for diagnostics, so packaged builds can emit `UCN1006` without depending on the workspace root manifest at compile time.
 
 ## Build The Cairo 2.14 Helper
 
