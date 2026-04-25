@@ -24,6 +24,7 @@
   "items": [
     {
       "tag": "sample_scarb_smoke",
+      "source_kind": "deployed_contract",
       "contract_address": "0x0",
       "class_hash": "0xsample",
       "source_ref": "benchmarks/corpora/source-fixtures/scarb_smoke in this repository",

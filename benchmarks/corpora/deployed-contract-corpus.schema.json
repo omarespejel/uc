@@ -40,9 +40,22 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["tag", "contract_address", "class_hash", "source_ref", "manifest_path", "cairo_version"],
+        "required": ["tag", "source_kind", "class_hash", "source_ref", "manifest_path", "cairo_version"],
+        "allOf": [
+          {
+            "if": {
+              "properties": { "source_kind": { "const": "deployed_contract" } },
+              "required": ["source_kind"]
+            },
+            "then": { "required": ["contract_address"] }
+          }
+        ],
         "properties": {
           "tag": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+          "source_kind": {
+            "enum": ["deployed_contract", "declared_class"],
+            "description": "Whether this row represents a deployed contract address or declared class source evidence."
+          },
           "contract_address": { "type": "string", "minLength": 1 },
           "class_hash": { "type": "string", "minLength": 1 },
           "source_ref": { "type": "string", "minLength": 1 },

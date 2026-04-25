@@ -260,6 +260,7 @@ item_json() {
     --arg cairo_version "$cairo_version" \
     '{
       tag: $tag,
+      source_kind: "deployed_contract",
       contract_address: "0x123",
       class_hash: $class_hash,
       source_ref: "local test fixture",
@@ -616,6 +617,49 @@ test_complete_supported_corpus_emits_bounded_claim() {
   assert_contains "$markdown_text" "Compiled-all claim: We compiled every contract"
 }
 
+test_complete_corpus_with_declared_class_blocks_deployed_claim() {
+  local corpus_dir="$TEST_TMP_DIR/declared-class/corpora"
+  local case_root="$TEST_TMP_DIR/declared-class/cases"
+  local results_dir="$TEST_TMP_DIR/declared-class/results"
+  local mock_bin_dir="$TEST_TMP_DIR/declared-class/mock-bin"
+  mkdir -p "$corpus_dir" "$case_root" "$results_dir" "$mock_bin_dir"
+  write_manifest_case "$case_root" "class-only"
+  write_mock_uc_bin "$mock_bin_dir/uc"
+  write_mock_scarb_bin "$mock_bin_dir/scarb"
+
+  local item stdout_text json_path md_path safe reason source_kind_count claim markdown_text
+  item="$(item_json class-only "../cases/class-only/Scarb.toml" "0xclass" "2.14.0")"
+  item="$(jq '.source_kind = "declared_class" | del(.contract_address)' <<<"$item")"
+  write_corpus_file "$corpus_dir/corpus.json" complete_deployed_contracts class_hash "$item"
+
+  stdout_text="$(
+    PATH="$mock_bin_dir:$PATH" \
+    MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/declared-class/uc.args" \
+    MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/declared-class/scarb.args" \
+    "$CORPUS_SCRIPT" \
+      --uc-bin "$mock_bin_dir/uc" \
+      --results-dir "$results_dir" \
+      --runs 1 \
+      --cold-runs 1 \
+      --warm-settle-seconds 0 \
+      --corpus "$corpus_dir/corpus.json"
+  )"
+
+  json_path="$(extract_labeled_path "Corpus Benchmark JSON" <<<"$stdout_text")"
+  md_path="$(extract_labeled_path "Corpus Benchmark Markdown" <<<"$stdout_text")"
+  safe="$(jq -r '.claim_guard.safe_to_say_compiled_all_deployed_contracts_in_corpus' "$json_path")"
+  reason="$(jq -r '.claim_guard.reason' "$json_path")"
+  source_kind_count="$(jq -r '.summary.source_kind_counts.declared_class' "$json_path")"
+  claim="$(jq -r '.claim_guard.compiled_all_claim_text // ""' "$json_path")"
+  markdown_text="$(cat "$md_path")"
+  if [[ "$safe" != "false" || "$reason" != "corpus contains non-deployed source_kind rows" || "$source_kind_count" != "1" || -n "$claim" ]]; then
+    echo "declared_class corpus item should block deployed-contract launch claim" >&2
+    cat "$json_path" >&2
+    return 1
+  fi
+  assert_contains "$markdown_text" "| class-only | declared_class | declared-class:0xclass |"
+}
+
 run_test "plan_only_normalizes_sample_corpus" \
   test_plan_only_normalizes_sample_corpus
 run_test "rejects_duplicate_tags" \
@@ -636,3 +680,5 @@ run_test "complete_corpus_with_unsupported_blocks_compiled_all_claim" \
   test_complete_corpus_with_unsupported_blocks_compiled_all_claim
 run_test "complete_supported_corpus_emits_bounded_claim" \
   test_complete_supported_corpus_emits_bounded_claim
+run_test "complete_corpus_with_declared_class_blocks_deployed_claim" \
+  test_complete_corpus_with_declared_class_blocks_deployed_claim

@@ -170,6 +170,10 @@ each item to a local `Scarb.toml`, runs `run_real_repo_benchmarks.sh`, and emits
 a combined JSON/Markdown artifact with:
 
 - the pinned chain/snapshot/block-range selection,
+- a per-item `source_kind`:
+  - `deployed_contract` rows must include `contract_address`
+  - `declared_class` rows benchmark class source evidence but do not count as
+    deployed-contract coverage
 - deduplication and source/license policy metadata,
 - Cairo version min/max across the corpus,
 - a support matrix for `native_supported`, `native_unsupported`,
@@ -178,8 +182,8 @@ a combined JSON/Markdown artifact with:
   - `.claim_guard.compiled_all_claim_text` only when
     `.claim_guard.safe_to_say_compiled_all_deployed_contracts_in_corpus=true`;
     this requires `coverage=complete_deployed_contracts`, every item classified
-    as `native_supported`, no fallback, no unsupported rows, no build failures,
-    and no failed native benchmark cases
+    as `source_kind=deployed_contract` and `native_supported`, no fallback, no
+    unsupported rows, no build failures, and no failed native benchmark cases
   - `.claim_guard.native_supported_claim_text` only when
     `.claim_guard.safe_to_say_all_items_native_supported=true`
 
