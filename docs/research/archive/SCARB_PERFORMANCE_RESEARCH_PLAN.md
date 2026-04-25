@@ -1,4 +1,4 @@
-# Scarb Replacement Research Plan (Performance-First)
+# Scarb-Compatible Performance Research Plan
 
 ## 1. Goal
 Build a Scarb-compatible next-generation compiler plan focused on lower latency, lower network overhead, and better cache reuse for large Cairo workspaces.

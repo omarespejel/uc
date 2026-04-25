@@ -51,7 +51,7 @@
 8. `uc agent eval`
 - Probes a manifest and returns an agent decision: proceed to build/benchmark, run a safe action and retry, or stop as native-unsupported.
 - Always emits JSON and can also write it with `--report-path`.
-- Includes the nested native support report, safe actions, next commands, and required launch fixtures (`monero`, `braavos`).
+- Includes the nested native support report, safe actions, manifest-specific next commands, and fallback/toolchain state.
 
 9. `uc agent safe-action`
 - Dry-run-first remediation surface.
@@ -92,5 +92,6 @@ Native auto mode still falls back to Scarb only when the failure class is explic
   - Fails on missing or invalid helper-lane env vars for that manifest.
 
 ## Next Expansion
+- Add read-only `uc project inspect --manifest-path <Scarb.toml> --format json` as the first project-model surface.
 - Add more native toolchain helper lanes beyond Cairo `2.14`.
 - Keep `compare-build` as mandatory gate while deeper frontend-compile optimizations mature.
