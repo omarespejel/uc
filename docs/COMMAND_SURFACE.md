@@ -11,7 +11,7 @@
   - `--engine scarb`: direct Scarb execution path.
 - `--json` emits the same execution report JSON on stdout and suppresses normal build log replay so the payload stays machine-readable.
 - Optional `--report-path` writes the execution report JSON to disk; it can be combined with `--json`.
-- Optional `--record-failure <path>` writes a redacted failure bundle when the build exits with an error.
+- Optional `--record-failure <path>` writes a redacted, replay-safe failure bundle when the build exits with an error. Sensitive argv values are redacted and `--record-failure` itself is stripped from the recorded replay command.
 - Build report JSON now includes:
   - `compile_backend`: `scarb`, `uc_scarb`, `scarb_fallback`, `uc_native`, or `uc_native_external_helper`
   - `native_toolchain`: requested lane, selected source, resolved compiler version, and helper binary path when applicable
@@ -61,7 +61,7 @@
 
 10. `uc replay <bundle>`
 - Reads a `uc build --record-failure` bundle and emits a replay report.
-- Dry-run by default; `--execute` replays the recorded command.
+- Dry-run by default; `--execute` replays the recorded command after stripping legacy `--record-failure` arguments so replay cannot overwrite the original evidence bundle.
 
 11. `uc mcp serve`
 - Emits the read-only MCP command/resource catalog as JSON.

@@ -348,6 +348,27 @@ impl AgentSafeActionKind {
             Self::RegenerateSupportMatrix => "regenerate_support_matrix",
         }
     }
+
+    fn cli_name(self) -> &'static str {
+        match self {
+            Self::BuildHelperLane => "build-helper-lane",
+            Self::RebuildHelperLane => "rebuild-helper-lane",
+            Self::RefreshCache => "refresh-cache",
+            Self::RerunDoctor => "rerun-doctor",
+            Self::RegenerateSupportMatrix => "regenerate-support-matrix",
+        }
+    }
+
+    fn from_safe_automated_action(action: &str) -> Option<Self> {
+        match action {
+            "build_helper_lane" => Some(Self::BuildHelperLane),
+            "rebuild_helper_lane" => Some(Self::RebuildHelperLane),
+            "refresh_cache" => Some(Self::RefreshCache),
+            "rerun_doctor" => Some(Self::RerunDoctor),
+            "regenerate_support_matrix" => Some(Self::RegenerateSupportMatrix),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -2051,29 +2072,25 @@ fn agent_eval_decision(
         );
     }
 
-    if safe_actions.iter().any(|action| {
-        matches!(
-            action.as_str(),
-            "build_helper_lane" | "rebuild_helper_lane" | "refresh_cache" | "rerun_doctor"
-        )
-    }) {
-        if let Some(action) = safe_actions.first() {
-            let lane = support
-                .toolchain
-                .as_ref()
-                .and_then(|toolchain| {
-                    toolchain
-                        .requested_major_minor
-                        .clone()
-                        .or_else(|| toolchain.requested_version.clone())
-                })
-                .unwrap_or_else(|| "<lane>".to_string());
-            next_commands.push(format!(
-                "uc agent safe-action {} --lane {}",
-                action.replace('_', "-"),
-                lane
-            ));
-        }
+    if let Some(action) = safe_actions
+        .iter()
+        .find_map(|action| AgentSafeActionKind::from_safe_automated_action(action))
+    {
+        let lane = support
+            .toolchain
+            .as_ref()
+            .and_then(|toolchain| {
+                toolchain
+                    .requested_major_minor
+                    .clone()
+                    .or_else(|| toolchain.requested_version.clone())
+            })
+            .unwrap_or_else(|| "<lane>".to_string());
+        next_commands.push(format!(
+            "uc agent safe-action {} --lane {}",
+            action.cli_name(),
+            lane
+        ));
         return (
             AgentEvalDecision::RunSafeActionThenRetry,
             "run_safe_action_then_retry_support_probe".to_string(),
@@ -2129,8 +2146,26 @@ fn run_agent_safe_action(args: AgentSafeActionArgs) -> Result<()> {
         return emit_json_value(args.report_path.as_deref(), &report);
     }
 
-    let (command, command_vec) = command_from_vec(&command_vec)?;
-    let run = run_command_capture(command, command_vec)?;
+    let (command, command_vec) = match command_from_vec(&command_vec) {
+        Ok(command) => command,
+        Err(err) => {
+            let message = format!("execution failed: {err:#}");
+            report.blocked_reason = Some(message.clone());
+            report.stderr = message;
+            emit_json_value(args.report_path.as_deref(), &report)?;
+            return Err(err);
+        }
+    };
+    let run = match run_command_capture(command, command_vec) {
+        Ok(run) => run,
+        Err(err) => {
+            let message = format!("execution failed: {err:#}");
+            report.blocked_reason = Some(message.clone());
+            report.stderr = message;
+            emit_json_value(args.report_path.as_deref(), &report)?;
+            return Err(err);
+        }
+    };
     report.executed = true;
     report.exit_code = Some(run.exit_code);
     report.stdout = run.stdout;
@@ -2334,9 +2369,10 @@ fn run_build_entry(args: BuildArgs) -> Result<()> {
                 if let Err(record_err) =
                     write_failure_bundle(path, &bundle_args, &format!("{err:#}"))
                 {
-                    eprintln!(
-                        "uc: warning: failed to write failure bundle {}: {record_err:#}",
-                        path.display()
+                    tracing::warn!(
+                        bundle_path = %path.display(),
+                        error = %format!("{record_err:#}"),
+                        "failed to write failure bundle"
                     );
                 }
             }
@@ -2371,7 +2407,7 @@ fn write_failure_bundle(path: &Path, args: &BuildArgs, error: &str) -> Result<()
     let bundle = FailureBundle {
         schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
         generated_at_epoch_ms: epoch_ms_u64()?,
-        command: std::env::args().collect(),
+        command: sanitized_failure_command_args(std::env::args()),
         manifest_path: manifest_path
             .as_ref()
             .map(|path| path.display().to_string()),
@@ -2415,18 +2451,85 @@ fn redacted_agent_environment() -> BTreeMap<String, String> {
     values
 }
 
+fn sanitized_failure_command_args<I, S>(args: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+    replay_safe_command_args(&redact_sensitive_command_args(&args))
+}
+
+fn replay_safe_command_args(args: &[String]) -> Vec<String> {
+    let mut sanitized = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--record-failure" {
+            index += 2;
+            continue;
+        }
+        if arg.starts_with("--record-failure=") {
+            index += 1;
+            continue;
+        }
+        sanitized.push(arg.clone());
+        index += 1;
+    }
+    sanitized
+}
+
+fn redact_sensitive_command_args(args: &[String]) -> Vec<String> {
+    let mut redacted = Vec::new();
+    let mut redact_next = false;
+    for arg in args {
+        if redact_next {
+            redacted.push("<redacted>".to_string());
+            redact_next = false;
+            continue;
+        }
+
+        if let Some((flag, _value)) = arg.split_once('=') {
+            if is_sensitive_command_arg_name(flag) {
+                redacted.push(format!("{flag}=<redacted>"));
+                continue;
+            }
+        }
+
+        redacted.push(arg.clone());
+        if is_sensitive_command_arg_name(arg) {
+            redact_next = true;
+        }
+    }
+    redacted
+}
+
+fn is_sensitive_command_arg_name(arg: &str) -> bool {
+    let normalized = arg
+        .trim_start_matches('-')
+        .replace('-', "_")
+        .to_ascii_uppercase();
+    normalized == "KEY"
+        || normalized.ends_with("_KEY")
+        || normalized.contains("TOKEN")
+        || normalized.contains("SECRET")
+        || normalized.contains("PASSWORD")
+        || normalized.contains("PRIVATE_KEY")
+}
+
 fn run_replay(args: ReplayArgs) -> Result<()> {
     let bytes = fs::read(&args.bundle)
         .with_context(|| format!("failed to read replay bundle {}", args.bundle.display()))?;
     let bundle: FailureBundle = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed to parse replay bundle {}", args.bundle.display()))?;
+    let replay_command = sanitized_failure_command_args(bundle.command.clone());
     let mut report = ReplayReport {
         schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
         generated_at_epoch_ms: epoch_ms_u64()?,
         bundle_path: args.bundle.display().to_string(),
         execute_requested: args.execute,
         executed: false,
-        command: bundle.command.clone(),
+        command: replay_command.clone(),
         manifest_path: bundle.manifest_path.clone(),
         original_error: bundle.error.clone(),
         selected_support: bundle.selected_support.clone(),
@@ -2440,8 +2543,26 @@ fn run_replay(args: ReplayArgs) -> Result<()> {
             Some("dry run only; pass --execute to replay the recorded command".to_string());
         return emit_json_value(args.report_path.as_deref(), &report);
     }
-    let (command, command_vec) = command_from_vec(&bundle.command)?;
-    let run = run_command_capture(command, command_vec)?;
+    let (command, command_vec) = match command_from_vec(&replay_command) {
+        Ok(command) => command,
+        Err(err) => {
+            let message = format!("execution failed: {err:#}");
+            report.blocked_reason = Some(message.clone());
+            report.stderr = message;
+            emit_json_value(args.report_path.as_deref(), &report)?;
+            return Err(err);
+        }
+    };
+    let run = match run_command_capture(command, command_vec) {
+        Ok(run) => run,
+        Err(err) => {
+            let message = format!("execution failed: {err:#}");
+            report.blocked_reason = Some(message.clone());
+            report.stderr = message;
+            emit_json_value(args.report_path.as_deref(), &report)?;
+            return Err(err);
+        }
+    };
     report.executed = true;
     report.exit_code = Some(run.exit_code);
     report.stdout = run.stdout;

@@ -27,8 +27,8 @@ Already in this PR or required before launch:
 
 - `uc support native --format json` emits stable support reports.
 - `uc build --json` and `--report-path` carry build diagnostics.
-- `uc build --record-failure <path>` writes a redacted failure bundle on build errors.
-- `uc replay <bundle>` reads that bundle and is dry-run by default.
+- `uc build --record-failure <path>` writes a redacted, replay-safe failure bundle on build errors.
+- `uc replay <bundle>` reads that bundle, strips legacy `--record-failure` arguments, and is dry-run by default.
 - `uc agent eval --manifest-path <Scarb.toml>` returns a decision agents can act on before compiling.
 - `uc agent safe-action <action>` exposes dry-run-first remediation commands.
 - `uc mcp serve` emits the read-only command/resource catalog for MCP adapters.
@@ -120,6 +120,8 @@ When a build fails, agents should preserve a replayable artifact:
 uc build --engine uc --daemon-mode off --manifest-path Scarb.toml --record-failure /tmp/uc-failure.json
 uc replay /tmp/uc-failure.json
 ```
+
+Use `uc replay /tmp/uc-failure.json --execute` only when the agent is allowed to rerun the recorded build command. Replay reports still emit structured JSON if the command cannot spawn or exceeds capture limits.
 
 ## Sources
 

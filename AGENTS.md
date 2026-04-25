@@ -30,6 +30,11 @@
 - Fast Rust validation: `make validate-fast`
 - Native-focused validation: `make validate-native`
 - Validate Cairo 2.14 helper compatibility: `make validate-helper-lane`
+- Agent support decision: `uc agent eval --manifest-path /abs/path/to/Scarb.toml`
+- Dry-run safe remediation: `uc agent safe-action build-helper-lane --lane 2.14`
+- Record replayable build failure: `uc build --engine uc --daemon-mode off --manifest-path /abs/path/to/Scarb.toml --record-failure /abs/path/to/uc-failure.json`
+- Replay failure bundle: `uc replay /abs/path/to/uc-failure.json`
+- Read-only MCP catalog: `uc mcp serve`
 - Strict smoke benchmark: `make benchmark-strict-smoke`
 - Strict research benchmark: `make benchmark-strict-research`
 - Build deployed-contract source index: `benchmarks/scripts/build_deployed_contract_source_index.sh --inventory /abs/path/to/source-inventory.json --out /abs/path/to/pinned-deployed-contract-source-index.json`
