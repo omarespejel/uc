@@ -97,6 +97,47 @@ test_prepare_only_excludes_in_repo_staging_dir_from_archive() {
   rm -rf "$stage_dir"
 }
 
+write_helper_repo_with_lane_patch() {
+  local repo_root="$1"
+  local registry_src="$2"
+  write_minimal_helper_repo_without_patch_section "$repo_root"
+  cat >> "$repo_root/Cargo.toml" <<'TOML'
+patch-dir = "toolchains/cairo-2.14/patches"
+TOML
+  mkdir -p "$repo_root/toolchains/cairo-2.14/patches"
+  cat > "$repo_root/toolchains/cairo-2.14/patches/cairo-lang-compiler.patch" <<'PATCH'
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1 +1 @@
+-original helper crate source
++patched helper crate source
+PATCH
+  mkdir -p "$registry_src/fake-index/cairo-lang-compiler-2.14.0"
+  printf 'original helper crate source\n' > "$registry_src/fake-index/cairo-lang-compiler-2.14.0/README.md"
+}
+
+test_prepare_only_applies_helper_lane_patches_from_registry_source() {
+  local fake_root="$TMP_DIR/patch-root"
+  local fake_registry_src="$TMP_DIR/fake-registry/src"
+  local stage_dir="$TMP_DIR/patch-stage"
+  local stdout_path="$TMP_DIR/patch.out"
+  write_helper_repo_with_lane_patch "$fake_root" "$fake_registry_src"
+
+  UC_HELPER_CARGO_REGISTRY_SRC="$fake_registry_src" \
+    "$fake_root/scripts/build_native_toolchain_helper.sh" \
+      --lane 2.14 \
+      --staging-dir "$stage_dir" \
+      --prepare-only >"$stdout_path"
+
+  grep -q "Applied helper lane patch:" "$stdout_path"
+  grep -q 'patched helper crate source' \
+    "$stage_dir/.uc/helper-lane-patches/cairo-2.14/cairo-lang-compiler/README.md"
+  grep -q '^\[patch\.crates-io\]' "$stage_dir/Cargo.toml"
+  grep -q 'cairo-lang-compiler = { path = ".uc/helper-lane-patches/cairo-2.14/cairo-lang-compiler" }' \
+    "$stage_dir/Cargo.toml"
+}
+
 test_prepare_only_and_check_only_are_mutually_exclusive() {
   local stdout_path="$TMP_DIR/mutually-exclusive.out"
   if "$HELPER_SCRIPT" --lane 2.14 --prepare-only --check-only >"$stdout_path" 2>&1; then
@@ -144,6 +185,8 @@ run_test "prepare_only_accepts_workspace_manifest_without_patch_section" \
   test_prepare_only_accepts_workspace_manifest_without_patch_section
 run_test "prepare_only_excludes_in_repo_staging_dir_from_archive" \
   test_prepare_only_excludes_in_repo_staging_dir_from_archive
+run_test "prepare_only_applies_helper_lane_patches_from_registry_source" \
+  test_prepare_only_applies_helper_lane_patches_from_registry_source
 run_test "prepare_only_and_check_only_are_mutually_exclusive" \
   test_prepare_only_and_check_only_are_mutually_exclusive
 run_test "unsupported_lane_reports_actionable_error" \

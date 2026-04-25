@@ -39,6 +39,7 @@ walkdir = "2"
 cairo-version = "2.14.0"
 salsa-version = "0.24.0"
 lockfile = "toolchains/cairo-2.14/Cargo.lock"
+patch-dir = "toolchains/cairo-2.14/patches"
 
 [patch.crates-io]
 cairo-lang-filesystem = { path = "third_party/cairo-lang-filesystem" }
