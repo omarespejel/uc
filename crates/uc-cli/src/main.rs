@@ -590,7 +590,7 @@ struct NativeDiagnostic {
     docs_url: String,
     what_happened: String,
     why: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     how_to_fix: Vec<String>,
     #[serde(default)]
     next_commands: Vec<String>,
@@ -1275,7 +1275,7 @@ struct BuildReport {
     compile_backend: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     native_toolchain: Option<NativeToolchainReport>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     diagnostics: Vec<NativeDiagnostic>,
 }
 
