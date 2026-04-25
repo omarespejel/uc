@@ -21,11 +21,15 @@ test_prepare_only_rewrites_workspace_manifest_for_cairo214() {
   grep -q "Prepared helper staging tree:" "$stdout_path"
   grep -q 'cairo-lang-compiler = "=2.14.0"' "$stage_dir/Cargo.toml"
   grep -q 'salsa = "0.24.0"' "$stage_dir/Cargo.toml"
-  if grep -q '^\[patch\.crates-io\]' "$stage_dir/Cargo.toml"; then
-    echo "expected helper staging Cargo.toml to drop [patch.crates-io]" >&2
-    return 1
-  fi
-  cmp "$ROOT/toolchains/cairo-2.14/Cargo.lock" "$stage_dir/Cargo.lock" >/dev/null
+  grep -q '^\[patch\.crates-io\]' "$stage_dir/Cargo.toml"
+  grep -q 'cairo-lang-lowering = { path = ".uc/helper-lane-patches/cairo-2.14/cairo-lang-lowering" }' \
+    "$stage_dir/Cargo.toml"
+  grep -q 'cairo-lang-sierra-generator = { path = ".uc/helper-lane-patches/cairo-2.14/cairo-lang-sierra-generator" }' \
+    "$stage_dir/Cargo.toml"
+  grep -q 'UC_CAIRO214_SIZE_TRACE' \
+    "$stage_dir/.uc/helper-lane-patches/cairo-2.14/cairo-lang-lowering/src/db.rs"
+  grep -q 'UC_CAIRO214_SIZE_TRACE' \
+    "$stage_dir/.uc/helper-lane-patches/cairo-2.14/cairo-lang-sierra-generator/src/program_generator.rs"
 }
 
 write_minimal_helper_repo_without_patch_section() {

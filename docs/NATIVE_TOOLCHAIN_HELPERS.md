@@ -50,6 +50,28 @@ The helper-lane compatibility shims are covered by targeted regressions for:
 - native crate-cache restore preserving existing config fields
 - file-keyed update behavior for removed untracked file slots
 
+## Cairo 2.14 Frontend Trace
+
+The Cairo `2.14` helper lane includes opt-in trace points for size-estimation work:
+
+```bash
+UC_CAIRO214_SIZE_TRACE=/tmp/uc-cairo214-size-trace.tsv \
+  UC_PHASE_TIMING=1 \
+  UC_NATIVE_TOOLCHAIN_2_14_BIN=/abs/path/to/uc-cairo214-helper \
+  uc build --engine uc --daemon-mode off --offline --manifest-path /abs/path/to/Scarb.toml
+```
+
+When the variable is unset, the patched helper is silent. When set, the helper appends bounded TSV counter samples. Each `(event, function)` emits its first call and later powers of two:
+
+```text
+estimate_size	1	salsa_internal_id	salsa_internal_id
+estimate_size	2	salsa_internal_id	salsa_internal_id
+estimate_size	4	salsa_internal_id	salsa_internal_id
+dummy_program_for_size_estimation	1	salsa_internal_id	salsa_internal_id
+```
+
+Use this only for local diagnostics. The default label is the cheap Salsa internal id so tracing does not make hot Cairo paths materially slower. If a named preview is needed, also set `UC_CAIRO214_SIZE_TRACE_NAMES=1`; the fourth column becomes `fnv1a64_hash:function_preview`, with the preview capped so heavily generic Cairo names do not create unbounded trace files.
+
 ## Preflight A Real Manifest
 
 ```bash

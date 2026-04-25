@@ -1,0 +1,88 @@
+diff -ruN a/src/program_generator.rs b/src/program_generator.rs
+--- a/src/program_generator.rs	2026-04-25 10:53:29
++++ b/src/program_generator.rs	2026-04-25 10:53:29
+@@ -1,7 +1,10 @@
+-use std::collections::VecDeque;
++use std::collections::{HashMap, VecDeque};
++use std::io::Write;
++use std::sync::{Mutex, OnceLock};
+ 
+ use cairo_lang_debug::DebugWithDb;
+ use cairo_lang_defs::db::DefsGroup;
++use cairo_lang_defs::ids::UnstableSalsaId;
+ use cairo_lang_diagnostics::Maybe;
+ use cairo_lang_filesystem::ids::{CrateId, Tracked};
+ use cairo_lang_filesystem::location_marks::get_location_marks;
+@@ -419,6 +422,64 @@
+     Ok(requested_function_ids)
+ }
+ 
++static UC_CAIRO214_SIZE_TRACE_COUNTS: OnceLock<Mutex<HashMap<String, u64>>> =
++    OnceLock::new();
++
++fn uc_cairo214_size_trace_hash(text: &str) -> u64 {
++    let mut hash = 0xcbf29ce484222325u64;
++    for byte in text.as_bytes() {
++        hash ^= u64::from(*byte);
++        hash = hash.wrapping_mul(0x100000001b3);
++    }
++    hash
++}
++
++fn uc_cairo214_size_trace_preview(text: &str) -> String {
++    let mut preview = text.chars().take(160).collect::<String>();
++    if preview.len() < text.len() {
++        preview.push_str("...");
++    }
++    preview
++}
++
++fn uc_cairo214_size_trace_event(
++    db: &dyn Database,
++    event: &str,
++    function_id: ConcreteFunctionWithBodyId<'_>,
++) {
++    let Some(path) = std::env::var_os("UC_CAIRO214_SIZE_TRACE") else {
++        return;
++    };
++    let function_key = format!("{:?}", function_id.get_internal_id());
++    let key = format!("{event}\t{function_key}");
++    let counts = UC_CAIRO214_SIZE_TRACE_COUNTS
++        .get_or_init(|| Mutex::new(HashMap::new()));
++    let Ok(mut counts) = counts.lock() else {
++        return;
++    };
++    let count = counts.entry(key).or_insert(0);
++    *count = count.saturating_add(1);
++    let count = *count;
++    drop(counts);
++    if count != 1 && !count.is_power_of_two() {
++        return;
++    }
++    let function_label = if std::env::var_os("UC_CAIRO214_SIZE_TRACE_NAMES").is_some() {
++        let function_path = function_id.full_path(db);
++        format!(
++            "{:016x}:{}",
++            uc_cairo214_size_trace_hash(&function_path),
++            uc_cairo214_size_trace_preview(&function_path)
++        )
++    } else {
++        function_key.clone()
++    };
++    let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
++        return;
++    };
++    let _ = writeln!(file, "{event}\t{count}\t{function_key}\t{function_label}");
++}
++
+ /// Given `function_id` generates a dummy program with the body of the relevant function
+ /// and dummy helper functions that allows the program to be compiled to CASM.
+ /// The generated program is not valid, but it can be used to estimate the size of the
+@@ -427,6 +488,7 @@
+     db: &dyn Database,
+     function_id: ConcreteFunctionWithBodyId<'_>,
+ ) -> Maybe<Program> {
++    uc_cairo214_size_trace_event(db, "dummy_program_for_size_estimation", function_id);
+     let function = db.function_with_body_sierra(function_id)?;
+ 
+     let mut processed_function_ids =
