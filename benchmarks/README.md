@@ -97,6 +97,9 @@ separately with the exact unsupported reason and are excluded from speedup claim
 If a native-eligible case fails during `scarb` or `uc` execution, the harness
 records that build failure in a separate section with exit code and log path
 instead of aborting the whole benchmark run.
+If dependency prefetch fails before classification, the harness records that
+manifest as a per-case `build_failed` row with the `scarb --offline fetch` log
+path instead of aborting the entire corpus sweep.
 
 ## Build Deployed-Contract Source Index From Inventory
 
@@ -236,7 +239,7 @@ backlog for larger corpora:
 - `UCO2001` / `UCO2002`: failed or unstable benchmark lanes.
 - `UCO3001` through `UCO3007`: phase-level acceleration targets.
 - `UCO4001` / `UCO4002`: bounded launch-evidence candidates.
-- `UCO5001`: diagnostics that are not yet complete enough for agent remediation.
+- `UCO5001`: diagnostics that are missing fields or too generic for agent remediation.
 
 Do not use the opportunity summary as a launch claim by itself. It is an
 experiment-control artifact. Public claims still come only from the benchmark

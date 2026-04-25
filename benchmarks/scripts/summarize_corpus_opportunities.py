@@ -22,6 +22,12 @@ REQUIRED_DIAGNOSTIC_FIELDS = {
     "toolchain_expected",
     "toolchain_found",
 }
+GENERIC_DIAGNOSTIC_TEXT = {
+    "compilation failed",
+    "native failed",
+    "native compilation failed",
+    "uc auto build failed",
+}
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -126,6 +132,21 @@ def add_opportunity(opps: list[dict[str, Any]], code: str, severity: str, title:
             "next_action": next_action,
         }
     )
+
+
+def is_generic_diagnostic_text(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip().rstrip(".").lower()
+    return normalized in GENERIC_DIAGNOSTIC_TEXT
+
+
+def diagnostic_quality_issues(diag: dict[str, Any]) -> list[str]:
+    issues = [f"missing {field}" for field in sorted(REQUIRED_DIAGNOSTIC_FIELDS) if field not in diag]
+    for field in ("what_happened", "why"):
+        if is_generic_diagnostic_text(diag.get(field)):
+            issues.append(f"{field} is generic")
+    return issues
 
 
 def unstable_lanes_by_tag(summary: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
@@ -267,14 +288,14 @@ def summarize_case(
         )
 
     for diag in diagnostics:
-        missing = sorted(field for field in REQUIRED_DIAGNOSTIC_FIELDS if field not in diag)
-        if missing:
+        quality_issues = diagnostic_quality_issues(diag)
+        if quality_issues:
             add_opportunity(
                 opps,
                 "UCO5001",
                 "medium",
                 "Diagnostic is not agent-grade",
-                f"Diagnostic {diag.get('code', '<missing-code>')} is missing: {', '.join(missing)}.",
+                f"Diagnostic {diag.get('code', '<missing-code>')} has weak remediation detail: {', '.join(quality_issues)}.",
                 "Extend the diagnostic payload before relying on agents to remediate this class automatically.",
             )
 
