@@ -632,11 +632,13 @@ test_real_repo_benchmark_reports_prefetch_failure_context() {
   classification="$(jq -r '.cases[] | select(.tag=="fails-fetch") | .support_matrix.classification' "$json_path")"
   local benchmark_status
   benchmark_status="$(jq -r '.cases[] | select(.tag=="fails-fetch") | .benchmark_status' "$json_path")"
+  local exit_code
+  exit_code="$(jq -r '.cases[] | select(.tag=="fails-fetch") | .support_matrix.exit_code' "$json_path")"
   local log_path
   log_path="$(jq -r '.cases[] | select(.tag=="fails-fetch") | .support_matrix.log_path' "$json_path")"
   local reason
   reason="$(jq -r '.cases[] | select(.tag=="fails-fetch") | .support_matrix.reason' "$json_path")"
-  if [[ "$classification" != "build_failed" || "$benchmark_status" != "skipped" || "$reason" != "scarb offline fetch failed before uc auto build classification" ]]; then
+  if [[ "$classification" != "build_failed" || "$benchmark_status" != "skipped" || "$exit_code" != "18" || "$reason" != "scarb offline fetch failed before uc auto build classification" ]]; then
     echo "expected prefetch failure to be recorded as a per-case build_failed support classification" >&2
     cat "$json_path" >&2
     return 1
@@ -651,9 +653,14 @@ test_real_repo_benchmark_reports_prefetch_failure_context() {
     cat "$stderr_path" >&2
     return 1
   fi
+  if ! grep -q "exit_code=18" "$stderr_path"; then
+    echo "expected real scarb fetch exit code on stderr" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
   local markdown_text
   markdown_text="$(cat "$md_path")"
-  if [[ "$markdown_text" != *"| fails-fetch | 1 | $log_path | scarb offline fetch failed before uc auto build classification |"* ]]; then
+  if [[ "$markdown_text" != *"| fails-fetch | 18 | $log_path | scarb offline fetch failed before uc auto build classification |"* ]]; then
     echo "expected markdown auto-build classification row for prefetch failure" >&2
     cat "$md_path" >&2
     return 1

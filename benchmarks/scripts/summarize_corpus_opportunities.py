@@ -144,7 +144,8 @@ def is_generic_diagnostic_text(value: Any) -> bool:
 def diagnostic_quality_issues(diag: dict[str, Any]) -> list[str]:
     issues = [f"missing {field}" for field in sorted(REQUIRED_DIAGNOSTIC_FIELDS) if field not in diag]
     for field in ("what_happened", "why"):
-        if is_generic_diagnostic_text(diag.get(field)):
+        text = (diag.get(field) or "").strip()
+        if not text or is_generic_diagnostic_text(text):
             issues.append(f"{field} is generic")
     return issues
 
