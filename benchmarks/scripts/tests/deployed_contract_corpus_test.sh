@@ -731,6 +731,8 @@ test_native_benchmark_failure_blocks_native_support_claim() {
 
   json_path="$(extract_labeled_path "Corpus Benchmark JSON" <<<"$stdout_text")"
   md_path="$(extract_labeled_path "Corpus Benchmark Markdown" <<<"$stdout_text")"
+  [[ -f "$json_path" ]] || { echo "missing corpus benchmark json: $json_path" >&2; return 1; }
+  [[ -f "$md_path" ]] || { echo "missing corpus benchmark markdown: $md_path" >&2; return 1; }
   safe="$(jq -r '.claim_guard.safe_to_say_compiled_all_deployed_contracts_in_corpus' "$json_path")"
   selected_safe="$(jq -r '.claim_guard.safe_to_say_compiled_all_selected_deployed_units_in_corpus' "$json_path")"
   all_supported="$(jq -r '.claim_guard.safe_to_say_all_items_native_supported' "$json_path")"
