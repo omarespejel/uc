@@ -539,11 +539,35 @@ fn report_schemas_match_nullable_option_output() {
         replay_schema["properties"]["blocked_reason"]["type"],
         serde_json::json!(["string", "null"])
     );
-    assert!(replay_schema["properties"]["selected_support"]["anyOf"]
+    let selected_support_any_of = replay_schema["properties"]["selected_support"]["anyOf"]
         .as_array()
-        .expect("selected_support should use anyOf")
+        .expect("selected_support should use anyOf");
+    assert!(selected_support_any_of
         .iter()
         .any(|entry| entry == &serde_json::json!({"type": "null"})));
+    assert!(
+        selected_support_any_of
+            .iter()
+            .any(|entry| entry.get("$ref").is_some()
+                || entry.get("type") == Some(&serde_json::json!("object"))),
+        "selected_support should preserve a non-null schema branch"
+    );
+    let replay_required = replay_schema["required"]
+        .as_array()
+        .expect("replay schema should list required fields");
+    for optional_field in [
+        "manifest_path",
+        "selected_support",
+        "exit_code",
+        "blocked_reason",
+    ] {
+        assert!(
+            !replay_required
+                .iter()
+                .any(|field| field.as_str() == Some(optional_field)),
+            "{optional_field} should stay optional in replay schema"
+        );
+    }
 
     let safe_action_schema: serde_json::Value = serde_json::from_str(include_str!(
         "../../../docs/agent/schemas/safe-action-report.schema.json"
@@ -557,6 +581,17 @@ fn report_schemas_match_nullable_option_output() {
         safe_action_schema["properties"]["blocked_reason"]["type"],
         serde_json::json!(["string", "null"])
     );
+    let safe_action_required = safe_action_schema["required"]
+        .as_array()
+        .expect("safe-action schema should list required fields");
+    for optional_field in ["exit_code", "blocked_reason"] {
+        assert!(
+            !safe_action_required
+                .iter()
+                .any(|field| field.as_str() == Some(optional_field)),
+            "{optional_field} should stay optional in safe-action schema"
+        );
+    }
 }
 
 #[test]

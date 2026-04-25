@@ -16,22 +16,26 @@ This checkpoint records the current local evidence for the agent-first Cairo com
 ## Generation Commands
 
 ```bash
-cargo build -p uc-cli --release
-./scripts/build_native_toolchain_helper.sh --lane 2.14 --output "$HOME/.uc/toolchain-helpers/uc-cairo214-helper/bin/uc"
+export UC_REPO_ROOT="/Users/espejelomar/StarkNet/uc-launch-evidence-pr-20260425"
+export EVIDENCE_ROOT="/Users/espejelomar/StarkNet/uc-launch-evidence-20260425"
 export UC_NATIVE_TOOLCHAIN_2_14_BIN="$HOME/.uc/toolchain-helpers/uc-cairo214-helper/bin/uc"
 
+cd "$UC_REPO_ROOT"
+cargo build -p uc-cli --release
+./scripts/build_native_toolchain_helper.sh --lane 2.14 --output "$UC_NATIVE_TOOLCHAIN_2_14_BIN"
+
 ./benchmarks/scripts/build_deployed_contract_source_index.sh \
-  --inventory /Users/espejelomar/StarkNet/uc-launch-evidence-20260425/reviewed-source-inventory.json \
-  --out /Users/espejelomar/StarkNet/uc-launch-evidence-20260425/pinned-source-index.json
+  --inventory "$EVIDENCE_ROOT/reviewed-source-inventory.json" \
+  --out "$EVIDENCE_ROOT/pinned-source-index.json"
 
 ./benchmarks/scripts/generate_deployed_contract_corpus.sh \
-  --source-index /Users/espejelomar/StarkNet/uc-launch-evidence-20260425/pinned-source-index.json \
-  --out /Users/espejelomar/StarkNet/uc-launch-evidence-20260425/generated-corpus.json
+  --source-index "$EVIDENCE_ROOT/pinned-source-index.json" \
+  --out "$EVIDENCE_ROOT/generated-corpus.json"
 
 ./benchmarks/scripts/run_deployed_contract_corpus.sh \
-  --uc-bin /Users/espejelomar/StarkNet/uc-launch-evidence-pr-20260425/target/release/uc \
-  --corpus /Users/espejelomar/StarkNet/uc-launch-evidence-20260425/generated-corpus.json \
-  --results-dir /Users/espejelomar/StarkNet/uc-launch-evidence-20260425/results \
+  --uc-bin "$UC_REPO_ROOT/target/release/uc" \
+  --corpus "$EVIDENCE_ROOT/generated-corpus.json" \
+  --results-dir "$EVIDENCE_ROOT/results" \
   --runs 3 \
   --cold-runs 3 \
   --warm-settle-seconds 2.2
@@ -47,6 +51,19 @@ export UC_NATIVE_TOOLCHAIN_2_14_BIN="$HOME/.uc/toolchain-helpers/uc-cairo214-hel
 Summary: `native_supported=2`, `fallback_used=0`, `native_unsupported=0`, `build_failed=0`.
 
 ## Same-Window Benchmark Results
+
+Lane and conditions:
+
+- Benchmark lane: `run_deployed_contract_corpus.sh` wrapping `run_real_repo_benchmarks.sh`.
+- Benchmark stages: `build.cold` and `build.warm_noop`.
+- Native lane: Cairo `2.14.0` external helper via `UC_NATIVE_TOOLCHAIN_2_14_BIN`.
+- uc backend: `uc_native_external_helper`.
+- Baseline: `scarb 2.14.0 (682b29e13 2025-11-25)`.
+- Host: Apple M3 Pro, `Mac15,7`, macOS `26.4.1` build `25E253`, `aarch64-apple-darwin`.
+- Runs: warm runs `3`, cold runs `3`, warm settle `2.2s`.
+- CPU pinning: not set on this macOS host.
+- uc binary SHA-256: `22da63681dfcd6a5429cbcf096638ac08618f71cb2987f3616b59c2b7ce5cb99`.
+- Cairo 2.14 helper SHA-256: `b184a564ebd1b9761cc20ef8a11594aba2e4b355b348cfc5875a26d040ea27a3`.
 
 | Item | Cold Scarb p95 (ms) | Cold uc p95 (ms) | Cold speedup | Warm Scarb p95 (ms) | Warm uc p95 (ms) | Warm speedup |
 |---|---:|---:|---:|---:|---:|---:|
