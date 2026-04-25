@@ -13,7 +13,7 @@ This directory is the checked-in handoff layer for humans, coding agents, and PR
 - `AGENT_QUICKSTART.md`: command sequence agents should prefer before build, fix, or benchmark work.
 - `HUMAN_QUICKSTART.md`: human-oriented command sequence for the same support/build surfaces.
 - `../PROJECT_MODEL_STRATEGY.md`: first-party project model direction and parity gates.
-- `schemas/`: JSON schemas for diagnostic, support, and build report outputs.
+- `schemas/`: JSON schemas for diagnostic, project inspect, support, and build report outputs.
 
 ## Why This Exists
 

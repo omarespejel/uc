@@ -2,6 +2,26 @@
 
 Agents should prefer structured commands and stop guessing from terminal prose.
 
+## Project Inspect
+
+```sh
+uc project inspect --manifest-path /abs/path/to/Scarb.toml --format json
+```
+
+Read:
+
+- `.readonly`
+- `.mutation_status`
+- `.package`
+- `.workspace.members`
+- `.targets`
+- `.dependencies`
+- `.lockfile`
+- `.toolchain.requested_version`
+- `.toolchain.requested_major_minor`
+- `.toolchain.native_status`
+- `.diagnostics[].code`
+
 ## Native Support Probe
 
 ```sh

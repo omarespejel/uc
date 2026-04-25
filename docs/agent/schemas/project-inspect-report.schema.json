@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/omarespejel/uc/docs/agent/schemas/project-inspect-report.schema.json",
+  "title": "uc ProjectInspectReport",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "generated_at_epoch_ms",
+    "manifest_path",
+    "workspace_root",
+    "readonly",
+    "mutation_status",
+    "manifest",
+    "package",
+    "workspace",
+    "targets",
+    "dependencies",
+    "lockfile",
+    "toolchain",
+    "diagnostics"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "generated_at_epoch_ms": { "type": "integer", "minimum": 0 },
+    "manifest_path": { "type": "string", "minLength": 1 },
+    "workspace_root": { "type": "string", "minLength": 1 },
+    "readonly": { "const": true },
+    "mutation_status": { "const": "none" },
+    "manifest": {
+      "type": "object",
+      "required": ["valid", "size_bytes"],
+      "properties": {
+        "valid": { "type": "boolean" },
+        "size_bytes": { "type": "integer", "minimum": 0 },
+        "hash": { "type": ["string", "null"] }
+      }
+    },
+    "package": { "type": "object" },
+    "workspace": {
+      "type": "object",
+      "required": ["has_workspace_table", "members", "exclude"],
+      "properties": {
+        "has_workspace_table": { "type": "boolean" },
+        "members": { "type": "array", "items": { "type": "string" } },
+        "exclude": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "targets": { "type": "array", "items": { "type": "object" } },
+    "dependencies": { "type": "array", "items": { "type": "object" } },
+    "lockfile": {
+      "type": "object",
+      "required": ["present", "valid", "packages"],
+      "properties": {
+        "present": { "type": "boolean" },
+        "valid": { "type": "boolean" },
+        "packages": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "toolchain": {
+      "type": "object",
+      "required": ["native_status", "native_supported", "fallback_used"],
+      "properties": {
+        "requested_version": { "type": ["string", "null"] },
+        "requested_major_minor": { "type": ["string", "null"] },
+        "request_source": { "type": ["string", "null"] },
+        "native_status": { "enum": ["supported", "unsupported", "unavailable"] },
+        "native_supported": { "type": "boolean" },
+        "fallback_used": { "const": false }
+      }
+    },
+    "native_support": { "$ref": "native-support-report.schema.json" },
+    "diagnostics": {
+      "type": "array",
+      "items": { "$ref": "native-diagnostic.schema.json" }
+    }
+  }
+}

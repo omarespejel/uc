@@ -276,6 +276,7 @@ enum Commands {
     #[command(hide = true)]
     Benchmark(benchmark_cmd::BenchmarkArgs),
     Agent(AgentArgs),
+    Project(ProjectArgs),
     Cache(CacheArgs),
     Mcp(McpArgs),
     Support(SupportArgs),
@@ -297,6 +298,37 @@ struct AgentArgs {
 enum AgentCommand {
     Eval(AgentEvalArgs),
     SafeAction(AgentSafeActionArgs),
+}
+
+#[derive(Args, Debug)]
+struct ProjectArgs {
+    #[command(subcommand)]
+    command: ProjectCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum ProjectCommand {
+    Inspect(ProjectInspectArgs),
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum ProjectInspectFormatArg {
+    Json,
+}
+
+#[derive(Args, Debug, Clone)]
+struct ProjectInspectArgs {
+    #[arg(long)]
+    manifest_path: Option<PathBuf>,
+
+    #[arg(long, value_enum, default_value_t = ProjectInspectFormatArg::Json)]
+    format: ProjectInspectFormatArg,
+
+    #[arg(long, conflicts_with = "format")]
+    json: bool,
+
+    #[arg(long)]
+    report_path: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -617,6 +649,103 @@ struct NativeSupportReport {
     toolchain: Option<NativeToolchainReport>,
     #[serde(default)]
     diagnostics: Vec<NativeDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ProjectInspectReport {
+    #[serde(default = "uc_agent_json_schema_version")]
+    schema_version: u32,
+    generated_at_epoch_ms: u64,
+    manifest_path: String,
+    workspace_root: String,
+    readonly: bool,
+    mutation_status: String,
+    manifest: ProjectManifestSummary,
+    package: ProjectPackageSummary,
+    workspace: ProjectWorkspaceSummary,
+    targets: Vec<ProjectTargetSummary>,
+    dependencies: Vec<ProjectDependencySummary>,
+    lockfile: ProjectLockfileSummary,
+    toolchain: ProjectToolchainSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    native_support: Option<NativeSupportReport>,
+    diagnostics: Vec<NativeDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ProjectManifestSummary {
+    valid: bool,
+    size_bytes: u64,
+    hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+struct ProjectPackageSummary {
+    name: Option<String>,
+    version: Option<String>,
+    edition: Option<String>,
+    cairo_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ProjectWorkspaceSummary {
+    has_workspace_table: bool,
+    members: Vec<String>,
+    exclude: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ProjectTargetSummary {
+    kind: String,
+    declaration: String,
+    name: Option<String>,
+    source_path: Option<String>,
+    raw_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ProjectDependencySummary {
+    section: String,
+    name: String,
+    kind: String,
+    version: Option<String>,
+    path: Option<String>,
+    git: Option<String>,
+    branch: Option<String>,
+    tag: Option<String>,
+    rev: Option<String>,
+    workspace: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ProjectLockfileSummary {
+    present: bool,
+    path: Option<String>,
+    valid: bool,
+    version: Option<String>,
+    size_bytes: Option<u64>,
+    modified_unix_ms: Option<u64>,
+    hash: Option<String>,
+    packages: Vec<ProjectLockfilePackageSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ProjectLockfilePackageSummary {
+    name: String,
+    version: Option<String>,
+    source: Option<String>,
+    dependencies_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ProjectToolchainSummary {
+    edition: Option<String>,
+    requested_version: Option<String>,
+    requested_major_minor: Option<String>,
+    request_source: Option<NativeToolchainRequestSource>,
+    native_status: NativeSupportStatus,
+    native_supported: bool,
+    fallback_used: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1985,6 +2114,7 @@ fn main() -> Result<()> {
         #[cfg(feature = "dev-benchmark-command")]
         Commands::Benchmark(args) => benchmark_cmd::run(args),
         Commands::Agent(args) => run_agent(args),
+        Commands::Project(args) => run_project(args),
         Commands::Cache(args) => run_cache(args),
         Commands::Mcp(args) => run_mcp(args),
         Commands::Support(args) => run_support(args),
@@ -2030,6 +2160,700 @@ fn run_agent(args: AgentArgs) -> Result<()> {
     match args.command {
         AgentCommand::Eval(args) => run_agent_eval(args),
         AgentCommand::SafeAction(args) => run_agent_safe_action(args),
+    }
+}
+
+fn run_project(args: ProjectArgs) -> Result<()> {
+    match args.command {
+        ProjectCommand::Inspect(args) => run_project_inspect(args),
+    }
+}
+
+fn run_project_inspect(args: ProjectInspectArgs) -> Result<()> {
+    let manifest_path = resolve_manifest_path(&args.manifest_path)?;
+    let report = project_inspect_report_from_manifest_path(&manifest_path)?;
+    let format = if args.json {
+        ProjectInspectFormatArg::Json
+    } else {
+        args.format
+    };
+    match format {
+        ProjectInspectFormatArg::Json => emit_json_value(args.report_path.as_deref(), &report),
+    }
+}
+
+fn project_inspect_report_from_manifest_path(manifest_path: &Path) -> Result<ProjectInspectReport> {
+    let workspace_root = manifest_path
+        .parent()
+        .context("manifest path has no parent")?;
+    let manifest_metadata = fs::metadata(manifest_path)
+        .with_context(|| format!("failed to stat {}", manifest_path.display()))?;
+    let manifest_hash = hash_file_blake3(manifest_path)
+        .ok()
+        .map(|hash| format!("blake3:{hash}"));
+    let mut diagnostics = Vec::new();
+
+    let manifest_text =
+        match read_text_file_with_limit(manifest_path, MAX_MANIFEST_BYTES, "manifest") {
+            Ok(text) => Some(text),
+            Err(err) => {
+                diagnostics.push(project_agent_diagnostic(
+                    "UCP1000",
+                    "manifest_read",
+                    NativeDiagnosticSeverity::Error,
+                    "Manifest could not be read",
+                    format!("uc could not read manifest {}.", manifest_path.display()),
+                    format!("{err:#}"),
+                    vec![
+                        "Verify the file is UTF-8 and below the manifest size limit.".to_string(),
+                        "Rerun project inspection after fixing the manifest file.".to_string(),
+                    ],
+                    vec![
+                        "uc project inspect --manifest-path <Scarb.toml> --format json".to_string(),
+                    ],
+                    "manual_manifest_fix_required",
+                    false,
+                    false,
+                    None,
+                    None,
+                ));
+                None
+            }
+        };
+    let manifest = manifest_text.as_deref().and_then(|text| {
+        match parse_manifest_toml(
+            text,
+            manifest_path,
+            "failed to parse manifest for project inspect",
+        ) {
+            Ok(value) => Some(value),
+            Err(err) => {
+                diagnostics.push(project_agent_diagnostic(
+                    "UCP1001",
+                    "manifest_parse",
+                    NativeDiagnosticSeverity::Error,
+                    "Manifest TOML could not be parsed",
+                    format!(
+                        "uc could not parse manifest {} as TOML.",
+                        manifest_path.display()
+                    ),
+                    format!("{err:#}"),
+                    vec![
+                        "Fix the TOML syntax error reported by the parser.".to_string(),
+                        "Keep the manifest in Scarb-compatible TOML before rerunning inspection."
+                            .to_string(),
+                    ],
+                    vec![
+                        "uc project inspect --manifest-path <Scarb.toml> --format json".to_string(),
+                    ],
+                    "manual_manifest_fix_required",
+                    false,
+                    false,
+                    None,
+                    None,
+                ));
+                None
+            }
+        }
+    });
+
+    let package = manifest
+        .as_ref()
+        .map(project_package_summary_from_manifest)
+        .unwrap_or_default();
+    let workspace = manifest
+        .as_ref()
+        .map(project_workspace_summary_from_manifest)
+        .unwrap_or_else(|| ProjectWorkspaceSummary {
+            has_workspace_table: false,
+            members: Vec::new(),
+            exclude: Vec::new(),
+        });
+    let targets = manifest
+        .as_ref()
+        .map(project_targets_from_manifest)
+        .unwrap_or_default();
+    let dependencies = manifest
+        .as_ref()
+        .map(project_dependencies_from_manifest)
+        .unwrap_or_default();
+    let lockfile = project_lockfile_summary(workspace_root, &mut diagnostics)?;
+    let readonly_native_source =
+        project_has_readonly_native_toolchain_source(&package, &dependencies, &lockfile);
+    let native_support = if manifest.is_some()
+        && (readonly_native_source || !cfg!(feature = "native-compile"))
+    {
+        match native_support_report_from_manifest_path(manifest_path) {
+            Ok(report) => Some(report),
+            Err(err) => {
+                diagnostics.push(project_agent_diagnostic(
+                    "UCP1002",
+                    "native_support_probe",
+                    NativeDiagnosticSeverity::Warn,
+                    "Native support probe failed during project inspection",
+                    "uc parsed the project manifest, but native support classification failed."
+                        .to_string(),
+                    format!("{err:#}"),
+                    vec![
+                        "Run native support probing directly to isolate the toolchain issue."
+                            .to_string(),
+                    ],
+                    vec![
+                        "uc support native --manifest-path <Scarb.toml> --format json".to_string(),
+                    ],
+                    "inspect_native_support_then_retry",
+                    true,
+                    false,
+                    None,
+                    None,
+                ));
+                None
+            }
+        }
+    } else if manifest.is_some() {
+        diagnostics.push(project_agent_diagnostic(
+            "UCP1005",
+            "native_support_probe",
+            NativeDiagnosticSeverity::Info,
+            "Native support probe skipped for read-only inspection",
+            "uc project inspect did not run native support probing because the manifest and lockfile did not contain an exact native toolchain source.".to_string(),
+            "The native support probe may need to run metadata resolution, which can create local cache state; project inspection is read-only by contract.".to_string(),
+            vec![
+                "Run uc support native directly when you want full native support probing.".to_string(),
+                "Add an exact [package].cairo-version or commit a lockfile with an exact starknet version when you need read-only toolchain selection.".to_string(),
+            ],
+            vec![
+                "uc support native --manifest-path <Scarb.toml> --format json".to_string(),
+            ],
+            "inspect_native_support_then_retry",
+            true,
+            false,
+            None,
+            None,
+        ));
+        None
+    } else {
+        None
+    };
+    if let Some(support) = &native_support {
+        diagnostics.extend(support.diagnostics.clone());
+    }
+    let toolchain =
+        project_toolchain_summary(&package, &dependencies, &lockfile, native_support.as_ref());
+
+    Ok(ProjectInspectReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        generated_at_epoch_ms: epoch_ms_u64()?,
+        manifest_path: manifest_path.display().to_string(),
+        workspace_root: workspace_root.display().to_string(),
+        readonly: true,
+        mutation_status: "none".to_string(),
+        manifest: ProjectManifestSummary {
+            valid: manifest.is_some(),
+            size_bytes: manifest_metadata.len(),
+            hash: manifest_hash,
+        },
+        package,
+        workspace,
+        targets,
+        dependencies,
+        lockfile,
+        toolchain,
+        native_support,
+        diagnostics,
+    })
+}
+
+fn project_has_readonly_native_toolchain_source(
+    package: &ProjectPackageSummary,
+    dependencies: &[ProjectDependencySummary],
+    lockfile: &ProjectLockfileSummary,
+) -> bool {
+    package.cairo_version.is_some()
+        || dependencies.iter().any(|dependency| {
+            dependency.section == "dependencies"
+                && dependency.name == "starknet"
+                && dependency
+                    .version
+                    .as_deref()
+                    .is_some_and(project_manifest_dependency_version_avoids_metadata_probe)
+        })
+        || lockfile
+            .packages
+            .iter()
+            .any(|package| package.name == "starknet" && package.version.is_some())
+}
+
+fn project_manifest_dependency_version_avoids_metadata_probe(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    trimmed.starts_with('=')
+        || project_parse_cairo_version_major_minor(trimmed).is_some_and(|_| {
+            let exact = trimmed.strip_prefix('=').map(str::trim).unwrap_or(trimmed);
+            let mut parts = exact.split('.');
+            let Some(major) = parts.next() else {
+                return false;
+            };
+            let Some(minor) = parts.next() else {
+                return false;
+            };
+            let patch = parts.next();
+            parts.next().is_none()
+                && major.parse::<u64>().is_ok()
+                && minor.parse::<u64>().is_ok()
+                && patch.is_none_or(|part| part.parse::<u64>().is_ok())
+        })
+}
+
+fn project_package_summary_from_manifest(manifest: &TomlValue) -> ProjectPackageSummary {
+    let package = manifest.get("package").and_then(TomlValue::as_table);
+    let get_package_string = |key: &str| {
+        package
+            .and_then(|table| table.get(key))
+            .and_then(TomlValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    ProjectPackageSummary {
+        name: get_package_string("name"),
+        version: get_package_string("version"),
+        edition: get_package_string("edition").or_else(|| Some(DEFAULT_CAIRO_EDITION.to_string())),
+        cairo_version: get_package_string("cairo-version")
+            .or_else(|| get_package_string("cairo_version")),
+    }
+}
+
+fn project_workspace_summary_from_manifest(manifest: &TomlValue) -> ProjectWorkspaceSummary {
+    let workspace = manifest.get("workspace").and_then(TomlValue::as_table);
+    ProjectWorkspaceSummary {
+        has_workspace_table: workspace.is_some(),
+        members: workspace
+            .and_then(|table| table.get("members"))
+            .map(project_toml_string_array)
+            .unwrap_or_default(),
+        exclude: workspace
+            .and_then(|table| table.get("exclude"))
+            .map(project_toml_string_array)
+            .unwrap_or_default(),
+    }
+}
+
+fn project_targets_from_manifest(manifest: &TomlValue) -> Vec<ProjectTargetSummary> {
+    let mut targets = Vec::new();
+    for key in ["lib", "executable", "starknet-contract"] {
+        if let Some(value) = manifest.get(key) {
+            project_push_target_summary(&mut targets, key, key, value);
+        }
+    }
+    if let Some(target_table) = manifest.get("target").and_then(TomlValue::as_table) {
+        for (kind, value) in target_table {
+            project_push_target_summary(&mut targets, kind, &format!("target.{kind}"), value);
+        }
+    }
+    targets.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.declaration.cmp(&right.declaration))
+    });
+    targets
+}
+
+fn project_push_target_summary(
+    targets: &mut Vec<ProjectTargetSummary>,
+    kind: &str,
+    declaration: &str,
+    value: &TomlValue,
+) {
+    match value {
+        TomlValue::Table(table) => {
+            targets.push(project_target_summary_from_table(kind, declaration, table));
+        }
+        TomlValue::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                if let Some(table) = item.as_table() {
+                    targets.push(project_target_summary_from_table(
+                        kind,
+                        &format!("{declaration}[{index}]"),
+                        table,
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn project_target_summary_from_table(
+    kind: &str,
+    declaration: &str,
+    table: &toml::map::Map<String, TomlValue>,
+) -> ProjectTargetSummary {
+    let mut raw_keys = table.keys().cloned().collect::<Vec<_>>();
+    raw_keys.sort();
+    ProjectTargetSummary {
+        kind: kind.to_string(),
+        declaration: declaration.to_string(),
+        name: project_table_string(table, "name"),
+        source_path: project_table_string(table, "source-path")
+            .or_else(|| project_table_string(table, "source_path"))
+            .or_else(|| project_table_string(table, "path"))
+            .or_else(|| project_table_string(table, "src")),
+        raw_keys,
+    }
+}
+
+fn project_dependencies_from_manifest(manifest: &TomlValue) -> Vec<ProjectDependencySummary> {
+    let mut dependencies = Vec::new();
+    for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        let Some(table) = manifest.get(section).and_then(TomlValue::as_table) else {
+            continue;
+        };
+        for (name, value) in table {
+            dependencies.push(project_dependency_summary(section, name, value));
+        }
+    }
+    dependencies.sort_by(|left, right| {
+        left.section
+            .cmp(&right.section)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    dependencies
+}
+
+fn project_dependency_summary(
+    section: &str,
+    name: &str,
+    value: &TomlValue,
+) -> ProjectDependencySummary {
+    let table = value.as_table();
+    let workspace = table
+        .and_then(|table| table.get("workspace"))
+        .and_then(TomlValue::as_bool)
+        .unwrap_or(false);
+    let version = match value {
+        TomlValue::String(raw) => Some(raw.trim().to_string()).filter(|value| !value.is_empty()),
+        TomlValue::Table(table) => project_table_string(table, "version"),
+        _ => None,
+    };
+    let path = table.and_then(|table| project_table_string(table, "path"));
+    let git = table.and_then(|table| project_table_string(table, "git"));
+    let branch = table.and_then(|table| project_table_string(table, "branch"));
+    let tag = table.and_then(|table| project_table_string(table, "tag"));
+    let rev = table.and_then(|table| project_table_string(table, "rev"));
+    let kind = if workspace {
+        "workspace"
+    } else if path.is_some() {
+        "path"
+    } else if git.is_some() {
+        "git"
+    } else if version.is_some() {
+        "version"
+    } else if table.is_some() {
+        "table"
+    } else {
+        "unknown"
+    };
+    ProjectDependencySummary {
+        section: section.to_string(),
+        name: name.to_string(),
+        kind: kind.to_string(),
+        version,
+        path,
+        git,
+        branch,
+        tag,
+        rev,
+        workspace,
+    }
+}
+
+fn project_lockfile_summary(
+    workspace_root: &Path,
+    diagnostics: &mut Vec<NativeDiagnostic>,
+) -> Result<ProjectLockfileSummary> {
+    let lock_path = workspace_root.join("Scarb.lock");
+    let metadata = match fs::metadata(&lock_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok(ProjectLockfileSummary {
+                present: false,
+                path: Some(lock_path.display().to_string()),
+                valid: true,
+                version: None,
+                size_bytes: None,
+                modified_unix_ms: None,
+                hash: None,
+                packages: Vec::new(),
+            });
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to stat {}", lock_path.display()));
+        }
+    };
+    if !metadata.is_file() {
+        diagnostics.push(project_agent_diagnostic(
+            "UCP1003",
+            "lockfile_shape",
+            NativeDiagnosticSeverity::Error,
+            "Lockfile path is not a regular file",
+            format!("{} exists but is not a regular file.", lock_path.display()),
+            "Project inspection cannot trust lockfile metadata from a non-file path.".to_string(),
+            vec!["Replace the path with a regular Scarb.lock file or remove it.".to_string()],
+            vec!["uc project inspect --manifest-path <Scarb.toml> --format json".to_string()],
+            "manual_lockfile_fix_required",
+            false,
+            false,
+            None,
+            Some(lock_path.display().to_string()),
+        ));
+        return Ok(ProjectLockfileSummary {
+            present: true,
+            path: Some(lock_path.display().to_string()),
+            valid: false,
+            version: None,
+            size_bytes: Some(metadata.len()),
+            modified_unix_ms: metadata_modified_unix_ms(&metadata).ok(),
+            hash: None,
+            packages: Vec::new(),
+        });
+    }
+
+    let hash = hash_file_blake3(&lock_path)
+        .ok()
+        .map(|hash| format!("blake3:{hash}"));
+    let modified_unix_ms = metadata_modified_unix_ms(&metadata).ok();
+    let mut version = None;
+    let mut packages = Vec::new();
+    let mut valid = true;
+    match read_text_file_with_limit(&lock_path, MAX_LOCKFILE_BYTES, "Scarb.lock").and_then(|text| {
+        text.parse::<TomlValue>()
+            .with_context(|| format!("failed to parse {}", lock_path.display()))
+    }) {
+        Ok(lock) => {
+            version = lock.get("version").and_then(project_toml_scalar_string);
+            if let Some(items) = lock.get("package").and_then(TomlValue::as_array) {
+                for item in items {
+                    let Some(table) = item.as_table() else {
+                        continue;
+                    };
+                    let Some(name) = project_table_string(table, "name") else {
+                        continue;
+                    };
+                    let dependencies_count = table
+                        .get("dependencies")
+                        .and_then(TomlValue::as_array)
+                        .map(Vec::len)
+                        .unwrap_or(0);
+                    packages.push(ProjectLockfilePackageSummary {
+                        name,
+                        version: project_table_string(table, "version"),
+                        source: project_table_string(table, "source"),
+                        dependencies_count,
+                    });
+                }
+            }
+        }
+        Err(err) => {
+            valid = false;
+            diagnostics.push(project_agent_diagnostic(
+                "UCP1004",
+                "lockfile_parse",
+                NativeDiagnosticSeverity::Warn,
+                "Lockfile could not be parsed",
+                format!("uc could not parse {}.", lock_path.display()),
+                format!("{err:#}"),
+                vec![
+                    "Regenerate or fix Scarb.lock before relying on lockfile-derived toolchain selection."
+                        .to_string(),
+                ],
+                vec![
+                    "uc project inspect --manifest-path <Scarb.toml> --format json"
+                        .to_string(),
+                    "scarb metadata --manifest-path <Scarb.toml>".to_string(),
+                ],
+                "manual_lockfile_fix_required",
+                false,
+                false,
+                None,
+                Some(lock_path.display().to_string()),
+            ));
+        }
+    }
+    packages.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.version.cmp(&right.version))
+    });
+    Ok(ProjectLockfileSummary {
+        present: true,
+        path: Some(lock_path.display().to_string()),
+        valid,
+        version,
+        size_bytes: Some(metadata.len()),
+        modified_unix_ms,
+        hash,
+        packages,
+    })
+}
+
+fn project_toolchain_summary(
+    package: &ProjectPackageSummary,
+    dependencies: &[ProjectDependencySummary],
+    lockfile: &ProjectLockfileSummary,
+    native_support: Option<&NativeSupportReport>,
+) -> ProjectToolchainSummary {
+    let native_status = native_support
+        .map(|support| support.status.clone())
+        .unwrap_or(NativeSupportStatus::Unavailable);
+    let native_supported = native_support
+        .map(|support| support.supported)
+        .unwrap_or(false);
+    let native_toolchain = native_support.and_then(|support| support.toolchain.as_ref());
+    let mut requested_version = native_toolchain
+        .and_then(|toolchain| toolchain.requested_version.clone())
+        .or_else(|| package.cairo_version.clone());
+    let mut request_source = native_toolchain
+        .and_then(|toolchain| toolchain.request_source.clone())
+        .or_else(|| {
+            package
+                .cairo_version
+                .as_ref()
+                .map(|_| NativeToolchainRequestSource::PackageCairoVersion)
+        });
+    if requested_version.is_none() {
+        if let Some(dep) = dependencies
+            .iter()
+            .find(|dep| dep.section == "dependencies" && dep.name == "starknet")
+            .and_then(|dep| dep.version.clone())
+        {
+            requested_version = Some(dep);
+            request_source = Some(NativeToolchainRequestSource::ManifestDependencyVersion);
+        }
+    }
+    if requested_version.is_none() {
+        if let Some(package) = lockfile
+            .packages
+            .iter()
+            .find(|package| package.name == "starknet")
+        {
+            requested_version = package.version.clone();
+            request_source = Some(NativeToolchainRequestSource::LockfileDependencyVersion);
+        }
+    }
+    let requested_major_minor = native_toolchain
+        .and_then(|toolchain| toolchain.requested_major_minor.clone())
+        .or_else(|| {
+            requested_version
+                .as_deref()
+                .and_then(project_parse_cairo_version_major_minor)
+                .map(project_format_cairo_version_major_minor)
+        });
+    ProjectToolchainSummary {
+        edition: package.edition.clone(),
+        requested_version,
+        requested_major_minor,
+        request_source,
+        native_status,
+        native_supported,
+        fallback_used: false,
+    }
+}
+
+fn project_table_string(table: &toml::map::Map<String, TomlValue>, key: &str) -> Option<String> {
+    table
+        .get(key)
+        .and_then(TomlValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn project_toml_string_array(value: &TomlValue) -> Vec<String> {
+    value
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(TomlValue::as_str)
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn project_toml_scalar_string(value: &TomlValue) -> Option<String> {
+    match value {
+        TomlValue::String(raw) => Some(raw.trim().to_string()).filter(|value| !value.is_empty()),
+        TomlValue::Integer(raw) => Some(raw.to_string()),
+        TomlValue::Float(raw) => Some(raw.to_string()),
+        TomlValue::Boolean(raw) => Some(raw.to_string()),
+        _ => None,
+    }
+}
+
+fn project_parse_cairo_version_major_minor(raw: &str) -> Option<(u64, u64)> {
+    let normalized = raw
+        .trim()
+        .trim_start_matches('=')
+        .trim()
+        .trim_start_matches('v');
+    let mut parts = normalized.split('.');
+    let major = project_parse_version_component_leading_u64(parts.next()?)?;
+    let minor = project_parse_version_component_leading_u64(parts.next()?)?;
+    Some((major, minor))
+}
+
+fn project_parse_version_component_leading_u64(raw: &str) -> Option<u64> {
+    let digits = raw
+        .trim()
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u64>().ok()
+}
+
+fn project_format_cairo_version_major_minor(version: (u64, u64)) -> String {
+    format!("{}.{}", version.0, version.1)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_agent_diagnostic(
+    code: &str,
+    category: &str,
+    severity: NativeDiagnosticSeverity,
+    title: &str,
+    what_happened: String,
+    why: String,
+    how_to_fix: Vec<String>,
+    next_commands: Vec<String>,
+    safe_automated_action: &str,
+    retryable: bool,
+    fallback_used: bool,
+    toolchain_expected: Option<String>,
+    toolchain_found: Option<String>,
+) -> NativeDiagnostic {
+    NativeDiagnostic {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        code: code.to_string(),
+        category: category.to_string(),
+        severity,
+        title: title.to_string(),
+        docs_url: native_diagnostic_docs_url(code),
+        what_happened,
+        why,
+        how_to_fix,
+        next_commands,
+        safe_automated_action: safe_automated_action.to_string(),
+        retryable,
+        fallback_used,
+        toolchain_expected,
+        toolchain_found,
     }
 }
 
@@ -2362,6 +3186,23 @@ fn run_mcp_serve(args: McpServeArgs) -> Result<()> {
                 ],
                 mutates_state: false,
                 schema: "docs/agent/schemas/native-support-report.schema.json".to_string(),
+            },
+            McpToolDescriptor {
+                name: "uc.project_inspect".to_string(),
+                description:
+                    "Inspect manifest, lockfile, target, dependency, and native support state."
+                        .to_string(),
+                command: vec![
+                    "uc".to_string(),
+                    "project".to_string(),
+                    "inspect".to_string(),
+                    "--manifest-path".to_string(),
+                    "<Scarb.toml>".to_string(),
+                    "--format".to_string(),
+                    "json".to_string(),
+                ],
+                mutates_state: false,
+                schema: "docs/agent/schemas/project-inspect-report.schema.json".to_string(),
             },
             McpToolDescriptor {
                 name: "uc.support_native".to_string(),

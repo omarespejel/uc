@@ -2,6 +2,12 @@
 
 Use this path when you are debugging `uc` directly.
 
+## Inspect Project State
+
+```sh
+uc project inspect --manifest-path Scarb.toml --format json | jq
+```
+
 ## Probe Native Support
 
 ```sh
