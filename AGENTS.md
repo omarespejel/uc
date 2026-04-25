@@ -30,6 +30,7 @@
 - Fast Rust validation: `make validate-fast`
 - Native-focused validation: `make validate-native`
 - Validate Cairo 2.14 helper compatibility: `make validate-helper-lane`
+- Read-only project inspection: `uc project inspect --manifest-path /abs/path/to/Scarb.toml --format json`
 - Agent support decision: `uc agent eval --manifest-path /abs/path/to/Scarb.toml`
 - Dry-run safe remediation: `uc agent safe-action build-helper-lane --lane 2.14`
 - Record replayable build failure: `uc build --engine uc --daemon-mode off --manifest-path /abs/path/to/Scarb.toml --record-failure /abs/path/to/uc-failure.json`

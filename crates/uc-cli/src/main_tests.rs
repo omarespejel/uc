@@ -17,6 +17,20 @@ fn unique_test_dir(prefix: &str) -> PathBuf {
     dir
 }
 
+struct TestDirCleanup(PathBuf);
+
+impl TestDirCleanup {
+    fn new(path: &Path) -> Self {
+        Self(path.to_path_buf())
+    }
+}
+
+impl Drop for TestDirCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 #[cfg(feature = "native-compile")]
 fn unique_platform_absolute_fixture_path(prefix: &str) -> String {
     normalize_fingerprint_path(
@@ -457,6 +471,7 @@ fn project_inspect_cli_accepts_json_format_and_report_path() {
 #[test]
 fn project_inspect_report_summarizes_manifest_lockfile_and_support_without_mutation() {
     let dir = unique_test_dir("uc-project-inspect-report");
+    let _cleanup = TestDirCleanup::new(&dir);
     let manifest_path = dir.join("Scarb.toml");
     fs::write(
         &manifest_path,
@@ -567,6 +582,7 @@ dependencies = ["core"]
 #[test]
 fn project_inspect_report_returns_structured_diagnostic_for_invalid_manifest() {
     let dir = unique_test_dir("uc-project-inspect-invalid-manifest");
+    let _cleanup = TestDirCleanup::new(&dir);
     let manifest_path = dir.join("Scarb.toml");
     fs::write(&manifest_path, "[package\nname = \"broken\"\n").expect("write manifest");
 
@@ -586,6 +602,7 @@ fn project_inspect_report_returns_structured_diagnostic_for_invalid_manifest() {
 #[test]
 fn project_inspect_skips_metadata_probe_to_preserve_readonly_contract() {
     let dir = unique_test_dir("uc-project-inspect-readonly-skip");
+    let _cleanup = TestDirCleanup::new(&dir);
     let manifest_path = dir.join("Scarb.toml");
     fs::write(
         &manifest_path,
@@ -615,6 +632,105 @@ starknet = ">=2.14.0"
     assert!(!dir.join(".uc").exists());
     assert!(!dir.join("target").exists());
     assert!(!dir.join("Uc.toml").exists());
+}
+
+#[test]
+fn project_inspect_uses_workspace_lockfile_for_member_manifest() {
+    let workspace = unique_test_dir("uc-project-inspect-member-lockfile");
+    let _cleanup = TestDirCleanup::new(&workspace);
+    let member = workspace.join("member");
+    fs::create_dir_all(&member).expect("create member dir");
+    fs::write(
+        workspace.join("Scarb.toml"),
+        r#"[workspace]
+members = ["member"]
+"#,
+    )
+    .expect("write workspace manifest");
+    fs::write(
+        workspace.join("Scarb.lock"),
+        r#"version = 1
+
+[[package]]
+name = "starknet"
+version = "2.14.0"
+"#,
+    )
+    .expect("write workspace lockfile");
+    let member_manifest = member.join("Scarb.toml");
+    fs::write(
+        &member_manifest,
+        r#"[package]
+name = "member"
+version = "0.1.0"
+edition = "2024_07"
+
+[dependencies]
+starknet = ">=2.14.0"
+"#,
+    )
+    .expect("write member manifest");
+
+    let report = project_inspect_report_from_manifest_path(&member_manifest)
+        .expect("inspect should succeed");
+
+    assert_eq!(report.workspace_root, workspace.display().to_string());
+    assert!(report.lockfile.present);
+    let lock_path = workspace.join("Scarb.lock").display().to_string();
+    assert_eq!(report.lockfile.path.as_deref(), Some(lock_path.as_str()));
+    assert!(report
+        .lockfile
+        .packages
+        .iter()
+        .any(|package| package.name == "starknet" && package.version.as_deref() == Some("2.14.0")));
+}
+
+#[test]
+fn project_inspect_does_not_hash_files_above_inspect_size_limits() {
+    let dir = unique_test_dir("uc-project-inspect-size-limits");
+    let _cleanup = TestDirCleanup::new(&dir);
+    let manifest_path = dir.join("Scarb.toml");
+    let oversized_manifest = "x".repeat((MAX_MANIFEST_BYTES as usize) + 1);
+    fs::write(&manifest_path, oversized_manifest).expect("write oversized manifest");
+
+    let report =
+        project_inspect_report_from_manifest_path(&manifest_path).expect("inspect should succeed");
+
+    assert!(!report.manifest.valid);
+    assert_eq!(report.manifest.hash, None);
+    assert!(report
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "UCP1000" && diagnostic.category == "manifest_read"));
+
+    let dir = unique_test_dir("uc-project-inspect-lock-size-limits");
+    let _cleanup = TestDirCleanup::new(&dir);
+    let manifest_path = dir.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+
+[dependencies]
+starknet = ">=2.14.0"
+"#,
+    )
+    .expect("write manifest");
+    let oversized_lockfile = "x".repeat((MAX_LOCKFILE_BYTES as usize) + 1);
+    fs::write(dir.join("Scarb.lock"), oversized_lockfile).expect("write oversized lockfile");
+
+    let report =
+        project_inspect_report_from_manifest_path(&manifest_path).expect("inspect should succeed");
+
+    assert!(report.lockfile.present);
+    assert!(!report.lockfile.valid);
+    assert_eq!(report.lockfile.hash, None);
+    assert!(report
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "UCP1004" && diagnostic.category == "lockfile_parse"));
 }
 
 #[test]

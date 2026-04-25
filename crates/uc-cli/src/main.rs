@@ -2183,14 +2183,16 @@ fn run_project_inspect(args: ProjectInspectArgs) -> Result<()> {
 }
 
 fn project_inspect_report_from_manifest_path(manifest_path: &Path) -> Result<ProjectInspectReport> {
-    let workspace_root = manifest_path
-        .parent()
-        .context("manifest path has no parent")?;
+    let workspace_root = metadata_cache_workspace_root(manifest_path)?;
     let manifest_metadata = fs::metadata(manifest_path)
         .with_context(|| format!("failed to stat {}", manifest_path.display()))?;
-    let manifest_hash = hash_file_blake3(manifest_path)
-        .ok()
-        .map(|hash| format!("blake3:{hash}"));
+    let manifest_hash = if manifest_metadata.len() <= MAX_MANIFEST_BYTES {
+        hash_file_blake3(manifest_path)
+            .ok()
+            .map(|hash| format!("blake3:{hash}"))
+    } else {
+        None
+    };
     let mut diagnostics = Vec::new();
 
     let manifest_text =
@@ -2277,12 +2279,10 @@ fn project_inspect_report_from_manifest_path(manifest_path: &Path) -> Result<Pro
         .as_ref()
         .map(project_dependencies_from_manifest)
         .unwrap_or_default();
-    let lockfile = project_lockfile_summary(workspace_root, &mut diagnostics)?;
+    let lockfile = project_lockfile_summary(&workspace_root, &mut diagnostics)?;
     let readonly_native_source =
         project_has_readonly_native_toolchain_source(&package, &dependencies, &lockfile);
-    let native_support = if manifest.is_some()
-        && (readonly_native_source || !cfg!(feature = "native-compile"))
-    {
+    let native_support = if manifest.is_some() && readonly_native_source {
         match native_support_report_from_manifest_path(manifest_path) {
             Ok(report) => Some(report),
             Err(err) => {
@@ -2619,9 +2619,13 @@ fn project_lockfile_summary(
         });
     }
 
-    let hash = hash_file_blake3(&lock_path)
-        .ok()
-        .map(|hash| format!("blake3:{hash}"));
+    let hash = if metadata.len() <= MAX_LOCKFILE_BYTES {
+        hash_file_blake3(&lock_path)
+            .ok()
+            .map(|hash| format!("blake3:{hash}"))
+    } else {
+        None
+    };
     let modified_unix_ms = metadata_modified_unix_ms(&metadata).ok();
     let mut version = None;
     let mut packages = Vec::new();
