@@ -34,7 +34,7 @@
 - Build deployed-contract source index: `benchmarks/scripts/build_deployed_contract_source_index.sh --inventory /abs/path/to/source-inventory.json --out /abs/path/to/pinned-deployed-contract-source-index.json`
 - Generate deployed-contract corpus: `benchmarks/scripts/generate_deployed_contract_corpus.sh --source-index /abs/path/to/source-index.json --out /abs/path/to/generated-corpus.json`
 - Run deployed-contract corpus evidence: `benchmarks/scripts/run_deployed_contract_corpus.sh --corpus /abs/path/to/generated-corpus.json`
-- Summarize corpus opportunities: `benchmarks/scripts/summarize_corpus_opportunities.py --input /abs/path/to/benchmark.json --output /abs/path/to/opportunities.json --markdown /abs/path/to/opportunities.md`
+- Summarize corpus opportunities: `benchmarks/scripts/summarize_corpus_opportunities.py --benchmark-json /abs/path/to/benchmark.json --out-json /abs/path/to/opportunities.json --out-md /abs/path/to/opportunities.md`
 
 ## Key Files
 
