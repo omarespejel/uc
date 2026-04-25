@@ -2055,14 +2055,15 @@ fn agent_eval_decision(
 ) -> (AgentEvalDecision, String, Vec<String>, Vec<String>) {
     let safe_actions = native_report_safe_actions(support);
     let mut next_commands = Vec::new();
+    let manifest_path = shell_escape_command_arg(&support.manifest_path);
     next_commands.push(format!(
         "uc support native --manifest-path {} --format json",
-        support.manifest_path
+        manifest_path
     ));
     if support.supported {
         next_commands.push(format!(
             "uc build --engine uc --daemon-mode off --manifest-path {} --json",
-            support.manifest_path
+            manifest_path
         ));
         return (
             AgentEvalDecision::ProceedToBuildAndBenchmark,
@@ -2086,6 +2087,7 @@ fn agent_eval_decision(
                     .or_else(|| toolchain.requested_version.clone())
             })
             .unwrap_or_else(|| "<lane>".to_string());
+        let lane = shell_escape_command_arg(&lane);
         next_commands.push(format!(
             "uc agent safe-action {} --lane {}",
             action.cli_name(),
@@ -2121,6 +2123,22 @@ fn native_report_safe_actions(support: &NativeSupportReport) -> Vec<String> {
         actions.push(diagnostic.safe_automated_action.clone());
     }
     actions
+}
+
+fn shell_escape_command_arg(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    if value.chars().all(|character| {
+        character.is_ascii_alphanumeric()
+            || matches!(
+                character,
+                '/' | '.' | '_' | '-' | ':' | '=' | '+' | ',' | '@'
+            )
+    }) {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn run_agent_safe_action(args: AgentSafeActionArgs) -> Result<()> {
@@ -2237,12 +2255,56 @@ fn safe_action_command(args: &AgentSafeActionArgs) -> Result<Vec<String>> {
 }
 
 fn repo_relative_command(relative: &str) -> Result<PathBuf> {
-    let cwd = std::env::current_dir()?.canonicalize()?;
-    let path = cwd.join(relative);
+    let repo_root = repo_root_for_command_surface()?;
+    let path = repo_root.join(relative);
     if path.is_file() {
         return Ok(path);
     }
-    Ok(PathBuf::from(relative))
+    bail!(
+        "repo command {relative} not found under repository root {}",
+        repo_root.display()
+    )
+}
+
+fn repo_root_for_command_surface() -> Result<PathBuf> {
+    let cwd = std::env::current_dir()
+        .context("failed to read current directory")?
+        .canonicalize()
+        .context("failed to canonicalize current directory")?;
+    if let Some(root) = repo_root_anchor_from(&cwd) {
+        return Ok(root);
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Ok(exe) = exe.canonicalize() {
+            if let Some(root) = repo_root_anchor_from(&exe) {
+                return Ok(root);
+            }
+        }
+    }
+
+    bail!(
+        "failed to locate uc repository root from current directory {}",
+        cwd.display()
+    )
+}
+
+fn repo_root_anchor_from(start: &Path) -> Option<PathBuf> {
+    let start = if start.is_file() {
+        start.parent().unwrap_or(start)
+    } else {
+        start
+    };
+    start
+        .ancestors()
+        .find(|candidate| is_uc_repo_root(candidate))
+        .map(Path::to_path_buf)
+}
+
+fn is_uc_repo_root(candidate: &Path) -> bool {
+    candidate.join("AGENTS.md").is_file()
+        && candidate.join(".codex/START_HERE.md").is_file()
+        && candidate.join("scripts").is_dir()
 }
 
 fn resolve_uc_bin(path: Option<&PathBuf>) -> Result<PathBuf> {
@@ -2382,7 +2444,12 @@ fn run_build_entry(args: BuildArgs) -> Result<()> {
 }
 
 fn write_failure_bundle(path: &Path, args: &BuildArgs, error: &str) -> Result<()> {
-    let manifest_path = resolve_manifest_path(&args.common.manifest_path).ok();
+    let raw_manifest_path = args
+        .common
+        .manifest_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("Scarb.toml"));
+    let manifest_path = resolve_manifest_path(&Some(raw_manifest_path.clone())).ok();
     let workspace_root = manifest_path
         .as_ref()
         .and_then(|manifest| metadata_cache_workspace_root(manifest).ok());
@@ -2408,9 +2475,7 @@ fn write_failure_bundle(path: &Path, args: &BuildArgs, error: &str) -> Result<()
         schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
         generated_at_epoch_ms: epoch_ms_u64()?,
         command: sanitized_failure_command_args(std::env::args()),
-        manifest_path: manifest_path
-            .as_ref()
-            .map(|path| path.display().to_string()),
+        manifest_path: Some(raw_manifest_path.display().to_string()),
         workspace_root: workspace_root
             .as_ref()
             .map(|path| path.display().to_string()),
@@ -2433,12 +2498,7 @@ fn redacted_agent_environment() -> BTreeMap<String, String> {
         {
             continue;
         }
-        let upper = key.to_ascii_uppercase();
-        let redacted = upper.contains("SECRET")
-            || upper.contains("TOKEN")
-            || upper.contains("PASSWORD")
-            || upper.ends_with("_KEY")
-            || upper.contains("PRIVATE_KEY");
+        let redacted = is_sensitive_name(&key);
         values.insert(
             key,
             if redacted {
@@ -2465,11 +2525,11 @@ fn replay_safe_command_args(args: &[String]) -> Vec<String> {
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
-        if arg == "--record-failure" {
+        if artifact_writing_flag_takes_value(arg) {
             index += 2;
             continue;
         }
-        if arg.starts_with("--record-failure=") {
+        if artifact_writing_flag_with_value(arg) {
             index += 1;
             continue;
         }
@@ -2504,17 +2564,49 @@ fn redact_sensitive_command_args(args: &[String]) -> Vec<String> {
     redacted
 }
 
+fn artifact_writing_flag_takes_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--record-failure" | "--report-path" | "--output-path" | "--emit-uc-toml"
+    )
+}
+
+fn artifact_writing_flag_with_value(arg: &str) -> bool {
+    matches!(
+        arg.split_once('=').map(|(flag, _)| flag),
+        Some("--record-failure" | "--report-path" | "--output-path" | "--emit-uc-toml")
+    )
+}
+
 fn is_sensitive_command_arg_name(arg: &str) -> bool {
     let normalized = arg
         .trim_start_matches('-')
         .replace('-', "_")
         .to_ascii_uppercase();
+    is_sensitive_normalized_name(&normalized)
+}
+
+fn is_sensitive_name(name: &str) -> bool {
+    let normalized = name.replace('-', "_").to_ascii_uppercase();
+    is_sensitive_normalized_name(&normalized)
+}
+
+fn is_sensitive_normalized_name(normalized: &str) -> bool {
+    let tokens = normalized.split('_').collect::<Vec<_>>();
     normalized == "KEY"
         || normalized.ends_with("_KEY")
+        || normalized.contains("API_KEY")
+        || normalized.contains("APIKEY")
+        || normalized.contains("PRIVATE_KEY")
         || normalized.contains("TOKEN")
         || normalized.contains("SECRET")
         || normalized.contains("PASSWORD")
-        || normalized.contains("PRIVATE_KEY")
+        || tokens.iter().any(|token| {
+            matches!(
+                *token,
+                "PAT" | "AUTH" | "CREDENTIAL" | "CREDENTIALS" | "SECRET" | "TOKEN"
+            )
+        })
 }
 
 fn run_replay(args: ReplayArgs) -> Result<()> {
@@ -2543,7 +2635,7 @@ fn run_replay(args: ReplayArgs) -> Result<()> {
             Some("dry run only; pass --execute to replay the recorded command".to_string());
         return emit_json_value(args.report_path.as_deref(), &report);
     }
-    let (command, command_vec) = match command_from_vec(&replay_command) {
+    let (mut command, command_vec) = match command_from_vec(&replay_command) {
         Ok(command) => command,
         Err(err) => {
             let message = format!("execution failed: {err:#}");
@@ -2553,6 +2645,13 @@ fn run_replay(args: ReplayArgs) -> Result<()> {
             return Err(err);
         }
     };
+    if let Some(workspace_root) = bundle
+        .workspace_root
+        .as_deref()
+        .filter(|workspace_root| !workspace_root.is_empty())
+    {
+        command.current_dir(workspace_root);
+    }
     let run = match run_command_capture(command, command_vec) {
         Ok(run) => run,
         Err(err) => {

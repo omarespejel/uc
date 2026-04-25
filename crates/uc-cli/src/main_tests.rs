@@ -404,6 +404,25 @@ fn replay_cli_defaults_to_dry_run() {
         panic!("expected replay command");
     };
     assert_eq!(args.bundle, PathBuf::from("/tmp/uc-failure.json"));
+    assert_eq!(args.report_path, None);
+    assert!(!args.execute);
+}
+
+#[test]
+fn replay_cli_accepts_report_path() {
+    let cli = Cli::try_parse_from([
+        "uc",
+        "replay",
+        "--report-path",
+        "/tmp/replay.json",
+        "/tmp/uc-failure.json",
+    ])
+    .expect("replay args should parse");
+    let Commands::Replay(args) = cli.command else {
+        panic!("expected replay command");
+    };
+    assert_eq!(args.bundle, PathBuf::from("/tmp/uc-failure.json"));
+    assert_eq!(args.report_path, Some(PathBuf::from("/tmp/replay.json")));
     assert!(!args.execute);
 }
 
@@ -456,6 +475,31 @@ fn agent_eval_decision_runs_safe_action_for_helper_lane_failure() {
     assert!(next_commands
         .iter()
         .any(|command| { command.contains("uc agent safe-action build-helper-lane --lane 2.14") }));
+}
+
+#[test]
+fn agent_eval_decision_shell_escapes_next_command_paths() {
+    let support = NativeSupportReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        manifest_path: "/tmp/My Project/Scarb.toml".to_string(),
+        status: NativeSupportStatus::Supported,
+        supported: true,
+        reason: None,
+        compiler_version: Some("2.16.0".to_string()),
+        package_cairo_version: Some("2.16.0".to_string()),
+        issue_kind: None,
+        toolchain: None,
+        diagnostics: Vec::new(),
+    };
+
+    let (decision, _, _, next_commands) = agent_eval_decision(&support);
+    assert_eq!(decision, AgentEvalDecision::ProceedToBuildAndBenchmark);
+    assert!(
+        next_commands
+            .iter()
+            .any(|command| { command.contains("--manifest-path '/tmp/My Project/Scarb.toml'") }),
+        "agent next commands must shell-escape paths with spaces: {next_commands:?}"
+    );
 }
 
 #[test]
@@ -545,6 +589,7 @@ fn sanitized_failure_command_args_redacts_sensitive_values_and_strips_record_fai
         "build",
         "--record-failure",
         "/tmp/original-bundle.json",
+        "--report-path=/tmp/original-report.json",
         "--manifest-path",
         "/tmp/workspace/Scarb.toml",
         "--api-key",
@@ -571,6 +616,69 @@ fn sanitized_failure_command_args_redacts_sensitive_values_and_strips_record_fai
 }
 
 #[test]
+fn redacted_agent_environment_masks_common_token_names() {
+    let guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _pat = ScopedEnvVar::set_with_lock(&guard, "UC_GITHUB_PAT", "secret-pat");
+    let _auth = ScopedEnvVar::set_with_lock(&guard, "SCARB_REGISTRY_AUTH", "secret-auth");
+    let _credential = ScopedEnvVar::set_with_lock(&guard, "UC_API_CREDENTIAL", "secret-credential");
+    let _safe = ScopedEnvVar::set_with_lock(&guard, "UC_SAFE_MODE", "enabled");
+
+    let env = redacted_agent_environment();
+    assert_eq!(
+        env.get("UC_GITHUB_PAT").map(String::as_str),
+        Some("<redacted>")
+    );
+    assert_eq!(
+        env.get("SCARB_REGISTRY_AUTH").map(String::as_str),
+        Some("<redacted>")
+    );
+    assert_eq!(
+        env.get("UC_API_CREDENTIAL").map(String::as_str),
+        Some("<redacted>")
+    );
+    assert_eq!(env.get("UC_SAFE_MODE").map(String::as_str), Some("enabled"));
+}
+
+#[test]
+fn write_failure_bundle_preserves_missing_manifest_cli_path() {
+    let dir = unique_test_dir("uc-failure-bundle-missing-manifest");
+    let bundle_path = dir.join("uc-failure.json");
+    let missing_manifest = dir.join("missing").join("Scarb.toml");
+    let args = BuildArgs {
+        common: BuildCommonArgs {
+            manifest_path: Some(missing_manifest.clone()),
+            package: None,
+            workspace: false,
+            features: Vec::new(),
+            offline: false,
+            release: false,
+            profile: None,
+        },
+        engine: EngineArg::Uc,
+        daemon_mode: DaemonModeArg::Off,
+        json: false,
+        report_path: None,
+        record_failure: Some(bundle_path.clone()),
+    };
+
+    write_failure_bundle(&bundle_path, &args, "failed to resolve manifest")
+        .expect("failure bundle should be written even when manifest resolution fails");
+    let bundle: FailureBundle =
+        serde_json::from_slice(&fs::read(&bundle_path).expect("failed to read failure bundle"))
+            .expect("failure bundle should parse");
+    assert_eq!(
+        bundle.manifest_path,
+        Some(missing_manifest.display().to_string())
+    );
+    assert_eq!(bundle.workspace_root, None);
+    assert_eq!(bundle.selected_support, None);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn replay_dry_run_reports_replay_safe_command() {
     let dir = unique_test_dir("uc-replay-dry-run-safe-command");
     let bundle_path = dir.join("uc-failure.json");
@@ -586,6 +694,8 @@ fn replay_dry_run_reports_replay_safe_command() {
                 "build",
                 "--record-failure",
                 bundle_path.display().to_string(),
+                "--report-path",
+                report_path.display().to_string(),
                 "--manifest-path",
                 "/tmp/workspace/Scarb.toml"
             ],
@@ -622,6 +732,77 @@ fn replay_dry_run_reports_replay_safe_command() {
     assert!(!report.executed);
 
     fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn replay_execute_uses_bundle_workspace_root() {
+    let dir = unique_test_dir("uc-replay-workspace-root");
+    let workspace = dir.join("workspace");
+    let bundle_path = dir.join("uc-failure.json");
+    let report_path = dir.join("replay-report.json");
+    fs::create_dir_all(&workspace).expect("failed to create replay workspace");
+    fs::write(
+        &bundle_path,
+        serde_json::json!({
+            "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
+            "generated_at_epoch_ms": 1u64,
+            "command": ["/bin/sh", "-c", "pwd"],
+            "manifest_path": "Scarb.toml",
+            "workspace_root": workspace.display().to_string(),
+            "manifest_hash": null,
+            "lockfile_hash": null,
+            "selected_support": null,
+            "redacted_environment": {},
+            "error": "original failure"
+        })
+        .to_string(),
+    )
+    .expect("failed to write replay bundle");
+
+    run_replay(ReplayArgs {
+        bundle: bundle_path,
+        report_path: Some(report_path.clone()),
+        execute: true,
+    })
+    .expect("workspace-root replay should succeed");
+    let report: ReplayReport =
+        serde_json::from_slice(&fs::read(&report_path).expect("failed to read replay report"))
+            .expect("replay report should parse");
+    assert!(report.executed);
+    assert_eq!(report.exit_code, Some(0));
+    let replay_cwd = PathBuf::from(report.stdout.trim())
+        .canonicalize()
+        .expect("replay cwd should canonicalize");
+    assert_eq!(
+        replay_cwd,
+        workspace
+            .canonicalize()
+            .expect("workspace should canonicalize")
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn repo_relative_command_resolves_from_stable_repo_anchor() {
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _cwd_guard = CurrentDirRestore::capture();
+    let outside_repo = unique_test_dir("uc-repo-relative-command-outside-root");
+    std::env::set_current_dir(&outside_repo).expect("failed to set outside repo cwd");
+
+    let script =
+        repo_relative_command("scripts/doctor.sh").expect("repo script should resolve by anchor");
+    assert!(
+        script.is_absolute(),
+        "script path should be absolute: {script:?}"
+    );
+    assert!(script.is_file(), "script path should exist: {script:?}");
+    assert!(script.ends_with(Path::new("scripts/doctor.sh")));
+
+    fs::remove_dir_all(&outside_repo).ok();
 }
 
 #[test]

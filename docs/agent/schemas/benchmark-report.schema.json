@@ -4,20 +4,28 @@
   "title": "uc BenchmarkReport",
   "type": "object",
   "additionalProperties": true,
+  "required": ["schema_version", "summary", "cases"],
   "properties": {
     "schema_version": { "type": "number" },
     "summary": {
       "type": "object",
       "additionalProperties": true,
+      "required": ["support_matrix"],
       "properties": {
         "support_matrix": {
           "type": "object",
           "additionalProperties": true,
+          "required": [
+            "native_supported",
+            "native_unsupported",
+            "fallback_used",
+            "build_failed"
+          ],
           "properties": {
-            "native_supported": { "type": "integer" },
-            "native_unsupported": { "type": "integer" },
-            "fallback_used": { "type": "integer" },
-            "build_failed": { "type": "integer" }
+            "native_supported": { "type": "integer", "minimum": 0 },
+            "native_unsupported": { "type": "integer", "minimum": 0 },
+            "fallback_used": { "type": "integer", "minimum": 0 },
+            "build_failed": { "type": "integer", "minimum": 0 }
           }
         }
       }
