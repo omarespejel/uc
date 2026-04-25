@@ -117,6 +117,21 @@ Treat the source inventory as the durable raw evidence input. The source index
 and generated corpus JSON are deterministic artifacts and should be regenerated
 from the reviewed inventory instead of edited by hand.
 
+After a corpus run, generate the experiment backlog before optimizing or
+drafting launch copy:
+
+```sh
+./benchmarks/scripts/summarize_corpus_opportunities.py \
+  --benchmark-json /abs/path/to/deployed-contract-corpus-bench.json \
+  --out-json /abs/path/to/corpus-opportunities.json \
+  --out-md /abs/path/to/corpus-opportunities.md
+```
+
+Agents should treat `UCO1001`, `UCO1002`, `UCO1003`, and `UCO2001` as blockers
+before speed work. `UCO3001` marks `native_frontend_compile_ms` as the likely
+next acceleration target. `UCO5001` means the diagnostic payload is not yet
+safe enough for automated remediation.
+
 ## Stop Conditions
 
 Stop and ask for human permission before:
