@@ -2030,6 +2030,7 @@ edition = "2023_01"
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_support_report_from_manifest_path_marks_supported_and_unsupported_manifests() {
+    let _guard = integration_env_lock().lock().unwrap();
     let dir = unique_test_dir("uc-native-support-report");
     fs::create_dir_all(&dir).expect("create temp dir");
     let manifest_path = dir.join("Scarb.toml");
@@ -2055,6 +2056,19 @@ cairo-version = "{compiler_major}.{compiler_minor}.0"
     assert!(supported_report.supported);
     assert!(supported_report.reason.is_none());
 
+    let requested_major_minor = productized_native_toolchain_helper_lanes()
+        .into_iter()
+        .find(|lane| {
+            parse_cairo_version_major_minor(lane)
+                .is_some_and(|lane_version| lane_version != (compiler_major, compiler_minor))
+        });
+    let Some(requested_major_minor) = requested_major_minor else {
+        fs::remove_dir_all(&dir).ok();
+        return;
+    };
+    let helper_env = native_toolchain_env_var_name_for_major_minor(&requested_major_minor);
+    let _helper = ScopedDynamicEnvVar::unset_with_lock(&_guard, helper_env);
+
     fs::write(
         &manifest_path,
         format!(
@@ -2062,9 +2076,8 @@ cairo-version = "{compiler_major}.{compiler_minor}.0"
 name = "demo"
 version = "0.1.0"
 edition = "2024_07"
-cairo-version = "{compiler_major}.{}.0"
-"#,
-            compiler_minor.saturating_add(1)
+cairo-version = "{requested_major_minor}.0"
+"#
         ),
     )
     .expect("write unsupported manifest");
@@ -2443,6 +2456,154 @@ cairo-version = "{requested_version}"
         requested_major_minor
     );
     assert_eq!(json["toolchain"]["requested_version"], requested_version);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_support_report_from_manifest_path_reports_unproductized_helper_lane() {
+    let _guard = integration_env_lock().lock().unwrap();
+    let requested_major_minor = "2.5";
+    let requested_version = "2.5.3";
+    let helper_env = native_toolchain_env_var_name_for_major_minor(requested_major_minor);
+    let _helper = ScopedDynamicEnvVar::unset_with_lock(&_guard, helper_env.clone());
+    assert!(
+        !native_toolchain_helper_lane_is_productized(requested_major_minor),
+        "this regression documents the current Cairo 2.5 boundary; update it when a real 2.5 adapter lands"
+    );
+
+    let dir = unique_test_dir("uc-native-support-unproductized-helper-lane");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let manifest_path = dir.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2023_11"
+cairo-version = "{requested_version}"
+
+[dependencies]
+starknet = "={requested_version}"
+"#
+        ),
+    )
+    .expect("write manifest");
+
+    let report = native_support_report_from_manifest_path(&manifest_path)
+        .expect("unproductized helper lane should still return support JSON");
+    assert_eq!(report.status, NativeSupportStatus::Unsupported);
+    assert!(!report.supported);
+    assert_eq!(
+        report.issue_kind.as_deref(),
+        Some("unsupported_toolchain_helper_lane")
+    );
+    let json = serde_json::to_value(&report).expect("support report should serialize");
+    assert_eq!(json["diagnostics"][0]["code"], "UCN1006");
+    assert_eq!(
+        json["diagnostics"][0]["category"],
+        "toolchain_lane_unsupported"
+    );
+    assert_eq!(
+        json["diagnostics"][0]["safe_automated_action"],
+        "manual_legacy_adapter_required"
+    );
+    assert_eq!(
+        json["diagnostics"][0]["toolchain_expected"],
+        requested_major_minor
+    );
+    assert!(
+        json["diagnostics"][0]["toolchain_found"].is_null(),
+        "unproductized lane diagnostics should explicitly expose no found helper"
+    );
+    let commands = json["diagnostics"][0]["next_commands"]
+        .as_array()
+        .expect("next_commands should stay an array");
+    assert!(
+        commands.iter().all(|cmd| !cmd
+            .as_str()
+            .unwrap_or_default()
+            .contains("build_native_toolchain_helper")),
+        "agents must not be told to run the productized helper builder for unsupported lanes"
+    );
+    let fixes = json["diagnostics"][0]["how_to_fix"]
+        .as_array()
+        .expect("how_to_fix should stay an array");
+    assert!(
+        fixes.iter().any(|fix| {
+            fix.as_str()
+                .unwrap_or_default()
+                .contains("native_unsupported")
+        }),
+        "diagnostic should tell agents to keep this workload in the support matrix"
+    );
+    assert_eq!(json["toolchain"]["source"], "external_helper");
+    assert_eq!(
+        json["toolchain"]["requested_major_minor"],
+        requested_major_minor
+    );
+    assert_eq!(json["toolchain"]["requested_version"], requested_version);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(all(feature = "native-compile", unix))]
+#[test]
+fn native_support_report_from_manifest_path_allows_reviewed_unproductized_helper_env() {
+    let _guard = integration_env_lock().lock().unwrap();
+    let requested_major_minor = "2.5";
+    let requested_version = "2.5.3";
+    let helper_env = native_toolchain_env_var_name_for_major_minor(requested_major_minor);
+
+    let dir = unique_test_dir("uc-native-support-unproductized-helper-env");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let manifest_path = dir.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2023_11"
+cairo-version = "{requested_version}"
+"#
+        ),
+    )
+    .expect("write manifest");
+    let helper_path = dir.join("uc-cairo25-helper.sh");
+    write_fake_uc_support_helper(
+        &helper_path,
+        &NativeSupportReport {
+            schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+            manifest_path: manifest_path.display().to_string(),
+            status: NativeSupportStatus::Supported,
+            supported: true,
+            reason: None,
+            compiler_version: Some(requested_version.to_string()),
+            package_cairo_version: Some(requested_version.to_string()),
+            issue_kind: None,
+            toolchain: None,
+            diagnostics: Vec::new(),
+        },
+    );
+    let _helper = ScopedDynamicEnvVar::set_with_lock(&_guard, helper_env, &helper_path);
+
+    let report = native_support_report_from_manifest_path(&manifest_path)
+        .expect("reviewed external helper should be allowed even for unproductized lanes");
+    assert_eq!(report.status, NativeSupportStatus::Supported);
+    assert!(report.supported);
+    let toolchain = report.toolchain.expect("toolchain should be populated");
+    assert_eq!(toolchain.source, NativeToolchainSource::ExternalHelper);
+    assert_eq!(
+        toolchain.binary_path.as_deref(),
+        Some(helper_path.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        toolchain.compiler_version.as_deref(),
+        Some(requested_version)
+    );
 
     fs::remove_dir_all(&dir).ok();
 }

@@ -4,6 +4,7 @@
 
 - The active binary provides the builtin lane for its baked-in `cairo-lang` version.
 - Older lanes, such as Cairo `2.14`, are supplied via external helper binaries.
+- Only lanes listed under `workspace.metadata.uc-native-toolchain-helpers` in `Cargo.toml` are productized for automatic helper building.
 
 ## Build The Cairo 2.14 Helper
 
@@ -45,3 +46,11 @@ The helper-lane compatibility shims are covered by targeted regressions for:
 ```
 
 If a repo needs an external helper lane, doctor will report the missing or invalid `UC_NATIVE_TOOLCHAIN_<major>_<minor>_BIN` env var before a build starts.
+
+If a repo asks for a lane that is not productized by this release, `uc support native --format json` emits `UCN1006` with `safe_automated_action=manual_legacy_adapter_required`. Agents must keep that repo in the support matrix as `native_unsupported` unless a reviewed compatible helper binary is supplied explicitly through the reported helper env var.
+
+## Cairo 2.5 Boundary
+
+Cairo `2.5` is not a productized helper-builder lane in this release. It is older than the Cairo `2.6` split that introduced `cairo-lang-starknet-classes`, and it also predates several native compile APIs used by the current helper shim. Supporting it requires a dedicated legacy compatibility adapter rather than a metadata-only helper lane.
+
+Until that adapter exists, Cairo `2.5` workloads should be included in support matrices and classified as `native_unsupported`, not excluded from the benchmark/support story.
