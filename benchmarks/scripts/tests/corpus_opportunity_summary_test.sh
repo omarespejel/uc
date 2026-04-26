@@ -236,7 +236,7 @@ test_complete_but_generic_diagnostic_is_not_agent_grade() {
       "native_supported": 0,
       "fallback_used": 0,
       "native_unsupported": 0,
-      "build_failed": 1
+      "build_failed": 3
     },
     "unstable_lanes": [],
     "unstable_lane_count": 0
@@ -370,7 +370,7 @@ test_stock_and_malformed_diagnostic_is_not_agent_grade() {
       "native_supported": 0,
       "fallback_used": 0,
       "native_unsupported": 0,
-      "build_failed": 1
+      "build_failed": 3
     },
     "unstable_lanes": [],
     "unstable_lane_count": 0
@@ -500,7 +500,7 @@ test_fallback_signal_branches_are_detected() {
       "native_supported": 0,
       "fallback_used": 0,
       "native_unsupported": 0,
-      "build_failed": 3
+      "build_failed": 4
     },
     "unstable_lanes": [],
     "unstable_lane_count": 0
@@ -565,6 +565,26 @@ test_fallback_signal_branches_are_detected() {
       },
       "benchmark_status": "skipped",
       "benchmarks": null
+    },
+    {
+      "tag": "build-failed-no-fallback",
+      "manifest_path": "/tmp/build-failed-no-fallback/Scarb.toml",
+      "native_support": {
+        "supported": true,
+        "package_cairo_version": "2.14.0",
+        "diagnostics": []
+      },
+      "support_matrix": {
+        "classification": "build_failed",
+        "compile_backend": "uc_native_external_helper",
+        "fallback_used": false,
+        "reason": "native compile failed before fallback was attempted",
+        "build_report": {
+          "diagnostics": []
+        }
+      },
+      "benchmark_status": "skipped",
+      "benchmarks": null
     }
   ]
 }
@@ -590,6 +610,12 @@ JSON
   uc_scarb_uco="$(jq -r '.cases[] | select(.tag=="uc-scarb-only") | .opportunity_codes | index("UCO1002") != null' "$out_json")"
   uc_scarb_uco3="$(jq -r '.cases[] | select(.tag=="uc-scarb-only") | .opportunity_codes | index("UCO1003") != null' "$out_json")"
 
+  local no_fallback_backend no_fallback_output no_fallback_uco no_fallback_uco3
+  no_fallback_backend="$(jq -r '.cases[] | select(.tag=="build-failed-no-fallback") | .compile_backend' "$out_json")"
+  no_fallback_output="$(jq -r '.cases[] | select(.tag=="build-failed-no-fallback") | .fallback_used' "$out_json")"
+  no_fallback_uco="$(jq -r '.cases[] | select(.tag=="build-failed-no-fallback") | .opportunity_codes | index("UCO1002") != null' "$out_json")"
+  no_fallback_uco3="$(jq -r '.cases[] | select(.tag=="build-failed-no-fallback") | .opportunity_codes | index("UCO1003") != null' "$out_json")"
+
   assert_json_value "fallback-used-only backend" "$flag_only_backend" "uc_native_external_helper" "$out_json"
   assert_json_value "fallback-used-only fallback_used" "$flag_only_matrix" "true" "$out_json"
   assert_json_value "fallback-used-only UCO1002" "$flag_only_output" "true" "$out_json"
@@ -602,6 +628,10 @@ JSON
   assert_json_value "uc-scarb-only fallback_used" "$uc_scarb_output" "true" "$out_json"
   assert_json_value "uc-scarb-only UCO1002" "$uc_scarb_uco" "true" "$out_json"
   assert_json_value "uc-scarb-only UCO1003" "$uc_scarb_uco3" "true" "$out_json"
+  assert_json_value "build-failed-no-fallback backend" "$no_fallback_backend" "uc_native_external_helper" "$out_json"
+  assert_json_value "build-failed-no-fallback fallback_used" "$no_fallback_output" "false" "$out_json"
+  assert_json_value "build-failed-no-fallback UCO1002" "$no_fallback_uco" "false" "$out_json"
+  assert_json_value "build-failed-no-fallback UCO1003" "$no_fallback_uco3" "true" "$out_json"
 }
 
 test_remediation_fields_are_validated_without_overmatching() {
