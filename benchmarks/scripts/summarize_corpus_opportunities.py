@@ -121,6 +121,15 @@ def collect_diagnostics(case: dict[str, Any]) -> list[dict[str, Any]]:
     return diagnostics
 
 
+def case_used_fallback(matrix: dict[str, Any], diagnostics: list[dict[str, Any]], classification: str) -> bool:
+    return (
+        classification == "fallback_used"
+        or matrix.get("fallback_used") is True
+        or matrix.get("compile_backend") in {"scarb_fallback", "uc_scarb"}
+        or any(diag.get("fallback_used") is True for diag in diagnostics)
+    )
+
+
 def phase_telemetry(case: dict[str, Any]) -> dict[str, Any]:
     matrix = case.get("support_matrix") if isinstance(case.get("support_matrix"), dict) else {}
     build_report = matrix.get("build_report") if isinstance(matrix.get("build_report"), dict) else {}
@@ -238,6 +247,7 @@ def summarize_case(
     unstable = unstable_by_tag.get(tag, [])
     classification = str(matrix.get("classification") or "unknown")
     benchmark_status = str(case.get("benchmark_status") or "unknown")
+    fallback_used = case_used_fallback(matrix, diagnostics, classification)
     opps: list[dict[str, Any]] = []
 
     if classification == "native_unsupported":
@@ -249,7 +259,7 @@ def summarize_case(
             str(matrix.get("reason") or native_support.get("reason") or "native support probe returned unsupported"),
             "Fix toolchain selection or add the missing native lane before benchmarking this case.",
         )
-    elif classification == "fallback_used":
+    if fallback_used:
         add_opportunity(
             opps,
             "UCO1002",
@@ -258,7 +268,7 @@ def summarize_case(
             str(matrix.get("reason") or "uc auto build fell back to Scarb"),
             "Treat this as unsupported for launch speed claims; capture the fallback diagnostic and fix the native failure class.",
         )
-    elif classification == "build_failed":
+    if classification == "build_failed":
         add_opportunity(
             opps,
             "UCO1003",
@@ -366,7 +376,7 @@ def summarize_case(
         "classification": classification,
         "benchmark_status": benchmark_status,
         "compile_backend": matrix.get("compile_backend"),
-        "fallback_used": bool(matrix.get("fallback_used")),
+        "fallback_used": fallback_used,
         "toolchain": {
             "requested_version": toolchain.get("requested_version"),
             "requested_major_minor": toolchain.get("requested_major_minor"),
