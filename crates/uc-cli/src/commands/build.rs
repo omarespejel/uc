@@ -14,7 +14,11 @@ const DAEMON_LOCAL_PROBE_HINT_MAX_ENTRIES_PER_DIR: usize = 256;
 const DAEMON_LOCAL_PROBE_HINT_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 const MAX_AGENT_DIAGNOSTIC_REASON_CHARS: usize = 2_000;
 const MAX_FALLBACK_ERROR_BLOCKS: usize = 3;
+const MIN_FALLBACK_ERROR_SUMMARY_CHARS: usize = 800;
+const FALLBACK_ERROR_SUMMARY_SEPARATOR: &str = " Fallback build failure summary: ";
+const TRUNCATED_DIAGNOSTIC_SUFFIX: &str = "...";
 
+/// Creates the base native-fallback diagnostic shared by native downgrade paths.
 fn native_fallback_diagnostic(
     code: &str,
     category: &str,
@@ -48,6 +52,7 @@ fn native_fallback_diagnostic(
     }
 }
 
+/// Builds a UCN2002 diagnostic from an anyhow error chain without losing generic roots.
 fn native_fallback_diagnostic_from_error(
     code: &str,
     category: &str,
@@ -104,6 +109,7 @@ fn native_fallback_diagnostic_from_error(
     diagnostic
 }
 
+/// Returns the de-duplicated anyhow error chain from outer context to root cause.
 fn native_error_chain(err: &anyhow::Error) -> Vec<String> {
     let mut chain = Vec::new();
     for cause in err.chain() {
@@ -120,6 +126,7 @@ fn native_error_chain(err: &anyhow::Error) -> Vec<String> {
     chain
 }
 
+/// Detects root causes that need surrounding error-chain context to be useful.
 fn is_generic_native_compile_failure(reason: &str) -> bool {
     let normalized = reason.trim().trim_end_matches('.').to_ascii_lowercase();
     matches!(
@@ -128,19 +135,55 @@ fn is_generic_native_compile_failure(reason: &str) -> bool {
     )
 }
 
+/// Truncates agent-facing diagnostic text to the standard reason character budget.
 fn truncate_agent_diagnostic_text(value: &str) -> String {
+    truncate_agent_diagnostic_text_to(value, MAX_AGENT_DIAGNOSTIC_REASON_CHARS)
+}
+
+/// Truncates agent-facing diagnostic text using a character budget, including suffix.
+fn truncate_agent_diagnostic_text_to(value: &str, max_chars: usize) -> String {
     let trimmed = value.trim();
-    if trimmed.len() <= MAX_AGENT_DIAGNOSTIC_REASON_CHARS {
+    if trimmed.chars().count() <= max_chars {
         return trimmed.to_string();
     }
-    let mut truncated = trimmed
-        .chars()
-        .take(MAX_AGENT_DIAGNOSTIC_REASON_CHARS)
-        .collect::<String>();
-    truncated.push_str("...");
+    if max_chars == 0 {
+        return String::new();
+    }
+    let suffix_chars = TRUNCATED_DIAGNOSTIC_SUFFIX.chars().count();
+    let take_chars = max_chars.saturating_sub(suffix_chars);
+    let mut truncated = trimmed.chars().take(take_chars).collect::<String>();
+    if take_chars > 0 {
+        truncated.push_str(TRUNCATED_DIAGNOSTIC_SUFFIX);
+    }
     truncated
 }
 
+/// Combines native and fallback failures while reserving room for fallback output.
+fn native_fallback_reason_with_fallback_summary(
+    native_why: &str,
+    fallback_summary: &str,
+) -> String {
+    let separator_chars = FALLBACK_ERROR_SUMMARY_SEPARATOR.chars().count();
+    let available_chars = MAX_AGENT_DIAGNOSTIC_REASON_CHARS.saturating_sub(separator_chars);
+    if available_chars == 0 {
+        return truncate_agent_diagnostic_text(fallback_summary);
+    }
+
+    let fallback_chars = fallback_summary.trim().chars().count();
+    let fallback_min_budget =
+        fallback_chars.min(MIN_FALLBACK_ERROR_SUMMARY_CHARS.min(available_chars));
+    let native_budget = available_chars.saturating_sub(fallback_min_budget);
+    let native_section = truncate_agent_diagnostic_text_to(native_why, native_budget);
+    let native_chars = native_section.chars().count();
+    let fallback_budget = available_chars.saturating_sub(native_chars);
+    let fallback_section = truncate_agent_diagnostic_text_to(fallback_summary, fallback_budget);
+
+    truncate_agent_diagnostic_text(&format!(
+        "{native_section}{FALLBACK_ERROR_SUMMARY_SEPARATOR}{fallback_section}"
+    ))
+}
+
+/// Adds fallback build failure details to an existing native-fallback diagnostic.
 fn enrich_native_fallback_diagnostic_with_fallback_run(
     diagnostic: &mut NativeDiagnostic,
     fallback_run: &CommandRun,
@@ -163,9 +206,7 @@ fn enrich_native_fallback_diagnostic_with_fallback_run(
         "Native Cairo compilation failed, uc downgraded to Scarb, and the fallback build exited with code {}.",
         fallback_run.exit_code
     );
-    diagnostic.why = truncate_agent_diagnostic_text(&format!(
-        "{native_why} Fallback build failure summary: {fallback_summary}"
-    ));
+    diagnostic.why = native_fallback_reason_with_fallback_summary(&native_why, &fallback_summary);
     diagnostic.how_to_fix.push(
         "Fix the fallback compiler diagnostics before claiming native support for this manifest."
             .to_string(),
@@ -175,6 +216,7 @@ fn enrich_native_fallback_diagnostic_with_fallback_run(
     );
 }
 
+/// Extracts the first actionable compiler diagnostic blocks from fallback output.
 fn extract_fallback_error_summary(stderr: &str, stdout: &str) -> Option<String> {
     let combined = if stdout.trim().is_empty() {
         stderr.to_string()
@@ -190,6 +232,7 @@ fn extract_fallback_error_summary(stderr: &str, stdout: &str) -> Option<String> 
     Some(truncate_agent_diagnostic_text(&blocks.join("\n---\n")))
 }
 
+/// Prefers compiler error blocks and falls back to warning blocks when needed.
 fn extract_agent_error_blocks(output: &str) -> Vec<String> {
     let error_blocks = extract_agent_diagnostic_blocks(output, is_agent_error_lead);
     if !error_blocks.is_empty() {
@@ -198,6 +241,7 @@ fn extract_agent_error_blocks(output: &str) -> Vec<String> {
     extract_agent_diagnostic_blocks(output, is_agent_warning_lead)
 }
 
+/// Extracts bounded diagnostic blocks using the supplied lead-line classifier.
 fn extract_agent_diagnostic_blocks(output: &str, is_lead: impl Fn(&str) -> bool) -> Vec<String> {
     let mut blocks = Vec::new();
     let mut current = Vec::new();
@@ -236,12 +280,14 @@ fn extract_agent_diagnostic_blocks(output: &str, is_lead: impl Fn(&str) -> bool)
     blocks
 }
 
+/// Returns true for compiler output lines that begin an error block.
 fn is_agent_error_lead(line: &str) -> bool {
     let trimmed = line.trim_start();
     let lowered = trimmed.to_ascii_lowercase();
     lowered.starts_with("error:") || lowered.starts_with("error[") || lowered.starts_with("error ")
 }
 
+/// Returns true for compiler output lines that begin a warning block.
 fn is_agent_warning_lead(line: &str) -> bool {
     let trimmed = line.trim_start();
     let lowered = trimmed.to_ascii_lowercase();
@@ -250,6 +296,7 @@ fn is_agent_warning_lead(line: &str) -> bool {
         || trimmed.starts_with("Plugin diagnostic")
 }
 
+/// Returns true for source spans and indented lines that belong to the active block.
 fn is_agent_error_continuation(line: &str) -> bool {
     if line.trim().is_empty() {
         return false;
@@ -2083,6 +2130,130 @@ mod tests {
                 .any(|command| command.contains("--engine scarb")),
             "agents need a command to isolate fallback build failures: {:?}",
             diagnostic.next_commands
+        );
+    }
+
+    #[test]
+    fn native_fallback_diagnostic_reserves_fallback_error_budget() {
+        let err = anyhow::anyhow!("Compilation failed.").context("native cairo compile failed");
+        let mut diagnostic = native_fallback_diagnostic_from_error(
+            "UCN2002",
+            "native_fallback_local_native_error",
+            "Native local build downgraded to Scarb",
+            &err,
+            None,
+        );
+        diagnostic.why = "native chain entry -> ".repeat(300);
+        let fallback_run = CommandRun {
+            command: vec!["scarb".to_string(), "build".to_string()],
+            exit_code: 1,
+            elapsed_ms: 10.0,
+            stdout: String::new(),
+            stderr: "error[E0002]: Method `span` could not be called on type `core::array::Span::<core::felt252>`.\n --> src/account.cairo:254:64\n        calldata.span()\n                 ^^^^\n".to_string(),
+        };
+
+        enrich_native_fallback_diagnostic_with_fallback_run(&mut diagnostic, &fallback_run);
+
+        assert!(
+            diagnostic.why.contains("Fallback build failure summary"),
+            "fallback section should always remain visible: {}",
+            diagnostic.why
+        );
+        assert!(
+            diagnostic.why.contains("error[E0002]"),
+            "fallback compiler errors must survive long native chains: {}",
+            diagnostic.why
+        );
+        assert!(
+            diagnostic.why.chars().count() <= MAX_AGENT_DIAGNOSTIC_REASON_CHARS,
+            "diagnostic reason should respect the char budget: {} chars",
+            diagnostic.why.chars().count()
+        );
+    }
+
+    #[test]
+    fn truncate_agent_diagnostic_text_uses_char_budget() {
+        let input = "é".repeat(MAX_AGENT_DIAGNOSTIC_REASON_CHARS + 20);
+
+        let truncated = truncate_agent_diagnostic_text(&input);
+
+        assert!(
+            truncated.chars().count() <= MAX_AGENT_DIAGNOSTIC_REASON_CHARS,
+            "truncation should enforce a char budget, not mix byte and char units"
+        );
+        assert!(truncated.ends_with(TRUNCATED_DIAGNOSTIC_SUFFIX));
+    }
+
+    #[test]
+    fn build_report_json_preserves_enriched_ucn2002_payload() {
+        let err = anyhow::anyhow!("Compilation failed.")
+            .context("native starknet compile failed")
+            .context("native fallback to scarb is allowed");
+        let mut diagnostic = native_fallback_diagnostic_from_error(
+            "UCN2002",
+            "native_fallback_local_native_error",
+            "Native local build downgraded to Scarb",
+            &err,
+            None,
+        );
+        let fallback_run = CommandRun {
+            command: vec!["scarb".to_string(), "build".to_string()],
+            exit_code: 1,
+            elapsed_ms: 10.0,
+            stdout: String::new(),
+            stderr: "error[E0002]: Method `span` could not be called on type `core::array::Span::<core::felt252>`.\n --> src/account.cairo:254:64\n        calldata.span()\n                 ^^^^\n".to_string(),
+        };
+        enrich_native_fallback_diagnostic_with_fallback_run(&mut diagnostic, &fallback_run);
+        let report = BuildReport {
+            schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+            generated_at_epoch_ms: 1,
+            engine: "uc".to_string(),
+            daemon_used: false,
+            manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
+            workspace_root: "/tmp/workspace".to_string(),
+            profile: "dev".to_string(),
+            session_key: "test-session".to_string(),
+            command: vec!["scarb".to_string(), "build".to_string()],
+            exit_code: 1,
+            elapsed_ms: 10.0,
+            cache_hit: false,
+            fingerprint: "test-fingerprint".to_string(),
+            artifact_count: 0,
+            phase_telemetry: None,
+            compile_backend: Some("scarb_fallback".to_string()),
+            native_toolchain: None,
+            diagnostics: vec![diagnostic],
+        };
+
+        let report_json = serde_json::to_value(&report).expect("build report should serialize");
+        let payload = &report_json["diagnostics"][0];
+        assert_eq!(payload["code"], "UCN2002");
+        assert!(payload["what_happened"]
+            .as_str()
+            .expect("what_happened should be a string")
+            .contains("Native Cairo compilation failed"));
+        assert!(payload["why"]
+            .as_str()
+            .expect("why should be a string")
+            .contains("native starknet compile failed"));
+        assert!(payload["why"]
+            .as_str()
+            .expect("why should be a string")
+            .contains("error[E0002]"));
+        let next_commands = payload["next_commands"]
+            .as_array()
+            .expect("next_commands should be an array");
+        assert!(
+            next_commands.iter().any(|command| command
+                .as_str()
+                .is_some_and(|value| value.contains("--record-failure"))),
+            "report JSON should preserve replay-bundle next command: {next_commands:?}"
+        );
+        assert!(
+            next_commands.iter().any(|command| command
+                .as_str()
+                .is_some_and(|value| value.contains("--engine scarb"))),
+            "report JSON should preserve fallback isolation next command: {next_commands:?}"
         );
     }
 
