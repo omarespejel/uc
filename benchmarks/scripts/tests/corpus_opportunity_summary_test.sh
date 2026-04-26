@@ -558,10 +558,11 @@ JSON
   flag_only_output="$(jq -r '.cases[] | select(.tag=="fallback-used-only") | .opportunity_codes | index("UCO1002") != null' "$out_json")"
   flag_only_uco="$(jq -r '.cases[] | select(.tag=="fallback-used-only") | .opportunity_codes | index("UCO1003") != null' "$out_json")"
 
-  local backend_only_backend backend_only_output backend_only_uco
+  local backend_only_backend backend_only_output backend_only_uco backend_only_uco3
   backend_only_backend="$(jq -r '.cases[] | select(.tag=="scarb-fallback-only") | .compile_backend' "$out_json")"
   backend_only_output="$(jq -r '.cases[] | select(.tag=="scarb-fallback-only") | .fallback_used' "$out_json")"
   backend_only_uco="$(jq -r '.cases[] | select(.tag=="scarb-fallback-only") | .opportunity_codes | index("UCO1002") != null' "$out_json")"
+  backend_only_uco3="$(jq -r '.cases[] | select(.tag=="scarb-fallback-only") | .opportunity_codes | index("UCO1003") != null' "$out_json")"
 
   assert_json_value "fallback-used-only backend" "$flag_only_backend" "uc_native_external_helper" "$out_json"
   assert_json_value "fallback-used-only fallback_used" "$flag_only_matrix" "true" "$out_json"
@@ -570,6 +571,7 @@ JSON
   assert_json_value "scarb-fallback-only backend" "$backend_only_backend" "scarb_fallback" "$out_json"
   assert_json_value "scarb-fallback-only fallback_used" "$backend_only_output" "true" "$out_json"
   assert_json_value "scarb-fallback-only UCO1002" "$backend_only_uco" "true" "$out_json"
+  assert_json_value "scarb-fallback-only UCO1003" "$backend_only_uco3" "true" "$out_json"
 }
 
 test_remediation_fields_are_validated_without_overmatching() {
