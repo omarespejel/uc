@@ -73,16 +73,19 @@ The 20-contract corpus is an experiment harness first. It becomes launch evidenc
 
 This sweep is diagnostic evidence, not launch copy. It used `--runs 1`,
 `--cold-runs 1`, and no pinned-host strict stability window. The purpose was to
-expand coverage, surface blockers, and produce an agent-readable backlog.
+expand coverage, surface blockers, and produce an agent-readable backlog. The
+latest artifact below was regenerated after fallback-aware helper-report
+classification landed, so helper reports that activate Scarb fallback are no
+longer counted as native-supported.
 
 Artifacts:
 
 - Evidence root: `<abs/path>/uc-20-contract-experiment-20260425`
 - Cases file: `<evidence-root>/cases.tsv`
-- Benchmark JSON: `<evidence-root>/results/real-repo-bench-20260426-011206.json`
-- Benchmark Markdown: `<evidence-root>/results/real-repo-bench-20260426-011206.md`
-- Opportunity JSON: `<evidence-root>/corpus-opportunities.json`
-- Opportunity Markdown: `<evidence-root>/corpus-opportunities.md`
+- Benchmark JSON: `<evidence-root>/results-refresh-20260426-pr56-classifier/real-repo-bench-20260426-045630.json`
+- Benchmark Markdown: `<evidence-root>/results-refresh-20260426-pr56-classifier/real-repo-bench-20260426-045630.md`
+- Opportunity JSON: `<evidence-root>/corpus-opportunities-refresh-pr56-classifier.json`
+- Opportunity Markdown: `<evidence-root>/corpus-opportunities-refresh-pr56-classifier.md`
 - Cairo 2.14 helper: `${UC_NATIVE_TOOLCHAIN_2_14_BIN}`, produced by
   `./scripts/build_native_toolchain_helper.sh --lane 2.14`
 
@@ -102,26 +105,32 @@ Benchmark status:
 | `ok` | 12 |
 | `skipped` | 8 |
 
-Opportunity counts after applying the generic-diagnostic quality rule:
+Opportunity counts after applying the generic-diagnostic quality rule and the
+fallback-activation rule:
 
 | Code | Count | Meaning |
 |---|---:|---|
 | `UCO1001` | 6 | Native support gap. |
+| `UCO1002` | 2 | Fallback path used. |
 | `UCO1003` | 2 | Auto-build classification failed. |
 | `UCO3001` | 12 | Native frontend compile dominates. |
-| `UCO3006` | 2 | Cold speedup is weak. |
 | `UCO4001` | 12 | Bounded launch-evidence candidate after stricter validation. |
 | `UCO4002` | 2 | Strong warm no-op speedup. |
-| `UCO5001` | 4 | Diagnostic is not agent-grade. |
+| `UCO5001` | 2 | Diagnostic is not agent-grade. |
 
 The two `build_failed` rows were `accounts_workshop` and
-`starknetpy_contracts`. Both selected the Cairo 2.14 external helper and failed
-inside a cached `cairo-contracts` dependency with a Cairo diagnostic shaped like
+`starknetpy_contracts`. Both selected the Cairo 2.14 external helper, activated
+the Scarb fallback path, and failed inside a cached `cairo-contracts` dependency
+with a Cairo diagnostic shaped like
 `error[E0002]: Method span could not be called on type core::array::Span::<core::felt252>`.
-The generated build reports carried structured `UCN2002` diagnostics, but the
-`what_happened` and `why` fields were only `Compilation failed.`. That is too
-generic for an agent to remediate, so the opportunity summarizer now treats
-generic diagnostic text as `UCO5001` even when all required fields are present.
+The refreshed build reports classify their backend as `scarb_fallback` with
+`fallback_used=true`; the opportunity summary now emits `UCO1002` for that
+fallback activation even though the exclusive classification remains
+`build_failed`. The generated build reports carried structured `UCN2002`
+diagnostics, but the `what_happened` and `why` fields were only
+`Compilation failed.`. That is too generic for an agent to remediate, so the
+opportunity summarizer treats generic diagnostic text as `UCO5001` even when all
+required fields are present.
 
 Low-sample same-window observed ratios for native-supported rows:
 
@@ -131,7 +140,7 @@ Low-sample same-window observed ratios for native-supported rows:
 - Stages: `build.cold` observed value and `build.warm_noop` observed value
   from a single-sample diagnostic run.
 - Sample settings: `--runs 1`, `--cold-runs 1`,
-  `--warm-settle-seconds 0`, `--timeout-secs 180`.
+  `--warm-settle-seconds 0`, `--timeout-secs 240`.
 - Host condition: local ad hoc macOS developer workstation run; no pinned CPU,
   no strict host-noise preflight, and no recorded hardware claim metadata.
 - Claim-guard status: no deployed-contract `claim_guard` was produced for this
@@ -140,18 +149,29 @@ Low-sample same-window observed ratios for native-supported rows:
 
 | Tag | Cold observed ratio (single-sample) | Warm no-op observed ratio (single-sample) | Launch-use status |
 |---|---:|---:|---|
-| `braavos_account` | 1.196x | 34.334x | Diagnostic only; cold speedup weak. |
-| `monero_atomic_swap` | 1.211x | 135.222x | Diagnostic only; cold speedup weak. |
-| `agentic_session` | 1.821x | 4.819x | Needs strict rerun. |
-| `agentic_agent` | 2.089x | 4.530x | Needs strict rerun. |
-| `agentic_erc8004` | 1.789x | 8.791x | Needs strict rerun. |
-| `agentic_huginn` | 1.562x | 2.102x | Needs strict rerun. |
-| `book_ownable` | 1.290x | 0.544x | Warm regression target. |
-| `book_vote_contracts` | 1.693x | 6.109x | Needs strict rerun. |
-| `book_ownable_components` | 1.918x | 6.284x | Needs strict rerun. |
-| `token_factory` | 1.287x | 0.977x | Warm parity/regression target. |
-| `zcash_relay` | 1.747x | 1.058x | Needs strict rerun. |
-| `glint_contracts` | 2.132x | 3.123x | Needs strict rerun. |
+| `braavos_account` | 1.372x | 44.157x | Needs strict rerun. |
+| `monero_atomic_swap` | 1.367x | 125.859x | Needs strict rerun. |
+| `agentic_session` | 1.647x | 4.410x | Needs strict rerun. |
+| `agentic_agent` | 1.603x | 5.245x | Needs strict rerun. |
+| `agentic_erc8004` | 1.437x | 3.852x | Needs strict rerun. |
+| `agentic_huginn` | 1.383x | 2.277x | Needs strict rerun. |
+| `book_ownable` | 1.629x | 0.518x | Warm regression target. |
+| `book_vote_contracts` | 2.305x | 6.274x | Needs strict rerun. |
+| `book_ownable_components` | 1.897x | 5.866x | Needs strict rerun. |
+| `token_factory` | 1.653x | 0.657x | Warm regression target. |
+| `zcash_relay` | 1.613x | 0.551x | Warm regression target. |
+| `glint_contracts` | 1.759x | 1.733x | Needs strict rerun. |
+
+Refresh artifact hashes:
+
+```text
+c996fffd4a0f2e063fafe7e4f8e15934e1bccf51343f41ce8aa8b73d46ff382f  cases.tsv
+0c86d3bb226398dd0037594e2ebc0e71cdee0d0603878765c6cc4eb14bcdcd81  results-refresh-20260426-pr56-classifier/real-repo-bench-20260426-045630.json
+b7d3ca2b56f20e62d63b261381b846e0497c3d13615e8780db12ba5f0d25a76d  results-refresh-20260426-pr56-classifier/real-repo-bench-20260426-045630.md
+d83d440c1a6b9abaa82db4b258f7f1d69a63e89260674af6b1739bbbc1929121  corpus-opportunities-refresh-pr56-classifier.json
+1d7c9e44f30721ceebada069a2f327891db3530461483b51c5aaccaaa8df1e0f  corpus-opportunities-refresh-pr56-classifier.md
+34212c3af55637476cc172eb7cafa19de8c3b45616b2724fb5577eb3681fcba0  run-20-refresh-pr56-classifier.log
+```
 
 Next blockers from this sweep:
 

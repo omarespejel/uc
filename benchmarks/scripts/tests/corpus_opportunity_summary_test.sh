@@ -290,12 +290,14 @@ JSON
 
   "$SUMMARY_SCRIPT" --benchmark-json "$fixture" --out-json "$out_json"
 
-  local generic_gap weak_reason build_blocker
+  local generic_gap weak_reason build_blocker fallback_activation
   generic_gap="$(jq -r '.cases[] | select(.tag=="generic-native-failure") | .opportunity_codes | index("UCO5001") != null' "$out_json")"
   weak_reason="$(jq -r '.cases[] | select(.tag=="generic-native-failure") | .opportunities[] | select(.code=="UCO5001") | .why' "$out_json")"
   build_blocker="$(jq -r '.cases[] | select(.tag=="generic-native-failure") | .opportunity_codes | index("UCO1003") != null' "$out_json")"
+  fallback_activation="$(jq -r '.cases[] | select(.tag=="generic-native-failure") | .opportunity_codes | index("UCO1002") != null' "$out_json")"
   assert_json_value "generic_gap" "$generic_gap" "true" "$out_json"
   assert_json_value "build_blocker" "$build_blocker" "true" "$out_json"
+  assert_json_value "fallback_activation" "$fallback_activation" "true" "$out_json"
   if [[ "$weak_reason" != *"what_happened is generic"* || "$weak_reason" != *"why is generic"* ]]; then
     echo "expected generic diagnostic fields to be named in UCO5001 reason" >&2
     cat "$out_json" >&2
@@ -366,10 +368,12 @@ JSON
 
   "$SUMMARY_SCRIPT" --benchmark-json "$fixture" --out-json "$out_json"
 
-  local generic_gap weak_reason
+  local generic_gap weak_reason fallback_activation
   generic_gap="$(jq -r '.cases[] | select(.tag=="stock-malformed-native-failure") | .opportunity_codes | index("UCO5001") != null' "$out_json")"
   weak_reason="$(jq -r '.cases[] | select(.tag=="stock-malformed-native-failure") | .opportunities[] | select(.code=="UCO5001") | .why' "$out_json")"
+  fallback_activation="$(jq -r '.cases[] | select(.tag=="stock-malformed-native-failure") | .opportunity_codes | index("UCO1002") != null' "$out_json")"
   assert_json_value "generic_gap" "$generic_gap" "true" "$out_json"
+  assert_json_value "fallback_activation" "$fallback_activation" "true" "$out_json"
   if [[ "$weak_reason" != *"what_happened is generic"* || "$weak_reason" != *"why is not a string"* ]]; then
     echo "expected stock and malformed diagnostic fields to be named in UCO5001 reason" >&2
     cat "$out_json" >&2
