@@ -12,6 +12,8 @@ const DEFAULT_UC_NATIVE_FALLBACK_HINT_RETRY_SECS: u64 = 30 * 60;
 // so total footprint can be up to 2x this value across both directories.
 const DAEMON_LOCAL_PROBE_HINT_MAX_ENTRIES_PER_DIR: usize = 256;
 const DAEMON_LOCAL_PROBE_HINT_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+const MAX_AGENT_DIAGNOSTIC_REASON_CHARS: usize = 2_000;
+const MAX_FALLBACK_ERROR_BLOCKS: usize = 3;
 
 fn native_fallback_diagnostic(
     code: &str,
@@ -44,6 +46,219 @@ fn native_fallback_diagnostic(
             .and_then(|entry| entry.requested_version.clone().or(entry.requested_major_minor.clone())),
         toolchain_found: toolchain.and_then(|entry| entry.compiler_version.clone()),
     }
+}
+
+fn native_fallback_diagnostic_from_error(
+    code: &str,
+    category: &str,
+    title: &str,
+    err: &anyhow::Error,
+    toolchain: Option<&NativeToolchainReport>,
+) -> NativeDiagnostic {
+    let chain = native_error_chain(err);
+    let root_cause = err.root_cause().to_string();
+    let stage = chain
+        .iter()
+        .find(|message| {
+            message.contains("native starknet compile failed")
+                || message.contains("native cairo compile failed")
+                || message.contains("native compile")
+        })
+        .cloned()
+        .unwrap_or_else(|| "native Cairo compilation failed".to_string());
+    let chain_summary = truncate_agent_diagnostic_text(&chain.join(" -> "));
+
+    let mut diagnostic = native_fallback_diagnostic(
+        code,
+        category,
+        title,
+        if is_generic_native_compile_failure(&root_cause) {
+            format!(
+                "Native Cairo compilation failed before native artifacts were produced ({stage})."
+            )
+        } else {
+            format!(
+                "Native Cairo compilation failed before native artifacts were produced: {root_cause}"
+            )
+        },
+        toolchain,
+    );
+    diagnostic.why = if is_generic_native_compile_failure(&root_cause) {
+        format!(
+            "The native compiler returned a generic root cause (`{root_cause}`). Full error chain: {chain_summary}"
+        )
+    } else {
+        format!("Full native error chain: {chain_summary}")
+    };
+    diagnostic.how_to_fix = vec![
+        "Inspect the native error chain and selected toolchain lane before changing source code."
+            .to_string(),
+        "If the fallback build also failed, fix the reported Cairo compiler errors first, then rerun native with fallback disallowed to isolate native-only failures.".to_string(),
+        "If the failure comes from a registry or git dependency, keep it in the support matrix until the dependency/toolchain combination is validated.".to_string(),
+    ];
+    diagnostic.next_commands = vec![
+        "uc support native --manifest-path <Scarb.toml> --format json".to_string(),
+        "uc build --engine uc --daemon-mode off --manifest-path <Scarb.toml> --report-path /tmp/uc-build-report.json".to_string(),
+        "UC_NATIVE_DISALLOW_SCARB_FALLBACK=1 uc build --engine uc --daemon-mode off --manifest-path <Scarb.toml> --record-failure /tmp/uc-failure.json".to_string(),
+    ];
+    diagnostic
+}
+
+fn native_error_chain(err: &anyhow::Error) -> Vec<String> {
+    let mut chain = Vec::new();
+    for cause in err.chain() {
+        let message = cause.to_string();
+        let message = message.trim();
+        if message.is_empty() || chain.iter().any(|existing| existing == message) {
+            continue;
+        }
+        chain.push(message.to_string());
+    }
+    if chain.is_empty() {
+        chain.push(err.to_string());
+    }
+    chain
+}
+
+fn is_generic_native_compile_failure(reason: &str) -> bool {
+    let normalized = reason.trim().trim_end_matches('.').to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "compilation failed" | "native failed" | "build failed"
+    )
+}
+
+fn truncate_agent_diagnostic_text(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() <= MAX_AGENT_DIAGNOSTIC_REASON_CHARS {
+        return trimmed.to_string();
+    }
+    let mut truncated = trimmed
+        .chars()
+        .take(MAX_AGENT_DIAGNOSTIC_REASON_CHARS)
+        .collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+fn enrich_native_fallback_diagnostic_with_fallback_run(
+    diagnostic: &mut NativeDiagnostic,
+    fallback_run: &CommandRun,
+) {
+    if fallback_run.exit_code == 0 {
+        return;
+    }
+
+    let fallback_summary =
+        extract_fallback_error_summary(&fallback_run.stderr, &fallback_run.stdout).unwrap_or_else(
+            || {
+                format!(
+            "Scarb fallback command exited with code {} without captured compiler diagnostics.",
+            fallback_run.exit_code
+        )
+            },
+        );
+    let native_why = diagnostic.why.clone();
+    diagnostic.what_happened = format!(
+        "Native Cairo compilation failed, uc downgraded to Scarb, and the fallback build exited with code {}.",
+        fallback_run.exit_code
+    );
+    diagnostic.why = truncate_agent_diagnostic_text(&format!(
+        "{native_why} Fallback build failure summary: {fallback_summary}"
+    ));
+    diagnostic.how_to_fix.push(
+        "Fix the fallback compiler diagnostics before claiming native support for this manifest."
+            .to_string(),
+    );
+    diagnostic.next_commands.push(
+        "uc build --engine scarb --daemon-mode off --manifest-path <Scarb.toml> --report-path /tmp/uc-scarb-fallback-report.json".to_string(),
+    );
+}
+
+fn extract_fallback_error_summary(stderr: &str, stdout: &str) -> Option<String> {
+    let combined = if stdout.trim().is_empty() {
+        stderr.to_string()
+    } else if stderr.trim().is_empty() {
+        stdout.to_string()
+    } else {
+        format!("{stderr}\n{stdout}")
+    };
+    let blocks = extract_agent_error_blocks(&combined);
+    if blocks.is_empty() {
+        return None;
+    }
+    Some(truncate_agent_diagnostic_text(&blocks.join("\n---\n")))
+}
+
+fn extract_agent_error_blocks(output: &str) -> Vec<String> {
+    let error_blocks = extract_agent_diagnostic_blocks(output, is_agent_error_lead);
+    if !error_blocks.is_empty() {
+        return error_blocks;
+    }
+    extract_agent_diagnostic_blocks(output, is_agent_warning_lead)
+}
+
+fn extract_agent_diagnostic_blocks(output: &str, is_lead: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current = Vec::new();
+
+    for raw_line in output.lines() {
+        let line = raw_line.trim_end();
+        if is_lead(line) {
+            if !current.is_empty() {
+                blocks.push(current.join("\n"));
+                current.clear();
+                if blocks.len() >= MAX_FALLBACK_ERROR_BLOCKS {
+                    break;
+                }
+            }
+            current.push(line.to_string());
+            continue;
+        }
+
+        if !current.is_empty() && is_agent_error_continuation(line) {
+            current.push(line.to_string());
+            continue;
+        }
+
+        if !current.is_empty() {
+            blocks.push(current.join("\n"));
+            current.clear();
+            if blocks.len() >= MAX_FALLBACK_ERROR_BLOCKS {
+                break;
+            }
+        }
+    }
+
+    if !current.is_empty() && blocks.len() < MAX_FALLBACK_ERROR_BLOCKS {
+        blocks.push(current.join("\n"));
+    }
+    blocks
+}
+
+fn is_agent_error_lead(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let lowered = trimmed.to_ascii_lowercase();
+    lowered.starts_with("error:") || lowered.starts_with("error[") || lowered.starts_with("error ")
+}
+
+fn is_agent_warning_lead(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let lowered = trimmed.to_ascii_lowercase();
+    lowered.starts_with("warn:")
+        || lowered.starts_with("warning:")
+        || trimmed.starts_with("Plugin diagnostic")
+}
+
+fn is_agent_error_continuation(line: &str) -> bool {
+    if line.trim().is_empty() {
+        return false;
+    }
+    line.starts_with(' ')
+        || line.starts_with('\t')
+        || line.trim_start().starts_with("-->")
+        || line.trim_start().starts_with('|')
+        || line.trim_start().starts_with('=')
 }
 
 fn diagnostics_used_native_fallback(diagnostics: &[NativeDiagnostic]) -> bool {
@@ -1194,13 +1409,13 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                     );
                                 }
                                 record_native_fallback(NativeFallbackReason::LocalNativeError);
-                                diagnostics.borrow_mut().push(native_fallback_diagnostic(
+                                let mut diagnostic = native_fallback_diagnostic_from_error(
                                     "UCN2002",
                                     "native_fallback_local_native_error",
                                     "Native local build downgraded to Scarb",
-                                    format!("{}", native_err.root_cause()),
+                                    &native_err,
                                     native_toolchain.as_ref(),
-                                ));
+                                );
                                 eprintln!(
                                     "uc: native compile unavailable ({}), falling back to scarb backend",
                                     native_err.root_cause()
@@ -1213,6 +1428,11 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                         &compiler_version,
                                         BuildCompileBackend::Scarb,
                                     )?;
+                                enrich_native_fallback_diagnostic_with_fallback_run(
+                                    &mut diagnostic,
+                                    &run,
+                                );
+                                diagnostics.borrow_mut().push(diagnostic);
                                 let _ = persist_daemon_local_probe_hint(
                                     &workspace_root,
                                     &native_session_key,
@@ -1778,6 +1998,92 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    #[test]
+    fn native_fallback_diagnostic_expands_generic_compiler_root_cause() {
+        let err = anyhow::anyhow!("Compilation failed.")
+            .context("native starknet compile failed")
+            .context(
+                "native compile manifest includes non-starknet dependencies (cairo-contracts); retrying with scarb fallback is allowed",
+            );
+
+        let diagnostic = native_fallback_diagnostic_from_error(
+            "UCN2002",
+            "native_fallback_local_native_error",
+            "Native local build downgraded to Scarb",
+            &err,
+            None,
+        );
+
+        assert_ne!(diagnostic.what_happened, "Compilation failed.");
+        assert!(
+            diagnostic
+                .what_happened
+                .contains("Native Cairo compilation failed"),
+            "unexpected what_happened: {}",
+            diagnostic.what_happened
+        );
+        assert!(
+            diagnostic.why.contains("native starknet compile failed"),
+            "generic roots should preserve the actionable chain: {}",
+            diagnostic.why
+        );
+        assert!(
+            diagnostic
+                .next_commands
+                .iter()
+                .any(|command| command.contains("--record-failure")),
+            "agents need a replay-bundle command for native failures: {:?}",
+            diagnostic.next_commands
+        );
+    }
+
+    #[test]
+    fn native_fallback_diagnostic_includes_fallback_build_errors() {
+        let err = anyhow::anyhow!("Compilation failed.").context("native cairo compile failed");
+        let mut diagnostic = native_fallback_diagnostic_from_error(
+            "UCN2002",
+            "native_fallback_local_native_error",
+            "Native local build downgraded to Scarb",
+            &err,
+            None,
+        );
+        let fallback_run = CommandRun {
+            command: vec!["scarb".to_string(), "build".to_string()],
+            exit_code: 1,
+            elapsed_ms: 10.0,
+            stdout: String::new(),
+            stderr: "warn: `edition` field not set in `[package]` section\n   Compiling account v0.1.0\nerror[E0002]: Method `span` could not be called on type `core::array::Span::<core::felt252>`.\n --> src/account.cairo:254:64\n        calldata.span()\n                 ^^^^\nwarning: ignored after the error block\n".to_string(),
+        };
+
+        enrich_native_fallback_diagnostic_with_fallback_run(&mut diagnostic, &fallback_run);
+
+        assert!(
+            diagnostic
+                .what_happened
+                .contains("fallback build exited with code 1"),
+            "unexpected what_happened: {}",
+            diagnostic.what_happened
+        );
+        assert!(
+            diagnostic.why.contains("error[E0002]"),
+            "fallback Cairo diagnostics should be surfaced to agents: {}",
+            diagnostic.why
+        );
+        assert!(
+            !diagnostic.why.contains("edition"),
+            "leading warnings should not hide the first actual error: {}",
+            diagnostic.why
+        );
+        assert!(
+            diagnostic
+                .next_commands
+                .iter()
+                .any(|command| command.contains("--engine scarb")),
+            "agents need a command to isolate fallback build failures: {:?}",
+            diagnostic.next_commands
+        );
     }
 
     #[test]

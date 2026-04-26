@@ -151,6 +151,9 @@ Native local build downgraded to Scarb.
 - Category: `native_fallback_local_native_error`
 - Safe action: `inspect_native_support_then_retry`
 - Agent behavior: keep the fallback result, inspect native support and build report diagnostics, then retry native with fallback disallowed only after fixing the native failure.
+- Required payload behavior: if the native compiler only reports a generic root cause such as `Compilation failed.`, preserve the full error chain in `why` so agents can distinguish native Cairo frontend failures, external-dependency compatibility failures, and fallback activation.
+- Required fallback-failure behavior: if the Scarb fallback build also exits nonzero, keep `fallback_used=true` and include the first bounded compiler error blocks in `why`; agents should fix those Cairo diagnostics before claiming native support for that manifest.
+- Replay evidence: `next_commands` must include a `--record-failure` command so agents can preserve a redacted replay bundle for native-only retry failures.
 
 ### UCN2003
 
