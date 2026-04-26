@@ -140,6 +140,8 @@ uc replay "$failure_bundle"
 
 Use `uc replay "$failure_bundle" --execute` only when the agent is allowed to rerun the recorded build command. Replay reports still emit structured JSON if the command cannot spawn or exceeds capture limits.
 
+When native fallback activates, agents should inspect `UCN2002` before editing source. If `UCN2002` says the fallback build also failed, treat the embedded compiler error blocks as the immediate blocker and keep the manifest in `build_failed` support state until those errors are fixed or a lane-specific compatibility patch lands.
+
 ## Sources
 
 - AGENTS.md: <https://agents.md/>
