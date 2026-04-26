@@ -120,11 +120,14 @@ if [[ "$1" == "build" ]]; then
     compile_backend="uc_native"
     fallback_used="false"
     diagnostics='[]'
-  if [[ "$manifest" == *"fallback-used"* ]]; then
-    compile_backend="scarb_fallback"
-    fallback_used="true"
-    diagnostics='[{"code":"UCN2002","category":"native_fallback_local_native_error","severity":"warn","title":"Native local build downgraded to Scarb","what_happened":"native failed","why":"native failed","how_to_fix":["fix native"],"retryable":true,"fallback_used":true,"toolchain_expected":"2.16.0","toolchain_found":"2.16.0"}]'
-  fi
+    if [[ "$manifest" == *"fallback-used"* ]]; then
+      compile_backend="uc_native_external_helper"
+      fallback_used="true"
+      diagnostics='[{"code":"UCN2002","category":"native_fallback_local_native_error","severity":"warn","title":"Native local build downgraded to Scarb","what_happened":"native failed","why":"native failed","how_to_fix":["fix native"],"retryable":true,"fallback_used":true,"toolchain_expected":"2.16.0","toolchain_found":"2.16.0"}]'
+    fi
+    if [[ "$manifest" == *"fallback-backend-only"* ]]; then
+      compile_backend="scarb_fallback"
+    fi
   cat > "$report_path" <<REPORT
 {
   "generated_at_epoch_ms": 1,
@@ -458,6 +461,7 @@ test_real_repo_benchmark_records_support_matrix_categories() {
   write_mock_scarb_bin "$mock_scarb"
   write_manifest_case "$cases_root" "supported"
   write_manifest_case "$cases_root" "fallback-used"
+  write_manifest_case "$cases_root" "fallback-backend-only"
   write_manifest_case "$cases_root" "unsupported"
 
   local stdout_text
@@ -474,6 +478,7 @@ test_real_repo_benchmark_records_support_matrix_categories() {
       --warm-settle-seconds 0 \
       --case "$cases_root/supported/Scarb.toml" supported \
       --case "$cases_root/fallback-used/Scarb.toml" fallback-used \
+      --case "$cases_root/fallback-backend-only/Scarb.toml" fallback-backend-only \
       --case "$cases_root/unsupported/Scarb.toml" unsupported
   )"
   assert_contains "$stdout_text" "Benchmark JSON:"
@@ -492,13 +497,19 @@ test_real_repo_benchmark_records_support_matrix_categories() {
   unsupported_status="$(jq -r '.cases[] | select(.tag=="unsupported") | .native_support.status' "$json_path")"
   local fallback_classification
   fallback_classification="$(jq -r '.cases[] | select(.tag=="fallback-used") | .support_matrix.classification' "$json_path")"
+  local fallback_used_flag
+  fallback_used_flag="$(jq -r '.cases[] | select(.tag=="fallback-used") | .support_matrix.fallback_used' "$json_path")"
+  local fallback_backend_only_classification
+  fallback_backend_only_classification="$(jq -r '.cases[] | select(.tag=="fallback-backend-only") | .support_matrix.classification' "$json_path")"
+  local fallback_backend_only_flag
+  fallback_backend_only_flag="$(jq -r '.cases[] | select(.tag=="fallback-backend-only") | .support_matrix.fallback_used' "$json_path")"
   local supported_benchmark_status
   supported_benchmark_status="$(jq -r '.cases[] | select(.tag=="supported") | .benchmark_status' "$json_path")"
   local unsupported_classification
   unsupported_classification="$(jq -r '.cases[] | select(.tag=="unsupported") | .support_matrix.classification' "$json_path")"
   local supported_classification
   supported_classification="$(jq -r '.cases[] | select(.tag=="supported") | .support_matrix.classification' "$json_path")"
-  if [[ "$supported_status" != "supported" || "$unsupported_status" != "unsupported" || "$supported_benchmark_status" != "ok" || "$supported_classification" != "native_supported" || "$fallback_classification" != "fallback_used" || "$unsupported_classification" != "native_unsupported" ]]; then
+  if [[ "$supported_status" != "supported" || "$unsupported_status" != "unsupported" || "$supported_benchmark_status" != "ok" || "$supported_classification" != "native_supported" || "$fallback_classification" != "fallback_used" || "$fallback_used_flag" != "true" || "$fallback_backend_only_classification" != "fallback_used" || "$fallback_backend_only_flag" != "true" || "$unsupported_classification" != "native_unsupported" ]]; then
     echo "unexpected support classification in json report" >&2
     cat "$json_path" >&2
     return 1
@@ -512,7 +523,8 @@ test_real_repo_benchmark_records_support_matrix_categories() {
   assert_contains "$markdown_text" "## Fallback-Used Cases"
   assert_contains "$markdown_text" "## Native-Unsupported Cases"
   assert_contains "$markdown_text" "| supported |"
-  assert_contains "$markdown_text" "| fallback-used | fallback_used | scarb_fallback |"
+  assert_contains "$markdown_text" "| fallback-used | fallback_used | uc_native_external_helper |"
+  assert_contains "$markdown_text" "| fallback-backend-only | fallback_used | scarb_fallback |"
   assert_contains "$markdown_text" "| unsupported | native_unsupported | <none> | 2.14.0 |"
 
   local canonical_corelib_dir
@@ -534,6 +546,11 @@ test_real_repo_benchmark_records_support_matrix_categories() {
   fi
   if grep -q "build .*fallback-used.* disallow=1" "$TEST_TMP_DIR/uc.args"; then
     echo "fallback-used case should not run strict native benchmark builds" >&2
+    cat "$TEST_TMP_DIR/uc.args" >&2
+    return 1
+  fi
+  if grep -q "build .*fallback-backend-only.* disallow=1" "$TEST_TMP_DIR/uc.args"; then
+    echo "fallback-backend-only case should not run strict native benchmark builds" >&2
     cat "$TEST_TMP_DIR/uc.args" >&2
     return 1
   fi

@@ -320,18 +320,33 @@ fn build_report_compile_backend_label(
     used_external_helper: bool,
     diagnostics: &[NativeDiagnostic],
 ) -> &'static str {
+    if matches!(engine, EngineArg::Uc) && diagnostics_used_native_fallback(diagnostics) {
+        return "scarb_fallback";
+    }
     match (engine, compile_backend, used_external_helper) {
         (EngineArg::Scarb, BuildCompileBackend::Scarb, _) => "scarb",
         (EngineArg::Uc, BuildCompileBackend::Native, true) => "uc_native_external_helper",
         (EngineArg::Uc, BuildCompileBackend::Native, false) => "uc_native",
-        (EngineArg::Uc, BuildCompileBackend::Scarb, _) => {
-            if diagnostics_used_native_fallback(diagnostics) {
-                "scarb_fallback"
-            } else {
-                "uc_scarb"
-            }
-        }
+        (EngineArg::Uc, BuildCompileBackend::Scarb, _) => "uc_scarb",
         (EngineArg::Scarb, BuildCompileBackend::Native, _) => "native",
+    }
+}
+
+fn compile_backend_from_build_report_label(
+    label: Option<&str>,
+    diagnostics: &[NativeDiagnostic],
+) -> Option<BuildCompileBackend> {
+    if diagnostics_used_native_fallback(diagnostics) {
+        return Some(BuildCompileBackend::Scarb);
+    }
+    match label.map(str::trim) {
+        Some("scarb") | Some("uc_scarb") | Some("scarb_fallback") => {
+            Some(BuildCompileBackend::Scarb)
+        }
+        Some("native") | Some("uc_native") | Some("uc_native_external_helper") => {
+            Some(BuildCompileBackend::Native)
+        }
+        _ => None,
     }
 }
 
@@ -1147,7 +1162,6 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                 if let Ok(selection) = &toolchain_selection {
                     if let Some(helper_path) = selection.helper_path.as_ref() {
                         used_external_helper = true;
-                        actual_compile_backend = Some(BuildCompileBackend::Native);
                         let helper_display = helper_path.display().to_string();
                         let helper_report_path = if write_report {
                             Some(helper_build_report_temp_path(&workspace_root)?)
@@ -1172,6 +1186,12 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                         if let Some(path) = helper_report_path.as_ref() {
                             if path.exists() {
                                 let helper_report = load_build_report(path)?;
+                                if let Some(backend) = compile_backend_from_build_report_label(
+                                    helper_report.compile_backend.as_deref(),
+                                    &helper_report.diagnostics,
+                                ) {
+                                    actual_compile_backend = Some(backend);
+                                }
                                 daemon_used = helper_report.daemon_used;
                                 session_key = helper_report.session_key;
                                 phase_telemetry = helper_report.phase_telemetry;
@@ -2327,7 +2347,61 @@ mod tests {
             ),
             "scarb_fallback"
         );
+        assert_eq!(
+            build_report_compile_backend_label(
+                EngineArg::Uc,
+                BuildCompileBackend::Native,
+                true,
+                &diagnostics,
+            ),
+            "scarb_fallback"
+        );
         assert!(diagnostics_used_native_fallback(&diagnostics));
+    }
+
+    #[test]
+    fn helper_build_report_backend_prefers_fallback_diagnostics() {
+        let diagnostics = vec![NativeDiagnostic {
+            schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+            code: "UCN2002".to_string(),
+            category: "native_fallback_local_native_error".to_string(),
+            severity: NativeDiagnosticSeverity::Warn,
+            title: "Native local build downgraded to Scarb".to_string(),
+            docs_url: native_diagnostic_docs_url("UCN2002"),
+            what_happened: "native failed, fallback used".to_string(),
+            why: "fallback_used=true".to_string(),
+            how_to_fix: vec!["inspect fallback".to_string()],
+            next_commands: vec![
+                "uc build --engine scarb --daemon-mode off --manifest-path <Scarb.toml>"
+                    .to_string(),
+            ],
+            safe_automated_action: "inspect_native_support_then_retry".to_string(),
+            retryable: true,
+            fallback_used: true,
+            toolchain_expected: Some("2.14.0".to_string()),
+            toolchain_found: Some("2.14.0".to_string()),
+        }];
+
+        assert_eq!(
+            compile_backend_from_build_report_label(
+                Some("uc_native_external_helper"),
+                &diagnostics
+            ),
+            Some(BuildCompileBackend::Scarb)
+        );
+        assert_eq!(
+            compile_backend_from_build_report_label(Some("scarb_fallback"), &[]),
+            Some(BuildCompileBackend::Scarb)
+        );
+        assert_eq!(
+            compile_backend_from_build_report_label(Some("uc_native_external_helper"), &[]),
+            Some(BuildCompileBackend::Native)
+        );
+        assert_eq!(compile_backend_from_build_report_label(None, &[]), None);
+        assert_eq!(
+            compile_backend_from_build_report_label(Some("future_backend"), &[]),
+            None
+        );
     }
 
     #[test]
