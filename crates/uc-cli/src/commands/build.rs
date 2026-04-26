@@ -184,9 +184,10 @@ fn native_fallback_reason_with_fallback_summary(
 }
 
 /// Adds fallback build failure details to an existing native-fallback diagnostic.
-fn enrich_native_fallback_diagnostic_with_fallback_run(
+fn enrich_native_fallback_diagnostic_with_fallback_run_context(
     diagnostic: &mut NativeDiagnostic,
     fallback_run: &CommandRun,
+    what_happened_prefix: &str,
 ) {
     if fallback_run.exit_code == 0 {
         return;
@@ -203,7 +204,7 @@ fn enrich_native_fallback_diagnostic_with_fallback_run(
         );
     let native_why = diagnostic.why.clone();
     diagnostic.what_happened = format!(
-        "Native Cairo compilation failed, uc downgraded to Scarb, and the fallback build exited with code {}.",
+        "{what_happened_prefix}, and the fallback build exited with code {}.",
         fallback_run.exit_code
     );
     diagnostic.why = native_fallback_reason_with_fallback_summary(&native_why, &fallback_summary);
@@ -214,6 +215,40 @@ fn enrich_native_fallback_diagnostic_with_fallback_run(
     diagnostic.next_commands.push(
         "uc build --engine scarb --daemon-mode off --manifest-path <Scarb.toml> --report-path /tmp/uc-scarb-fallback-report.json".to_string(),
     );
+}
+
+/// Adds fallback build failure details to a UCN2002 diagnostic.
+fn enrich_native_fallback_diagnostic_with_fallback_run(
+    diagnostic: &mut NativeDiagnostic,
+    fallback_run: &CommandRun,
+) {
+    enrich_native_fallback_diagnostic_with_fallback_run_context(
+        diagnostic,
+        fallback_run,
+        "Native Cairo compilation failed, uc downgraded to Scarb",
+    );
+}
+
+/// Enriches a specific queued fallback diagnostic when a Scarb fallback build fails.
+fn enrich_indexed_native_fallback_diagnostic_with_fallback_run(
+    diagnostics: &std::cell::RefCell<Vec<NativeDiagnostic>>,
+    diagnostic_index: Option<usize>,
+    fallback_run: &CommandRun,
+    what_happened_prefix: &str,
+) {
+    if fallback_run.exit_code == 0 {
+        return;
+    }
+    let Some(index) = diagnostic_index else {
+        return;
+    };
+    if let Some(diagnostic) = diagnostics.borrow_mut().get_mut(index) {
+        enrich_native_fallback_diagnostic_with_fallback_run_context(
+            diagnostic,
+            fallback_run,
+            what_happened_prefix,
+        );
+    }
 }
 
 /// Extracts the first actionable compiler diagnostic blocks from fallback output.
@@ -1137,6 +1172,12 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
     };
     let mut used_external_helper = false;
     let diagnostics = std::cell::RefCell::new(Vec::<NativeDiagnostic>::new());
+    let push_diagnostic = |diagnostic: NativeDiagnostic| -> usize {
+        let mut entries = diagnostics.borrow_mut();
+        let index = entries.len();
+        entries.push(diagnostic);
+        index
+    };
     let (run, cache_hit, fingerprint) = match engine {
         EngineArg::Scarb => {
             validate_scarb_toolchain()?;
@@ -1158,6 +1199,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             });
             let configured_native_mode = native_build_mode();
             let disallow_native_fallback = native_disallow_scarb_fallback();
+            let preflight_fallback_diagnostic_index = std::cell::Cell::new(None::<usize>);
             if configured_native_mode != NativeBuildMode::Off {
                 if let Ok(selection) = &toolchain_selection {
                     if let Some(helper_path) = selection.helper_path.as_ref() {
@@ -1285,13 +1327,14 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                     );
                 }
                 record_native_fallback(NativeFallbackReason::PreflightIneligible);
-                diagnostics.borrow_mut().push(native_fallback_diagnostic(
+                let diagnostic_index = push_diagnostic(native_fallback_diagnostic(
                     "UCN2001",
                     "native_fallback_preflight_ineligible",
                     "Native preflight downgraded to Scarb",
                     reason.to_string(),
                     native_toolchain.as_ref(),
                 ));
+                preflight_fallback_diagnostic_index.set(Some(diagnostic_index));
                 tracing::debug!(
                     manifest_path = %manifest_path.display(),
                     reason,
@@ -1361,6 +1404,12 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             &compiler_version,
                             BuildCompileBackend::Scarb,
                         )?;
+                        enrich_indexed_native_fallback_diagnostic_with_fallback_run(
+                            &diagnostics,
+                            preflight_fallback_diagnostic_index.get(),
+                            &run,
+                            "Native preflight selected Scarb",
+                        );
                         Ok((
                             run,
                             cache_hit,
@@ -1399,7 +1448,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                 );
                             }
                             record_native_fallback(NativeFallbackReason::DaemonBackendDowngrade);
-                            diagnostics.borrow_mut().push(native_fallback_diagnostic(
+                            let diagnostic_index = push_diagnostic(native_fallback_diagnostic(
                                 "UCN2003",
                                 "native_fallback_daemon_backend_downgrade",
                                 "Native daemon hint downgraded to Scarb",
@@ -1415,6 +1464,12 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                 &compiler_version,
                                 BuildCompileBackend::Scarb,
                             )?;
+                            enrich_indexed_native_fallback_diagnostic_with_fallback_run(
+                                &diagnostics,
+                                Some(diagnostic_index),
+                                &run,
+                                "Cached daemon fallback hint selected Scarb",
+                            );
                             if hinted_session_key != local_session_key {
                                 let _ = persist_daemon_local_probe_hint(
                                     &workspace_root,
@@ -1499,7 +1554,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                     &mut diagnostic,
                                     &run,
                                 );
-                                diagnostics.borrow_mut().push(diagnostic);
+                                push_diagnostic(diagnostic);
                                 let _ = persist_daemon_local_probe_hint(
                                     &workspace_root,
                                     &native_session_key,
@@ -2141,6 +2196,51 @@ mod tests {
         assert!(
             !diagnostic.why.contains("edition"),
             "leading warnings should not hide the first actual error: {}",
+            diagnostic.why
+        );
+        assert!(
+            diagnostic
+                .next_commands
+                .iter()
+                .any(|command| command.contains("--engine scarb")),
+            "agents need a command to isolate fallback build failures: {:?}",
+            diagnostic.next_commands
+        );
+    }
+
+    #[test]
+    fn preflight_fallback_diagnostic_includes_fallback_build_errors() {
+        let mut diagnostic = native_fallback_diagnostic(
+            "UCN2001",
+            "native_fallback_preflight_ineligible",
+            "Native preflight downgraded to Scarb",
+            "cached fallback hint present for session key deadbeef".to_string(),
+            None,
+        );
+        let fallback_run = CommandRun {
+            command: vec!["scarb".to_string(), "build".to_string()],
+            exit_code: 1,
+            elapsed_ms: 10.0,
+            stdout: String::new(),
+            stderr: "error[E0002]: Method `span` could not be called on type `core::array::Span::<core::felt252>`.\n --> src/account.cairo:254:64\n        calldata.span()\n                 ^^^^\n".to_string(),
+        };
+
+        enrich_native_fallback_diagnostic_with_fallback_run_context(
+            &mut diagnostic,
+            &fallback_run,
+            "Native preflight selected Scarb",
+        );
+
+        assert!(
+            diagnostic.what_happened.contains(
+                "Native preflight selected Scarb, and the fallback build exited with code 1."
+            ),
+            "unexpected what_happened: {}",
+            diagnostic.what_happened
+        );
+        assert!(
+            diagnostic.why.contains("error[E0002]"),
+            "fallback Cairo diagnostics should be surfaced to agents: {}",
             diagnostic.why
         );
         assert!(
