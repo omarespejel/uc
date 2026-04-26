@@ -164,6 +164,86 @@ fn write_fake_uc_support_helper(path: &Path, report: &NativeSupportReport) {
     fs::set_permissions(path, perms).expect("chmod fake helper");
 }
 
+#[cfg(all(feature = "native-compile", unix))]
+fn write_fake_uc_build_helper_with_fallback_report(path: &Path, toolchain_version: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = r#"#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "support" ]]; then
+  printf '%s\n' '{"schema_version":1,"manifest_path":"","status":"supported","supported":true,"compiler_version":"__TOOLCHAIN_VERSION__","diagnostics":[]}'
+  exit 0
+fi
+
+if [[ "${1:-}" == "build" ]]; then
+  report_path=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --report-path)
+        report_path="${2:-}"
+        shift 2
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+  if [[ -n "$report_path" ]]; then
+    mkdir -p "$(dirname "$report_path")"
+    cat > "$report_path" <<'JSON'
+{
+  "schema_version": 1,
+  "generated_at_epoch_ms": 1,
+  "engine": "uc",
+  "daemon_used": false,
+  "manifest_path": "helper-manifest",
+  "workspace_root": "helper-workspace",
+  "profile": "dev",
+  "session_key": "helper-session",
+  "command": ["uc", "build"],
+  "exit_code": 0,
+  "elapsed_ms": 1.0,
+  "cache_hit": false,
+  "fingerprint": "helper-fingerprint",
+  "artifact_count": 0,
+  "phase_telemetry": null,
+  "compile_backend": "uc_native_external_helper",
+  "diagnostics": [
+    {
+      "schema_version": 1,
+      "code": "UCN2002",
+      "category": "native_fallback_local_native_error",
+      "severity": "warn",
+      "title": "Native local build downgraded to Scarb",
+      "docs_url": "https://example.invalid/docs#ucn2002",
+      "what_happened": "native failed, fallback used",
+      "why": "fake helper emitted fallback diagnostics",
+      "how_to_fix": ["inspect native failure"],
+      "next_commands": ["uc build --engine scarb --daemon-mode off --manifest-path <Scarb.toml>"],
+      "safe_automated_action": "inspect_native_support_then_retry",
+      "retryable": true,
+      "fallback_used": true,
+      "toolchain_expected": "__TOOLCHAIN_VERSION__",
+      "toolchain_found": "__TOOLCHAIN_VERSION__"
+    }
+  ]
+}
+JSON
+  fi
+  exit 0
+fi
+
+echo "unexpected helper invocation: $*" >&2
+exit 64
+"#
+    .replace("__TOOLCHAIN_VERSION__", toolchain_version);
+    fs::write(path, script).expect("write fake helper script");
+    let mut perms = fs::metadata(path).expect("stat fake helper").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).expect("chmod fake helper");
+}
+
 #[cfg(feature = "native-compile")]
 fn native_progress_hook_lock() -> &'static Mutex<()> {
     static LOCK: TestOnceLock<Mutex<()>> = TestOnceLock::new();
@@ -3820,6 +3900,88 @@ cairo-version = "{requested_version}"
         Some(requested_version.as_str())
     );
     assert!(report.diagnostics.is_empty());
+}
+
+#[cfg(all(feature = "native-compile", unix))]
+#[test]
+fn build_report_from_external_helper_preserves_fallback_backend() {
+    let _guard = integration_env_lock().lock().unwrap();
+    let current = parse_cairo_version_major_minor(native_cairo_lang_compiler_version())
+        .expect("compiler version should parse");
+    let current_major_minor = format_cairo_version_major_minor(current);
+    let productized_lanes = productized_native_toolchain_helper_lanes();
+    let requested_major_minor = productized_lanes
+        .iter()
+        .find(|lane| *lane != &current_major_minor)
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a productized native helper lane different from current {current_major_minor}; productized lanes: {productized_lanes:?}"
+            )
+        });
+    let requested_version = format!("{requested_major_minor}.0");
+    let helper_env = native_toolchain_env_var_name_for_major_minor(&requested_major_minor);
+
+    let dir = unique_test_dir("uc-build-helper-fallback-report");
+    let _cleanup = TestDirCleanup::new(&dir);
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let manifest_path = dir.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+cairo-version = "{requested_version}"
+"#
+        ),
+    )
+    .expect("write manifest");
+
+    let helper_path = dir.join("uc-helper.sh");
+    write_fake_uc_build_helper_with_fallback_report(&helper_path, &requested_version);
+    let report_path = dir.join("outer-build-report.json");
+    let _helper = ScopedDynamicEnvVar::set_with_lock(&_guard, helper_env, &helper_path);
+    let _mode = ScopedEnvVar::set_with_lock(&_guard, "UC_NATIVE_BUILD_MODE", "auto");
+    let _disallow = ScopedEnvVar::unset_with_lock(&_guard, "UC_NATIVE_DISALLOW_SCARB_FALLBACK");
+
+    run_build(BuildArgs {
+        common: BuildCommonArgs {
+            manifest_path: Some(manifest_path),
+            package: None,
+            workspace: false,
+            features: Vec::new(),
+            offline: false,
+            release: false,
+            profile: None,
+        },
+        engine: EngineArg::Uc,
+        daemon_mode: DaemonModeArg::Off,
+        json: false,
+        report_path: Some(report_path.clone()),
+        record_failure: None,
+    })
+    .expect("helper-backed build should succeed");
+
+    let report: BuildReport =
+        serde_json::from_slice(&fs::read(&report_path).expect("read outer build report"))
+            .expect("outer build report should parse");
+    assert_eq!(report.compile_backend.as_deref(), Some("scarb_fallback"));
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "UCN2002" && diagnostic.fallback_used),
+        "outer report should preserve helper fallback diagnostics: {report:#?}"
+    );
+    assert_eq!(
+        report
+            .native_toolchain
+            .as_ref()
+            .map(|toolchain| &toolchain.source),
+        Some(&NativeToolchainSource::ExternalHelper)
+    );
 }
 
 #[cfg(feature = "native-compile")]

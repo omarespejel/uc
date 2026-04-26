@@ -484,19 +484,21 @@ classify_support_matrix_case() {
     --arg log_path "$log_path" \
     --arg report_path "$report_path" \
     '
-      def fallback_used:
-        (($build_report.diagnostics // []) | any(.fallback_used == true));
       def compile_backend:
         ($build_report.compile_backend // null);
+      def fallback_used:
+        (compile_backend == "scarb_fallback"
+          or compile_backend == "uc_scarb"
+          or (($build_report.diagnostics // []) | any(.fallback_used == true)));
       def classification:
         if $native_support.supported != true then
           "native_unsupported"
         elif $exit_code != 0 then
           "build_failed"
-        elif compile_backend == "uc_native" or compile_backend == "uc_native_external_helper" then
-          "native_supported"
         elif compile_backend == "scarb_fallback" or compile_backend == "uc_scarb" or fallback_used then
           "fallback_used"
+        elif compile_backend == "uc_native" or compile_backend == "uc_native_external_helper" then
+          "native_supported"
         else
           "build_failed"
         end;

@@ -132,7 +132,7 @@ if [[ "$1" == "build" ]]; then
   compile_backend="uc_native"
   diagnostics="[]"
   if [[ "$manifest" == *"fallback-used"* ]]; then
-    compile_backend="scarb_fallback"
+    compile_backend="uc_native_external_helper"
     diagnostics='[{"code":"UCN2002","category":"native_fallback_local_native_error","severity":"warn","title":"Native local build downgraded to Scarb","what_happened":"native failed","why":"native failed","how_to_fix":["fix native"],"retryable":true,"fallback_used":true,"toolchain_expected":"2.16.0","toolchain_found":"2.16.0"}]'
   fi
   if [[ -n "$report_path" ]]; then
