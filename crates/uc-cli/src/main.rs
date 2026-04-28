@@ -662,10 +662,14 @@ struct ProjectInspectReport {
     mutation_status: String,
     manifest: ProjectManifestSummary,
     package: ProjectPackageSummary,
+    packages: Vec<ProjectInspectPackageSummary>,
     workspace: ProjectWorkspaceSummary,
+    profiles: ProjectProfilesSummary,
     targets: Vec<ProjectTargetSummary>,
     dependencies: Vec<ProjectDependencySummary>,
+    source_origins: Vec<ProjectSourceOriginSummary>,
     lockfile: ProjectLockfileSummary,
+    offline_readiness: ProjectOfflineReadinessSummary,
     toolchain: ProjectToolchainSummary,
     #[serde(skip_serializing_if = "Option::is_none")]
     native_support: Option<NativeSupportReport>,
@@ -685,6 +689,29 @@ struct ProjectPackageSummary {
     version: Option<String>,
     edition: Option<String>,
     cairo_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ProjectInspectPackageSummary {
+    manifest_path: String,
+    package_root: String,
+    role: ProjectInspectPackageRole,
+    name: Option<String>,
+    version: Option<String>,
+    edition: Option<String>,
+    cairo_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ProjectInspectPackageRole {
+    InspectedManifest,
+    WorkspaceRootManifest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+struct ProjectProfilesSummary {
+    declared: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -718,6 +745,16 @@ struct ProjectDependencySummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ProjectSourceOriginSummary {
+    dependency: String,
+    section: String,
+    kind: String,
+    locator: String,
+    workspace_inherited: bool,
+    locked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ProjectLockfileSummary {
     present: bool,
     path: Option<String>,
@@ -746,6 +783,28 @@ struct ProjectToolchainSummary {
     native_status: NativeSupportStatus,
     native_supported: bool,
     fallback_used: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ProjectOfflineReadinessSummary {
+    status: ProjectOfflineReadinessStatus,
+    readonly_native_source: bool,
+    lockfile_present: bool,
+    lockfile_valid: bool,
+    remote_dependency_count: usize,
+    path_dependency_count: usize,
+    workspace_dependency_count: usize,
+    cache_state_known: bool,
+    reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ProjectOfflineReadinessStatus {
+    Ready,
+    NeedsLockfile,
+    NeedsExactToolchainSource,
+    Blocked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2291,6 +2350,14 @@ fn project_inspect_report_from_manifest_path(manifest_path: &Path) -> Result<Pro
         inspected_manifest_for_workspace,
         workspace_manifest_for_report,
     );
+    let packages = project_packages_for_report(
+        manifest.as_ref(),
+        manifest_path,
+        workspace_manifest_for_report,
+        &workspace_manifest_path,
+    );
+    let profiles =
+        project_profiles_summary_for_report(manifest.as_ref(), workspace_manifest_for_report);
     let targets = manifest
         .as_ref()
         .map(project_targets_from_manifest)
@@ -2303,6 +2370,13 @@ fn project_inspect_report_from_manifest_path(manifest_path: &Path) -> Result<Pro
         .map(project_workspace_dependencies_from_manifest)
         .unwrap_or_default();
     let lockfile = project_lockfile_summary(&workspace_root, &mut diagnostics)?;
+    let source_origins = project_source_origins_for_report(
+        &dependencies,
+        &workspace_dependencies,
+        &lockfile,
+        manifest_path,
+        &workspace_root,
+    );
     let readonly_native_source = project_has_readonly_native_toolchain_source(
         &package,
         &dependencies,
@@ -2392,6 +2466,13 @@ fn project_inspect_report_from_manifest_path(manifest_path: &Path) -> Result<Pro
         &lockfile,
         native_support.as_ref(),
     );
+    let offline_readiness = project_offline_readiness_summary(
+        manifest.is_some(),
+        readonly_native_source,
+        &dependencies,
+        &workspace_dependencies,
+        &lockfile,
+    );
 
     Ok(ProjectInspectReport {
         schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
@@ -2406,10 +2487,14 @@ fn project_inspect_report_from_manifest_path(manifest_path: &Path) -> Result<Pro
             hash: manifest_hash,
         },
         package,
+        packages,
         workspace,
+        profiles,
         targets,
         dependencies,
+        source_origins,
         lockfile,
+        offline_readiness,
         toolchain,
         native_support,
         diagnostics,
@@ -2539,6 +2624,87 @@ fn project_workspace_summary_for_report(
     manifest
         .map(project_workspace_summary_from_manifest)
         .unwrap_or_else(empty_project_workspace_summary)
+}
+
+fn project_packages_for_report(
+    manifest: Option<&TomlValue>,
+    manifest_path: &Path,
+    workspace_manifest: Option<&TomlValue>,
+    workspace_manifest_path: &Path,
+) -> Vec<ProjectInspectPackageSummary> {
+    let mut packages = Vec::new();
+    project_push_package_for_report(
+        &mut packages,
+        manifest,
+        manifest_path,
+        ProjectInspectPackageRole::InspectedManifest,
+    );
+    if workspace_manifest_path != manifest_path {
+        project_push_package_for_report(
+            &mut packages,
+            workspace_manifest,
+            workspace_manifest_path,
+            ProjectInspectPackageRole::WorkspaceRootManifest,
+        );
+    }
+    packages.sort_by(|left, right| {
+        left.manifest_path
+            .cmp(&right.manifest_path)
+            .then_with(|| left.package_root.cmp(&right.package_root))
+    });
+    packages
+}
+
+fn project_push_package_for_report(
+    packages: &mut Vec<ProjectInspectPackageSummary>,
+    manifest: Option<&TomlValue>,
+    manifest_path: &Path,
+    role: ProjectInspectPackageRole,
+) {
+    let Some(manifest) = manifest else {
+        return;
+    };
+    let package = project_package_summary_from_manifest(manifest);
+    if package.name.is_none()
+        && package.version.is_none()
+        && package.edition.is_none()
+        && package.cairo_version.is_none()
+    {
+        return;
+    }
+    packages.push(ProjectInspectPackageSummary {
+        manifest_path: manifest_path.display().to_string(),
+        package_root: manifest_path
+            .parent()
+            .unwrap_or(manifest_path)
+            .display()
+            .to_string(),
+        role,
+        name: package.name,
+        version: package.version,
+        edition: package.edition,
+        cairo_version: package.cairo_version,
+    });
+}
+
+fn project_profiles_summary_for_report(
+    manifest: Option<&TomlValue>,
+    workspace_manifest: Option<&TomlValue>,
+) -> ProjectProfilesSummary {
+    let mut declared = BTreeSet::new();
+    for current in [workspace_manifest, manifest] {
+        let Some(current) = current else {
+            continue;
+        };
+        if let Some(table) = current.get("profile").and_then(TomlValue::as_table) {
+            for name in table.keys() {
+                declared.insert(name.to_string());
+            }
+        }
+    }
+    ProjectProfilesSummary {
+        declared: declared.into_iter().collect(),
+    }
 }
 
 fn project_targets_from_manifest(manifest: &TomlValue) -> Vec<ProjectTargetSummary> {
@@ -2688,6 +2854,101 @@ fn project_workspace_dependencies_from_manifest(
         .collect::<Vec<_>>();
     dependencies.sort_by(|left, right| left.name.cmp(&right.name));
     dependencies
+}
+
+fn project_source_origins_for_report(
+    dependencies: &[ProjectDependencySummary],
+    workspace_dependencies: &[ProjectDependencySummary],
+    lockfile: &ProjectLockfileSummary,
+    manifest_path: &Path,
+    workspace_root: &Path,
+) -> Vec<ProjectSourceOriginSummary> {
+    let mut origins = dependencies
+        .iter()
+        .map(|dependency| {
+            project_source_origin_summary(
+                dependency,
+                workspace_dependencies,
+                lockfile,
+                manifest_path,
+                workspace_root,
+            )
+        })
+        .collect::<Vec<_>>();
+    origins.sort_by(|left, right| {
+        left.section
+            .cmp(&right.section)
+            .then_with(|| left.dependency.cmp(&right.dependency))
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.locator.cmp(&right.locator))
+    });
+    origins
+}
+
+fn project_source_origin_summary(
+    dependency: &ProjectDependencySummary,
+    workspace_dependencies: &[ProjectDependencySummary],
+    lockfile: &ProjectLockfileSummary,
+    manifest_path: &Path,
+    workspace_root: &Path,
+) -> ProjectSourceOriginSummary {
+    let inherited = dependency.workspace;
+    let source_dependency = if dependency.workspace {
+        workspace_dependencies
+            .iter()
+            .find(|workspace_dependency| workspace_dependency.name == dependency.name)
+            .unwrap_or(dependency)
+    } else {
+        dependency
+    };
+    let locator = project_dependency_locator(source_dependency, manifest_path, workspace_root);
+    let locked = lockfile
+        .packages
+        .iter()
+        .any(|package| package.name == dependency.name);
+    ProjectSourceOriginSummary {
+        dependency: dependency.name.clone(),
+        section: dependency.section.clone(),
+        kind: source_dependency.kind.clone(),
+        locator,
+        workspace_inherited: inherited,
+        locked,
+    }
+}
+
+fn project_dependency_locator(
+    dependency: &ProjectDependencySummary,
+    manifest_path: &Path,
+    workspace_root: &Path,
+) -> String {
+    if let Some(path) = dependency.path.as_deref() {
+        let base = if dependency.section == "workspace.dependencies" {
+            workspace_root
+        } else {
+            manifest_path.parent().unwrap_or(workspace_root)
+        };
+        return base.join(path).display().to_string();
+    }
+    if let Some(git) = dependency.git.as_deref() {
+        let mut locator = git.to_string();
+        if let Some(branch) = dependency.branch.as_deref() {
+            locator.push_str(&format!("#branch={branch}"));
+        }
+        if let Some(tag) = dependency.tag.as_deref() {
+            locator.push_str(&format!("#tag={tag}"));
+        }
+        if let Some(rev) = dependency.rev.as_deref() {
+            locator.push_str(&format!("#rev={rev}"));
+        }
+        return locator;
+    }
+    if let Some(version) = dependency.version.as_deref() {
+        return version.to_string();
+    }
+    if dependency.workspace {
+        return format!("workspace.dependencies.{}", dependency.name);
+    }
+    "unknown".to_string()
 }
 
 fn project_dependency_resolved_version(
@@ -2912,6 +3173,84 @@ fn project_toolchain_summary(
         native_status,
         native_supported,
         fallback_used: false,
+    }
+}
+
+fn project_offline_readiness_summary(
+    manifest_valid: bool,
+    readonly_native_source: bool,
+    dependencies: &[ProjectDependencySummary],
+    workspace_dependencies: &[ProjectDependencySummary],
+    lockfile: &ProjectLockfileSummary,
+) -> ProjectOfflineReadinessSummary {
+    let path_dependency_count = dependencies
+        .iter()
+        .filter(|dependency| {
+            project_dependency_resolved_origin_kind(dependency, workspace_dependencies) == "path"
+        })
+        .count();
+    let workspace_dependency_count = dependencies
+        .iter()
+        .filter(|dependency| dependency.workspace)
+        .count();
+    let remote_dependency_count = dependencies
+        .iter()
+        .filter(|dependency| {
+            matches!(
+                project_dependency_resolved_origin_kind(dependency, workspace_dependencies)
+                    .as_str(),
+                "git" | "version" | "table" | "unknown"
+            )
+        })
+        .count();
+
+    let mut reasons = Vec::new();
+    let status = if !manifest_valid {
+        reasons.push("manifest_invalid".to_string());
+        ProjectOfflineReadinessStatus::Blocked
+    } else if remote_dependency_count > 0 && (!lockfile.present || !lockfile.valid) {
+        if !lockfile.present {
+            reasons.push("lockfile_missing_for_remote_dependencies".to_string());
+        } else {
+            reasons.push("lockfile_invalid_for_remote_dependencies".to_string());
+        }
+        if !readonly_native_source {
+            reasons.push("native_support_requires_exact_local_source".to_string());
+        }
+        ProjectOfflineReadinessStatus::NeedsLockfile
+    } else if !readonly_native_source {
+        reasons.push("native_support_requires_exact_local_source".to_string());
+        ProjectOfflineReadinessStatus::NeedsExactToolchainSource
+    } else {
+        reasons.push("cache_state_unknown".to_string());
+        ProjectOfflineReadinessStatus::Ready
+    };
+
+    ProjectOfflineReadinessSummary {
+        status,
+        readonly_native_source,
+        lockfile_present: lockfile.present,
+        lockfile_valid: lockfile.valid,
+        remote_dependency_count,
+        path_dependency_count,
+        workspace_dependency_count,
+        cache_state_known: false,
+        reasons,
+    }
+}
+
+fn project_dependency_resolved_origin_kind(
+    dependency: &ProjectDependencySummary,
+    workspace_dependencies: &[ProjectDependencySummary],
+) -> String {
+    if dependency.workspace {
+        workspace_dependencies
+            .iter()
+            .find(|workspace_dependency| workspace_dependency.name == dependency.name)
+            .map(|workspace_dependency| workspace_dependency.kind.clone())
+            .unwrap_or_else(|| "workspace".to_string())
+    } else {
+        dependency.kind.clone()
     }
 }
 

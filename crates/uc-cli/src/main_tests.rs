@@ -691,6 +691,9 @@ cairo-version = "2.14.0"
 members = ["crates/*"]
 exclude = ["target"]
 
+[profile.ci]
+inherits = "release"
+
 [dependencies]
 starknet = "2.14.0"
 path_dep = { path = "../path_dep" }
@@ -733,8 +736,15 @@ dependencies = ["core"]
     assert_eq!(report.package.name.as_deref(), Some("demo"));
     assert_eq!(report.package.edition.as_deref(), Some("2024_07"));
     assert_eq!(report.package.cairo_version.as_deref(), Some("2.14.0"));
+    assert_eq!(report.packages.len(), 1);
+    assert_eq!(
+        report.packages[0].role,
+        ProjectInspectPackageRole::InspectedManifest
+    );
+    assert_eq!(report.packages[0].name.as_deref(), Some("demo"));
     assert_eq!(report.workspace.members, vec!["crates/*".to_string()]);
     assert_eq!(report.workspace.exclude, vec!["target".to_string()]);
+    assert_eq!(report.profiles.declared, vec!["ci".to_string()]);
     assert!(report
         .targets
         .iter()
@@ -749,6 +759,25 @@ dependencies = ["core"]
         .dependencies
         .iter()
         .any(|dep| dep.name == "git_dep" && dep.kind == "git"));
+    assert!(report
+        .source_origins
+        .iter()
+        .any(|origin| origin.dependency == "starknet"
+            && origin.kind == "version"
+            && origin.locator == "2.14.0"
+            && origin.locked));
+    assert!(report
+        .source_origins
+        .iter()
+        .any(|origin| origin.dependency == "path_dep"
+            && origin.kind == "path"
+            && origin.locator.ends_with("/path_dep")));
+    assert!(report
+        .source_origins
+        .iter()
+        .any(|origin| origin.dependency == "git_dep"
+            && origin.kind == "git"
+            && origin.locator == "https://example.com/repo.git#rev=abc123"));
     assert!(report.lockfile.present);
     assert!(report.lockfile.valid);
     assert_eq!(report.lockfile.version.as_deref(), Some("1"));
@@ -770,6 +799,21 @@ dependencies = ["core"]
     assert_eq!(
         report.toolchain.requested_major_minor.as_deref(),
         Some("2.14")
+    );
+    assert_eq!(
+        report.offline_readiness.status,
+        ProjectOfflineReadinessStatus::Ready
+    );
+    assert!(report.offline_readiness.readonly_native_source);
+    assert!(report.offline_readiness.lockfile_present);
+    assert!(report.offline_readiness.lockfile_valid);
+    assert_eq!(report.offline_readiness.remote_dependency_count, 3);
+    assert_eq!(report.offline_readiness.path_dependency_count, 1);
+    assert_eq!(report.offline_readiness.workspace_dependency_count, 0);
+    assert!(!report.offline_readiness.cache_state_known);
+    assert_eq!(
+        report.offline_readiness.reasons,
+        vec!["cache_state_unknown".to_string()]
     );
     assert!(report.native_support.is_some());
     assert_eq!(
@@ -795,6 +839,15 @@ fn project_inspect_report_returns_structured_diagnostic_for_invalid_manifest() {
 
     assert!(!report.manifest.valid);
     assert!(report.native_support.is_none());
+    assert!(report.packages.is_empty());
+    assert_eq!(
+        report.offline_readiness.status,
+        ProjectOfflineReadinessStatus::Blocked
+    );
+    assert!(report
+        .offline_readiness
+        .reasons
+        .contains(&"manifest_invalid".to_string()));
     assert!(report
         .diagnostics
         .iter()
@@ -826,8 +879,10 @@ members = ["crates/*"]
     assert_eq!(report.package.version, None);
     assert_eq!(report.package.edition, None);
     assert_eq!(report.package.cairo_version, None);
+    assert!(report.packages.is_empty());
     assert!(report.workspace.has_workspace_table);
     assert_eq!(report.workspace.members, vec!["crates/*".to_string()]);
+    assert!(report.profiles.declared.is_empty());
     assert!(report.readonly);
     assert_eq!(report.mutation_status, "none");
     assert_project_inspect_left_no_artifacts(&dir);
@@ -863,6 +918,19 @@ starknet = ">=2.14.0"
         .any(|diagnostic| diagnostic.code == "UCP1005"
             && diagnostic.category == "native_support_probe"
             && diagnostic.safe_automated_action == "inspect_native_support_then_retry"));
+    assert_eq!(
+        report.offline_readiness.status,
+        ProjectOfflineReadinessStatus::NeedsLockfile
+    );
+    assert!(!report.offline_readiness.readonly_native_source);
+    assert!(report
+        .offline_readiness
+        .reasons
+        .contains(&"lockfile_missing_for_remote_dependencies".to_string()));
+    assert!(report
+        .offline_readiness
+        .reasons
+        .contains(&"native_support_requires_exact_local_source".to_string()));
     assert_project_inspect_left_no_artifacts(&dir);
 }
 
@@ -1045,6 +1113,25 @@ starknet = { workspace = true }
         .diagnostics
         .iter()
         .any(|diagnostic| diagnostic.code == "UCP1005"));
+    assert!(report
+        .source_origins
+        .iter()
+        .any(|origin| origin.dependency == "starknet"
+            && origin.kind == "version"
+            && origin.workspace_inherited
+            && origin.locator == "2.14.0"));
+    assert_eq!(
+        report.offline_readiness.status,
+        ProjectOfflineReadinessStatus::NeedsLockfile
+    );
+    assert!(report.offline_readiness.readonly_native_source);
+    assert!(!report.offline_readiness.lockfile_present);
+    assert_eq!(report.offline_readiness.remote_dependency_count, 1);
+    assert_eq!(report.offline_readiness.workspace_dependency_count, 1);
+    assert!(report
+        .offline_readiness
+        .reasons
+        .contains(&"lockfile_missing_for_remote_dependencies".to_string()));
     assert_project_inspect_left_no_artifacts(&workspace);
     assert_project_inspect_left_no_artifacts(&member);
 }
