@@ -766,12 +766,18 @@ dependencies = ["core"]
             && origin.kind == "version"
             && origin.locator == "2.14.0"
             && origin.locked));
+    let expected_path_dep = normalize_fingerprint_path(
+        &manifest_path
+            .parent()
+            .expect("manifest should have a parent")
+            .join("../path_dep"),
+    );
     assert!(report
         .source_origins
         .iter()
         .any(|origin| origin.dependency == "path_dep"
             && origin.kind == "path"
-            && origin.locator.ends_with("/path_dep")));
+            && origin.locator == expected_path_dep));
     assert!(report
         .source_origins
         .iter()
@@ -927,25 +933,70 @@ edition = "2024_07"
 
     assert_eq!(report.package.name, None);
     assert_eq!(report.packages.len(), 2);
-    assert_eq!(
-        report
-            .packages
-            .iter()
-            .map(|package| (package.name.clone(), package.role.clone()))
-            .collect::<Vec<_>>(),
-        vec![
-            (
-                Some("alpha".to_string()),
-                ProjectInspectPackageRole::WorkspaceMemberManifest,
-            ),
-            (
-                Some("beta".to_string()),
-                ProjectInspectPackageRole::WorkspaceMemberManifest,
-            ),
-        ]
-    );
+    assert!(report.packages.iter().any(|package| {
+        package.name.as_deref() == Some("alpha")
+            && package.role == ProjectInspectPackageRole::WorkspaceMemberManifest
+    }));
+    assert!(report.packages.iter().any(|package| {
+        package.name.as_deref() == Some("beta")
+            && package.role == ProjectInspectPackageRole::WorkspaceMemberManifest
+    }));
     assert!(report.workspace.has_workspace_table);
     assert_eq!(report.workspace.members, vec!["packages/*".to_string()]);
+    assert_project_inspect_left_no_artifacts(&dir);
+}
+
+#[test]
+fn project_inspect_workspace_member_excludes_are_honored() {
+    let dir = unique_test_dir("uc-project-inspect-workspace-member-exclude");
+    let _cleanup = TestDirCleanup::new(&dir);
+    let alpha_dir = dir.join("crates/alpha");
+    let template_dir = dir.join("crates/template");
+    fs::create_dir_all(&alpha_dir).expect("create alpha dir");
+    fs::create_dir_all(&template_dir).expect("create template dir");
+    fs::write(
+        dir.join("Scarb.toml"),
+        r#"[workspace]
+members = ["crates/*"]
+exclude = ["crates/template"]
+"#,
+    )
+    .expect("write workspace manifest");
+    fs::write(
+        alpha_dir.join("Scarb.toml"),
+        r#"[package]
+name = "alpha"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("write alpha manifest");
+    fs::write(
+        template_dir.join("Scarb.toml"),
+        r#"[package]
+name = "template"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("write template manifest");
+
+    let report = project_inspect_report_from_manifest_path(&dir.join("Scarb.toml"))
+        .expect("inspect should succeed");
+
+    assert_eq!(report.packages.len(), 1);
+    assert!(report
+        .packages
+        .iter()
+        .any(|package| package.name.as_deref() == Some("alpha")));
+    assert!(!report
+        .packages
+        .iter()
+        .any(|package| package.name.as_deref() == Some("template")));
+    assert_eq!(
+        report.workspace.exclude,
+        vec!["crates/template".to_string()]
+    );
     assert_project_inspect_left_no_artifacts(&dir);
 }
 
@@ -1241,6 +1292,57 @@ shared-dep = { workspace = true }
     assert_eq!(report.offline_readiness.remote_dependency_count, 1);
     assert_project_inspect_left_no_artifacts(&workspace);
     assert_project_inspect_left_no_artifacts(&member);
+}
+
+#[test]
+fn project_inspect_reports_workspace_member_manifest_diagnostics() {
+    let dir = unique_test_dir("uc-project-inspect-broken-workspace-member");
+    let _cleanup = TestDirCleanup::new(&dir);
+    let alpha_dir = dir.join("packages/alpha");
+    let broken_dir = dir.join("packages/broken");
+    fs::create_dir_all(&alpha_dir).expect("create alpha dir");
+    fs::create_dir_all(&broken_dir).expect("create broken dir");
+    fs::write(
+        dir.join("Scarb.toml"),
+        r#"[workspace]
+members = ["packages/*"]
+"#,
+    )
+    .expect("write workspace manifest");
+    fs::write(
+        alpha_dir.join("Scarb.toml"),
+        r#"[package]
+name = "alpha"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("write alpha manifest");
+    fs::write(
+        broken_dir.join("Scarb.toml"),
+        "[package\nname = \"broken\"\n",
+    )
+    .expect("write broken manifest");
+
+    let report = project_inspect_report_from_manifest_path(&dir.join("Scarb.toml"))
+        .expect("inspect should succeed");
+
+    assert!(report
+        .packages
+        .iter()
+        .any(|package| package.name.as_deref() == Some("alpha")));
+    assert!(report
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "UCP1006"
+            && diagnostic.category == "workspace_member_manifest"
+            && diagnostic.safe_automated_action
+                == "manual_workspace_member_manifest_fix_required"
+            && diagnostic
+                .toolchain_found
+                .as_deref()
+                .is_some_and(|path| path.ends_with("/packages/broken/Scarb.toml"))));
+    assert_project_inspect_left_no_artifacts(&dir);
 }
 
 #[test]
