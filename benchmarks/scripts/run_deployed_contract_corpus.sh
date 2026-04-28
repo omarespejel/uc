@@ -149,17 +149,34 @@ if ! command -v jq >/dev/null 2>&1; then
   echo "jq is required for deployed contract corpus benchmarks" >&2
   exit 1
 fi
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "python3 is required for deployed contract corpus benchmarks" >&2
-  exit 1
-fi
+
+find_python311_plus() {
+  local candidate
+  for candidate in python3 python3.13 python3.12 python3.11; do
+    if ! command -v "$candidate" >/dev/null 2>&1; then
+      continue
+    fi
+    if "$candidate" - <<'PY' >/dev/null 2>&1
+import sys, tomllib
+if sys.version_info < (3, 11):
+    raise SystemExit(1)
+PY
+    then
+      command -v "$candidate"
+      return 0
+    fi
+  done
+  echo "python >= 3.11 with tomllib is required for deployed contract corpus benchmarks" >&2
+  return 1
+}
 
 mkdir -p "$RESULTS_DIR"
 CORPUS_ABS="$(cd "$(dirname "$CORPUS_PATH")" && pwd -P)/$(basename "$CORPUS_PATH")"
 NORMALIZED_CORPUS="$TMP_DIR/normalized-corpus.json"
 CASES_TSV="$TMP_DIR/cases.tsv"
+PYTHON_BIN="$(find_python311_plus)"
 
-python3 - "$CORPUS_ABS" "$NORMALIZED_CORPUS" "$CASES_TSV" <<'PY'
+"$PYTHON_BIN" - "$CORPUS_ABS" "$NORMALIZED_CORPUS" "$CASES_TSV" <<'PY'
 import json
 import re
 import sys

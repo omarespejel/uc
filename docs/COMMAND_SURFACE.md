@@ -117,11 +117,12 @@ The intended primary surface for agents is:
   - `what_happened`
   - `why`
   - `retryable`
-  - `expected vs found`
+  - `expected`
+  - `found`
   - `fallback_used`
-  - replay command or replay handle
-  - artifact/log path
-  - schema version
+  - `replay_command` or `replay_handle`
+  - `artifact_log_path`
+  - `schema_version`
 - Bump the schema version or explicit format version when these report-contract fields change incompatibly.
 
 ## Current Engine Note

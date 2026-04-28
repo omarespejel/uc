@@ -1,7 +1,22 @@
-#!/usr/bin/env python3
+#!/bin/sh
+""":"
+for candidate in python3.13 python3.12 python3.11 python3; do
+  if ! command -v "$candidate" >/dev/null 2>&1; then
+    continue
+  fi
+  if "$candidate" - <<'PY' >/dev/null 2>&1
+import sys, tomllib
+if sys.version_info < (3, 11):
+    raise SystemExit(1)
+PY
+  then
+    exec "$candidate" "$0" "$@"
+  fi
+done
+echo "python >= 3.11 with tomllib is required for summarize_corpus_opportunities.py" >&2
+exit 1
+":"""
 """Summarize benchmark/support artifacts into an agent-actionable opportunity log."""
-
-from __future__ import annotations
 
 import argparse
 import datetime as dt
@@ -11,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 1
+DESCRIPTION = "Summarize benchmark/support artifacts into an agent-actionable opportunity log."
 REQUIRED_DIAGNOSTIC_FIELDS = {
     "schema_version",
     "code",
@@ -543,7 +559,7 @@ def build_summary(source_path: Path, data: dict[str, Any]) -> dict[str, Any]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=DESCRIPTION)
     parser.add_argument("--benchmark-json", required=True, type=Path, help="real-repo or deployed-contract benchmark JSON")
     parser.add_argument("--out-json", type=Path, help="write structured opportunity summary JSON")
     parser.add_argument("--out-md", type=Path, help="write Markdown opportunity summary")

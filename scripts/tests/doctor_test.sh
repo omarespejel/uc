@@ -128,7 +128,7 @@ PYTHON
 
 link_required_host_tools() {
   local fake_bin_dir="$1"
-  for cmd in bash dirname env head sort python3; do
+  for cmd in bash dirname env head sort; do
     local resolved
     resolved="$(command -v "$cmd" || true)"
     if [[ -z "$resolved" ]]; then
@@ -137,6 +137,18 @@ link_required_host_tools() {
     fi
     ln -s "$resolved" "$fake_bin_dir/$cmd"
   done
+
+  local py_resolved=""
+  local py_cmd
+  for py_cmd in python3 python3.13 python3.12 python3.11 python; do
+    py_resolved="$(command -v "$py_cmd" || true)"
+    if [[ -n "$py_resolved" ]]; then
+      ln -s "$py_resolved" "$fake_bin_dir/python3"
+      return 0
+    fi
+  done
+  echo "link_required_host_tools could not find python3/python3.13/python3.12/python3.11/python for $fake_bin_dir" >&2
+  return 1
 }
 
 write_version_stub() {

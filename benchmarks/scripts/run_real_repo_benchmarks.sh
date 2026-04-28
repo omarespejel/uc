@@ -248,10 +248,6 @@ if ! command -v jq >/dev/null 2>&1; then
   echo "jq is required for real repo benchmarks" >&2
   exit 1
 fi
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "python3 is required for real repo benchmarks" >&2
-  exit 1
-fi
 
 if [[ -n "${UC_NATIVE_CORELIB_SRC:-}" ]]; then
   UC_NATIVE_CORELIB_SRC="$(canonical_existing_dir_path "UC_NATIVE_CORELIB_SRC" "$UC_NATIVE_CORELIB_SRC")"
@@ -260,11 +256,33 @@ fi
 
 RESULTS_DIR="$(canonical_dir_path "results directory" "$RESULTS_DIR")"
 
+find_python311_plus() {
+  local candidate
+  for candidate in python3 python3.13 python3.12 python3.11; do
+    if ! command -v "$candidate" >/dev/null 2>&1; then
+      continue
+    fi
+    if "$candidate" - <<'PY' >/dev/null 2>&1
+import sys, tomllib
+if sys.version_info < (3, 11):
+    raise SystemExit(1)
+PY
+    then
+      command -v "$candidate"
+      return 0
+    fi
+  done
+  echo "python >= 3.11 with tomllib is required for real repo benchmarks" >&2
+  return 1
+}
+
+PYTHON_BIN="$(find_python311_plus)"
+
 measure_command_ms() {
   local cwd="$1"
   local log_path="$2"
   shift 2
-  python3 - "$cwd" "$log_path" "$CASE_TIMEOUT_SECS" "$@" <<'PY'
+  "$PYTHON_BIN" - "$cwd" "$log_path" "$CASE_TIMEOUT_SECS" "$@" <<'PY'
 import subprocess
 import sys
 import time

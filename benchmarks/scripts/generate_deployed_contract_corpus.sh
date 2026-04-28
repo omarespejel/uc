@@ -63,10 +63,25 @@ if [[ ! -f "$SOURCE_INDEX_PATH" ]]; then
   echo "Source index file not found: $SOURCE_INDEX_PATH" >&2
   exit 1
 fi
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "python3 is required for deployed contract corpus generation" >&2
-  exit 1
-fi
+find_python311_plus() {
+  local candidate
+  for candidate in python3 python3.13 python3.12 python3.11; do
+    if ! command -v "$candidate" >/dev/null 2>&1; then
+      continue
+    fi
+    if "$candidate" - <<'PY' >/dev/null 2>&1
+import sys, tomllib
+if sys.version_info < (3, 11):
+    raise SystemExit(1)
+PY
+    then
+      command -v "$candidate"
+      return 0
+    fi
+  done
+  echo "python >= 3.11 with tomllib is required for deployed contract corpus generation" >&2
+  return 1
+}
 
 SOURCE_INDEX_ABS="$(cd "$(dirname "$SOURCE_INDEX_PATH")" && pwd -P)/$(basename "$SOURCE_INDEX_PATH")"
 mkdir -p "$(dirname "$OUT_PATH")"
@@ -80,7 +95,9 @@ if [[ -d "$OUT_ABS" ]]; then
   exit 2
 fi
 
-python3 - "$SOURCE_INDEX_ABS" "$OUT_ABS" <<'PY'
+PYTHON_BIN="$(find_python311_plus)"
+
+"$PYTHON_BIN" - "$SOURCE_INDEX_ABS" "$OUT_ABS" <<'PY'
 import json
 import os
 import re

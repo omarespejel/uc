@@ -1,5 +1,25 @@
 #!/usr/bin/env bash
 
+uc_native_ci_find_python311_plus() {
+  local candidate
+  for candidate in python3 python3.13 python3.12 python3.11; do
+    if ! command -v "$candidate" >/dev/null 2>&1; then
+      continue
+    fi
+    if "$candidate" - <<'PY' >/dev/null 2>&1
+import sys, tomllib
+if sys.version_info < (3, 11):
+    raise SystemExit(1)
+PY
+    then
+      command -v "$candidate"
+      return 0
+    fi
+  done
+  echo "python >= 3.11 with tomllib is required for native CI gate helpers" >&2
+  return 1
+}
+
 uc_native_ci_install_no_scarb_stub() {
   local stub_path="$1"
   mkdir -p "$(dirname "$stub_path")"
@@ -32,7 +52,9 @@ uc_native_ci_verify_report() {
     return 1
   fi
 
-  python3 - "$report_path" "$tag" "$allowed_backends_csv" <<'PY'
+  local python_bin
+  python_bin="$(uc_native_ci_find_python311_plus)"
+  "$python_bin" - "$report_path" "$tag" "$allowed_backends_csv" <<'PY'
 import json
 import sys
 from pathlib import Path
