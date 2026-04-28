@@ -53,7 +53,9 @@ uc_native_ci_verify_report() {
   fi
 
   local python_bin
-  python_bin="$(uc_native_ci_find_python311_plus)"
+  if ! python_bin="$(uc_native_ci_find_python311_plus)"; then
+    return 1
+  fi
   "$python_bin" - "$report_path" "$tag" "$allowed_backends_csv" <<'PY'
 import json
 import sys

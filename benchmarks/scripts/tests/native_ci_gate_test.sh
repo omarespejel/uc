@@ -199,15 +199,14 @@ PYTHON311
 exit 1
 PYTHON
   chmod +x "$fake_bin_dir/python"
-  cat > "$fake_bin_dir/python3.12" <<'PYTHON312'
+  cat > "$fake_bin_dir/python3.12" <<PYTHON312
 #!/usr/bin/env bash
 if [[ "${1-}" == "--version" ]]; then
   printf 'Python 3.12.9\n'
   exit 0
 fi
-exec "__PYTHON_REAL__" "$@"
+exec "$python_real" "\$@"
 PYTHON312
-  perl -0pi -e 's#__PYTHON_REAL__#'"$python_real"'#g' "$fake_bin_dir/python3.12"
   chmod +x "$fake_bin_dir/python3.12"
 
   PATH="$fake_bin_dir:$PATH" \
