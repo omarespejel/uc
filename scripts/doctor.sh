@@ -7,6 +7,7 @@ cd "$ROOT"
 failures=0
 UC_BIN="${UC_DOCTOR_UC_BIN:-$ROOT/target/release/uc}"
 declare -a MANIFEST_PATHS=()
+PYTHON311_BIN=""
 
 usage() {
   cat <<'USAGE'
@@ -66,6 +67,25 @@ check_optional() {
   else
     printf '[warn] optional command missing: %s\n' "$cmd"
   fi
+}
+
+find_python311_plus() {
+  local candidate
+  for candidate in python3 python3.13 python3.12 python3.11; do
+    if ! command -v "$candidate" >/dev/null 2>&1; then
+      continue
+    fi
+    if "$candidate" - <<'PY' >/dev/null 2>&1
+import sys, tomllib
+if sys.version_info < (3, 11):
+    raise SystemExit(1)
+PY
+    then
+      PYTHON311_BIN="$(command -v "$candidate")"
+      return 0
+    fi
+  done
+  return 1
 }
 
 check_helper_env_vars() {
@@ -141,7 +161,7 @@ probe_manifest_native_support() {
 printf 'uc doctor\n'
 printf 'repo: %s\n' "$ROOT"
 
-for cmd in git cargo rustc rg jq scarb python3; do
+for cmd in git cargo rustc rg jq scarb; do
   check_required "$cmd"
 done
 check_optional gh
@@ -179,21 +199,11 @@ fi
 if command -v scarb >/dev/null 2>&1; then
   printf 'scarb: %s\n' "$(scarb --version | head -n 1)"
 fi
-python3_bin="$(command -v python3 || true)"
-if [[ -n "$python3_bin" ]]; then
-  if python3 - <<'PY' >/dev/null 2>&1
-import sys, tomllib
-if sys.version_info < (3, 11):
-    raise SystemExit(1)
-PY
-  then
-    printf '[ok] python3 tomllib support\n'
-  else
-    printf '[missing] python3 >= 3.11 with tomllib is required for native helper builds\n' >&2
-    failures=$((failures + 1))
-  fi
+if find_python311_plus; then
+  printf '[ok] python >= 3.11 with tomllib -> %s (%s)\n' "$PYTHON311_BIN" "$("$PYTHON311_BIN" --version 2>/dev/null || echo unknown)"
 else
-  printf '[skip] python3 tomllib support check skipped because python3 is unavailable\n'
+  printf '[missing] python >= 3.11 with tomllib is required for native helper builds\n' >&2
+  failures=$((failures + 1))
 fi
 if [[ -n "${UC_NATIVE_CORELIB_SRC:-}" ]]; then
   if [[ -d "${UC_NATIVE_CORELIB_SRC}" ]]; then
@@ -208,9 +218,11 @@ fi
 
 check_helper_env_vars
 
-for manifest_path in "${MANIFEST_PATHS[@]}"; do
-  probe_manifest_native_support "$manifest_path"
-done
+if (( ${#MANIFEST_PATHS[@]} > 0 )); then
+  for manifest_path in "${MANIFEST_PATHS[@]}"; do
+    probe_manifest_native_support "$manifest_path"
+  done
+fi
 
 if (( failures > 0 )); then
   printf 'doctor failed: %d issue(s)\n' "$failures" >&2

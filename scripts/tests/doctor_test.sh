@@ -108,22 +108,26 @@ test_doctor_requires_python_tomllib() {
   local fake_bin_dir="$TMP_DIR/fake-python-bin"
   local stdout_path="$TMP_DIR/python-tomllib.out"
   mkdir -p "$fake_bin_dir"
+  link_required_host_tools "$fake_bin_dir"
+  write_required_tool_stubs "$fake_bin_dir"
+  write_version_stub "$fake_bin_dir/jq" "jq-1.7"
+  write_git_hooks_stub "$fake_bin_dir/git"
   cat > "$fake_bin_dir/python3" <<'PYTHON'
 #!/usr/bin/env bash
 exit 1
 PYTHON
   chmod +x "$fake_bin_dir/python3"
 
-  if PATH="$fake_bin_dir:$PATH" "$DOCTOR_SCRIPT" >"$stdout_path" 2>&1; then
+  if PATH="$fake_bin_dir" "$DOCTOR_SCRIPT" >"$stdout_path" 2>&1; then
     echo "expected doctor to fail when python3 lacks tomllib support" >&2
     return 1
   fi
-  grep -q 'python3 >= 3.11 with tomllib is required for native helper builds' "$stdout_path"
+  grep -q 'python >= 3.11 with tomllib is required for native helper builds' "$stdout_path"
 }
 
 link_required_host_tools() {
   local fake_bin_dir="$1"
-  for cmd in bash env head sort python3; do
+  for cmd in bash dirname env head sort python3; do
     local resolved
     resolved="$(command -v "$cmd" || true)"
     if [[ -z "$resolved" ]]; then
@@ -191,7 +195,7 @@ test_doctor_skips_tomllib_probe_when_python3_missing() {
   local fake_bin_dir="$TMP_DIR/no-python-bin"
   local stdout_path="$TMP_DIR/no-python.out"
   mkdir -p "$fake_bin_dir"
-  for cmd in bash env head sort; do
+  for cmd in bash dirname env head sort; do
     local resolved
     resolved="$(command -v "$cmd" || true)"
     if [[ -z "$resolved" ]]; then
@@ -208,12 +212,7 @@ test_doctor_skips_tomllib_probe_when_python3_missing() {
     echo "expected doctor to fail when python3 is unavailable" >&2
     return 1
   fi
-  grep -q '\[missing\] python3' "$stdout_path"
-  grep -q '\[skip\] python3 tomllib support check skipped because python3 is unavailable' "$stdout_path"
-  if grep -q 'python3 >= 3.11 with tomllib is required' "$stdout_path"; then
-    echo "tomllib version check should not run when python3 is unavailable" >&2
-    return 1
-  fi
+  grep -q 'python >= 3.11 with tomllib is required for native helper builds' "$stdout_path"
 }
 
 test_doctor_detects_non_executable_uc_native_toolchain_env() {
@@ -259,6 +258,38 @@ test_doctor_manifest_probe_reports_invalid_json_without_aborting() {
   grep -q 'doctor failed:' "$stdout_path"
 }
 
+test_doctor_accepts_python312_when_python3_is_too_old() {
+  local fake_bin_dir="$TMP_DIR/python312-fallback-bin"
+  local stdout_path="$TMP_DIR/python312-fallback.out"
+  mkdir -p "$fake_bin_dir"
+
+  link_required_host_tools "$fake_bin_dir"
+  write_required_tool_stubs "$fake_bin_dir"
+  write_version_stub "$fake_bin_dir/jq" "jq-1.7"
+  write_git_hooks_stub "$fake_bin_dir/git"
+  cat > "$fake_bin_dir/python3" <<'PYTHON3'
+#!/usr/bin/env bash
+exit 1
+PYTHON3
+  chmod +x "$fake_bin_dir/python3"
+  cat > "$fake_bin_dir/python3.12" <<'PYTHON312'
+#!/usr/bin/env bash
+if [[ "${1-}" == "--version" ]]; then
+  printf 'Python 3.12.9\n'
+  exit 0
+fi
+while IFS= read -r _; do
+  :
+done
+exit 0
+PYTHON312
+  chmod +x "$fake_bin_dir/python3.12"
+
+  PATH="$fake_bin_dir" "$DOCTOR_SCRIPT" >"$stdout_path" 2>&1
+  grep -q '\[ok\] python >= 3.11 with tomllib -> .*python3.12' "$stdout_path"
+  grep -q 'doctor passed' "$stdout_path"
+}
+
 run_test "doctor_manifest_probe_fails_for_missing_helper_lane" \
   test_doctor_manifest_probe_fails_for_missing_helper_lane
 run_test "doctor_manifest_probe_warns_for_unproductized_helper_lane" \
@@ -273,3 +304,5 @@ run_test "doctor_detects_non_executable_uc_native_toolchain_env" \
   test_doctor_detects_non_executable_uc_native_toolchain_env
 run_test "doctor_manifest_probe_reports_invalid_json_without_aborting" \
   test_doctor_manifest_probe_reports_invalid_json_without_aborting
+run_test "doctor_accepts_python312_when_python3_is_too_old" \
+  test_doctor_accepts_python312_when_python3_is_too_old
