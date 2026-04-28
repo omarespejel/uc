@@ -49,7 +49,7 @@ Do not treat it as a human-only CLI wrapper around Scarb.
 - Always prefer a fresh clone or worktree for new PR work. Do not edit in a dirty checkout.
 - Keep changes scoped. Do not fold unrelated cleanup into performance or review-fix PRs.
 - For perf-sensitive work, preserve determinism first, then optimize.
-- If a change affects native compile, cache restore, daemon behavior, benchmark harnesses, artifact format, project inspect, support-native, resolve, fetch, or toolchain surfaces, add or update regression tests.
+- If a change affects native compile, cache restore, daemon behavior, benchmark harnesses, artifact format, project inspect, support-native, resolve, fetch, or toolchain surfaces, add or update regression tests in `crates/uc-cli/src/main_tests.rs` or `crates/uc-cli/tests/`.
 - No silent fallback.
 - No silent network access in locked/offline lanes.
 - No silent toolchain download.

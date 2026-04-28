@@ -6,7 +6,7 @@ Build `uc` as an agent-first Cairo project control plane with a performance-firs
 ## Top-Level Components
 1. `uc-cli` / agent surface
 - User command surface and machine-readable execution protocol.
-- Primary operations: inspect, support, resolve, fetch, toolchain ensure, plan, build, compare, explain.
+- Primary operations: `project inspect`, `support native`, `resolve`, `fetch`, `toolchain ensure`, `build --plan-only`, `build`, `compare-build`, and `explain`.
 
 2. `project-model-core`
 - Parse and normalize `Scarb.toml`, `Scarb.lock`, workspace topology, packages, targets, profiles, and source origins.

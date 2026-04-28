@@ -215,7 +215,7 @@ Must let an agent recover the exact reason for:
 - convenience behavior that weakens explicit policy or state reporting.
 
 ## Concrete next implementation slices
-1. Add `AGENTS.md` and `.codex/START_HERE.md`.
+1. Keep `AGENTS.md`, `.codex/START_HERE.md`, and `docs/agent/*.md` as the checked-in source of truth for agents and review bots.
 2. Add first-party `project inspect` report with versioned schema.
 3. Add explicit `support native` report.
 4. Add `resolve` as a lockfile-first read path.

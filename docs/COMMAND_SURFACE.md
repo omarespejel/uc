@@ -113,7 +113,16 @@ The intended primary surface for agents is:
 - Versioned schemas should be explicit (`--format-version` or equivalent).
 - Locked/offline commands must not mutate lockfiles or touch the network implicitly.
 - Fallback must always be classified explicitly.
-- Every execution report should include replay handles and artifact/log paths.
+- Every execution report should include:
+  - `what_happened`
+  - `why`
+  - `retryable`
+  - `expected vs found`
+  - `fallback_used`
+  - replay command or replay handle
+  - artifact/log path
+  - schema version
+- Bump the schema version or explicit format version when these report-contract fields change incompatibly.
 
 ## Current Engine Note
 
