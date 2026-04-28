@@ -83,30 +83,30 @@
 ## Target Agent-First Surface
 The intended primary surface for agents is:
 
-1. `uc project inspect`
-- Versioned JSON description of workspace, packages, targets, source origins, lockfile state, and offline readiness.
+- `uc project inspect`
+  - Versioned JSON description of workspace, packages, targets, source origins, lockfile state, and offline readiness.
 
-2. `uc support native`
-- Pre-build native support classification.
-- Must report native-supported, native-unsupported, fallback-likely, or build-blocked with reason codes.
+- `uc support native`
+  - Pre-build native support classification.
+  - Must report native-supported, native-unsupported, fallback-likely, or build-blocked with reason codes.
 
-3. `uc resolve`
-- Lockfile-first resolution and graph emission.
-- Must expose selected sources and whether network access is required.
+- `uc resolve`
+  - Lockfile-first resolution and graph emission.
+  - Must expose selected sources and whether network access is required.
 
-4. `uc fetch`
-- Source acquisition into the shared store.
-- Must be separable from build.
+- `uc fetch`
+  - Source acquisition into the shared store.
+  - Must be separable from build.
 
-5. `uc toolchain ensure`
-- Ensures required Cairo/helper lanes exist.
-- Must expose expected/found toolchain details and policy decisions.
+- `uc toolchain ensure`
+  - Ensures required Cairo/helper lanes exist.
+  - Must expose expected/found toolchain details and policy decisions.
 
-6. `uc build --plan-only`
-- Emits the execution plan and expected side effects without performing the build.
+- `uc build --plan-only`
+  - Emits the execution plan and expected side effects without performing the build.
 
-7. `uc explain <id>`
-- Re-renders a prior failure or fallback decision from stored machine-readable state.
+- `uc explain <id>`
+  - Re-renders a prior failure or fallback decision from stored machine-readable state.
 
 ## Agent Contract
 - `--json` output is primary for agent-facing commands.

@@ -142,7 +142,12 @@ link_required_host_tools() {
   local py_cmd
   for py_cmd in python3 python3.13 python3.12 python3.11 python; do
     py_resolved="$(command -v "$py_cmd" || true)"
-    if [[ -n "$py_resolved" ]]; then
+    if [[ -n "$py_resolved" ]] && "$py_resolved" - <<'PY' >/dev/null 2>&1
+import sys, tomllib
+if sys.version_info < (3, 11):
+    raise SystemExit(1)
+PY
+    then
       ln -s "$py_resolved" "$fake_bin_dir/python3"
       return 0
     fi

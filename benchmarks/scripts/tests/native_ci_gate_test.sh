@@ -36,7 +36,7 @@ run_test() {
 
 find_python311_plus() {
   local candidate
-  for candidate in python3 python3.13 python3.12 python3.11; do
+  for candidate in python3 python3.13 python3.12 python3.11 python; do
     if ! command -v "$candidate" >/dev/null 2>&1; then
       continue
     fi
@@ -184,6 +184,21 @@ test_verify_report_accepts_python312_when_python3_is_too_old() {
 exit 1
 PYTHON3
   chmod +x "$fake_bin_dir/python3"
+  cat > "$fake_bin_dir/python3.13" <<'PYTHON313'
+#!/usr/bin/env bash
+exit 1
+PYTHON313
+  chmod +x "$fake_bin_dir/python3.13"
+  cat > "$fake_bin_dir/python3.11" <<'PYTHON311'
+#!/usr/bin/env bash
+exit 1
+PYTHON311
+  chmod +x "$fake_bin_dir/python3.11"
+  cat > "$fake_bin_dir/python" <<'PYTHON'
+#!/usr/bin/env bash
+exit 1
+PYTHON
+  chmod +x "$fake_bin_dir/python"
   cat > "$fake_bin_dir/python3.12" <<'PYTHON312'
 #!/usr/bin/env bash
 if [[ "${1-}" == "--version" ]]; then
