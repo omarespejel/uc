@@ -2353,6 +2353,7 @@ fn project_inspect_report_from_manifest_path(manifest_path: &Path) -> Result<Pro
         manifest_path,
         workspace_manifest_for_report,
         &workspace_manifest_path,
+        &mut diagnostics,
     );
     let profiles =
         project_profiles_summary_for_report(manifest.as_ref(), workspace_manifest_for_report);
@@ -2627,6 +2628,7 @@ fn project_packages_for_report(
     manifest_path: &Path,
     workspace_manifest: Option<&TomlValue>,
     workspace_manifest_path: &Path,
+    diagnostics: &mut Vec<NativeDiagnostic>,
 ) -> Vec<ProjectInspectPackageSummary> {
     let mut packages = Vec::new();
     project_push_package_for_report(
@@ -2652,22 +2654,49 @@ fn project_packages_for_report(
             {
                 continue;
             }
-            if let Ok(member_manifest) =
-                read_text_file_with_limit(&member_manifest_path, MAX_MANIFEST_BYTES, "manifest")
-                    .and_then(|text| {
-                        parse_manifest_toml(
-                            &text,
-                            &member_manifest_path,
-                            "failed to parse workspace member manifest for project inspect",
-                        )
-                    })
-            {
-                project_push_package_for_report(
-                    &mut packages,
-                    Some(&member_manifest),
-                    &member_manifest_path,
-                    ProjectInspectPackageRole::WorkspaceMemberManifest,
-                );
+            match read_text_file_with_limit(&member_manifest_path, MAX_MANIFEST_BYTES, "manifest")
+                .and_then(|text| {
+                    parse_manifest_toml(
+                        &text,
+                        &member_manifest_path,
+                        "failed to parse workspace member manifest for project inspect",
+                    )
+                }) {
+                Ok(member_manifest) => {
+                    project_push_package_for_report(
+                        &mut packages,
+                        Some(&member_manifest),
+                        &member_manifest_path,
+                        ProjectInspectPackageRole::WorkspaceMemberManifest,
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        workspace_member_manifest = %member_manifest_path.display(),
+                        error = %err,
+                        "project inspect could not read workspace member manifest"
+                    );
+                    diagnostics.push(project_agent_diagnostic(
+                        "UCP1006",
+                        "workspace_member_manifest",
+                        NativeDiagnosticSeverity::Warn,
+                        "Workspace member manifest could not be inspected",
+                        format!(
+                            "uc could not inspect workspace member manifest {}.",
+                            member_manifest_path.display()
+                        ),
+                        format!("{err:#}"),
+                        vec![
+                            "Fix the workspace member manifest or remove it from [workspace].members before rerunning project inspection.".to_string(),
+                        ],
+                        vec!["uc project inspect --manifest-path <Scarb.toml> --json".to_string()],
+                        "manual_workspace_member_manifest_fix_required",
+                        false,
+                        false,
+                        None,
+                        Some(member_manifest_path.display().to_string()),
+                    ));
+                }
             }
         }
     }
@@ -2732,14 +2761,28 @@ fn project_workspace_member_manifest_paths(
     workspace_manifest: &TomlValue,
     workspace_manifest_path: &Path,
 ) -> Vec<PathBuf> {
-    let Some(members) = workspace_manifest
+    let Some(workspace_table) = workspace_manifest
         .get("workspace")
         .and_then(TomlValue::as_table)
-        .and_then(|workspace| workspace.get("members"))
-        .and_then(TomlValue::as_array)
     else {
         return Vec::new();
     };
+    let Some(members) = workspace_table.get("members").and_then(TomlValue::as_array) else {
+        return Vec::new();
+    };
+    let excludes = workspace_table
+        .get("exclude")
+        .and_then(TomlValue::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(TomlValue::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
     let workspace_root = workspace_manifest_path
         .parent()
@@ -2760,6 +2803,10 @@ fn project_workspace_member_manifest_paths(
         if project_workspace_member_pattern_is_literal(member_pattern) {
             let member_path = Path::new(member_pattern);
             if project_workspace_member_pattern_is_unsafe(member_path) {
+                continue;
+            }
+            let relative_member = normalize_fingerprint_path(member_path);
+            if project_workspace_member_is_excluded(&relative_member, &excludes) {
                 continue;
             }
             let candidate_manifest = workspace_root.join(member_path).join("Scarb.toml");
@@ -2802,6 +2849,9 @@ fn project_workspace_member_manifest_paths(
             if !project_workspace_member_pattern_matches(member_pattern, &relative_parent) {
                 continue;
             }
+            if project_workspace_member_is_excluded(&relative_parent, &excludes) {
+                continue;
+            }
             let canonical_candidate_manifest = match entry_path.canonicalize() {
                 Ok(path) => path,
                 Err(_) => continue,
@@ -2819,6 +2869,16 @@ fn project_workspace_member_manifest_paths(
     }
 
     manifests.into_iter().collect()
+}
+
+fn project_workspace_member_is_excluded(relative_member: &str, excludes: &[String]) -> bool {
+    excludes.iter().any(|exclude| {
+        if project_workspace_member_pattern_is_literal(exclude) {
+            relative_member == exclude.trim_start_matches("./")
+        } else {
+            project_workspace_member_pattern_matches(exclude, relative_member)
+        }
+    })
 }
 
 fn project_workspace_member_pattern_is_literal(pattern: &str) -> bool {
