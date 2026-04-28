@@ -13,10 +13,14 @@
     "mutation_status",
     "manifest",
     "package",
+    "packages",
     "workspace",
+    "profiles",
     "targets",
     "dependencies",
+    "source_origins",
     "lockfile",
+    "offline_readiness",
     "toolchain",
     "diagnostics"
   ],
@@ -37,6 +41,22 @@
       }
     },
     "package": { "type": "object" },
+    "packages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["manifest_path", "package_root", "role"],
+        "properties": {
+          "manifest_path": { "type": "string", "minLength": 1 },
+          "package_root": { "type": "string", "minLength": 1 },
+          "role": { "enum": ["inspected_manifest", "workspace_root_manifest"] },
+          "name": { "type": ["string", "null"] },
+          "version": { "type": ["string", "null"] },
+          "edition": { "type": ["string", "null"] },
+          "cairo_version": { "type": ["string", "null"] }
+        }
+      }
+    },
     "workspace": {
       "type": "object",
       "required": ["has_workspace_table", "members", "exclude"],
@@ -46,8 +66,30 @@
         "exclude": { "type": "array", "items": { "type": "string" } }
       }
     },
+    "profiles": {
+      "type": "object",
+      "required": ["declared"],
+      "properties": {
+        "declared": { "type": "array", "items": { "type": "string" } }
+      }
+    },
     "targets": { "type": "array", "items": { "type": "object" } },
     "dependencies": { "type": "array", "items": { "type": "object" } },
+    "source_origins": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["dependency", "section", "kind", "locator", "workspace_inherited", "locked"],
+        "properties": {
+          "dependency": { "type": "string", "minLength": 1 },
+          "section": { "type": "string", "minLength": 1 },
+          "kind": { "type": "string", "minLength": 1 },
+          "locator": { "type": "string", "minLength": 1 },
+          "workspace_inherited": { "type": "boolean" },
+          "locked": { "type": "boolean" }
+        }
+      }
+    },
     "lockfile": {
       "type": "object",
       "required": ["present", "valid", "packages"],
@@ -60,6 +102,33 @@
         "modified_unix_ms": { "type": ["integer", "null"], "minimum": 0 },
         "hash": { "type": ["string", "null"] },
         "packages": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "offline_readiness": {
+      "type": "object",
+      "required": [
+        "status",
+        "readonly_native_source",
+        "lockfile_present",
+        "lockfile_valid",
+        "remote_dependency_count",
+        "path_dependency_count",
+        "workspace_dependency_count",
+        "cache_state_known",
+        "reasons"
+      ],
+      "properties": {
+        "status": {
+          "enum": ["ready", "needs_lockfile", "needs_exact_toolchain_source", "blocked"]
+        },
+        "readonly_native_source": { "type": "boolean" },
+        "lockfile_present": { "type": "boolean" },
+        "lockfile_valid": { "type": "boolean" },
+        "remote_dependency_count": { "type": "integer", "minimum": 0 },
+        "path_dependency_count": { "type": "integer", "minimum": 0 },
+        "workspace_dependency_count": { "type": "integer", "minimum": 0 },
+        "cache_state_known": { "type": "boolean" },
+        "reasons": { "type": "array", "items": { "type": "string" } }
       }
     },
     "toolchain": {
