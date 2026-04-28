@@ -15,7 +15,7 @@ run_test() {
 
 find_python311_plus() {
   local candidate
-  for candidate in python3 python3.13 python3.12 python3.11; do
+  for candidate in python3 python3.13 python3.12 python3.11 python; do
     if ! command -v "$candidate" >/dev/null 2>&1; then
       continue
     fi

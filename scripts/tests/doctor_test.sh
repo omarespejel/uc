@@ -233,6 +233,40 @@ test_doctor_skips_tomllib_probe_when_python3_missing() {
   grep -q 'python >= 3.11 with tomllib is required for native helper builds' "$stdout_path"
 }
 
+test_doctor_accepts_python_fallback_when_python3_commands_are_missing() {
+  local fake_bin_dir="$TMP_DIR/python-fallback-bin"
+  local stdout_path="$TMP_DIR/python-fallback.out"
+  mkdir -p "$fake_bin_dir"
+  for cmd in bash dirname env head sort; do
+    local resolved
+    resolved="$(command -v "$cmd" || true)"
+    if [[ -z "$resolved" ]]; then
+      echo "required host command not found for test sandbox: $cmd" >&2
+      return 1
+    fi
+    ln -s "$resolved" "$fake_bin_dir/$cmd"
+  done
+  write_required_tool_stubs "$fake_bin_dir"
+  write_version_stub "$fake_bin_dir/jq" "jq-1.7"
+  write_git_hooks_stub "$fake_bin_dir/git"
+
+  local python_resolved=""
+  python_resolved="$(command -v python || true)"
+  if [[ -z "$python_resolved" ]]; then
+    echo "required python fallback command not found for test sandbox" >&2
+    return 1
+  fi
+  ln -s "$python_resolved" "$fake_bin_dir/python"
+
+  if ! PATH="$fake_bin_dir" "$DOCTOR_SCRIPT" >"$stdout_path" 2>&1; then
+    echo "expected doctor to accept python fallback when python3 commands are absent" >&2
+    cat "$stdout_path" >&2
+    return 1
+  fi
+  grep -q "\\[ok\\] python >= 3.11 with tomllib -> $fake_bin_dir/python" "$stdout_path"
+  grep -q 'doctor passed' "$stdout_path"
+}
+
 test_doctor_detects_non_executable_uc_native_toolchain_env() {
   local fake_bin_dir="$TMP_DIR/non-executable-helper-bin"
   local stdout_path="$TMP_DIR/non-executable-helper.out"
@@ -320,6 +354,8 @@ run_test "doctor_manifest_probe_reports_missing_jq_without_aborting" \
   test_doctor_manifest_probe_reports_missing_jq_without_aborting
 run_test "doctor_skips_tomllib_probe_when_python3_missing" \
   test_doctor_skips_tomllib_probe_when_python3_missing
+run_test "doctor_accepts_python_fallback_when_python3_commands_are_missing" \
+  test_doctor_accepts_python_fallback_when_python3_commands_are_missing
 run_test "doctor_detects_non_executable_uc_native_toolchain_env" \
   test_doctor_detects_non_executable_uc_native_toolchain_env
 run_test "doctor_manifest_probe_reports_invalid_json_without_aborting" \
