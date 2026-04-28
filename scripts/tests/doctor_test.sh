@@ -112,6 +112,7 @@ test_doctor_requires_python_tomllib() {
   write_required_tool_stubs "$fake_bin_dir"
   write_version_stub "$fake_bin_dir/jq" "jq-1.7"
   write_git_hooks_stub "$fake_bin_dir/git"
+  rm -f "$fake_bin_dir/python3"
   cat > "$fake_bin_dir/python3" <<'PYTHON'
 #!/usr/bin/env bash
 exit 1
@@ -267,11 +268,13 @@ test_doctor_accepts_python312_when_python3_is_too_old() {
   write_required_tool_stubs "$fake_bin_dir"
   write_version_stub "$fake_bin_dir/jq" "jq-1.7"
   write_git_hooks_stub "$fake_bin_dir/git"
+  rm -f "$fake_bin_dir/python3"
   cat > "$fake_bin_dir/python3" <<'PYTHON3'
 #!/usr/bin/env bash
 exit 1
 PYTHON3
   chmod +x "$fake_bin_dir/python3"
+  rm -f "$fake_bin_dir/python3.12"
   cat > "$fake_bin_dir/python3.12" <<'PYTHON312'
 #!/usr/bin/env bash
 if [[ "${1-}" == "--version" ]]; then
