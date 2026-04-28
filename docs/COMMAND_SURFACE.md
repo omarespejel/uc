@@ -1,4 +1,4 @@
-# Command Surface (Current)
+# Command Surface
 
 ## Implemented Commands
 
@@ -80,6 +80,41 @@
 - `status`: checks daemon reachability and reports pid/start timestamp.
 - `stop`: requests graceful shutdown.
 
+## Target Agent-First Surface
+The intended primary surface for agents is:
+
+1. `uc project inspect`
+- Versioned JSON description of workspace, packages, targets, source origins, lockfile state, and offline readiness.
+
+2. `uc support native`
+- Pre-build native support classification.
+- Must report native-supported, native-unsupported, fallback-likely, or build-blocked with reason codes.
+
+3. `uc resolve`
+- Lockfile-first resolution and graph emission.
+- Must expose selected sources and whether network access is required.
+
+4. `uc fetch`
+- Source acquisition into the shared store.
+- Must be separable from build.
+
+5. `uc toolchain ensure`
+- Ensures required Cairo/helper lanes exist.
+- Must expose expected/found toolchain details and policy decisions.
+
+6. `uc build --plan-only`
+- Emits the execution plan and expected side effects without performing the build.
+
+7. `uc explain <id>`
+- Re-renders a prior failure or fallback decision from stored machine-readable state.
+
+## Agent Contract
+- `--json` output is primary for agent-facing commands.
+- Versioned schemas should be explicit (`--format-version` or equivalent).
+- Locked/offline commands must not mutate lockfiles or touch the network implicitly.
+- Fallback must always be classified explicitly.
+- Every execution report should include replay handles and artifact/log paths.
+
 ## Current Engine Note
 
 `uc` now selects native toolchain lanes before compile starts:
@@ -100,6 +135,7 @@ Native auto mode still falls back to Scarb only when the failure class is explic
   - Fails on missing or invalid helper-lane env vars for that manifest.
 
 ## Next Expansion
-
 - Add more native toolchain helper lanes beyond Cairo `2.14`.
+- Add first-party `resolve`, `fetch`, `toolchain ensure`, and `build --plan-only` surfaces behind stable JSON/report contracts.
+- Add native `uc` compile engine implementation behind the existing command interface.
 - Keep `compare-build` as mandatory gate while deeper frontend-compile optimizations mature.

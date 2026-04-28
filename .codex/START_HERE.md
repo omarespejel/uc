@@ -1,21 +1,48 @@
 # uc Start Here
 
-## 5-Minute Bootstrap
+## Product Statement
+`uc` is an agent-first Cairo project control plane with package-management, toolchain, and compiler/build responsibilities.
 
+## The Direction
+The product is no longer just "make build faster".
+It must let agents:
+1. inspect a Cairo project,
+2. determine native support before build,
+3. resolve and fetch dependencies in a lockfile-first way,
+4. ensure the right toolchain/helper lane exists,
+5. plan and execute builds with explicit fallback behavior,
+6. consume stable structured results without scraping terminal prose.
+
+## 5-Minute Bootstrap
 1. `make bootstrap`
 2. `make doctor`
 3. `make agent-validate`
-4. Read `docs/agent/REPO_MAP.md`
-5. Read the subsystem doc you are changing:
+4. Read `docs/agent/README.md`
+5. Read `docs/agent/REPO_MAP.md`
+6. Read the subsystem doc you are changing:
+   - product: `docs/PRODUCT_CHARTER.md`
    - architecture: `docs/ARCHITECTURE_BLUEPRINT.md`
    - roadmap: `docs/ROADMAP.md`
+   - project model: `docs/PROJECT_MODEL_STRATEGY.md`
    - benchmarks: `docs/BENCHMARK_PLAN.md`, `benchmarks/README.md`
-   - supremacy/perf research: `docs/SUPREMACY_RESEARCH_2026-03-06.md`
-6. If the task is larger than a trivial one-line fix, create or reuse a scoped branch and plan to open a PR before broadening the change.
-7. Open normal PRs, not draft PRs, so CodeRabbit and Qodo review the branch immediately.
+   - agent direction: `docs/agent/AGENT_FIRST_COMPILER.md`
+   - package-manager research: `docs/research/AGENT_FIRST_PACKAGE_MANAGER_RESEARCH_2026-04-28.md`
+7. If the task is larger than a trivial one-line fix, create or reuse a scoped branch and plan to open a ready-for-review PR before broadening the change.
+
+## Immediate Priorities
+1. Keep agent-visible behavior explicit and versioned.
+2. Build first-party project-model, resolve, fetch, and toolchain surfaces.
+3. Preserve correctness and fallback classification.
+4. Keep acceleration work focused on native-supported modern Cairo lanes.
+
+## What Not To Do
+- Do not count fallback as native support.
+- Do not make launch claims from unsupported or fallback-backed cases.
+- Do not add implicit network, toolchain, or lockfile behavior to locked flows.
+- Do not optimize terminal UX ahead of machine-readable correctness.
+- Do not keep substantial local-only changes without a PR review surface.
 
 ## Common Commands
-
 - Install repo hooks: `make install-hooks`
 - Local push gate: `make local-ci`
 - Format: `cargo fmt --all`
@@ -24,41 +51,31 @@
 - Helper-lane validation: `make validate-helper-lane`
 - Refresh repo map: `make agent-map`
 - Read-only project inspection: `uc project inspect --manifest-path /abs/path/to/Scarb.toml --format json`
-- Agent support decision: `uc agent eval --manifest-path /abs/path/to/Scarb.toml`
+- Agent support decision: `uc support native --manifest-path /abs/path/to/Scarb.toml --format json`
 - Dry-run safe remediation: `uc agent safe-action build-helper-lane --lane 2.14`
 - Replayable build failure capture: `uc build --engine uc --daemon-mode off --manifest-path /abs/path/to/Scarb.toml --record-failure /abs/path/to/uc-failure.json`
 - Failure replay: `uc replay /abs/path/to/uc-failure.json`
 - Read-only MCP catalog: `uc mcp serve`
 - Strict smoke benchmark: `make benchmark-strict-smoke`
 - Strict research benchmark: `make benchmark-strict-research`
-- Build deployed-contract source index: `benchmarks/scripts/build_deployed_contract_source_index.sh --inventory /abs/path/to/source-inventory.json --out /abs/path/to/pinned-deployed-contract-source-index.json`
-- Generate deployed-contract corpus: `benchmarks/scripts/generate_deployed_contract_corpus.sh --source-index /abs/path/to/source-index.json --out /abs/path/to/generated-corpus.json`
-- Run deployed-contract corpus evidence: `benchmarks/scripts/run_deployed_contract_corpus.sh --corpus /abs/path/to/generated-corpus.json`
-- Summarize corpus opportunities: `benchmarks/scripts/summarize_corpus_opportunities.py --benchmark-json /abs/path/to/benchmark.json --out-json /abs/path/to/opportunities.json --out-md /abs/path/to/opportunities.md`
 
-## Key Files
+## Documents
+- Product: `docs/PRODUCT_CHARTER.md`
+- Architecture: `docs/ARCHITECTURE_BLUEPRINT.md`
+- Command surface: `docs/COMMAND_SURFACE.md`
+- Roadmap: `docs/ROADMAP.md`
+- Project model: `docs/PROJECT_MODEL_STRATEGY.md`
+- Agent docs: `docs/agent/README.md`
+- Research: `docs/research/AGENT_FIRST_PACKAGE_MANAGER_RESEARCH_2026-04-28.md`
+- ADR: `docs/adr/ADR-003-agent-first-control-plane.md`
 
-- `crates/uc-cli/src/main.rs`: build path, daemon, native compile session, persisted state.
-- `crates/uc-cli/src/fingerprint.rs`: semantic hashing and fingerprint cache.
-- `crates/uc-cli/src/main_tests.rs`: regression-heavy unit coverage.
-- `benchmarks/scripts/`: harnesses and gates.
-- `.coderabbit.yaml`, `.pr_agent.toml`, `best_practices.md`, `pr_compliance_checklist.yaml`: PR bot behavior.
-
-## Expected Workflow
-
-- Start in a fresh clone or worktree.
-- Install repo-managed hooks immediately; local validation is the primary gate in this repo.
-- Make the smallest coherent change that can be tested.
-- Add tests before or with risky code changes.
-- Re-run focused validation before broader benchmarks.
-- For older Cairo native repos, build the helper with `./scripts/build_native_toolchain_helper.sh --lane 2.14` and export the printed `UC_NATIVE_TOOLCHAIN_2_14_BIN`.
-- For helper-lane patch experiments, use lane metadata `patch-dir`; keep patch files in `toolchains/cairo-2.14/patches/*.patch`. The helper applies them only in staging and honors `UC_HELPER_CARGO_REGISTRY_SRC` for an alternate Cargo registry source cache.
-- For Cairo `2.14` frontend hot-path diagnosis, set `UC_CAIRO214_SIZE_TRACE=/abs/path/to/trace.tsv` on the helper run to collect bounded TSV counter samples for `estimate_size` and dummy-Sierra generation.
-- Before measuring a real manifest, run `./scripts/doctor.sh --uc-bin /abs/path/to/uc --manifest-path /abs/path/to/Scarb.toml` to catch missing helper lanes early.
-- For deployed-contract corpus claims, build the source index from a reviewed source inventory with `benchmarks/scripts/build_deployed_contract_source_index.sh`, generate the run corpus with `benchmarks/scripts/generate_deployed_contract_corpus.sh`, then run `benchmarks/scripts/run_deployed_contract_corpus.sh` and only quote `.claim_guard.compiled_all_claim_text` when the guard is true.
-- After corpus or real-repo benchmark runs, run `benchmarks/scripts/summarize_corpus_opportunities.py` so agents work from UCO-coded support gaps, fallback use, unstable lanes, diagnostics gaps, and phase hotspots instead of raw JSON.
-- Update `docs/agent/REPO_MAP.md` with `make agent-map` when repo entrypoints change.
-- Push coherent slices to a PR instead of holding large local diffs.
-- Assume GitHub Actions are disabled or manual-only. If you need a remote workflow run, trigger it deliberately with `workflow_dispatch`; do not expect automatic CI on push or PR.
-- Keep the PR in ready-for-review state; do not switch to draft unless a human explicitly asks for it.
-- After each meaningful push, run the review loop: check CodeRabbit and Qodo, fix relevant findings, and only merge after a 3-minute quiet window with no new useful bot feedback.
+## Edit Discipline
+If you change the product direction, update all of:
+- `docs/PRODUCT_CHARTER.md`
+- `docs/ARCHITECTURE_BLUEPRINT.md`
+- `docs/COMMAND_SURFACE.md`
+- `docs/ROADMAP.md`
+- `docs/PROJECT_MODEL_STRATEGY.md`
+- `docs/agent/README.md`
+- `AGENTS.md`
+- this file
