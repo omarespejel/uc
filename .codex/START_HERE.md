@@ -22,6 +22,7 @@ It must let agents:
 6. Read the subsystem doc you are changing:
    - product: `docs/PRODUCT_CHARTER.md`
    - architecture: `docs/ARCHITECTURE_BLUEPRINT.md`
+   - command surface: `docs/COMMAND_SURFACE.md`
    - roadmap: `docs/ROADMAP.md`
    - project model: `docs/PROJECT_MODEL_STRATEGY.md`
    - benchmarks: `docs/BENCHMARK_PLAN.md`, `benchmarks/README.md`
