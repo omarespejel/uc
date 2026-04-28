@@ -1,6 +1,6 @@
 #!/bin/sh
 """:"
-for candidate in python3.13 python3.12 python3.11 python3; do
+for candidate in python3.13 python3.12 python3.11 python3 python; do
   if ! command -v "$candidate" >/dev/null 2>&1; then
     continue
   fi
