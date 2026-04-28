@@ -158,6 +158,7 @@ PY
 
 CAIRO_VERSION="$(read_metadata_field cairo-version)"
 SALSA_VERSION="$(read_metadata_field salsa-version)"
+SALSA_PACKAGE="$(read_metadata_field_optional salsa-package)"
 LOCKFILE_REL="$(read_metadata_field lockfile)"
 PATCH_DIR_REL="$(read_metadata_field_optional patch-dir)"
 LOCKFILE_PATH="$ROOT/$LOCKFILE_REL"
@@ -212,12 +213,13 @@ prepare_staging_tree() {
 }
 
 rewrite_workspace_manifest() {
-  python3 - "$STAGING_DIR/Cargo.toml" "$CAIRO_VERSION" "$SALSA_VERSION" <<'PY'
+  python3 - "$STAGING_DIR/Cargo.toml" "$CAIRO_VERSION" "$SALSA_VERSION" "$SALSA_PACKAGE" <<'PY'
 import re, sys
 from pathlib import Path
 path = Path(sys.argv[1])
 cairo_version = sys.argv[2]
 salsa_version = sys.argv[3]
+salsa_package = sys.argv[4]
 text = path.read_text()
 for dep in [
     "cairo-lang-compiler",
@@ -233,7 +235,18 @@ for dep in [
     text, count = re.subn(pattern, replacement, text, flags=re.MULTILINE)
     if count != 1:
         raise SystemExit(f"failed to rewrite {dep} in {path}")
-text, count = re.subn(r'^salsa\s*=\s*".*"$', f'salsa = "{salsa_version}"', text, flags=re.MULTILINE)
+if salsa_package:
+    salsa_replacement = (
+        f'salsa = {{ version = "{salsa_version}", package = "{salsa_package}" }}'
+    )
+else:
+    salsa_replacement = f'salsa = "{salsa_version}"'
+text, count = re.subn(
+    r'^salsa\s*=\s*(?:"[^"]*"|\{.*\})$',
+    salsa_replacement,
+    text,
+    flags=re.MULTILINE,
+)
 if count != 1:
     raise SystemExit(f"failed to rewrite salsa in {path}")
 text, count = re.subn(r'\n\[patch\.crates-io\]\n(?:.*\n)*?(?=\n\[|\Z)', '\n', text, flags=re.MULTILINE)
