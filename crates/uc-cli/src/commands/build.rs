@@ -251,6 +251,30 @@ fn enrich_indexed_native_fallback_diagnostic_with_fallback_run(
     }
 }
 
+/// Enriches queued daemon fallback diagnostics when the daemon returns a failing Scarb build.
+fn enrich_daemon_fallback_diagnostics_from_response(
+    diagnostics: &std::cell::RefCell<Vec<NativeDiagnostic>>,
+    preflight_fallback_diagnostic_index: Option<usize>,
+    daemon_backend_fallback_diagnostic_index: Option<usize>,
+    response: &DaemonBuildResponse,
+) {
+    if response.compile_backend != DaemonBuildBackend::Scarb {
+        return;
+    }
+    enrich_indexed_native_fallback_diagnostic_with_fallback_run(
+        diagnostics,
+        preflight_fallback_diagnostic_index,
+        &response.run,
+        "Native preflight selected Scarb before the daemon build",
+    );
+    enrich_indexed_native_fallback_diagnostic_with_fallback_run(
+        diagnostics,
+        daemon_backend_fallback_diagnostic_index,
+        &response.run,
+        "Daemon backend downgraded to Scarb before the daemon build",
+    );
+}
+
 /// Extracts the first actionable compiler diagnostic blocks from fallback output.
 fn extract_fallback_error_summary(stderr: &str, stdout: &str) -> Option<String> {
     let combined = if stdout.trim().is_empty() {
@@ -1200,6 +1224,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             let configured_native_mode = native_build_mode();
             let disallow_native_fallback = native_disallow_scarb_fallback();
             let preflight_fallback_diagnostic_index = std::cell::Cell::new(None::<usize>);
+            let daemon_backend_fallback_diagnostic_index = std::cell::Cell::new(None::<usize>);
             if configured_native_mode != NativeBuildMode::Off {
                 if let Ok(selection) = &toolchain_selection {
                     if let Some(helper_path) = selection.helper_path.as_ref() {
@@ -1665,13 +1690,14 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                 NativeAutoPreflightHintState::Supported
                                 | NativeAutoPreflightHintState::Unknown => "unknown reason",
                             };
-                            diagnostics.borrow_mut().push(native_fallback_diagnostic(
+                            let diagnostic_index = push_diagnostic(native_fallback_diagnostic(
                                 "UCN2003",
                                 "native_fallback_daemon_backend_downgrade",
                                 "Daemon backend downgraded to Scarb",
                                 reason.to_string(),
                                 native_toolchain.as_ref(),
                             ));
+                            daemon_backend_fallback_diagnostic_index.set(Some(diagnostic_index));
                             tracing::debug!(
                                 session_key = %local_session_key,
                                 reason,
@@ -1874,6 +1900,12 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             daemon_compile_backend,
                             daemon_native_fallback_to_scarb,
                         )? {
+                            enrich_daemon_fallback_diagnostics_from_response(
+                                &diagnostics,
+                                preflight_fallback_diagnostic_index.get(),
+                                daemon_backend_fallback_diagnostic_index.get(),
+                                &response,
+                            );
                             if daemon_native_fallback_to_scarb
                                 && response.compile_backend == DaemonBuildBackend::Scarb
                                 && response.session_key != local_session_key
@@ -1944,6 +1976,12 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                         daemon_native_fallback_to_scarb,
                     )?;
                     if let Some(response) = daemon_response {
+                        enrich_daemon_fallback_diagnostics_from_response(
+                            &diagnostics,
+                            preflight_fallback_diagnostic_index.get(),
+                            daemon_backend_fallback_diagnostic_index.get(),
+                            &response,
+                        );
                         if daemon_native_fallback_to_scarb
                             && response.compile_backend == DaemonBuildBackend::Scarb
                             && response.session_key != local_session_key
@@ -2250,6 +2288,98 @@ mod tests {
                 .any(|command| command.contains("--engine scarb")),
             "agents need a command to isolate fallback build failures: {:?}",
             diagnostic.next_commands
+        );
+    }
+
+    #[test]
+    fn daemon_preflight_fallback_diagnostic_includes_fallback_build_errors() {
+        let diagnostics = std::cell::RefCell::new(vec![native_fallback_diagnostic(
+            "UCN2001",
+            "native_fallback_preflight_ineligible",
+            "Native preflight downgraded to Scarb",
+            "preflight said no".to_string(),
+            None,
+        )]);
+        let response = DaemonBuildResponse {
+            run: CommandRun {
+                command: vec!["scarb".to_string(), "build".to_string()],
+                exit_code: 1,
+                elapsed_ms: 11.0,
+                stdout: String::new(),
+                stderr: "error[E0002]: Identifier not found.\n --> src/lib.cairo:4:5".to_string(),
+            },
+            cache_hit: false,
+            fingerprint: "fp".to_string(),
+            session_key: "session".to_string(),
+            telemetry: BuildPhaseTelemetry::default(),
+            compile_backend: DaemonBuildBackend::Scarb,
+        };
+
+        enrich_daemon_fallback_diagnostics_from_response(&diagnostics, Some(0), None, &response);
+
+        let diagnostic = diagnostics
+            .borrow()
+            .first()
+            .cloned()
+            .expect("missing diagnostic");
+        assert_eq!(diagnostic.code, "UCN2001");
+        assert!(
+            diagnostic
+                .what_happened
+                .contains("Native preflight selected Scarb before the daemon build"),
+            "unexpected what_happened: {}",
+            diagnostic.what_happened
+        );
+        assert!(
+            diagnostic.why.contains("error[E0002]"),
+            "fallback compiler summary missing from why: {}",
+            diagnostic.why
+        );
+    }
+
+    #[test]
+    fn daemon_backend_downgrade_diagnostic_includes_fallback_build_errors() {
+        let diagnostics = std::cell::RefCell::new(vec![native_fallback_diagnostic(
+            "UCN2003",
+            "native_fallback_daemon_backend_downgrade",
+            "Daemon backend downgraded to Scarb",
+            "cached fallback hint present".to_string(),
+            None,
+        )]);
+        let response = DaemonBuildResponse {
+            run: CommandRun {
+                command: vec!["scarb".to_string(), "build".to_string()],
+                exit_code: 1,
+                elapsed_ms: 9.0,
+                stdout: String::new(),
+                stderr: "error[E0007]: Missing argument.\n --> src/lib.cairo:8:9".to_string(),
+            },
+            cache_hit: false,
+            fingerprint: "fp".to_string(),
+            session_key: "session".to_string(),
+            telemetry: BuildPhaseTelemetry::default(),
+            compile_backend: DaemonBuildBackend::Scarb,
+        };
+
+        enrich_daemon_fallback_diagnostics_from_response(&diagnostics, None, Some(0), &response);
+
+        let diagnostic = diagnostics
+            .borrow()
+            .first()
+            .cloned()
+            .expect("missing diagnostic");
+        assert_eq!(diagnostic.code, "UCN2003");
+        assert!(
+            diagnostic
+                .what_happened
+                .contains("Daemon backend downgraded to Scarb before the daemon build"),
+            "unexpected what_happened: {}",
+            diagnostic.what_happened
+        );
+        assert!(
+            diagnostic.why.contains("error[E0007]"),
+            "fallback compiler summary missing from why: {}",
+            diagnostic.why
         );
     }
 
