@@ -707,6 +707,7 @@ struct ProjectInspectPackageSummary {
 enum ProjectInspectPackageRole {
     InspectedManifest,
     WorkspaceRootManifest,
+    WorkspaceMemberManifest,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -802,6 +803,7 @@ struct ProjectOfflineReadinessSummary {
 #[serde(rename_all = "snake_case")]
 enum ProjectOfflineReadinessStatus {
     Ready,
+    Unverified,
     NeedsLockfile,
     NeedsExactToolchainSource,
     Blocked,
@@ -2274,9 +2276,7 @@ fn project_inspect_report_from_manifest_path(manifest_path: &Path) -> Result<Pro
                         "Verify the file is UTF-8 and below the manifest size limit.".to_string(),
                         "Rerun project inspection after fixing the manifest file.".to_string(),
                     ],
-                    vec![
-                        "uc project inspect --manifest-path <Scarb.toml> --format json".to_string(),
-                    ],
+                    vec!["uc project inspect --manifest-path <Scarb.toml> --json".to_string()],
                     "manual_manifest_fix_required",
                     false,
                     false,
@@ -2314,9 +2314,7 @@ fn project_inspect_report_from_manifest_path(manifest_path: &Path) -> Result<Pro
                         "Keep the manifest in Scarb-compatible TOML before rerunning inspection."
                             .to_string(),
                     ],
-                    vec![
-                        "uc project inspect --manifest-path <Scarb.toml> --format json".to_string(),
-                    ],
+                    vec!["uc project inspect --manifest-path <Scarb.toml> --json".to_string()],
                     "manual_manifest_fix_required",
                     false,
                     false,
@@ -2414,9 +2412,7 @@ fn project_inspect_report_from_manifest_path(manifest_path: &Path) -> Result<Pro
                         "Run native support probing directly to isolate the toolchain issue."
                             .to_string(),
                     ],
-                    vec![
-                        "uc support native --manifest-path <Scarb.toml> --format json".to_string(),
-                    ],
+                    vec!["uc support native --manifest-path <Scarb.toml> --json".to_string()],
                     "inspect_native_support_then_retry",
                     true,
                     false,
@@ -2444,7 +2440,7 @@ fn project_inspect_report_from_manifest_path(manifest_path: &Path) -> Result<Pro
                 "Add an exact [package].cairo-version or commit a lockfile with an exact starknet version when you need read-only toolchain selection.".to_string(),
             ],
             vec![
-                "uc support native --manifest-path <Scarb.toml> --format json".to_string(),
+                "uc support native --manifest-path <Scarb.toml> --json".to_string(),
             ],
             "inspect_native_support_then_retry",
             true,
@@ -2647,12 +2643,57 @@ fn project_packages_for_report(
             ProjectInspectPackageRole::WorkspaceRootManifest,
         );
     }
+    if let Some(workspace_manifest) = workspace_manifest {
+        for member_manifest_path in
+            project_workspace_member_manifest_paths(workspace_manifest, workspace_manifest_path)
+        {
+            if member_manifest_path == manifest_path
+                || member_manifest_path == workspace_manifest_path
+            {
+                continue;
+            }
+            if let Ok(member_manifest) =
+                read_text_file_with_limit(&member_manifest_path, MAX_MANIFEST_BYTES, "manifest")
+                    .and_then(|text| {
+                        parse_manifest_toml(
+                            &text,
+                            &member_manifest_path,
+                            "failed to parse workspace member manifest for project inspect",
+                        )
+                    })
+            {
+                project_push_package_for_report(
+                    &mut packages,
+                    Some(&member_manifest),
+                    &member_manifest_path,
+                    ProjectInspectPackageRole::WorkspaceMemberManifest,
+                );
+            }
+        }
+    }
     packages.sort_by(|left, right| {
         left.manifest_path
             .cmp(&right.manifest_path)
             .then_with(|| left.package_root.cmp(&right.package_root))
+            .then_with(|| {
+                project_inspect_package_role_rank(&left.role)
+                    .cmp(&project_inspect_package_role_rank(&right.role))
+            })
+    });
+    packages.dedup_by(|left, right| {
+        left.manifest_path == right.manifest_path
+            && left.package_root == right.package_root
+            && left.role == right.role
     });
     packages
+}
+
+fn project_inspect_package_role_rank(role: &ProjectInspectPackageRole) -> u8 {
+    match role {
+        ProjectInspectPackageRole::InspectedManifest => 0,
+        ProjectInspectPackageRole::WorkspaceRootManifest => 1,
+        ProjectInspectPackageRole::WorkspaceMemberManifest => 2,
+    }
 }
 
 fn project_push_package_for_report(
@@ -2685,6 +2726,181 @@ fn project_push_package_for_report(
         edition: package.edition,
         cairo_version: package.cairo_version,
     });
+}
+
+fn project_workspace_member_manifest_paths(
+    workspace_manifest: &TomlValue,
+    workspace_manifest_path: &Path,
+) -> Vec<PathBuf> {
+    let Some(members) = workspace_manifest
+        .get("workspace")
+        .and_then(TomlValue::as_table)
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(TomlValue::as_array)
+    else {
+        return Vec::new();
+    };
+
+    let workspace_root = workspace_manifest_path
+        .parent()
+        .unwrap_or(workspace_manifest_path);
+    let canonical_workspace_root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let mut manifests = BTreeSet::new();
+
+    for member in members {
+        let Some(member_pattern) = member
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if project_workspace_member_pattern_is_literal(member_pattern) {
+            let member_path = Path::new(member_pattern);
+            if project_workspace_member_pattern_is_unsafe(member_path) {
+                continue;
+            }
+            let candidate_manifest = workspace_root.join(member_path).join("Scarb.toml");
+            let canonical_candidate_manifest = match candidate_manifest.canonicalize() {
+                Ok(path) => path,
+                Err(_) => continue,
+            };
+            if ensure_path_within_root(
+                &canonical_workspace_root,
+                &canonical_candidate_manifest,
+                "project inspect workspace member manifest",
+            )
+            .is_ok()
+                && canonical_candidate_manifest.is_file()
+            {
+                manifests.insert(canonical_candidate_manifest);
+            }
+            continue;
+        }
+
+        for entry in WalkDir::new(workspace_root)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if !entry.file_type().is_file() || entry.file_name() != "Scarb.toml" {
+                continue;
+            }
+            let entry_path = entry.path();
+            let relative_parent = match entry_path
+                .parent()
+                .and_then(|parent| parent.strip_prefix(workspace_root).ok())
+            {
+                Some(path) => path,
+                None => continue,
+            };
+            let relative_parent = normalize_fingerprint_path(relative_parent)
+                .trim_start_matches("./")
+                .to_string();
+            if !project_workspace_member_pattern_matches(member_pattern, &relative_parent) {
+                continue;
+            }
+            let canonical_candidate_manifest = match entry_path.canonicalize() {
+                Ok(path) => path,
+                Err(_) => continue,
+            };
+            if ensure_path_within_root(
+                &canonical_workspace_root,
+                &canonical_candidate_manifest,
+                "project inspect workspace member manifest",
+            )
+            .is_ok()
+            {
+                manifests.insert(canonical_candidate_manifest);
+            }
+        }
+    }
+
+    manifests.into_iter().collect()
+}
+
+fn project_workspace_member_pattern_is_literal(pattern: &str) -> bool {
+    !pattern.contains('*') && !pattern.contains('?')
+}
+
+fn project_workspace_member_pattern_is_unsafe(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    })
+}
+
+fn project_workspace_member_pattern_matches(pattern: &str, relative_parent: &str) -> bool {
+    let pattern_segments = pattern
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let path_segments = relative_parent
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    project_workspace_member_pattern_segments_match(&pattern_segments, &path_segments)
+}
+
+fn project_workspace_member_pattern_segments_match(
+    pattern_segments: &[&str],
+    path_segments: &[&str],
+) -> bool {
+    match pattern_segments.split_first() {
+        None => path_segments.is_empty(),
+        Some((&"**", rest)) => {
+            project_workspace_member_pattern_segments_match(rest, path_segments)
+                || (!path_segments.is_empty()
+                    && project_workspace_member_pattern_segments_match(
+                        pattern_segments,
+                        &path_segments[1..],
+                    ))
+        }
+        Some((pattern_segment, rest)) => {
+            let Some((path_segment, remaining_path_segments)) = path_segments.split_first() else {
+                return false;
+            };
+            project_workspace_member_component_matches(pattern_segment, path_segment)
+                && project_workspace_member_pattern_segments_match(rest, remaining_path_segments)
+        }
+    }
+}
+
+fn project_workspace_member_component_matches(pattern: &str, value: &str) -> bool {
+    let pattern_bytes = pattern.as_bytes();
+    let value_bytes = value.as_bytes();
+    let (mut pattern_index, mut value_index) = (0usize, 0usize);
+    let mut star_index = None;
+    let mut match_index = 0usize;
+
+    while value_index < value_bytes.len() {
+        if pattern_index < pattern_bytes.len()
+            && (pattern_bytes[pattern_index] == value_bytes[value_index]
+                || pattern_bytes[pattern_index] == b'?')
+        {
+            pattern_index += 1;
+            value_index += 1;
+        } else if pattern_index < pattern_bytes.len() && pattern_bytes[pattern_index] == b'*' {
+            star_index = Some(pattern_index);
+            pattern_index += 1;
+            match_index = value_index;
+        } else if let Some(star) = star_index {
+            pattern_index = star + 1;
+            match_index += 1;
+            value_index = match_index;
+        } else {
+            return false;
+        }
+    }
+
+    while pattern_index < pattern_bytes.len() && pattern_bytes[pattern_index] == b'*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern_bytes.len()
 }
 
 fn project_profiles_summary_for_report(
@@ -2893,15 +3109,24 @@ fn project_source_origin_summary(
     workspace_root: &Path,
 ) -> ProjectSourceOriginSummary {
     let inherited = dependency.workspace;
-    let source_dependency = if dependency.workspace {
+    let resolved_workspace_dependency = if dependency.workspace {
         workspace_dependencies
             .iter()
             .find(|workspace_dependency| workspace_dependency.name == dependency.name)
-            .unwrap_or(dependency)
     } else {
-        dependency
+        None
     };
-    let locator = project_dependency_locator(source_dependency, manifest_path, workspace_root);
+    let source_dependency = resolved_workspace_dependency.unwrap_or(dependency);
+    let kind = if dependency.workspace && resolved_workspace_dependency.is_none() {
+        "unknown".to_string()
+    } else {
+        source_dependency.kind.clone()
+    };
+    let locator = if dependency.workspace && resolved_workspace_dependency.is_none() {
+        "unknown".to_string()
+    } else {
+        project_dependency_locator(source_dependency, manifest_path, workspace_root)
+    };
     let locked = lockfile
         .packages
         .iter()
@@ -2909,7 +3134,7 @@ fn project_source_origin_summary(
     ProjectSourceOriginSummary {
         dependency: dependency.name.clone(),
         section: dependency.section.clone(),
-        kind: source_dependency.kind.clone(),
+        kind,
         locator,
         workspace_inherited: inherited,
         locked,
@@ -3006,7 +3231,7 @@ fn project_lockfile_summary(
             format!("{} exists but is not a regular file.", lock_path.display()),
             "Project inspection cannot trust lockfile metadata from a non-file path.".to_string(),
             vec!["Replace the path with a regular Scarb.lock file or remove it.".to_string()],
-            vec!["uc project inspect --manifest-path <Scarb.toml> --format json".to_string()],
+            vec!["uc project inspect --manifest-path <Scarb.toml> --json".to_string()],
             "manual_lockfile_fix_required",
             false,
             false,
@@ -3083,7 +3308,7 @@ fn project_lockfile_summary(
                         .to_string(),
                 ],
                 vec![
-                    "uc project inspect --manifest-path <Scarb.toml> --format json"
+                    "uc project inspect --manifest-path <Scarb.toml> --json"
                         .to_string(),
                     "scarb metadata --manifest-path <Scarb.toml>".to_string(),
                 ],
@@ -3223,7 +3448,7 @@ fn project_offline_readiness_summary(
         ProjectOfflineReadinessStatus::NeedsExactToolchainSource
     } else {
         reasons.push("cache_state_unknown".to_string());
-        ProjectOfflineReadinessStatus::Ready
+        ProjectOfflineReadinessStatus::Unverified
     };
 
     ProjectOfflineReadinessSummary {
@@ -3248,7 +3473,7 @@ fn project_dependency_resolved_origin_kind(
             .iter()
             .find(|workspace_dependency| workspace_dependency.name == dependency.name)
             .map(|workspace_dependency| workspace_dependency.kind.clone())
-            .unwrap_or_else(|| "workspace".to_string())
+            .unwrap_or_else(|| "unknown".to_string())
     } else {
         dependency.kind.clone()
     }
@@ -3377,7 +3602,7 @@ fn agent_eval_decision(
     let mut next_commands = Vec::new();
     let manifest_path = shell_escape_command_arg(&support.manifest_path);
     next_commands.push(format!(
-        "uc support native --manifest-path {} --format json",
+        "uc support native --manifest-path {} --json",
         manifest_path
     ));
     if support.supported {
@@ -4907,21 +5132,21 @@ impl NativeCompileSupportIssue {
     fn next_commands(&self) -> Vec<String> {
         match self {
             Self::LegacyEditionRequiresPinnedCairoVersion { .. } => vec![
-                "uc support native --manifest-path <Scarb.toml> --format json".to_string(),
+                "uc support native --manifest-path <Scarb.toml> --json".to_string(),
                 "scarb metadata --manifest-path <Scarb.toml>".to_string(),
             ],
             Self::UnsupportedManifestConstraint { .. } => {
-                vec!["uc support native --manifest-path <Scarb.toml> --format json".to_string()]
+                vec!["uc support native --manifest-path <Scarb.toml> --json".to_string()]
             }
             Self::UnparseableCompilerVersion { .. } => vec![
-                "uc support native --manifest-path <Scarb.toml> --format json".to_string(),
+                "uc support native --manifest-path <Scarb.toml> --json".to_string(),
                 "scarb --version".to_string(),
             ],
             Self::CompilerVersionMismatch { requested, .. } => {
                 let lane = requested.split('.').take(2).collect::<Vec<_>>().join(".");
                 vec![
                     format!("./scripts/build_native_toolchain_helper.sh --lane {lane}"),
-                    "uc support native --manifest-path <Scarb.toml> --format json".to_string(),
+                    "uc support native --manifest-path <Scarb.toml> --json".to_string(),
                 ]
             }
             Self::MissingToolchainHelper {
@@ -4931,7 +5156,7 @@ impl NativeCompileSupportIssue {
                 let lane = requested.split('.').take(2).collect::<Vec<_>>().join(".");
                 vec![
                     format!("./scripts/build_native_toolchain_helper.sh --lane {lane}"),
-                    format!("{helper_env}=<helper-uc-path> uc support native --manifest-path <Scarb.toml> --format json"),
+                    format!("{helper_env}=<helper-uc-path> uc support native --manifest-path <Scarb.toml> --json"),
                 ]
             }
             Self::UnsupportedToolchainHelperLane {
@@ -4939,8 +5164,8 @@ impl NativeCompileSupportIssue {
                 requested,
                 ..
             } => vec![
-                "uc support native --manifest-path <Scarb.toml> --format json".to_string(),
-                format!("{helper_env}=<reviewed-cairo-{requested}-helper-uc-path> uc support native --manifest-path <Scarb.toml> --format json"),
+                "uc support native --manifest-path <Scarb.toml> --json".to_string(),
+                format!("{helper_env}=<reviewed-cairo-{requested}-helper-uc-path> uc support native --manifest-path <Scarb.toml> --json"),
             ],
             Self::InvalidToolchainHelper {
                 requested,
@@ -4950,7 +5175,7 @@ impl NativeCompileSupportIssue {
                 let lane = requested.split('.').take(2).collect::<Vec<_>>().join(".");
                 vec![
                     format!("./scripts/build_native_toolchain_helper.sh --lane {lane}"),
-                    format!("{helper_env}=<helper-uc-path> uc support native --manifest-path <Scarb.toml> --format json"),
+                    format!("{helper_env}=<helper-uc-path> uc support native --manifest-path <Scarb.toml> --json"),
                 ]
             }
         }
@@ -5301,7 +5526,7 @@ fn native_support_report_from_manifest_path(manifest_path: &Path) -> Result<Nati
             ],
             next_commands: vec![
                 "cargo build -p uc-cli --features native-compile".to_string(),
-                "uc support native --manifest-path <Scarb.toml> --format json".to_string(),
+                "uc support native --manifest-path <Scarb.toml> --json".to_string(),
             ],
             safe_automated_action: "use_native_enabled_binary".to_string(),
             retryable: false,

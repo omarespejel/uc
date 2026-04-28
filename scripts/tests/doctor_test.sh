@@ -128,6 +128,15 @@ PYTHON
 
 link_required_host_tools() {
   local fake_bin_dir="$1"
+  link_required_non_python_host_tools "$fake_bin_dir"
+
+  local py_resolved=""
+  py_resolved="$(find_python311_plus_for_test)" || return 1
+  write_exec_wrapper "$fake_bin_dir/python3" "$py_resolved"
+}
+
+link_required_non_python_host_tools() {
+  local fake_bin_dir="$1"
   for cmd in bash dirname env head sort; do
     local resolved
     resolved="$(command -v "$cmd" || true)"
@@ -137,7 +146,9 @@ link_required_host_tools() {
     fi
     ln -s "$resolved" "$fake_bin_dir/$cmd"
   done
+}
 
+find_python311_plus_for_test() {
   local py_resolved=""
   local py_cmd
   for py_cmd in python3 python3.13 python3.12 python3.11 python; do
@@ -148,11 +159,11 @@ if sys.version_info < (3, 11):
     raise SystemExit(1)
 PY
     then
-      write_exec_wrapper "$fake_bin_dir/python3" "$py_resolved"
+      printf '%s\n' "$py_resolved"
       return 0
     fi
   done
-  echo "link_required_host_tools could not find python3/python3.13/python3.12/python3.11/python for $fake_bin_dir" >&2
+  echo "find_python311_plus_for_test could not find python3/python3.13/python3.12/python3.11/python" >&2
   return 1
 }
 
@@ -247,25 +258,13 @@ test_doctor_accepts_python_fallback_when_python3_commands_are_missing() {
   local fake_bin_dir="$TMP_DIR/python-fallback-bin"
   local stdout_path="$TMP_DIR/python-fallback.out"
   mkdir -p "$fake_bin_dir"
-  for cmd in bash dirname env head sort; do
-    local resolved
-    resolved="$(command -v "$cmd" || true)"
-    if [[ -z "$resolved" ]]; then
-      echo "required host command not found for test sandbox: $cmd" >&2
-      return 1
-    fi
-    ln -s "$resolved" "$fake_bin_dir/$cmd"
-  done
+  link_required_non_python_host_tools "$fake_bin_dir"
   write_required_tool_stubs "$fake_bin_dir"
   write_version_stub "$fake_bin_dir/jq" "jq-1.7"
   write_git_hooks_stub "$fake_bin_dir/git"
 
   local python_resolved=""
-  python_resolved="$(command -v python || true)"
-  if [[ -z "$python_resolved" ]]; then
-    echo "required python fallback command not found for test sandbox" >&2
-    return 1
-  fi
+  python_resolved="$(find_python311_plus_for_test)" || return 1
   write_exec_wrapper "$fake_bin_dir/python" "$python_resolved"
 
   if ! PATH="$fake_bin_dir" "$DOCTOR_SCRIPT" >"$stdout_path" 2>&1; then
@@ -336,16 +335,15 @@ exit 1
 PYTHON3
   chmod +x "$fake_bin_dir/python3"
   rm -f "$fake_bin_dir/python3.12"
-  cat > "$fake_bin_dir/python3.12" <<'PYTHON312'
+  local python_real=""
+  python_real="$(find_python311_plus_for_test)" || return 1
+  cat > "$fake_bin_dir/python3.12" <<PYTHON312
 #!/usr/bin/env bash
 if [[ "${1-}" == "--version" ]]; then
   printf 'Python 3.12.9\n'
   exit 0
 fi
-while IFS= read -r _; do
-  :
-done
-exit 0
+exec "$python_real" "\$@"
 PYTHON312
   chmod +x "$fake_bin_dir/python3.12"
 

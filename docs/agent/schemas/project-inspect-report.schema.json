@@ -49,7 +49,7 @@
         "properties": {
           "manifest_path": { "type": "string", "minLength": 1 },
           "package_root": { "type": "string", "minLength": 1 },
-          "role": { "enum": ["inspected_manifest", "workspace_root_manifest"] },
+          "role": { "enum": ["inspected_manifest", "workspace_root_manifest", "workspace_member_manifest"] },
           "name": { "type": ["string", "null"] },
           "version": { "type": ["string", "null"] },
           "edition": { "type": ["string", "null"] },
@@ -119,7 +119,7 @@
       ],
       "properties": {
         "status": {
-          "enum": ["ready", "needs_lockfile", "needs_exact_toolchain_source", "blocked"]
+          "enum": ["ready", "unverified", "needs_lockfile", "needs_exact_toolchain_source", "blocked"]
         },
         "readonly_native_source": { "type": "boolean" },
         "lockfile_present": { "type": "boolean" },
