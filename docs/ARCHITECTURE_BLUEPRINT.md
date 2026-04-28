@@ -57,5 +57,5 @@ Build `uc` as an agent-first Cairo project control plane with a performance-firs
 - Machine-readable commands must be versioned and forward-compatible.
 - Locked/offline lanes must not mutate lockfiles or touch the network implicitly.
 - Fallback state must always be explicit and queryable.
-- Session keys include workspace + compiler version + profile/features/cfg/plugin signature.
+- Session keys include workspace, compiler version, profile/features/cfg/plugin signature, offline flag, package selection, Cairo edition, and environment fingerprint; keep that contract synchronized with implementation and tooling.
 - Deterministic outputs across machines are mandatory.

@@ -34,6 +34,26 @@ run_test() {
   "$@"
 }
 
+find_python311_plus() {
+  local candidate
+  for candidate in python3 python3.13 python3.12 python3.11; do
+    if ! command -v "$candidate" >/dev/null 2>&1; then
+      continue
+    fi
+    if "$candidate" - <<'PY' >/dev/null 2>&1
+import sys, tomllib
+if sys.version_info < (3, 11):
+    raise SystemExit(1)
+PY
+    then
+      command -v "$candidate"
+      return 0
+    fi
+  done
+  echo "python >= 3.11 with tomllib is required for native CI gate tests" >&2
+  return 1
+}
+
 write_file() {
   local path="$1"
   local content="${2-}"
@@ -150,6 +170,33 @@ test_verify_report_accepts_uc_native_backend() {
   write_file "$report_path" '{"exit_code":0,"command":["uc-native","build"]}'
 
   uc_native_ci_verify_report "$report_path" "strict-native" "uc-native" >/dev/null
+}
+
+test_verify_report_accepts_python312_when_python3_is_too_old() {
+  local report_path="$TEST_TMP_DIR/python312-native.json"
+  local fake_bin_dir="$TEST_TMP_DIR/python312-bin"
+  local python_real
+  mkdir -p "$fake_bin_dir"
+  python_real="$(find_python311_plus)"
+  write_file "$report_path" '{"exit_code":0,"command":["uc-native","build"]}'
+  cat > "$fake_bin_dir/python3" <<'PYTHON3'
+#!/usr/bin/env bash
+exit 1
+PYTHON3
+  chmod +x "$fake_bin_dir/python3"
+  cat > "$fake_bin_dir/python3.12" <<'PYTHON312'
+#!/usr/bin/env bash
+if [[ "${1-}" == "--version" ]]; then
+  printf 'Python 3.12.9\n'
+  exit 0
+fi
+exec "__PYTHON_REAL__" "$@"
+PYTHON312
+  perl -0pi -e 's#__PYTHON_REAL__#'"$python_real"'#g' "$fake_bin_dir/python3.12"
+  chmod +x "$fake_bin_dir/python3.12"
+
+  PATH="$fake_bin_dir:$PATH" \
+    uc_native_ci_verify_report "$report_path" "strict-native" "uc-native" >/dev/null
 }
 
 test_verify_report_rejects_scarb_fallback_for_native_only() {
@@ -411,6 +458,8 @@ run_test "detects unsupported executable fixture log" test_detects_unsupported_e
 run_test "detects generic unsupported capability log" test_detects_generic_unsupported_capability_log
 run_test "ignores generic failure log" test_ignores_generic_failure_log
 run_test "verify report accepts uc-native backend" test_verify_report_accepts_uc_native_backend
+run_test "verify report accepts python312 when python3 is too old" \
+  test_verify_report_accepts_python312_when_python3_is_too_old
 run_test "verify report rejects scarb fallback for native-only" test_verify_report_rejects_scarb_fallback_for_native_only
 run_test "verify report accepts controlled fallback backend" test_verify_report_accepts_controlled_fallback_backend
 run_test "verify report rejects non-zero exit_code" test_verify_report_rejects_non_zero_exit_code

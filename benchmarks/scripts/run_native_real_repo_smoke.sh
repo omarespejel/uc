@@ -161,7 +161,9 @@ run_uc_build_case() {
 
   set +e
   if [[ "$CASE_TIMEOUT_SECS" -gt 0 ]]; then
-    python3 - "$CASE_TIMEOUT_SECS" "$log_path" "$@" <<'PY'
+    local python_bin
+    python_bin="$(uc_native_ci_find_python311_plus)"
+    "$python_bin" - "$CASE_TIMEOUT_SECS" "$log_path" "$@" <<'PY'
 import subprocess
 import sys
 from pathlib import Path
