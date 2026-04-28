@@ -81,34 +81,43 @@
 - `stop`: requests graceful shutdown.
 
 ## Target Agent-First Surface
+
 The intended primary surface for agents is:
 
 - `uc project inspect`
+  - Status: implemented
   - Versioned JSON description of workspace, packages, targets, source origins, lockfile state, and offline readiness.
 
 - `uc support native`
+  - Status: implemented
   - Pre-build native support classification.
   - Must report native-supported, native-unsupported, fallback-likely, or build-blocked with reason codes.
 
 - `uc resolve`
+  - Status: planned (not yet implemented)
   - Lockfile-first resolution and graph emission.
   - Must expose selected sources and whether network access is required.
 
 - `uc fetch`
+  - Status: planned (not yet implemented)
   - Source acquisition into the shared store.
   - Must be separable from build.
 
 - `uc toolchain ensure`
+  - Status: planned (not yet implemented)
   - Ensures required Cairo/helper lanes exist.
   - Must expose expected/found toolchain details and policy decisions.
 
 - `uc build --plan-only`
+  - Status: planned (not yet implemented)
   - Emits the execution plan and expected side effects without performing the build.
 
 - `uc explain <id>`
+  - Status: planned (not yet implemented)
   - Re-renders a prior failure or fallback decision from stored machine-readable state.
 
 ## Agent Contract
+
 - `--json` output is primary for agent-facing commands.
 - Versioned schemas should be explicit (`--format-version` or equivalent).
 - Locked/offline commands must not mutate lockfiles or touch the network implicitly.

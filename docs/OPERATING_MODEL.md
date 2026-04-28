@@ -32,5 +32,5 @@
 
 ## Escalation Rules
 - Any correctness mismatch creates P0 blocker.
-- Any silent fallback, silent network access in locked mode, or silent lockfile mutation is a blocker for agent-facing surfaces.
+- Any silent fallback, silent network access in locked/offline lanes, or silent lockfile mutation is a blocker for agent-facing surfaces.
 - Two consecutive missed gate targets trigger replan within 48h.

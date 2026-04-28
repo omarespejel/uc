@@ -1,11 +1,13 @@
 # Agent-First Package Manager and Compiler Research (2026-04-28)
 
 ## Scope
+
 This note captures the current best-practice direction for package managers and compiler-adjacent project tools, then maps those practices onto `uc`.
 
 The focus is not generic package-manager history. It is the implementation pattern that is emerging in 2026 across leading tools and what changes when agents, not humans, are the main users.
 
 ## Executive Summary
+
 The modern pattern is consistent:
 1. Lockfile-first planning is the default.
 2. Fetch is a first-class phase, separate from build/install.
@@ -187,6 +189,7 @@ Must let an agent recover the exact reason for:
 - or fallback activation.
 
 ## Product rules that follow from this
+
 1. JSON is primary; terminal prose is secondary.
 2. Plan before action.
 3. No silent fallback.
@@ -215,6 +218,7 @@ Must let an agent recover the exact reason for:
 - convenience behavior that weakens explicit policy or state reporting.
 
 ## Concrete next implementation slices
+
 1. Keep `AGENTS.md`, `.codex/START_HERE.md`, and `docs/agent/*.md` as the checked-in source of truth for agents and review bots.
 2. Add first-party `project inspect` report with versioned schema.
 3. Add explicit `support native` report.
@@ -224,6 +228,7 @@ Must let an agent recover the exact reason for:
 7. Make `build --plan-only` emit the same phase model used by real execution.
 
 ## Sources
+
 Primary sources used:
 - uv docs: https://docs.astral.sh/uv/
 - uv cache: https://docs.astral.sh/uv/concepts/cache/

@@ -194,15 +194,14 @@ test_prepare_only_prefers_python312_when_python3_is_too_old() {
 exit 1
 PYTHON3
   chmod +x "$fake_bin_dir/python3"
-  cat > "$fake_bin_dir/python3.12" <<'PYTHON312'
+  cat > "$fake_bin_dir/python3.12" <<PYTHON312
 #!/usr/bin/env bash
 if [[ "${1-}" == "--version" ]]; then
   printf 'Python 3.12.9\n'
   exit 0
 fi
-exec "__PYTHON_REAL__" "$@"
+exec "$python_real" "\$@"
 PYTHON312
-  perl -0pi -e 's#__PYTHON_REAL__#'"$python_real"'#g' "$fake_bin_dir/python3.12"
   chmod +x "$fake_bin_dir/python3.12"
 
   PATH="$fake_bin_dir:$PATH" "$HELPER_SCRIPT" --lane 2.14 --staging-dir "$stage_dir" --prepare-only >"$stdout_path"
