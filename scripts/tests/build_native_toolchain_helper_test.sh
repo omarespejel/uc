@@ -13,6 +13,26 @@ run_test() {
   "$@"
 }
 
+find_python311_plus() {
+  local candidate
+  for candidate in python3 python3.13 python3.12 python3.11; do
+    if ! command -v "$candidate" >/dev/null 2>&1; then
+      continue
+    fi
+    if "$candidate" - <<'PY' >/dev/null 2>&1
+import sys, tomllib
+if sys.version_info < (3, 11):
+    raise SystemExit(1)
+PY
+    then
+      command -v "$candidate"
+      return 0
+    fi
+  done
+  echo "python >= 3.11 with tomllib is required for helper tests" >&2
+  return 1
+}
+
 test_prepare_only_rewrites_workspace_manifest_for_cairo214() {
   local stage_dir="$TMP_DIR/stage"
   local stdout_path="$TMP_DIR/prepare.out"
@@ -116,8 +136,10 @@ test_prepare_only_excludes_in_repo_staging_dir_from_archive() {
 write_helper_repo_with_lane_patch() {
   local repo_root="$1"
   local registry_src="$2"
+  local python_bin
+  python_bin="$(find_python311_plus)"
   write_minimal_helper_repo_without_patch_section "$repo_root"
-  python3 - "$repo_root/Cargo.toml" <<'PY'
+  "$python_bin" - "$repo_root/Cargo.toml" <<'PY'
 import sys
 from pathlib import Path
 path = Path(sys.argv[1])
@@ -157,6 +179,35 @@ edition = "2021"
 TOML
   printf 'pub fn fake_compiler() {}\n' > "$registry_src/fake-index/cairo-lang-compiler-2.14.0/src/lib.rs"
   printf 'original helper crate source\n' > "$registry_src/fake-index/cairo-lang-compiler-2.14.0/README.md"
+}
+
+test_prepare_only_prefers_python312_when_python3_is_too_old() {
+  local fake_bin_dir="$TMP_DIR/helper-python312-bin"
+  local stage_dir="$TMP_DIR/helper-python312-stage"
+  local stdout_path="$TMP_DIR/helper-python312.out"
+  local python_real
+  mkdir -p "$fake_bin_dir"
+  python_real="$(find_python311_plus)"
+
+  cat > "$fake_bin_dir/python3" <<'PYTHON3'
+#!/usr/bin/env bash
+exit 1
+PYTHON3
+  chmod +x "$fake_bin_dir/python3"
+  cat > "$fake_bin_dir/python3.12" <<'PYTHON312'
+#!/usr/bin/env bash
+if [[ "${1-}" == "--version" ]]; then
+  printf 'Python 3.12.9\n'
+  exit 0
+fi
+exec "__PYTHON_REAL__" "$@"
+PYTHON312
+  perl -0pi -e 's#__PYTHON_REAL__#'"$python_real"'#g' "$fake_bin_dir/python3.12"
+  chmod +x "$fake_bin_dir/python3.12"
+
+  PATH="$fake_bin_dir:$PATH" "$HELPER_SCRIPT" --lane 2.14 --staging-dir "$stage_dir" --prepare-only >"$stdout_path"
+  grep -qF "Prepared helper staging tree:" "$stdout_path"
+  grep -qF 'cairo-lang-compiler = "=2.14.0"' "$stage_dir/Cargo.toml"
 }
 
 test_prepare_only_applies_helper_lane_patches_from_registry_source() {
@@ -229,6 +280,8 @@ run_test "prepare_only_accepts_workspace_manifest_without_patch_section" \
   test_prepare_only_accepts_workspace_manifest_without_patch_section
 run_test "prepare_only_excludes_in_repo_staging_dir_from_archive" \
   test_prepare_only_excludes_in_repo_staging_dir_from_archive
+run_test "prepare_only_prefers_python312_when_python3_is_too_old" \
+  test_prepare_only_prefers_python312_when_python3_is_too_old
 run_test "prepare_only_applies_helper_lane_patches_from_registry_source" \
   test_prepare_only_applies_helper_lane_patches_from_registry_source
 run_test "prepare_only_and_check_only_are_mutually_exclusive" \

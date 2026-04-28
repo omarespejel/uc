@@ -6,6 +6,7 @@ LANE=""
 OUTPUT=""
 STAGING_DIR=""
 TARGET_DIR=""
+PYTHON_BIN=""
 PREPARE_ONLY=0
 CHECK_ONLY=0
 KEEP_STAGING=0
@@ -34,6 +35,25 @@ require_option_value() {
     usage >&2
     exit 2
   fi
+}
+
+find_python311_plus() {
+  local candidate
+  for candidate in python3 python3.13 python3.12 python3.11; do
+    if ! command -v "$candidate" >/dev/null 2>&1; then
+      continue
+    fi
+    if "$candidate" - <<'PY' >/dev/null 2>&1
+import sys, tomllib
+if sys.version_info < (3, 11):
+    raise SystemExit(1)
+PY
+    then
+      PYTHON_BIN="$(command -v "$candidate")"
+      return 0
+    fi
+  done
+  return 1
 }
 
 while [[ $# -gt 0 ]]; do
@@ -97,23 +117,14 @@ if ! command -v cargo >/dev/null 2>&1; then
   echo "cargo is required" >&2
   exit 1
 fi
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "python3 is required" >&2
-  exit 1
-fi
-if ! python3 - <<'PY' >/dev/null 2>&1
-import sys, tomllib
-if sys.version_info < (3, 11):
-    raise SystemExit(1)
-PY
-then
-  echo "python3 >= 3.11 with tomllib is required to rewrite helper manifests" >&2
+if ! find_python311_plus; then
+  echo "python >= 3.11 with tomllib is required to rewrite helper manifests" >&2
   exit 1
 fi
 
 read_metadata_field() {
   local field="$1"
-  python3 - "$ROOT/Cargo.toml" "$LANE" "$field" <<'PY'
+  "$PYTHON_BIN" - "$ROOT/Cargo.toml" "$LANE" "$field" <<'PY'
 import sys, tomllib
 from pathlib import Path
 cargo_path = Path(sys.argv[1])
@@ -140,7 +151,7 @@ PY
 
 read_metadata_field_optional() {
   local field="$1"
-  python3 - "$ROOT/Cargo.toml" "$LANE" "$field" <<'PY'
+  "$PYTHON_BIN" - "$ROOT/Cargo.toml" "$LANE" "$field" <<'PY'
 import sys, tomllib
 from pathlib import Path
 cargo_path = Path(sys.argv[1])
@@ -212,7 +223,7 @@ prepare_staging_tree() {
 }
 
 rewrite_workspace_manifest() {
-  python3 - "$STAGING_DIR/Cargo.toml" "$CAIRO_VERSION" "$SALSA_VERSION" <<'PY'
+  "$PYTHON_BIN" - "$STAGING_DIR/Cargo.toml" "$CAIRO_VERSION" "$SALSA_VERSION" <<'PY'
 import re, sys
 from pathlib import Path
 path = Path(sys.argv[1])
@@ -255,7 +266,7 @@ helper_cargo_registry_src_root() {
 
 helper_locked_crate_version() {
   local crate_name="$1"
-  python3 - "$LOCKFILE_PATH" "$crate_name" <<'PY'
+  "$PYTHON_BIN" - "$LOCKFILE_PATH" "$crate_name" <<'PY'
 import sys, tomllib
 from pathlib import Path
 lock_path = Path(sys.argv[1])
