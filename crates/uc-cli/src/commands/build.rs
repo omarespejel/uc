@@ -40,7 +40,7 @@ fn native_fallback_diagnostic(
             "If native is required, rerun with UC_NATIVE_DISALLOW_SCARB_FALLBACK=1 after fixing the mismatch.".to_string(),
         ],
         next_commands: vec![
-            "uc support native --manifest-path <Scarb.toml> --format json".to_string(),
+            "uc support native --manifest-path <Scarb.toml> --json".to_string(),
             "UC_NATIVE_DISALLOW_SCARB_FALLBACK=1 uc build --engine uc --daemon-mode off --manifest-path <Scarb.toml>".to_string(),
         ],
         safe_automated_action: "inspect_native_support_then_retry".to_string(),
@@ -102,7 +102,7 @@ fn native_fallback_diagnostic_from_error(
         "If the failure comes from a registry or git dependency, keep it in the support matrix until the dependency/toolchain combination is validated.".to_string(),
     ];
     diagnostic.next_commands = vec![
-        "uc support native --manifest-path <Scarb.toml> --format json".to_string(),
+        "uc support native --manifest-path <Scarb.toml> --json".to_string(),
         "uc build --engine uc --daemon-mode off --manifest-path <Scarb.toml> --report-path /tmp/uc-build-report.json".to_string(),
         "UC_NATIVE_DISALLOW_SCARB_FALLBACK=1 uc build --engine uc --daemon-mode off --manifest-path <Scarb.toml> --record-failure /tmp/uc-failure.json".to_string(),
     ];
@@ -2559,9 +2559,7 @@ mod tests {
             what_happened: "native failed".to_string(),
             why: "native failed".to_string(),
             how_to_fix: vec!["fix native".to_string()],
-            next_commands: vec![
-                "uc support native --manifest-path <Scarb.toml> --format json".to_string(),
-            ],
+            next_commands: vec!["uc support native --manifest-path <Scarb.toml> --json".to_string()],
             safe_automated_action: "inspect_native_support_then_retry".to_string(),
             retryable: true,
             fallback_used: true,

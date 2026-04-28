@@ -802,7 +802,7 @@ dependencies = ["core"]
     );
     assert_eq!(
         report.offline_readiness.status,
-        ProjectOfflineReadinessStatus::Ready
+        ProjectOfflineReadinessStatus::Unverified
     );
     assert!(report.offline_readiness.readonly_native_source);
     assert!(report.offline_readiness.lockfile_present);
@@ -885,6 +885,67 @@ members = ["crates/*"]
     assert!(report.profiles.declared.is_empty());
     assert!(report.readonly);
     assert_eq!(report.mutation_status, "none");
+    assert_project_inspect_left_no_artifacts(&dir);
+}
+
+#[test]
+fn project_inspect_workspace_only_manifest_reports_workspace_member_packages() {
+    let dir = unique_test_dir("uc-project-inspect-workspace-member-packages");
+    let _cleanup = TestDirCleanup::new(&dir);
+    let alpha_dir = dir.join("packages/alpha");
+    let beta_dir = dir.join("packages/beta");
+    fs::create_dir_all(&alpha_dir).expect("create alpha dir");
+    fs::create_dir_all(&beta_dir).expect("create beta dir");
+    fs::write(
+        dir.join("Scarb.toml"),
+        r#"[workspace]
+members = ["packages/*"]
+"#,
+    )
+    .expect("write workspace manifest");
+    fs::write(
+        alpha_dir.join("Scarb.toml"),
+        r#"[package]
+name = "alpha"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("write alpha manifest");
+    fs::write(
+        beta_dir.join("Scarb.toml"),
+        r#"[package]
+name = "beta"
+version = "0.2.0"
+edition = "2024_07"
+"#,
+    )
+    .expect("write beta manifest");
+
+    let report = project_inspect_report_from_manifest_path(&dir.join("Scarb.toml"))
+        .expect("inspect should succeed");
+
+    assert_eq!(report.package.name, None);
+    assert_eq!(report.packages.len(), 2);
+    assert_eq!(
+        report
+            .packages
+            .iter()
+            .map(|package| (package.name.clone(), package.role.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                Some("alpha".to_string()),
+                ProjectInspectPackageRole::WorkspaceMemberManifest,
+            ),
+            (
+                Some("beta".to_string()),
+                ProjectInspectPackageRole::WorkspaceMemberManifest,
+            ),
+        ]
+    );
+    assert!(report.workspace.has_workspace_table);
+    assert_eq!(report.workspace.members, vec!["packages/*".to_string()]);
     assert_project_inspect_left_no_artifacts(&dir);
 }
 
@@ -1132,6 +1193,52 @@ starknet = { workspace = true }
         .offline_readiness
         .reasons
         .contains(&"lockfile_missing_for_remote_dependencies".to_string()));
+    assert_project_inspect_left_no_artifacts(&workspace);
+    assert_project_inspect_left_no_artifacts(&member);
+}
+
+#[test]
+fn project_inspect_marks_unresolved_workspace_dependency_origin_unknown() {
+    let workspace = unique_test_dir("uc-project-inspect-unresolved-workspace-dependency");
+    let _cleanup = TestDirCleanup::new(&workspace);
+    let member = workspace.join("member");
+    fs::create_dir_all(&member).expect("create member dir");
+    fs::write(
+        workspace.join("Scarb.toml"),
+        r#"[workspace]
+members = ["member"]
+"#,
+    )
+    .expect("write workspace manifest");
+    let member_manifest = member.join("Scarb.toml");
+    fs::write(
+        &member_manifest,
+        r#"[package]
+name = "member"
+version = "0.1.0"
+edition = "2024_07"
+
+[dependencies]
+shared-dep = { workspace = true }
+"#,
+    )
+    .expect("write member manifest");
+
+    let report = project_inspect_report_from_manifest_path(&member_manifest)
+        .expect("inspect should succeed");
+
+    assert!(report
+        .source_origins
+        .iter()
+        .any(|origin| origin.dependency == "shared-dep"
+            && origin.workspace_inherited
+            && origin.kind == "unknown"
+            && origin.locator == "unknown"));
+    assert_eq!(
+        report.offline_readiness.status,
+        ProjectOfflineReadinessStatus::NeedsLockfile
+    );
+    assert_eq!(report.offline_readiness.remote_dependency_count, 1);
     assert_project_inspect_left_no_artifacts(&workspace);
     assert_project_inspect_left_no_artifacts(&member);
 }
@@ -4252,7 +4359,7 @@ cairo-version = "{requested_version}"
     assert!(
         commands
             .iter()
-            .any(|cmd| cmd.as_str().unwrap_or_default().contains("--format json")),
+            .any(|cmd| cmd.as_str().unwrap_or_default().contains("--json")),
         "agent diagnostics should keep a JSON retry/probe command"
     );
     assert!(
