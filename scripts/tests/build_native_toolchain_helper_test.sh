@@ -91,6 +91,51 @@ test_prepare_only_accepts_workspace_manifest_without_patch_section() {
   fi
 }
 
+write_minimal_helper_repo_with_salsa_package() {
+  local repo_root="$1"
+  mkdir -p "$repo_root/scripts" "$repo_root/toolchains/cairo-2.10"
+  cp "$HELPER_SCRIPT" "$repo_root/scripts/build_native_toolchain_helper.sh"
+  cp "$ROOT/toolchains/cairo-2.14/Cargo.lock" "$repo_root/toolchains/cairo-2.10/Cargo.lock"
+  cat > "$repo_root/Cargo.toml" <<'TOML'
+[workspace]
+members = []
+resolver = "2"
+
+[workspace.dependencies]
+cairo-lang-compiler = "2.16.0"
+cairo-lang-defs = "2.16.0"
+cairo-lang-filesystem = "2.16.0"
+cairo-lang-lowering = "2.16.0"
+cairo-lang-semantic = "2.16.0"
+cairo-lang-starknet = "2.16.0"
+cairo-lang-starknet-classes = "2.16.0"
+salsa = "0.26.0"
+
+[workspace.metadata.uc-native-toolchain-helpers."2.10"]
+cairo-version = "2.10.1"
+salsa-version = "0.17.0-pre.6"
+salsa-package = "rust-analyzer-salsa"
+lockfile = "toolchains/cairo-2.10/Cargo.lock"
+TOML
+}
+
+test_prepare_only_rewrites_workspace_manifest_with_salsa_package_override() {
+  local fake_root="$TMP_DIR/salsa-package-root"
+  local stage_dir="$TMP_DIR/salsa-package-stage"
+  local stdout_path="$TMP_DIR/salsa-package.out"
+  write_minimal_helper_repo_with_salsa_package "$fake_root"
+
+  "$fake_root/scripts/build_native_toolchain_helper.sh" \
+    --lane 2.10 \
+    --staging-dir "$stage_dir" \
+    --prepare-only >"$stdout_path"
+
+  grep -qF "Prepared helper staging tree:" "$stdout_path"
+  grep -qF 'cairo-lang-compiler = "=2.10.1"' "$stage_dir/Cargo.toml"
+  grep -qF 'salsa = { version = "0.17.0-pre.6", package = "rust-analyzer-salsa" }' \
+    "$stage_dir/Cargo.toml"
+}
+
 test_prepare_only_excludes_in_repo_staging_dir_from_archive() {
   local stage_dir="$ROOT/.tmp-helper-inrepo-stage-$$"
   local stdout_path="$TMP_DIR/inrepo-stage.out"
@@ -227,6 +272,8 @@ run_test "prepare_only_rewrites_workspace_manifest_for_cairo214" \
   test_prepare_only_rewrites_workspace_manifest_for_cairo214
 run_test "prepare_only_accepts_workspace_manifest_without_patch_section" \
   test_prepare_only_accepts_workspace_manifest_without_patch_section
+run_test "prepare_only_rewrites_workspace_manifest_with_salsa_package_override" \
+  test_prepare_only_rewrites_workspace_manifest_with_salsa_package_override
 run_test "prepare_only_excludes_in_repo_staging_dir_from_archive" \
   test_prepare_only_excludes_in_repo_staging_dir_from_archive
 run_test "prepare_only_applies_helper_lane_patches_from_registry_source" \

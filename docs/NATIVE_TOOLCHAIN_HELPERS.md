@@ -35,6 +35,7 @@ The helper rewriter is fail-closed: it rewrites only the current workspace depen
 Lane-specific Cairo patches are applied only after the main-lane patch section is removed:
 
 - the lane metadata can set `patch-dir = "toolchains/cairo-2.14/patches"`
+- the lane metadata can also set `salsa-package = "rust-analyzer-salsa"` when an older Cairo lane still aliases the `salsa` dependency to a different Cargo package name
 - patch files must be named after the patched crate, such as `cairo-lang-compiler.patch`
 - the builder copies the matching exact version from `$UC_HELPER_CARGO_REGISTRY_SRC`, `$CARGO_HOME/registry/src`, or `$HOME/.cargo/registry/src`
 - patched sources live only in the staging tree under `.uc/helper-lane-patches/cairo-2.14/`
