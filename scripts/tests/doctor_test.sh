@@ -148,7 +148,7 @@ if sys.version_info < (3, 11):
     raise SystemExit(1)
 PY
     then
-      ln -s "$py_resolved" "$fake_bin_dir/python3"
+      write_exec_wrapper "$fake_bin_dir/python3" "$py_resolved"
       return 0
     fi
   done
@@ -163,6 +163,16 @@ write_version_stub() {
 #!/usr/bin/env bash
 printf '%s\n' "$body"
 STUB
+  chmod +x "$path"
+}
+
+write_exec_wrapper() {
+  local path="$1"
+  local target="$2"
+  cat > "$path" <<WRAPPER
+#!/usr/bin/env bash
+exec "$target" "\$@"
+WRAPPER
   chmod +x "$path"
 }
 
@@ -256,7 +266,7 @@ test_doctor_accepts_python_fallback_when_python3_commands_are_missing() {
     echo "required python fallback command not found for test sandbox" >&2
     return 1
   fi
-  ln -s "$python_resolved" "$fake_bin_dir/python"
+  write_exec_wrapper "$fake_bin_dir/python" "$python_resolved"
 
   if ! PATH="$fake_bin_dir" "$DOCTOR_SCRIPT" >"$stdout_path" 2>&1; then
     echo "expected doctor to accept python fallback when python3 commands are absent" >&2
