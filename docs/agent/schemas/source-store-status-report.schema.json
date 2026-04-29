@@ -3,7 +3,7 @@
   "$id": "https://github.com/omarespejel/uc/docs/agent/schemas/source-store-status-report.schema.json",
   "title": "uc SourceStoreStatusReport",
   "type": "object",
-  "additionalProperties": true,
+  "additionalProperties": false,
   "required": [
     "schema_version",
     "generated_at_epoch_ms",

@@ -29,6 +29,7 @@ uc resolve --locked --manifest-path Scarb.toml --format json | jq
 ```sh
 uc fetch --locked --manifest-path Scarb.toml --format json | jq
 uc cache status --format json | jq
+uc cache prune --format json | jq
 ```
 
 ## Ensure Native Toolchain

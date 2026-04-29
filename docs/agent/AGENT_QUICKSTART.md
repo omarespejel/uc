@@ -95,6 +95,27 @@ state first. Use `.missing_entries` and `.source_store` directly instead of
 guessing from terminal output whether the local dependency graph is actually
 hydrated.
 
+## Source Store Inventory
+
+```sh
+uc cache status --format json
+uc cache prune --format json
+```
+
+Read:
+
+- `.root`
+- `.available`
+- `.writable`
+- `.entry_count`
+- `.total_bytes`
+- `.max_bytes`
+- `.invalid_entry_count`
+
+Use `uc cache status` before forcing offline fetch/build flows. Use
+`uc cache prune` only as an explicit maintenance step; do not assume pruning is
+safe in the middle of a benchmark or active build investigation.
+
 ## Toolchain Ensure
 
 ```sh
