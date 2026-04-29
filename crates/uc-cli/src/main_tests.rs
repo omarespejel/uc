@@ -752,6 +752,22 @@ fn report_schemas_match_nullable_option_output() {
         resolve_schema["properties"]["blocked_reason"]["type"],
         serde_json::json!(["string", "null"])
     );
+    assert_eq!(
+        resolve_schema["properties"]["expected"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    assert_eq!(
+        resolve_schema["properties"]["found"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    assert_eq!(
+        resolve_schema["properties"]["artifact_path"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    assert_eq!(
+        resolve_schema["properties"]["log_path"]["type"],
+        serde_json::json!(["string", "null"])
+    );
 }
 
 #[test]
@@ -934,6 +950,12 @@ fn resolve_report_from_args_marks_missing_manifest_build_blocked() {
         report.lockfile_sync.status,
         ResolveLockfileSyncStatus::ManifestInvalid
     );
+    assert!(report.retryable);
+    assert!(!report.fallback_used);
+    assert!(report.expected.is_some());
+    assert!(report.found.is_some());
+    assert!(report.artifact_path.is_none());
+    assert!(report.log_path.is_none());
     assert!(
         report
             .diagnostics
@@ -1001,8 +1023,14 @@ source = "git+https://example.com/repo.git?rev=abc123"
         ProjectOfflineReadinessStatus::Unverified
     );
     assert!(report.blocked_reason.is_none());
+    assert!(!report.retryable || report.status == ResolveStatus::Ready);
+    assert!(!report.fallback_used);
+    assert_eq!(report.artifact_path, None);
+    assert_eq!(report.log_path, None);
     let json = serde_json::to_value(&report).expect("resolve report should serialize");
     assert_eq!(json["blocked_reason"], serde_json::Value::Null);
+    assert_eq!(json["artifact_path"], serde_json::Value::Null);
+    assert_eq!(json["log_path"], serde_json::Value::Null);
     assert!(
         report
             .diagnostics
@@ -1058,6 +1086,67 @@ source = "registry+https://example.com"
         report.blocked_reason.as_deref(),
         Some("lockfile_manifest_drift")
     );
+}
+
+#[test]
+fn resolve_report_from_manifest_path_marks_workspace_remote_missing_lockfile_blocked() {
+    let dir = unique_test_dir("uc-resolve-report-workspace-remote-missing-lockfile");
+    let _cleanup = TestDirCleanup::new(&dir);
+    let manifest_path = dir.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+cairo-version = "2.14.0"
+
+[workspace]
+members = []
+
+[workspace.dependencies]
+git_dep = { git = "https://example.com/repo.git", rev = "abc123" }
+
+[dependencies]
+git_dep = { workspace = true }
+"#,
+    )
+    .expect("write manifest");
+
+    let report = resolve_report_from_manifest_path(&manifest_path)
+        .expect("workspace-inherited remote dependency should still produce a resolve report");
+    assert_eq!(report.status, ResolveStatus::BuildBlocked);
+    assert_eq!(
+        report.lockfile_sync.status,
+        ResolveLockfileSyncStatus::LockfileMissing
+    );
+    assert_eq!(
+        report.blocked_reason.as_deref(),
+        Some("lockfile_missing_for_locked_resolve")
+    );
+    assert_eq!(
+        report.lockfile_sync.missing_dependencies,
+        vec!["git_dep".to_string()]
+    );
+}
+
+#[test]
+fn resolve_offline_readiness_ready_is_not_blocking() {
+    assert!(!resolve_offline_readiness_is_blocking(
+        ProjectOfflineReadinessStatus::Ready
+    ));
+    assert!(!resolve_offline_readiness_is_blocking(
+        ProjectOfflineReadinessStatus::Unverified
+    ));
+    assert!(resolve_offline_readiness_is_blocking(
+        ProjectOfflineReadinessStatus::NeedsLockfile
+    ));
+    assert!(resolve_offline_readiness_is_blocking(
+        ProjectOfflineReadinessStatus::NeedsExactToolchainSource
+    ));
+    assert!(resolve_offline_readiness_is_blocking(
+        ProjectOfflineReadinessStatus::Blocked
+    ));
 }
 
 #[test]

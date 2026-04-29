@@ -871,6 +871,15 @@ struct ResolveReport {
     lockfile_sync: ResolveLockfileSyncSummary,
     offline_readiness: ProjectOfflineReadinessSummary,
     toolchain: ProjectToolchainSummary,
+    what_happened: String,
+    why: String,
+    retryable: bool,
+    expected: Option<String>,
+    found: Option<String>,
+    fallback_used: bool,
+    replay_command: String,
+    artifact_path: Option<String>,
+    log_path: Option<String>,
     blocked_reason: Option<String>,
     diagnostics: Vec<NativeDiagnostic>,
 }
@@ -909,7 +918,7 @@ struct ProjectOfflineReadinessSummary {
     reasons: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum ProjectOfflineReadinessStatus {
     Ready,
@@ -2709,12 +2718,10 @@ fn resolve_report_from_manifest_path(manifest_path: &Path) -> Result<ResolveRepo
         project_inspect_report_from_manifest_path_with_native_support(manifest_path, false)?;
     let lockfile_sync = resolve_lockfile_sync_summary(
         inspect.manifest.valid,
-        &inspect.dependencies,
         &inspect.source_origins,
         &inspect.lockfile,
     );
-    let blocked_reason = (inspect.offline_readiness.status
-        != ProjectOfflineReadinessStatus::Unverified
+    let blocked_reason = (resolve_offline_readiness_is_blocking(inspect.offline_readiness.status)
         || lockfile_sync.status != ResolveLockfileSyncStatus::InSync
         || !inspect.manifest.valid)
         .then(|| {
@@ -2746,6 +2753,77 @@ fn resolve_report_from_manifest_path(manifest_path: &Path) -> Result<ResolveRepo
     } else {
         ResolveStatus::Ready
     };
+    let what_happened = match status {
+        ResolveStatus::Ready => {
+            format!(
+                "uc resolved {} in locked read-only mode without requiring mutation.",
+                inspect.manifest_path
+            )
+        }
+        ResolveStatus::BuildBlocked => {
+            format!(
+                "uc could not complete a locked read-only resolve for {}.",
+                inspect.manifest_path
+            )
+        }
+    };
+    let why = if !inspect.manifest.valid {
+        "The manifest could not be read or parsed into a valid project model.".to_string()
+    } else {
+        match lockfile_sync.status {
+            ResolveLockfileSyncStatus::InSync => match inspect.offline_readiness.status {
+                ProjectOfflineReadinessStatus::Ready | ProjectOfflineReadinessStatus::Unverified => {
+                    "The manifest and lockfile provided enough local state for a lockfile-first resolve report.".to_string()
+                }
+                ProjectOfflineReadinessStatus::NeedsLockfile => {
+                    "Remote dependencies require a valid Scarb.lock before locked resolve can be trusted.".to_string()
+                }
+                ProjectOfflineReadinessStatus::NeedsExactToolchainSource => {
+                    "The dependency graph is readable, but the local manifest/lockfile state does not pin an exact native toolchain source.".to_string()
+                }
+                ProjectOfflineReadinessStatus::Blocked => {
+                    "The project model is blocked before locked resolve can complete.".to_string()
+                }
+            },
+            ResolveLockfileSyncStatus::LockfileMissing => {
+                "Remote dependencies are present, but Scarb.lock is missing.".to_string()
+            }
+            ResolveLockfileSyncStatus::LockfileInvalid => {
+                "Remote dependencies are present, but Scarb.lock could not be parsed as a valid lockfile.".to_string()
+            }
+            ResolveLockfileSyncStatus::ManifestDrift => {
+                "The manifest declares remote dependencies that are not covered by the current Scarb.lock.".to_string()
+            }
+            ResolveLockfileSyncStatus::ManifestInvalid => {
+                "The manifest is invalid, so the locked dependency graph cannot be trusted.".to_string()
+            }
+        }
+    };
+    let retryable = matches!(status, ResolveStatus::Ready)
+        || matches!(
+            blocked_reason.as_deref(),
+            Some(
+                "lockfile_missing_for_locked_resolve"
+                    | "lockfile_invalid_for_locked_resolve"
+                    | "lockfile_manifest_drift"
+                    | "native_support_requires_exact_local_source"
+            )
+        );
+    let expected = Some(
+        "locked read-only resolve with remote dependencies covered by a valid Scarb.lock"
+            .to_string(),
+    );
+    let found = Some(format!(
+        "status={}, lockfile_sync={}, offline_readiness={}",
+        serde_json::to_string(&status).unwrap_or_else(|_| "\"unknown\"".to_string()),
+        serde_json::to_string(&lockfile_sync.status).unwrap_or_else(|_| "\"unknown\"".to_string()),
+        serde_json::to_string(&inspect.offline_readiness.status)
+            .unwrap_or_else(|_| "\"unknown\"".to_string())
+    ));
+    let replay_command = format!(
+        "uc resolve --locked --manifest-path {} --json",
+        shell_escape_path(manifest_path)
+    );
 
     Ok(ResolveReport {
         schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
@@ -2764,6 +2842,15 @@ fn resolve_report_from_manifest_path(manifest_path: &Path) -> Result<ResolveRepo
         lockfile_sync,
         offline_readiness: inspect.offline_readiness,
         toolchain: inspect.toolchain,
+        what_happened,
+        why,
+        retryable,
+        expected,
+        found,
+        fallback_used: false,
+        replay_command,
+        artifact_path: None,
+        log_path: None,
         blocked_reason,
         diagnostics: inspect.diagnostics,
     })
@@ -2832,6 +2919,15 @@ fn resolve_manifest_path_resolution_blocked_report(
             native_supported: false,
             fallback_used: false,
         },
+        what_happened: format!("uc could not resolve the manifest path for {manifest_text}."),
+        why: format!("{err:#}"),
+        retryable: true,
+        expected: Some("an existing Scarb.toml path inside the active checkout".to_string()),
+        found: Some(manifest_text.clone()),
+        fallback_used: false,
+        replay_command: "uc resolve --locked --manifest-path <Scarb.toml> --json".to_string(),
+        artifact_path: None,
+        log_path: None,
         blocked_reason: Some("manifest_path_resolution_failed".to_string()),
         diagnostics: vec![project_agent_diagnostic(
             "UCN1100",
@@ -3883,7 +3979,6 @@ fn project_offline_readiness_summary(
 
 fn resolve_lockfile_sync_summary(
     manifest_valid: bool,
-    dependencies: &[ProjectDependencySummary],
     source_origins: &[ProjectSourceOriginSummary],
     lockfile: &ProjectLockfileSummary,
 ) -> ResolveLockfileSyncSummary {
@@ -3895,10 +3990,10 @@ fn resolve_lockfile_sync_summary(
         };
     }
 
-    let remote_dependencies = dependencies
+    let remote_dependencies = source_origins
         .iter()
-        .filter(|dependency| matches!(dependency.kind.as_str(), "git" | "version" | "table"))
-        .map(|dependency| dependency.name.as_str())
+        .filter(|origin| matches!(origin.kind.as_str(), "git" | "version" | "table"))
+        .map(|origin| origin.dependency.as_str())
         .collect::<BTreeSet<_>>();
 
     if !remote_dependencies.is_empty() && !lockfile.present {
@@ -3945,6 +4040,26 @@ fn resolve_lockfile_sync_summary(
         missing_dependencies: Vec::new(),
         reasons: vec!["lockfile_covers_remote_dependencies".to_string()],
     }
+}
+
+fn resolve_offline_readiness_is_blocking(status: ProjectOfflineReadinessStatus) -> bool {
+    matches!(
+        status,
+        ProjectOfflineReadinessStatus::NeedsLockfile
+            | ProjectOfflineReadinessStatus::NeedsExactToolchainSource
+            | ProjectOfflineReadinessStatus::Blocked
+    )
+}
+
+fn shell_escape_path(path: &Path) -> String {
+    let raw = path.display().to_string();
+    if raw
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':'))
+    {
+        return raw;
+    }
+    format!("'{}'", raw.replace('\'', "'\"'\"'"))
 }
 
 fn project_dependency_resolved_origin_kind(
