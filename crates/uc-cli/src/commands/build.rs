@@ -729,24 +729,22 @@ pub(crate) fn build_plan_report_from_args(args: &BuildArgs) -> Result<BuildPlanR
 
             let subprocess_command =
                 if matches!(execution_driver, BuildPlanExecutionDriver::ExternalHelper) {
-                    native_toolchain
+                    let helper_path = native_toolchain
                         .as_ref()
                         .and_then(|toolchain| toolchain.binary_path.as_deref())
                         .map(PathBuf::from)
-                        .map(|helper_path| {
-                            let helper_display = helper_path.display().to_string();
-                            let (_command, command_vec) = build_uc_build_command(
-                                &helper_path,
-                                &args.common,
-                                &manifest_path,
-                                EngineArg::Uc,
-                                args.daemon_mode,
-                                None,
-                                Some(&helper_display),
-                            )
-                            .expect("external helper build plan command should be constructible");
-                            command_vec
-                        })
+                        .context("external helper build plan missing helper binary path")?;
+                    let helper_display = helper_path.display().to_string();
+                    let (_command, command_vec) = build_uc_build_command(
+                        &helper_path,
+                        &args.common,
+                        &manifest_path,
+                        EngineArg::Uc,
+                        args.daemon_mode,
+                        None,
+                        Some(&helper_display),
+                    )?;
+                    Some(command_vec)
                 } else {
                     None
                 };
