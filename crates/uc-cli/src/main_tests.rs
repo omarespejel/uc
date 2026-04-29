@@ -607,6 +607,87 @@ fn resolve_cli_accepts_locked_json_and_report_path() {
 }
 
 #[test]
+fn fetch_cli_accepts_locked_offline_json_and_report_path() {
+    let cli = Cli::try_parse_from([
+        "uc",
+        "fetch",
+        "--locked",
+        "--offline",
+        "--manifest-path",
+        "/tmp/workspace/Scarb.toml",
+        "--format",
+        "json",
+        "--report-path",
+        "/tmp/fetch.json",
+    ])
+    .expect("fetch args should parse");
+    let Commands::Fetch(args) = cli.command else {
+        panic!("expected fetch command");
+    };
+    assert!(args.locked);
+    assert!(args.offline);
+    assert_eq!(
+        args.manifest_path,
+        Some(PathBuf::from("/tmp/workspace/Scarb.toml"))
+    );
+    assert_eq!(args.format, FetchFormatArg::Json);
+    assert_eq!(args.report_path, Some(PathBuf::from("/tmp/fetch.json")));
+}
+
+#[test]
+fn cache_status_cli_accepts_json_and_report_path() {
+    let cli = Cli::try_parse_from([
+        "uc",
+        "cache",
+        "status",
+        "--format",
+        "json",
+        "--report-path",
+        "/tmp/cache-status.json",
+    ])
+    .expect("cache status args should parse");
+    let Commands::Cache(args) = cli.command else {
+        panic!("expected cache command");
+    };
+    let CacheCommand::Status(args) = args.command else {
+        panic!("expected cache status subcommand");
+    };
+    assert_eq!(args.format, CacheFormatArg::Json);
+    assert_eq!(
+        args.report_path,
+        Some(PathBuf::from("/tmp/cache-status.json"))
+    );
+}
+
+#[test]
+fn cache_prune_cli_accepts_max_bytes_and_report_path() {
+    let cli = Cli::try_parse_from([
+        "uc",
+        "cache",
+        "prune",
+        "--max-bytes",
+        "1234",
+        "--format",
+        "json",
+        "--report-path",
+        "/tmp/cache-prune.json",
+    ])
+    .expect("cache prune args should parse");
+    let Commands::Cache(args) = cli.command else {
+        panic!("expected cache command");
+    };
+    let CacheCommand::Prune(args) = args.command else {
+        panic!("expected cache prune subcommand");
+    };
+    assert_eq!(args.max_bytes, Some(1234));
+    assert_eq!(args.format, CacheFormatArg::Json);
+    assert_eq!(
+        args.report_path,
+        Some(PathBuf::from("/tmp/cache-prune.json"))
+    );
+}
+
+#[test]
 fn required_agent_arrays_serialize_when_empty() {
     let diagnostic = NativeDiagnostic {
         schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
@@ -667,6 +748,18 @@ fn report_schemas_match_nullable_option_output() {
         "../../../docs/agent/schemas/resolve-report.schema.json"
     ))
     .expect("resolve report schema should parse");
+    let fetch_schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../docs/agent/schemas/fetch-report.schema.json"
+    ))
+    .expect("fetch report schema should parse");
+    let cache_status_schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../docs/agent/schemas/source-store-status-report.schema.json"
+    ))
+    .expect("source-store status schema should parse");
+    let cache_prune_schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../docs/agent/schemas/source-store-prune-report.schema.json"
+    ))
+    .expect("source-store prune schema should parse");
     assert_eq!(
         replay_schema["properties"]["manifest_path"]["type"],
         serde_json::json!(["string", "null"])
@@ -766,6 +859,26 @@ fn report_schemas_match_nullable_option_output() {
     );
     assert_eq!(
         resolve_schema["properties"]["log_path"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    assert_eq!(
+        fetch_schema["properties"]["artifact_path"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    assert_eq!(
+        fetch_schema["properties"]["log_path"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    assert_eq!(
+        fetch_schema["properties"]["blocked_reason"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    assert_eq!(
+        cache_status_schema["properties"]["root"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    assert_eq!(
+        cache_prune_schema["properties"]["root"]["type"],
         serde_json::json!(["string", "null"])
     );
 }
@@ -967,6 +1080,85 @@ fn resolve_report_from_args_marks_missing_manifest_build_blocked() {
         report.blocked_reason.as_deref(),
         Some("manifest_path_resolution_failed")
     );
+}
+
+#[test]
+fn fetch_report_from_args_marks_missing_manifest_build_blocked() {
+    let dir = unique_test_dir("uc-fetch-report-missing-manifest");
+    let _cleanup = TestDirCleanup::new(&dir);
+    let missing_manifest = dir.join("missing").join("Scarb.toml");
+    let report = fetch_report_from_args(&FetchArgs {
+        manifest_path: Some(missing_manifest.clone()),
+        locked: true,
+        offline: true,
+        format: FetchFormatArg::Json,
+        json: false,
+        report_path: None,
+    })
+    .expect("missing manifest should still produce a structured fetch report");
+    assert_eq!(report.status, FetchStatus::BuildBlocked);
+    assert_eq!(report.manifest_path, missing_manifest.display().to_string());
+    assert_eq!(report.mode, "locked");
+    assert_eq!(report.network_intent, ResolveNetworkIntent::Forbidden);
+    assert_eq!(
+        report.lockfile_sync.status,
+        ResolveLockfileSyncStatus::ManifestInvalid
+    );
+    assert!(report.retryable);
+    assert!(!report.fallback_used);
+    assert!(report.expected.is_some());
+    assert!(report.found.is_some());
+    assert!(report.artifact_path.is_none());
+    assert!(report.log_path.is_none());
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "UCN1100"),
+        "fetch should surface manifest resolution diagnostics: {report:#?}"
+    );
+    assert_eq!(
+        report.blocked_reason.as_deref(),
+        Some("manifest_path_resolution_failed")
+    );
+}
+
+#[test]
+fn fetch_report_from_manifest_path_is_ready_for_local_only_project_with_exact_toolchain_pin() {
+    let guard = integration_env_lock()
+        .lock()
+        .expect("integration env lock should succeed");
+    let _scarb_version = ScopedEnvVar::set_with_lock(
+        &guard,
+        "UC_SCARB_VERSION_LINE",
+        "scarb 2.14.0 (cafe123 2026-04-01)",
+    );
+    let dir = unique_test_dir("uc-fetch-local-only-ready");
+    let _cleanup = TestDirCleanup::new(&dir);
+    let manifest_path = dir.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+cairo-version = "2.16.0"
+"#,
+    )
+    .expect("write manifest");
+
+    let report =
+        fetch_report_from_manifest_path(&manifest_path, true).expect("fetch should succeed");
+    assert_eq!(report.status, FetchStatus::Ready);
+    assert!(report.blocked_reason.is_none());
+    assert_eq!(report.execution_driver, FetchExecutionDriver::UcLocal);
+    assert_eq!(
+        report.offline_readiness_after.status,
+        ProjectOfflineReadinessStatus::Ready
+    );
+    assert!(report.offline_readiness_after.cache_state_known);
+    assert!(report.fetched_entries.is_empty());
+    assert!(report.missing_entries.is_empty());
 }
 
 #[test]
@@ -1209,6 +1401,206 @@ fn resolve_offline_readiness_ready_is_not_blocking() {
     assert!(resolve_offline_readiness_is_blocking(
         ProjectOfflineReadinessStatus::Blocked
     ));
+}
+
+#[test]
+fn materialize_fetch_entries_into_source_store_imports_remote_and_reports_missing_locked_entries() {
+    let workspace = unique_test_dir("uc-fetch-materialize");
+    let _cleanup = TestDirCleanup::new(&workspace);
+    let source_store_root = workspace.join("source-store");
+    let remote_pkg_root = workspace.join("remote").join("openzeppelin-3.0.0");
+    fs::create_dir_all(remote_pkg_root.join("src")).expect("create remote package tree");
+    fs::write(
+        remote_pkg_root.join("Scarb.toml"),
+        "[package]\nname = \"openzeppelin\"\nversion = \"3.0.0\"\n",
+    )
+    .expect("write remote manifest");
+    fs::write(remote_pkg_root.join("src/lib.cairo"), "fn main() {}\n")
+        .expect("write remote source");
+
+    let manifest_path = workspace.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n",
+    )
+    .expect("write root manifest");
+
+    let inspect = ProjectInspectReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        generated_at_epoch_ms: 1,
+        manifest_path: manifest_path.display().to_string(),
+        workspace_root: workspace.display().to_string(),
+        readonly: true,
+        mutation_status: "none".to_string(),
+        manifest: ProjectManifestSummary {
+            valid: true,
+            size_bytes: 0,
+            hash: None,
+        },
+        package: ProjectPackageSummary {
+            name: Some("demo".to_string()),
+            version: Some("0.1.0".to_string()),
+            edition: Some("2024_07".to_string()),
+            cairo_version: None,
+        },
+        packages: vec![ProjectInspectPackageSummary {
+            manifest_path: manifest_path.display().to_string(),
+            package_root: workspace.display().to_string(),
+            role: ProjectInspectPackageRole::InspectedManifest,
+            name: Some("demo".to_string()),
+            version: Some("0.1.0".to_string()),
+            edition: Some("2024_07".to_string()),
+            cairo_version: None,
+        }],
+        workspace: ProjectWorkspaceSummary {
+            has_workspace_table: false,
+            members: Vec::new(),
+            exclude: Vec::new(),
+        },
+        profiles: ProjectProfilesSummary::default(),
+        targets: Vec::new(),
+        dependencies: Vec::new(),
+        source_origins: Vec::new(),
+        lockfile: ProjectLockfileSummary {
+            present: true,
+            path: Some(workspace.join("Scarb.lock").display().to_string()),
+            valid: true,
+            version: Some("1".to_string()),
+            size_bytes: None,
+            modified_unix_ms: None,
+            hash: None,
+            packages: vec![
+                ProjectLockfilePackageSummary {
+                    name: "openzeppelin".to_string(),
+                    version: Some("3.0.0".to_string()),
+                    source: Some("registry+https://example.invalid".to_string()),
+                    dependencies_count: 0,
+                },
+                ProjectLockfilePackageSummary {
+                    name: "missing_dep".to_string(),
+                    version: Some("1.2.3".to_string()),
+                    source: Some("registry+https://example.invalid".to_string()),
+                    dependencies_count: 0,
+                },
+            ],
+        },
+        offline_readiness: ProjectOfflineReadinessSummary {
+            status: ProjectOfflineReadinessStatus::Unverified,
+            readonly_native_source: true,
+            lockfile_present: true,
+            lockfile_valid: true,
+            remote_dependency_count: 2,
+            path_dependency_count: 0,
+            workspace_dependency_count: 0,
+            cache_state_known: false,
+            reasons: vec!["cache_state_unknown".to_string()],
+        },
+        toolchain: ProjectToolchainSummary {
+            edition: Some("2024_07".to_string()),
+            requested_version: None,
+            requested_major_minor: None,
+            request_source: None,
+            native_status: ProjectNativeSupportStatus::Unavailable,
+            native_supported: false,
+            fallback_used: false,
+        },
+        native_support: None,
+        diagnostics: Vec::new(),
+    };
+
+    let metadata = ScarbMetadataDocument {
+        packages: vec![ScarbMetadataPackage {
+            id: "openzeppelin 3.0.0".to_string(),
+            name: Some("openzeppelin".to_string()),
+            version: Some("3.0.0".to_string()),
+            manifest_path: remote_pkg_root.join("Scarb.toml").display().to_string(),
+        }],
+    };
+
+    let materialized =
+        materialize_fetch_entries_into_source_store(&inspect, &metadata, &source_store_root)
+            .expect("materialization should succeed");
+
+    assert_eq!(materialized.imported_count, 1);
+    assert_eq!(materialized.cache_hit_count, 0);
+    assert_eq!(materialized.fetched_entries.len(), 1);
+    assert_eq!(
+        materialized.fetched_entries[0].status,
+        FetchEntryStatus::Imported
+    );
+    assert_eq!(materialized.missing_entries.len(), 1);
+    assert_eq!(materialized.missing_entries[0].name, "missing_dep");
+
+    let key = source_store_entry_key(
+        "openzeppelin",
+        Some("3.0.0"),
+        Some("registry+https://example.invalid"),
+    );
+    let stored_source =
+        source_store_entry_source_path(&source_store_entry_dir(&source_store_root, &key));
+    assert!(stored_source.join("Scarb.toml").is_file());
+    assert!(stored_source.join("src/lib.cairo").is_file());
+}
+
+#[test]
+fn source_store_prune_report_removes_oldest_entries_over_budget() {
+    let guard = integration_env_lock()
+        .lock()
+        .expect("integration env lock should succeed");
+    let store_root = unique_test_dir("uc-source-store-prune");
+    let _cleanup = TestDirCleanup::new(&store_root);
+    let source_a = store_root.join("sources/a");
+    let source_b = store_root.join("sources/b");
+    fs::create_dir_all(&source_a).expect("create source a");
+    fs::create_dir_all(&source_b).expect("create source b");
+    fs::write(source_a.join("Scarb.toml"), "[package]\nname = \"a\"\n").expect("write a manifest");
+    fs::write(source_a.join("lib.cairo"), "aaaa").expect("write a source");
+    fs::write(source_b.join("Scarb.toml"), "[package]\nname = \"b\"\n").expect("write b manifest");
+    fs::write(source_b.join("lib.cairo"), "bbbbbbbbbbbbbbbb").expect("write b source");
+
+    let _store_env = ScopedEnvVar::set_with_lock(&guard, "UC_SOURCE_STORE_DIR", &store_root);
+    materialize_source_store_entry(
+        &source_store_entry_dir(&store_root, "entry-a"),
+        "entry-a",
+        "a",
+        Some("1.0.0"),
+        Some("registry+https://example.invalid"),
+        "registry",
+        Some(&source_a.join("Scarb.toml")),
+        &source_a,
+    )
+    .expect("materialize entry a");
+    materialize_source_store_entry(
+        &source_store_entry_dir(&store_root, "entry-b"),
+        "entry-b",
+        "b",
+        Some("1.0.0"),
+        Some("registry+https://example.invalid"),
+        "registry",
+        Some(&source_b.join("Scarb.toml")),
+        &source_b,
+    )
+    .expect("materialize entry b");
+
+    let entry_a_metadata =
+        source_store_entry_metadata_path(&source_store_entry_dir(&store_root, "entry-a"));
+    let mut entry_a: SourceStoreEntryFile =
+        serde_json::from_slice(&fs::read(&entry_a_metadata).expect("read entry a metadata"))
+            .expect("decode entry a metadata");
+    entry_a.last_access_epoch_ms = 1;
+    fs::write(
+        &entry_a_metadata,
+        serde_json::to_vec_pretty(&entry_a).expect("encode entry a metadata"),
+    )
+    .expect("write entry a metadata");
+
+    let before = fetch_source_store_scan(&store_root).expect("scan source store");
+    let report = source_store_prune_report(Some(before.total_bytes.saturating_sub(1)))
+        .expect("prune should succeed");
+    assert_eq!(report.removed_entry_count, 1);
+    assert!(report.removed_keys.iter().any(|key| key == "entry-a"));
+    let after = fetch_source_store_scan(&store_root).expect("scan source store after prune");
+    assert_eq!(after.entry_count, 1);
 }
 
 #[test]

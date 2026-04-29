@@ -20,8 +20,8 @@
 
 ## Milestone 3: Resolver, Fetch, and Toolchain Ownership (6 weeks)
 - Resolver read path landed: `uc resolve --locked` emits the lockfile-first report surface.
-- Next: source-fetch fast path (bounded concurrency, explicit store state, no implicit network in locked flows).
-- Shared source store with status and prune/GC behavior.
+- Source-fetch fast path landed: `uc fetch --locked` materializes locked package roots into the shared source store with explicit driver/network reporting.
+- Shared source store now exposes status and prune behavior.
 - Toolchain/helper-lane ensure path with explicit policy controls.
 - Metadata can be served from the project model behind `UC_METADATA_SOURCE=project-model`; see `docs/PROJECT_MODEL_STRATEGY.md`.
 

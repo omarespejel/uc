@@ -70,6 +70,31 @@ requires it as a nullable field and `uc` uses it as the authoritative blocked
 cause. Do not infer locked-resolve safety from diagnostics, lockfile prose, or
 terminal output.
 
+## Fetch
+
+```sh
+uc fetch --locked --manifest-path /abs/path/to/Scarb.toml --format json
+```
+
+Read:
+
+- `.status`
+- `.network_intent`
+- `.execution_driver`
+- `.source_store.entry_count`
+- `.source_store.total_bytes`
+- `.offline_readiness_before.status`
+- `.offline_readiness_after.status`
+- `.fetched_entries[].status`
+- `.missing_entries[].name`
+- `.blocked_reason`
+- `.diagnostics[].code`
+
+If `.status == "build_blocked"`, stop before build and fix the blocked fetch
+state first. Use `.missing_entries` and `.source_store` directly instead of
+guessing from terminal output whether the local dependency graph is actually
+hydrated.
+
 ## Build Plan
 
 ```sh

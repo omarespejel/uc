@@ -4,7 +4,7 @@ This document is the stable contract for machine-readable `uc` diagnostics. Huma
 
 ## Contract
 
-Every agent-facing diagnostic emitted by `uc project inspect --format json`, `uc support native --format json`, `uc resolve --locked --format json`, `uc build --plan-only --json`, `uc build --json`, or a build report must include:
+Every agent-facing diagnostic emitted by `uc project inspect --format json`, `uc support native --format json`, `uc resolve --locked --format json`, `uc fetch --locked --format json`, `uc build --plan-only --json`, `uc build --json`, or a build report must include:
 
 - `schema_version`: integer schema version. Current version: `1`.
 - `code`: stable diagnostic code such as `UCN1004`.
@@ -201,6 +201,38 @@ Daemon backend downgraded to Scarb.
 - Category: `native_fallback_daemon_backend_downgrade`
 - Safe action: `inspect_native_support_then_retry`
 - Agent behavior: inspect daemon fallback hints and support JSON before rerunning the daemon path.
+
+### UCF1001
+
+Scarb fetch failed while `uc fetch` was hydrating the locked dependency graph.
+
+- Category: `fetch_driver`
+- Safe action: `manual_fetch_fix_required`
+- Agent behavior: fix registry/git/auth/network access first; do not treat the source store as hydrated.
+
+### UCF1002
+
+Offline metadata replay failed after fetch.
+
+- Category: `metadata_after_fetch`
+- Safe action: `manual_fetch_fix_required`
+- Agent behavior: the locked graph is not yet reproducible from local state alone; inspect `Scarb.lock` and retry online fetch before proceeding offline.
+
+### UCF1003
+
+Fetched metadata JSON could not be decoded.
+
+- Category: `metadata_decode`
+- Safe action: `manual_fetch_fix_required`
+- Agent behavior: inspect raw `scarb metadata` output and treat the dependency graph as unreadable until the metadata surface is stable again.
+
+### UCF1004
+
+Some locked package sources are still missing after fetch.
+
+- Category: `source_store_hydration`
+- Safe action: `manual_fetch_fix_required`
+- Agent behavior: inspect the `missing_entries` list, verify local cache state, and do not claim the project is offline-ready yet.
 
 ## Agent Policy
 
