@@ -248,6 +248,7 @@ jq -n \
   --slurpfile rerun "$rerun_json" \
   --argjson expected_runs "$RUNS" \
   --argjson expected_cold_runs "$COLD_RUNS" \
+  --argjson expected_warm_settle_seconds "$WARM_SETTLE_SECONDS" \
   --arg generated_at "$generated_at" \
   --arg source_benchmark_json "$SOURCE_BENCHMARK_JSON" \
   --arg rerun_benchmark_json "$rerun_json" \
@@ -263,7 +264,10 @@ jq -n \
   def sorted_case_set:
     map({manifest_path, tag}) | sort_by(.manifest_path, .tag);
   def safe_claim($selected_count):
-    (.summary.support_matrix.native_supported == $selected_count)
+    (.runs == $expected_runs)
+    and (.cold_runs == $expected_cold_runs)
+    and (.warm_settle_seconds == $expected_warm_settle_seconds)
+    and (.summary.support_matrix.native_supported == $selected_count)
     and (.summary.support_matrix.native_unsupported == 0)
     and (.summary.support_matrix.fallback_used == 0)
     and (.summary.support_matrix.build_failed == 0)
@@ -273,6 +277,12 @@ jq -n \
   def guard_reason($selected_count):
     if $selected_count == 0 then
       "no native-supported cases were selected"
+    elif .runs != $expected_runs then
+      "runs changed in rerun"
+    elif .cold_runs != $expected_cold_runs then
+      "cold_runs changed in rerun"
+    elif .warm_settle_seconds != $expected_warm_settle_seconds then
+      "warm_settle_seconds changed in rerun"
     elif ((.cases | sorted_case_set) != ($selected_cases[0] | sorted_case_set)) then
       "rerun case set did not match the selected native_supported source cases"
     elif .summary.support_matrix.native_supported != $selected_count then
@@ -301,12 +311,14 @@ jq -n \
         selected_case_count: $selected_case_count,
         runs: $expected_runs,
         cold_runs: $expected_cold_runs,
+        warm_settle_seconds: $expected_warm_settle_seconds,
         unstable_lane_count: 0,
         benchmark_status: "ok"
       },
       found: {
         runs: .runs,
         cold_runs: .cold_runs,
+        warm_settle_seconds: .warm_settle_seconds,
         support_matrix: .summary.support_matrix,
         unstable_lane_count: (.summary.unstable_lane_count // 0),
         benchmark_statuses: [.cases[].benchmark_status]

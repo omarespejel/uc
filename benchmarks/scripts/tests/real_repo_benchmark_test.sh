@@ -1128,6 +1128,118 @@ SH
   fi
 }
 
+test_strict_supported_set_claim_guard_rejects_methodology_drift() {
+  local cases_root="$TEST_TMP_DIR/strict-methodology-cases"
+  local mock_bin_dir="$TEST_TMP_DIR/strict-methodology-mock-bin"
+  local mock_uc="$mock_bin_dir/uc"
+  local mock_scarb="$mock_bin_dir/scarb"
+  local results_dir="$TEST_TMP_DIR/strict-methodology-results"
+  local source_bench_json="$TEST_TMP_DIR/strict-methodology-source.json"
+  local fake_rerun_dir="$TEST_TMP_DIR/strict-methodology-fake"
+  local fake_rerun_script="$fake_rerun_dir/fake-rerun.sh"
+  local rerun_json="$fake_rerun_dir/rerun.json"
+  local rerun_md="$fake_rerun_dir/rerun.md"
+  mkdir -p "$mock_bin_dir" "$results_dir" "$fake_rerun_dir"
+  write_mock_uc_bin "$mock_uc"
+  write_mock_scarb_bin "$mock_scarb"
+  write_manifest_case "$cases_root" "strict-supported"
+
+  cat > "$source_bench_json" <<JSON
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "tag": "strict-supported",
+      "manifest_path": "$cases_root/strict-supported/Scarb.toml",
+      "support_matrix": { "classification": "native_supported" }
+    }
+  ]
+}
+JSON
+
+  cat > "$rerun_json" <<JSON
+{
+  "schema_version": 1,
+  "runs": 2,
+  "cold_runs": 1,
+  "warm_settle_seconds": 0,
+  "summary": {
+    "support_matrix": {
+      "native_supported": 1,
+      "native_unsupported": 0,
+      "fallback_used": 0,
+      "build_failed": 0
+    },
+    "unstable_lane_count": 0
+  },
+  "cases": [
+    {
+      "tag": "strict-supported",
+      "manifest_path": "$cases_root/strict-supported/Scarb.toml",
+      "benchmark_status": "ok"
+    }
+  ]
+}
+JSON
+  cat > "$rerun_md" <<'MD'
+# strict methodology rerun
+MD
+  cat > "$fake_rerun_script" <<SH
+#!/usr/bin/env bash
+set -euo pipefail
+echo "Benchmark JSON: $rerun_json"
+echo "Benchmark Markdown: $rerun_md"
+SH
+  chmod +x "$fake_rerun_script"
+
+  local stdout_text
+  stdout_text="$(
+    PATH="$mock_bin_dir:$PATH" \
+    REAL_REPO_BENCH_SCRIPT="$fake_rerun_script" \
+    MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/strict-methodology-uc.args" \
+    MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/strict-methodology-scarb.args" \
+    "$STRICT_BENCH_SCRIPT" \
+      --benchmark-json "$source_bench_json" \
+      --uc-bin "$mock_uc" \
+      --results-dir "$results_dir" \
+      --runs 1 \
+      --cold-runs 1 \
+      --warm-settle-seconds 0 \
+      --stamp strict-methodology
+  )"
+
+  local strict_json
+  strict_json="$(awk -F': ' '/Strict benchmark JSON:/ {print $2}' <<<"$stdout_text")"
+  if [[ ! -f "$strict_json" ]]; then
+    echo "expected strict methodology artifact to exist" >&2
+    echo "$stdout_text" >&2
+    return 1
+  fi
+
+  local safe_claim
+  local reason
+  local expected_runs
+  local found_runs
+  local expected_warm
+  local found_warm
+  safe_claim="$(jq -r '.claim_guard.safe_to_say_native_supported_speed_claim' "$strict_json")"
+  reason="$(jq -r '.claim_guard.reason' "$strict_json")"
+  expected_runs="$(jq -r '.expected.runs' "$strict_json")"
+  found_runs="$(jq -r '.found.runs' "$strict_json")"
+  expected_warm="$(jq -r '.expected.warm_settle_seconds' "$strict_json")"
+  found_warm="$(jq -r '.found.warm_settle_seconds' "$strict_json")"
+  if [[ "$safe_claim" != "false" || "$reason" != "runs changed in rerun" ]]; then
+    echo "expected methodology drift to block the strict claim" >&2
+    cat "$strict_json" >&2
+    return 1
+  fi
+  if [[ "$expected_runs" != "1" || "$found_runs" != "2" || "$expected_warm" != "0" || "$found_warm" != "0" ]]; then
+    echo "expected strict artifact to record expected vs found methodology values" >&2
+    cat "$strict_json" >&2
+    return 1
+  fi
+}
+
 run_test "real_repo_benchmark_rejects_missing_case_values" \
   test_real_repo_benchmark_rejects_missing_case_values
 run_test "real_repo_benchmark_rejects_zero_runs_from_environment" \
@@ -1164,3 +1276,5 @@ run_test "strict_supported_set_rejects_unsupported_source_schema" \
   test_strict_supported_set_rejects_unsupported_source_schema
 run_test "strict_supported_set_rejects_unsupported_rerun_schema" \
   test_strict_supported_set_rejects_unsupported_rerun_schema
+run_test "strict_supported_set_claim_guard_rejects_methodology_drift" \
+  test_strict_supported_set_claim_guard_rejects_methodology_drift
