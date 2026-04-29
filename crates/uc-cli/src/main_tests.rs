@@ -1089,6 +1089,39 @@ source = "registry+https://example.com"
 }
 
 #[test]
+fn resolve_report_from_manifest_path_marks_lockfile_invalid_build_blocked() {
+    let dir = unique_test_dir("uc-resolve-report-invalid-lockfile");
+    let _cleanup = TestDirCleanup::new(&dir);
+    let manifest_path = dir.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+cairo-version = "2.14.0"
+
+[dependencies]
+starknet = "2.14.0"
+"#,
+    )
+    .expect("write manifest");
+    fs::write(dir.join("Scarb.lock"), "not valid toml = [").expect("write invalid lockfile");
+
+    let report = resolve_report_from_manifest_path(&manifest_path)
+        .expect("invalid lockfile should still produce a resolve report");
+    assert_eq!(report.status, ResolveStatus::BuildBlocked);
+    assert_eq!(
+        report.lockfile_sync.status,
+        ResolveLockfileSyncStatus::LockfileInvalid
+    );
+    assert_eq!(
+        report.blocked_reason.as_deref(),
+        Some("lockfile_invalid_for_locked_resolve")
+    );
+}
+
+#[test]
 fn resolve_report_from_manifest_path_marks_workspace_remote_missing_lockfile_blocked() {
     let dir = unique_test_dir("uc-resolve-report-workspace-remote-missing-lockfile");
     let _cleanup = TestDirCleanup::new(&dir);
@@ -1127,6 +1160,35 @@ git_dep = { workspace = true }
     assert_eq!(
         report.lockfile_sync.missing_dependencies,
         vec!["git_dep".to_string()]
+    );
+}
+
+#[test]
+fn resolve_lockfile_sync_summary_treats_unknown_source_origins_as_remote() {
+    let source_origins = vec![ProjectSourceOriginSummary {
+        dependency: "workspace_dep".to_string(),
+        section: "dependencies".to_string(),
+        kind: "unknown".to_string(),
+        locator: "workspace".to_string(),
+        workspace_inherited: true,
+        locked: false,
+    }];
+    let lockfile = ProjectLockfileSummary {
+        present: false,
+        path: None,
+        valid: false,
+        version: None,
+        size_bytes: None,
+        modified_unix_ms: None,
+        hash: None,
+        packages: Vec::new(),
+    };
+
+    let summary = resolve_lockfile_sync_summary(true, &source_origins, &lockfile);
+    assert_eq!(summary.status, ResolveLockfileSyncStatus::LockfileMissing);
+    assert_eq!(
+        summary.missing_dependencies,
+        vec!["workspace_dep".to_string()]
     );
 }
 

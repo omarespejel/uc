@@ -43,14 +43,55 @@
     "mode": { "const": "locked" },
     "status": { "enum": ["ready", "build_blocked"] },
     "network_intent": { "enum": ["allowed", "forbidden"] },
-    "package": { "type": "object" },
+    "package": {
+      "type": "object",
+      "properties": {
+        "name": { "type": ["string", "null"] },
+        "version": { "type": ["string", "null"] },
+        "edition": { "type": ["string", "null"] },
+        "cairo_version": { "type": ["string", "null"] }
+      }
+    },
     "dependencies": {
       "type": "array",
-      "items": { "type": "object" }
+      "items": {
+        "type": "object",
+        "properties": {
+          "section": { "type": "string" },
+          "name": { "type": "string" },
+          "kind": { "type": "string" },
+          "version": { "type": ["string", "null"] },
+          "path": { "type": ["string", "null"] },
+          "git": { "type": ["string", "null"] },
+          "branch": { "type": ["string", "null"] },
+          "tag": { "type": ["string", "null"] },
+          "rev": { "type": ["string", "null"] },
+          "workspace": { "type": "boolean" }
+        },
+        "required": ["section", "name", "kind", "workspace"]
+      }
     },
     "source_origins": {
       "type": "array",
-      "items": { "type": "object" }
+      "items": {
+        "type": "object",
+        "properties": {
+          "dependency": { "type": "string" },
+          "section": { "type": "string" },
+          "kind": { "type": "string" },
+          "locator": { "type": "string" },
+          "workspace_inherited": { "type": "boolean" },
+          "locked": { "type": "boolean" }
+        },
+        "required": [
+          "dependency",
+          "section",
+          "kind",
+          "locator",
+          "workspace_inherited",
+          "locked"
+        ]
+      }
     },
     "lockfile": {
       "type": "object",
@@ -64,7 +105,16 @@
         "hash": { "type": ["string", "null"] },
         "packages": {
           "type": "array",
-          "items": { "type": "object" }
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "version": { "type": ["string", "null"] },
+              "source": { "type": ["string", "null"] },
+              "dependencies_count": { "type": "integer" }
+            },
+            "required": ["name", "version", "source", "dependencies_count"]
+          }
         }
       }
     },
