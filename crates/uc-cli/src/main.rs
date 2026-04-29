@@ -3993,7 +3993,12 @@ fn resolve_lockfile_sync_summary(
 
     let remote_dependencies = source_origins
         .iter()
-        .filter(|origin| matches!(origin.kind.as_str(), "git" | "version" | "table"))
+        .filter(|origin| {
+            matches!(
+                origin.kind.as_str(),
+                "git" | "version" | "table" | "unknown"
+            )
+        })
         .map(|origin| origin.dependency.as_str())
         .collect::<BTreeSet<_>>();
 
@@ -4021,7 +4026,12 @@ fn resolve_lockfile_sync_summary(
 
     let mut missing_dependencies = source_origins
         .iter()
-        .filter(|origin| matches!(origin.kind.as_str(), "git" | "version" | "table"))
+        .filter(|origin| {
+            matches!(
+                origin.kind.as_str(),
+                "git" | "version" | "table" | "unknown"
+            )
+        })
         .filter(|origin| !origin.locked)
         .map(|origin| origin.dependency.clone())
         .collect::<Vec<_>>();
