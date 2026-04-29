@@ -10448,11 +10448,19 @@ fn ensure_daemon_native_toolchain_request_supported(manifest_path: &Path) -> Res
     match selection {
         Ok(selection) => {
             if let Some(helper_path) = selection.helper_path {
+                let current_exe_matches_helper = std::env::current_exe()
+                    .ok()
+                    .and_then(|path| path.canonicalize().ok())
+                    .zip(helper_path.canonicalize().ok())
+                    .is_some_and(|(current_exe, helper)| current_exe == helper);
+                if current_exe_matches_helper {
+                    return Ok(());
+                }
                 let message = format!(
                     concat!(
                         "daemon native build requires external native toolchain helper {}; ",
-                        "daemon requests cannot safely carry helper metadata yet; ",
-                        "run with --daemon-mode off or allow scarb fallback"
+                        "daemon requests must run on the matching helper daemon binary; ",
+                        "run the helper with its scoped daemon socket or allow scarb fallback"
                     ),
                     helper_path.display()
                 );
@@ -18296,7 +18304,7 @@ fn build_uc_build_command(
     daemon_mode: DaemonModeArg,
     report_path: Option<&Path>,
     helper_path_override: Option<&str>,
-) -> (Command, Vec<String>) {
+) -> Result<(Command, Vec<String>)> {
     let mut command = Command::new(exe);
     let mut command_vec = vec![exe.display().to_string(), "build".to_string()];
 
@@ -18368,9 +18376,11 @@ fn build_uc_build_command(
     if let Some(path) = helper_path_override {
         command.env("UC_NATIVE_TOOLCHAIN_HELPER_ACTIVE", "1");
         command.env("UC_NATIVE_TOOLCHAIN_HELPER_PATH", path);
+        let helper_socket_path = daemon_socket_path_for_external_helper(Path::new(path))?;
+        command.env("UC_DAEMON_SOCKET_PATH", &helper_socket_path);
     }
 
-    (command, command_vec)
+    Ok((command, command_vec))
 }
 
 fn run_uc_build_subprocess(
@@ -18387,7 +18397,7 @@ fn run_uc_build_subprocess(
         DaemonModeArg::Off,
         None,
         None,
-    );
+    )?;
     run_command_capture(command, command_vec)
 }
 

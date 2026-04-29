@@ -11,6 +11,22 @@ pub(super) fn daemon_socket_path(override_path: Option<PathBuf>) -> Result<PathB
     Ok(PathBuf::from(home).join(".uc/daemon/uc.sock"))
 }
 
+pub(super) fn daemon_socket_path_for_external_helper(helper_path: &Path) -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").context("HOME is not set; provide --socket-path")?;
+    let helper_canonical = helper_path.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize helper path {}",
+            helper_path.display()
+        )
+    })?;
+    let helper_key = blake3::hash(helper_canonical.as_os_str().as_encoded_bytes())
+        .to_hex()
+        .to_string();
+    Ok(PathBuf::from(home)
+        .join(".uc/daemon/helpers")
+        .join(format!("{}.sock", &helper_key[..16])))
+}
+
 pub(super) fn daemon_log_path(socket_path: &Path) -> PathBuf {
     socket_path.with_extension("log")
 }
