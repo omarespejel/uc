@@ -18,6 +18,12 @@ uc support native --manifest-path Scarb.toml
 uc support native --manifest-path Scarb.toml --format json | jq
 ```
 
+## Inspect Locked Resolve State
+
+```sh
+uc resolve --locked --manifest-path Scarb.toml --format json | jq
+```
+
 ## Build With Native First
 
 ```sh

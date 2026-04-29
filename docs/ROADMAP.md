@@ -19,7 +19,8 @@
 - Add `check`, `test`, `lint`, `metadata` on `uc` core path as the project model/parity gates allow.
 
 ## Milestone 3: Resolver, Fetch, and Toolchain Ownership (6 weeks)
-- Resolver and source-fetch fast path (lockfile-first, bounded concurrency).
+- Resolver read path landed: `uc resolve --locked` emits the lockfile-first report surface.
+- Next: source-fetch fast path (bounded concurrency, explicit store state, no implicit network in locked flows).
 - Shared source store with status and prune/GC behavior.
 - Toolchain/helper-lane ensure path with explicit policy controls.
 - Metadata can be served from the project model behind `UC_METADATA_SOURCE=project-model`; see `docs/PROJECT_MODEL_STRATEGY.md`.
@@ -46,5 +47,5 @@
 - Phase 0: document the first-party project model contract.
 - Phase 1: add read-only `uc project inspect` with stable JSON.
 - Phase 2: compare project-model metadata against Scarb metadata on the support corpus.
-- Phase 3: expose resolver and source-cache reports keyed by lockfile content.
+- Phase 3: expose resolver and source-cache reports keyed by lockfile content, starting with `uc resolve --locked`.
 - Phase 4: expand one command at a time only after parity gates pass.

@@ -45,6 +45,28 @@ Read:
 - `.diagnostics[].next_commands`
 - `.diagnostics[].safe_automated_action`
 
+## Locked Resolve
+
+```sh
+uc resolve --locked --manifest-path /abs/path/to/Scarb.toml --format json
+```
+
+Read:
+
+- `.status`
+- `.mode`
+- `.network_intent`
+- `.lockfile.present`
+- `.lockfile.valid`
+- `.lockfile_sync.status`
+- `.lockfile_sync.missing_dependencies`
+- `.offline_readiness.status`
+- `.toolchain.requested_version`
+- `.diagnostics[].code`
+
+If `.status == "build_blocked"`, stop before fetch or build and fix the lockfile
+or manifest state first. Do not infer locked-resolve safety from terminal prose.
+
 ## Build Plan
 
 ```sh

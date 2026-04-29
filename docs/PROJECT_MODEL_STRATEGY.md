@@ -80,7 +80,15 @@ The gate can become default only after project-model metadata matches the compat
 
 ### Phase 3: Resolver And Source Cache
 
-Add deterministic, offline-aware resolver/source-cache reporting keyed by lockfile content.
+Implemented first slice: `uc resolve --locked` emits a deterministic, read-only
+resolver report keyed by the current manifest and lockfile view.
+
+Next hardening for this phase:
+
+- add lockfile drift fixtures from the reviewed corpus
+- extend the report with store/cache state once first-party fetch lands
+- keep `--locked` explicit until a separate policy-governed networked resolve
+  mode exists
 
 ### Phase 4: Command Surface Expansion
 

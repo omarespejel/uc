@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/omarespejel/uc/docs/agent/schemas/resolve-report.schema.json",
+  "title": "uc ResolveReport",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "generated_at_epoch_ms",
+    "manifest_path",
+    "workspace_root",
+    "readonly",
+    "mutation_status",
+    "mode",
+    "status",
+    "network_intent",
+    "package",
+    "dependencies",
+    "source_origins",
+    "lockfile",
+    "lockfile_sync",
+    "offline_readiness",
+    "toolchain",
+    "blocked_reason",
+    "diagnostics"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "generated_at_epoch_ms": { "type": "integer" },
+    "manifest_path": { "type": "string" },
+    "workspace_root": { "type": "string" },
+    "readonly": { "type": "boolean" },
+    "mutation_status": { "const": "none" },
+    "mode": { "const": "locked" },
+    "status": { "enum": ["ready", "build_blocked"] },
+    "network_intent": { "enum": ["allowed", "forbidden"] },
+    "package": { "type": "object" },
+    "dependencies": {
+      "type": "array",
+      "items": { "type": "object" }
+    },
+    "source_origins": {
+      "type": "array",
+      "items": { "type": "object" }
+    },
+    "lockfile": { "type": "object" },
+    "lockfile_sync": {
+      "type": "object",
+      "required": ["status", "missing_dependencies", "reasons"],
+      "properties": {
+        "status": {
+          "enum": [
+            "in_sync",
+            "lockfile_missing",
+            "lockfile_invalid",
+            "manifest_drift",
+            "manifest_invalid"
+          ]
+        },
+        "missing_dependencies": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "reasons": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "offline_readiness": { "type": "object" },
+    "toolchain": { "type": "object" },
+    "blocked_reason": { "type": ["string", "null"] },
+    "diagnostics": {
+      "type": "array",
+      "items": { "$ref": "native-diagnostic.schema.json" }
+    }
+  }
+}
