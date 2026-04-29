@@ -143,6 +143,30 @@ Native helper build failed during `uc toolchain ensure`.
 - Safe action: `rebuild_helper_lane`
 - Agent behavior: inspect helper-builder stderr, fix the helper lane build failure, and rerun `uc toolchain ensure`.
 
+### UCN1202
+
+Native helper builder could not be prepared during `uc toolchain ensure`.
+
+- Category: `toolchain_ensure`
+- Safe action: `manual_rebuild_required`
+- Agent behavior: verify the checked-in helper builder script path or set `UC_TOOLCHAIN_HELPER_BUILD_SCRIPT`, then rerun `uc toolchain ensure`.
+
+### UCN1203
+
+Native helper builder could not be executed during `uc toolchain ensure`.
+
+- Category: `toolchain_ensure`
+- Safe action: `rebuild_helper_lane`
+- Agent behavior: fix the helper builder execution environment or permissions, then rerun `uc toolchain ensure`.
+
+### UCN1204
+
+Native helper lane could not be revalidated after `uc toolchain ensure`.
+
+- Category: `toolchain_ensure`
+- Safe action: `rebuild_helper_lane`
+- Agent behavior: inspect the manifest and generated helper artifacts, restore any invalid manifest state, and rerun `uc toolchain ensure`.
+
 ### UCP1000
 
 Project manifest could not be read.

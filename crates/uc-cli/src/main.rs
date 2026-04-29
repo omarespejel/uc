@@ -4109,9 +4109,45 @@ fn toolchain_ensure_report_from_manifest_path(
                 ));
             }
             let (command, command_vec) =
-                build_toolchain_helper_command(&lane, output_path.as_deref())?;
+                match build_toolchain_helper_command(&lane, output_path.as_deref()) {
+                    Ok(command) => command,
+                    Err(err) => {
+                        tracing::warn!(
+                            manifest_path = %manifest_path.display(),
+                            lane,
+                            error = %err,
+                            "toolchain ensure could not prepare helper builder command"
+                        );
+                        return Ok(toolchain_ensure_builder_prepare_blocked_report(
+                            manifest_path,
+                            &replay_command,
+                            &requirement,
+                            &issue,
+                            &err,
+                        ));
+                    }
+                };
             let subprocess_commands = vec![command_vec.clone()];
-            let run = run_command_capture(command, command_vec)?;
+            let run = match run_command_capture(command, command_vec) {
+                Ok(run) => run,
+                Err(err) => {
+                    tracing::warn!(
+                        manifest_path = %manifest_path.display(),
+                        lane,
+                        command = ?subprocess_commands,
+                        error = %err,
+                        "toolchain ensure could not execute helper builder command"
+                    );
+                    return Ok(toolchain_ensure_builder_execution_blocked_report(
+                        manifest_path,
+                        &replay_command,
+                        &requirement,
+                        &issue,
+                        &err,
+                        subprocess_commands,
+                    ));
+                }
+            };
             if run.exit_code != 0 {
                 return Ok(toolchain_ensure_script_failure_report(
                     manifest_path,
@@ -4122,7 +4158,27 @@ fn toolchain_ensure_report_from_manifest_path(
                     subprocess_commands,
                 ));
             }
-            let (_, ensured_selection) = select_native_toolchain_from_manifest_path(manifest_path)?;
+            let (_, ensured_selection) =
+                match select_native_toolchain_from_manifest_path(manifest_path) {
+                    Ok(selection) => selection,
+                    Err(err) => {
+                        tracing::warn!(
+                            manifest_path = %manifest_path.display(),
+                            lane,
+                            command = ?subprocess_commands,
+                            error = %err,
+                            "toolchain ensure could not revalidate helper lane after build"
+                        );
+                        return Ok(toolchain_ensure_revalidation_blocked_report(
+                            manifest_path,
+                            &replay_command,
+                            &requirement,
+                            &issue,
+                            &err,
+                            subprocess_commands,
+                        ));
+                    }
+                };
             match ensured_selection {
                 Ok(selection) => Ok(ToolchainEnsureReport {
                     schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
@@ -4163,6 +4219,177 @@ fn toolchain_ensure_report_from_manifest_path(
                 )),
             }
         }
+    }
+}
+
+#[cfg(feature = "native-compile")]
+fn toolchain_ensure_builder_prepare_blocked_report(
+    manifest_path: &Path,
+    replay_command: &str,
+    requirement: &NativeToolchainRequirement,
+    issue: &NativeCompileSupportIssue,
+    err: &anyhow::Error,
+) -> ToolchainEnsureReport {
+    ToolchainEnsureReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        generated_at_epoch_ms: epoch_ms_u64().unwrap_or(0),
+        manifest_path: manifest_path.display().to_string(),
+        readonly: false,
+        mutation_status: "none".to_string(),
+        status: ToolchainEnsureStatus::BuildBlocked,
+        execution_driver: Some(ToolchainEnsureExecutionDriver::HelperBuilderScript),
+        toolchain: Some(native_toolchain_report_for_issue(requirement, issue)),
+        ensured_now: false,
+        expected: Some("helper builder script is available and can be prepared".to_string()),
+        found: Some(format!("{err:#}")),
+        what_happened: format!(
+            "uc could not prepare the helper builder needed to ensure the native toolchain for {}.",
+            manifest_path.display()
+        ),
+        why: format!("{err:#}"),
+        retryable: true,
+        fallback_used: false,
+        replay_command: replay_command.to_string(),
+        artifact_path: None,
+        log_path: None,
+        blocked_reason: Some("helper_builder_unavailable".to_string()),
+        subprocess_commands: Vec::new(),
+        diagnostics: vec![project_agent_diagnostic(
+            "UCN1202",
+            "toolchain_ensure",
+            NativeDiagnosticSeverity::Error,
+            "Native helper builder is unavailable",
+            format!(
+                "uc could not prepare the helper builder required to ensure the native toolchain for {}.",
+                manifest_path.display()
+            ),
+            format!("{err:#}"),
+            vec![
+                "Rerun from the uc checkout or set UC_TOOLCHAIN_HELPER_BUILD_SCRIPT to the checked-in helper builder script.".to_string(),
+                "Verify the helper builder script path exists and is readable.".to_string(),
+            ],
+            vec![replay_command.to_string()],
+            "manual_rebuild_required",
+            true,
+            false,
+            requirement.requested_version.clone(),
+            None,
+        )],
+    }
+}
+
+#[cfg(feature = "native-compile")]
+fn toolchain_ensure_builder_execution_blocked_report(
+    manifest_path: &Path,
+    replay_command: &str,
+    requirement: &NativeToolchainRequirement,
+    issue: &NativeCompileSupportIssue,
+    err: &anyhow::Error,
+    subprocess_commands: Vec<Vec<String>>,
+) -> ToolchainEnsureReport {
+    ToolchainEnsureReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        generated_at_epoch_ms: epoch_ms_u64().unwrap_or(0),
+        manifest_path: manifest_path.display().to_string(),
+        readonly: false,
+        mutation_status: "attempted".to_string(),
+        status: ToolchainEnsureStatus::BuildBlocked,
+        execution_driver: Some(ToolchainEnsureExecutionDriver::HelperBuilderScript),
+        toolchain: Some(native_toolchain_report_for_issue(requirement, issue)),
+        ensured_now: false,
+        expected: Some("helper builder command executes and yields a usable uc helper".to_string()),
+        found: Some(format!("{err:#}")),
+        what_happened: format!(
+            "uc prepared the helper builder for {}, but could not execute it successfully.",
+            manifest_path.display()
+        ),
+        why: format!("{err:#}"),
+        retryable: true,
+        fallback_used: false,
+        replay_command: replay_command.to_string(),
+        artifact_path: None,
+        log_path: None,
+        blocked_reason: Some("helper_builder_execution_failed".to_string()),
+        subprocess_commands,
+        diagnostics: vec![project_agent_diagnostic(
+            "UCN1203",
+            "toolchain_ensure",
+            NativeDiagnosticSeverity::Error,
+            "Native helper builder could not be executed",
+            format!(
+                "uc could not execute the helper builder required to ensure the native toolchain for {}.",
+                manifest_path.display()
+            ),
+            format!("{err:#}"),
+            vec![
+                "Fix the helper builder execution failure and rerun `uc toolchain ensure`.".to_string(),
+                "Check file permissions and the builder command environment.".to_string(),
+            ],
+            vec![replay_command.to_string()],
+            "rebuild_helper_lane",
+            true,
+            false,
+            requirement.requested_version.clone(),
+            None,
+        )],
+    }
+}
+
+#[cfg(feature = "native-compile")]
+fn toolchain_ensure_revalidation_blocked_report(
+    manifest_path: &Path,
+    replay_command: &str,
+    requirement: &NativeToolchainRequirement,
+    issue: &NativeCompileSupportIssue,
+    err: &anyhow::Error,
+    subprocess_commands: Vec<Vec<String>>,
+) -> ToolchainEnsureReport {
+    ToolchainEnsureReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        generated_at_epoch_ms: epoch_ms_u64().unwrap_or(0),
+        manifest_path: manifest_path.display().to_string(),
+        readonly: false,
+        mutation_status: "attempted".to_string(),
+        status: ToolchainEnsureStatus::BuildBlocked,
+        execution_driver: Some(ToolchainEnsureExecutionDriver::HelperBuilderScript),
+        toolchain: Some(native_toolchain_report_for_issue(requirement, issue)),
+        ensured_now: false,
+        expected: Some("helper lane revalidates after the build completes".to_string()),
+        found: Some(format!("{err:#}")),
+        what_happened: format!(
+            "uc built the helper lane for {}, but could not revalidate it afterward.",
+            manifest_path.display()
+        ),
+        why: format!("{err:#}"),
+        retryable: true,
+        fallback_used: false,
+        replay_command: replay_command.to_string(),
+        artifact_path: None,
+        log_path: None,
+        blocked_reason: Some("helper_revalidation_failed".to_string()),
+        subprocess_commands,
+        diagnostics: vec![project_agent_diagnostic(
+            "UCN1204",
+            "toolchain_ensure",
+            NativeDiagnosticSeverity::Error,
+            "Native helper revalidation failed",
+            format!(
+                "uc built the helper lane for {}, but the lane could not be revalidated afterward.",
+                manifest_path.display()
+            ),
+            format!("{err:#}"),
+            vec![
+                "Inspect the manifest and helper artifacts, then rerun `uc toolchain ensure`."
+                    .to_string(),
+                "If the manifest changed during the build, restore it before retrying.".to_string(),
+            ],
+            vec![replay_command.to_string()],
+            "rebuild_helper_lane",
+            true,
+            false,
+            requirement.requested_version.clone(),
+            None,
+        )],
     }
 }
 
