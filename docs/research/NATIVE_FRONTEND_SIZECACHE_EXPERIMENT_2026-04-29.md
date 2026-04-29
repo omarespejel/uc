@@ -15,9 +15,10 @@ behavior worse across most of the measured set.
 
 ## Scope
 
-- `uc` worktree: `/Users/espejelomar/StarkNet/compiler-starknet/_pr_work/uc-perf-native-frontier-20260429`
-- `uc` binary: `target/release/uc`
-- Cairo lane: external helper `2.14.0`
+- `uc` worktree: local perf worktree `uc-perf-native-frontier-20260429`
+- `uc` binary: local `target/release/uc` in that worktree
+- Benchmark lane id: `real-repo-bench-perf-frontier-20260429` same-window helper comparison
+- Conditions: local Apple M3 Pro macOS workstation (18 GiB RAM), daemon-free `--engine uc --daemon-mode off --offline`, Cairo external-helper lane `2.14.0`
 - Contracts:
   - `monero_atomic_swap`
   - `braavos_account`
@@ -31,18 +32,18 @@ behavior worse across most of the measured set.
 
 Reference rerun:
 
-- `/Users/espejelomar/StarkNet/compiler-starknet/_pr_work/uc-perf-native-frontier-20260429/benchmarks/results/real-repo-bench-perf-frontier-20260429-samewindow-reference.json`
-- `/Users/espejelomar/StarkNet/compiler-starknet/_pr_work/uc-perf-native-frontier-20260429/benchmarks/results/real-repo-bench-perf-frontier-20260429-samewindow-reference.md`
+- Local artifact: `benchmarks/results/real-repo-bench-perf-frontier-20260429-samewindow-reference.json`
+- Local artifact: `benchmarks/results/real-repo-bench-perf-frontier-20260429-samewindow-reference.md`
 
 Patched rerun:
 
-- `/Users/espejelomar/StarkNet/compiler-starknet/_pr_work/uc-perf-native-frontier-20260429/benchmarks/results/real-repo-bench-perf-frontier-20260429-samewindow-patched-sizecache.json`
-- `/Users/espejelomar/StarkNet/compiler-starknet/_pr_work/uc-perf-native-frontier-20260429/benchmarks/results/real-repo-bench-perf-frontier-20260429-samewindow-patched-sizecache.md`
+- Local artifact: `benchmarks/results/real-repo-bench-perf-frontier-20260429-samewindow-patched-sizecache.json`
+- Local artifact: `benchmarks/results/real-repo-bench-perf-frontier-20260429-samewindow-patched-sizecache.md`
 
 Earlier diagnostic baseline used to choose the experiment:
 
-- `/Users/espejelomar/StarkNet/compiler-starknet/_pr_work/uc-perf-native-frontier-20260429/benchmarks/results/real-repo-bench-perf-frontier-20260429.json`
-- `/tmp/uc-monero-size-trace-20260429.tsv`
+- Local artifact: `benchmarks/results/real-repo-bench-perf-frontier-20260429.json`
+- Local diagnostic trace: `uc-monero-size-trace-20260429.tsv`
 
 ## Why This Was Tried
 
@@ -60,6 +61,11 @@ The initial targeted sweep showed:
 
 That made exact size-estimate memoization the cheapest plausible helper-lane experiment to test
 before touching broader lowering/inlining behavior.
+
+Trace provenance:
+
+- Captured by running the local Cairo `2.14` helper with `UC_CAIRO214_SIZE_TRACE=/abs/path/to/trace.tsv` during daemon-free diagnostic builds
+- These trace files are local diagnostics only, not durable benchmark artifacts
 
 ## Result Summary
 

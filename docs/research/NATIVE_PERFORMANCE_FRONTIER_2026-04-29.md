@@ -18,9 +18,11 @@ Current focused native-supported set:
 - `zcash_relay`
 - `glint_contracts`
 
-Diagnostic benchmark artifact:
+Diagnostic benchmark lane and artifact:
 
-- [real-repo-bench-perf-frontier-20260429.json](/Users/espejelomar/StarkNet/compiler-starknet/_pr_work/uc-perf-native-frontier-20260429/benchmarks/results/real-repo-bench-perf-frontier-20260429.json)
+- Lane id: `real-repo-bench-perf-frontier-20260429`
+- Artifact location: `benchmarks/results/real-repo-bench-perf-frontier-20260429.json` in the local perf worktree
+- Conditions: local Apple M3 Pro macOS workstation (18 GiB RAM), Cairo external-helper lane `2.14.0`, `--engine uc --daemon-mode off --offline`, `3` cold runs, `3` warm-noop runs, `2.2s` warm settle, sequential same-window reruns
 
 ## Baseline Result
 
@@ -82,13 +84,11 @@ Braavos also surfaces app-level event helpers repeatedly, but the pattern is sti
 - repeated dummy-program generation,
 - concentrated in shared inlining/specialization decisions.
 
-Braavos trace file:
+Trace provenance:
 
-- `/tmp/uc-braavos-size-trace-20260429.tsv`
-
-Monero trace file:
-
-- `/tmp/uc-monero-size-trace-20260429.tsv`
+- Captured by running the local Cairo `2.14` helper with `UC_CAIRO214_SIZE_TRACE=/abs/path/to/trace.tsv` during daemon-free diagnostic builds
+- These TSV files are local diagnostics only, not durable benchmark artifacts
+- Example local filenames used during this pass: `uc-braavos-size-trace-20260429.tsv`, `uc-monero-size-trace-20260429.tsv`
 
 ## Rejected Optimization
 
@@ -142,6 +142,10 @@ This makes daemon work a separate compatibility/perf track:
 
 - useful for agent UX if fixed,
 - not currently usable for native launch claims on helper-backed lanes.
+
+Daemon-free baseline command used for correctness/perf diagnosis:
+
+- `uc build --engine uc --daemon-mode off --offline`
 
 ## Recommendation
 
