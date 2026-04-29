@@ -340,7 +340,7 @@ struct ToolchainEnsureArgs {
     #[arg(long, value_enum, default_value_t = ToolchainEnsureFormatArg::Json)]
     format: ToolchainEnsureFormatArg,
 
-    #[arg(long, conflicts_with = "format")]
+    #[arg(long)]
     json: bool,
 
     #[arg(long)]
@@ -3255,7 +3255,7 @@ fn resolve_manifest_path_resolution_blocked_report(
         },
         what_happened: format!("uc could not resolve the manifest path for {manifest_text}."),
         why: format!("{err:#}"),
-        retryable: true,
+        retryable: false,
         expected: Some("an existing Scarb.toml path inside the active checkout".to_string()),
         found: Some(manifest_text.clone()),
         fallback_used: false,
@@ -3832,7 +3832,7 @@ fn fetch_manifest_path_resolution_blocked_report(
         missing_entries: Vec::new(),
         what_happened: format!("uc could not resolve the manifest path for {manifest_text}."),
         why: format!("{err:#}"),
-        retryable: true,
+        retryable: false,
         expected: Some("an existing Scarb.toml path inside the active checkout".to_string()),
         found: Some(manifest_text.clone()),
         fallback_used: false,
@@ -4210,7 +4210,7 @@ fn toolchain_ensure_report_from_manifest_path(
                     subprocess_commands,
                     diagnostics: Vec::new(),
                 }),
-                Err(after_issue) => Ok(toolchain_ensure_issue_blocked_report(
+                Err(after_issue) => Ok(toolchain_ensure_attempted_issue_blocked_report(
                     manifest_path,
                     &replay_command,
                     &requirement,
@@ -4247,7 +4247,7 @@ fn toolchain_ensure_builder_prepare_blocked_report(
             manifest_path.display()
         ),
         why: format!("{err:#}"),
-        retryable: true,
+        retryable: false,
         fallback_used: false,
         replay_command: replay_command.to_string(),
         artifact_path: None,
@@ -4304,7 +4304,7 @@ fn toolchain_ensure_builder_execution_blocked_report(
             manifest_path.display()
         ),
         why: format!("{err:#}"),
-        retryable: true,
+        retryable: false,
         fallback_used: false,
         replay_command: replay_command.to_string(),
         artifact_path: None,
@@ -4322,12 +4322,12 @@ fn toolchain_ensure_builder_execution_blocked_report(
             ),
             format!("{err:#}"),
             vec![
-                "Fix the helper builder execution failure and rerun `uc toolchain ensure`.".to_string(),
-                "Check file permissions and the builder command environment.".to_string(),
+                "Fix the helper builder execution environment before rerunning `uc toolchain ensure`.".to_string(),
+                "Check file permissions, PATH, and interpreter availability for the builder command.".to_string(),
             ],
             vec![replay_command.to_string()],
-            "rebuild_helper_lane",
-            true,
+            "manual_rebuild_required",
+            false,
             false,
             requirement.requested_version.clone(),
             None,
@@ -4379,9 +4379,10 @@ fn toolchain_ensure_revalidation_blocked_report(
             ),
             format!("{err:#}"),
             vec![
-                "Inspect the manifest and helper artifacts, then rerun `uc toolchain ensure`."
+                "Regenerate helper artifacts or clear helper-lane caches, then rerun `uc toolchain ensure`."
                     .to_string(),
-                "If the manifest changed during the build, restore it before retrying.".to_string(),
+                "If manifest changes are required, stop and request user approval before editing or proposing them."
+                    .to_string(),
             ],
             vec![replay_command.to_string()],
             "rebuild_helper_lane",
@@ -4415,6 +4416,42 @@ fn toolchain_ensure_issue_blocked_report(
         found: Some(issue.kind().to_string()),
         what_happened: format!(
             "uc could not ensure the native toolchain for {}.",
+            manifest_path.display()
+        ),
+        why: issue.reason(),
+        retryable: issue.diagnostic().retryable,
+        fallback_used: false,
+        replay_command: replay_command.to_string(),
+        artifact_path: None,
+        log_path: None,
+        blocked_reason: Some(issue.kind().to_string()),
+        subprocess_commands,
+        diagnostics: vec![issue.diagnostic()],
+    }
+}
+
+#[cfg(feature = "native-compile")]
+fn toolchain_ensure_attempted_issue_blocked_report(
+    manifest_path: &Path,
+    replay_command: &str,
+    requirement: &NativeToolchainRequirement,
+    issue: &NativeCompileSupportIssue,
+    subprocess_commands: Vec<Vec<String>>,
+) -> ToolchainEnsureReport {
+    ToolchainEnsureReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        generated_at_epoch_ms: epoch_ms_u64().unwrap_or(0),
+        manifest_path: manifest_path.display().to_string(),
+        readonly: false,
+        mutation_status: "attempted".to_string(),
+        status: ToolchainEnsureStatus::BuildBlocked,
+        execution_driver: Some(ToolchainEnsureExecutionDriver::HelperBuilderScript),
+        toolchain: Some(native_toolchain_report_for_issue(requirement, issue)),
+        ensured_now: false,
+        expected: Some("selected native Cairo lane available locally".to_string()),
+        found: Some(issue.kind().to_string()),
+        what_happened: format!(
+            "uc attempted to ensure the native toolchain for {}, but the lane still failed validation afterward.",
             manifest_path.display()
         ),
         why: issue.reason(),
