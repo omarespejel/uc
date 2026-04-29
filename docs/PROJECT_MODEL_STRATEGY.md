@@ -81,7 +81,8 @@ The gate can become default only after project-model metadata matches the compat
 ### Phase 3: Resolver And Source Cache
 
 Implemented first slice: `uc resolve --locked` emits a deterministic, read-only
-resolver report keyed by the current manifest and lockfile view.
+resolver report derived from the current manifest and lockfile view without
+exposing an explicit correlation key.
 
 Next hardening for this phase:
 

@@ -19,8 +19,8 @@ Every agent-facing diagnostic emitted by `uc project inspect --format json`, `uc
 - `safe_automated_action`: symbolic action policy for autonomous agents.
 - `retryable`: whether retrying the same operation can plausibly succeed after remediation.
 - `fallback_used`: whether `uc` downgraded from native to Scarb.
-- `toolchain_expected`: expected Cairo/toolchain lane when relevant.
-- `toolchain_found`: found compiler/helper/path when relevant.
+- `toolchain_expected`: expected Cairo/toolchain lane when relevant; optional and serialized as `null` when not applicable.
+- `toolchain_found`: found compiler/helper/path when relevant; optional and serialized as `null` when not applicable.
 
 For `uc support native --format json`, agents should key their pre-build routing on `decision_status`:
 

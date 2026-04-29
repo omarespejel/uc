@@ -52,7 +52,22 @@
       "type": "array",
       "items": { "type": "object" }
     },
-    "lockfile": { "type": "object" },
+    "lockfile": {
+      "type": "object",
+      "properties": {
+        "present": { "type": "boolean" },
+        "path": { "type": ["string", "null"] },
+        "valid": { "type": "boolean" },
+        "version": { "type": ["string", "null"] },
+        "size_bytes": { "type": ["integer", "null"] },
+        "modified_unix_ms": { "type": ["integer", "null"] },
+        "hash": { "type": ["string", "null"] },
+        "packages": {
+          "type": "array",
+          "items": { "type": "object" }
+        }
+      }
+    },
     "lockfile_sync": {
       "type": "object",
       "required": ["status", "missing_dependencies", "reasons"],
@@ -76,8 +91,58 @@
         }
       }
     },
-    "offline_readiness": { "type": "object" },
-    "toolchain": { "type": "object" },
+    "offline_readiness": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "enum": [
+            "ready",
+            "unverified",
+            "needs_lockfile",
+            "needs_exact_toolchain_source",
+            "blocked"
+          ]
+        },
+        "readonly_native_source": { "type": "boolean" },
+        "lockfile_present": { "type": "boolean" },
+        "lockfile_valid": { "type": "boolean" },
+        "remote_dependency_count": { "type": "integer" },
+        "path_dependency_count": { "type": "integer" },
+        "workspace_dependency_count": { "type": "integer" },
+        "cache_state_known": { "type": "boolean" },
+        "reasons": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "toolchain": {
+      "type": "object",
+      "properties": {
+        "edition": { "type": ["string", "null"] },
+        "requested_version": { "type": ["string", "null"] },
+        "requested_major_minor": { "type": ["string", "null"] },
+        "request_source": {
+          "enum": [
+            "package",
+            "workspace",
+            "workspace_package",
+            null
+          ]
+        },
+        "native_status": {
+          "enum": [
+            "native_supported",
+            "native_unsupported",
+            "fallback_likely",
+            "build_blocked",
+            "unavailable"
+          ]
+        },
+        "native_supported": { "type": "boolean" },
+        "fallback_used": { "type": "boolean" }
+      }
+    },
     "what_happened": { "type": "string" },
     "why": { "type": "string" },
     "retryable": { "type": "boolean" },

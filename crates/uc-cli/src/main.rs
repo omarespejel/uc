@@ -2821,7 +2821,7 @@ fn resolve_report_from_manifest_path(manifest_path: &Path) -> Result<ResolveRepo
             .unwrap_or_else(|_| "\"unknown\"".to_string())
     ));
     let replay_command = format!(
-        "uc resolve --locked --manifest-path {} --json",
+        "uc resolve --locked --manifest-path {} --format json",
         shell_escape_path(manifest_path)
     );
 
@@ -2925,7 +2925,8 @@ fn resolve_manifest_path_resolution_blocked_report(
         expected: Some("an existing Scarb.toml path inside the active checkout".to_string()),
         found: Some(manifest_text.clone()),
         fallback_used: false,
-        replay_command: "uc resolve --locked --manifest-path <Scarb.toml> --json".to_string(),
+        replay_command: "uc resolve --locked --manifest-path <Scarb.toml> --format json"
+            .to_string(),
         artifact_path: None,
         log_path: None,
         blocked_reason: Some("manifest_path_resolution_failed".to_string()),
@@ -2941,7 +2942,7 @@ fn resolve_manifest_path_resolution_blocked_report(
                     .to_string(),
                 "Ensure the manifest path stays inside the current workspace checkout.".to_string(),
             ],
-            vec!["uc resolve --locked --manifest-path <Scarb.toml> --json".to_string()],
+            vec!["uc resolve --locked --manifest-path <Scarb.toml> --format json".to_string()],
             "manual_manifest_fix_required",
             true,
             false,
