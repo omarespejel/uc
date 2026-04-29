@@ -7,6 +7,8 @@
   "required": [
     "schema_version",
     "generated_at_epoch_ms",
+    "readonly",
+    "mutation_status",
     "root",
     "available",
     "writable",
@@ -16,11 +18,19 @@
     "invalid_entry_count",
     "what_happened",
     "why",
-    "retryable"
+    "retryable",
+    "expected",
+    "found",
+    "fallback_used",
+    "replay_command",
+    "artifact_path",
+    "log_path"
   ],
   "properties": {
     "schema_version": { "const": 1 },
     "generated_at_epoch_ms": { "type": "integer" },
+    "readonly": { "type": "boolean" },
+    "mutation_status": { "type": "string" },
     "root": { "type": ["string", "null"] },
     "available": { "type": "boolean" },
     "writable": { "type": "boolean" },
@@ -30,6 +40,12 @@
     "invalid_entry_count": { "type": "integer" },
     "what_happened": { "type": "string" },
     "why": { "type": "string" },
-    "retryable": { "type": "boolean" }
+    "retryable": { "type": "boolean" },
+    "expected": { "type": ["string", "null"] },
+    "found": { "type": ["string", "null"] },
+    "fallback_used": { "type": "boolean" },
+    "replay_command": { "type": "string" },
+    "artifact_path": { "type": ["string", "null"] },
+    "log_path": { "type": ["string", "null"] }
   }
 }

@@ -94,20 +94,34 @@
 - Reads the current shared source-store inventory.
 - Supports: `--format json`, `--json`, `--report-path`.
 - Emits:
+  - `schema_version`
+  - `generated_at_epoch_ms`
+  - `readonly`
+  - `mutation_status`
   - source-store root
   - availability / writability
   - entry counts and total bytes
   - invalid entry count
   - configured byte budget
+  - `what_happened`, `why`, and `retryable`
+  - `expected`, `found`, `fallback_used`, `replay_command`, `artifact_path`, `log_path`
 
 1. `uc cache prune`
 - Prunes the shared source store to the configured byte budget.
 - Supports: `--max-bytes`, `--format json`, `--json`, `--report-path`.
 - Emits:
+  - `schema_version`
+  - `generated_at_epoch_ms`
+  - `readonly`
+  - `mutation_status`
+  - source-store root
+  - availability / writability
+  - configured byte budget used for pruning
   - pre/post entry counts
   - pre/post byte totals
-  - removed entry count and keys
-  - configured byte budget used for pruning
+  - removed entry count, bytes, and keys
+  - `what_happened`, `why`, and `retryable`
+  - `expected`, `found`, `fallback_used`, `replay_command`, `artifact_path`, `log_path`
 
 1. `uc toolchain ensure`
 - Ensures the native Cairo/helper lane selected from the manifest is locally available.
@@ -149,7 +163,7 @@
 
 1. `uc mcp serve`
 - Emits the read-only MCP command/resource catalog as JSON.
-- Covers `doctor`, `project_inspect`, `support_native`, `explain_diagnostic`, `select_toolchain`, `fetch`, `cache_status`, `cache_prune`, `toolchain_ensure`, `benchmark_report`, and `profile_native_frontend`.
+- Covers `uc.doctor`, `uc.project_inspect`, `uc.support_native`, `uc.explain_diagnostic`, `uc.select_toolchain`, `uc.fetch`, `uc.cache_status`, `uc.cache_prune`, `uc.toolchain_ensure`, `uc.benchmark_report`, and `uc.profile_native_frontend`.
 - The catalog itself is read-only; adapters must honor each tool's `mutates_state` flag before executing mutable surfaces such as `fetch`, `cache prune`, or `toolchain ensure`.
 
 1. `uc daemon`

@@ -574,6 +574,26 @@ fn mcp_catalog_report_includes_source_store_tools() {
             .any(|resource| resource.uri == "uc://source-store/status"),
         "mcp catalog should keep the source-store status resource"
     );
+    let cache_status = report
+        .tools
+        .iter()
+        .find(|tool| tool.name == "uc.cache_status")
+        .expect("mcp catalog should expose cache_status descriptor");
+    assert!(!cache_status.mutates_state);
+    assert_eq!(
+        cache_status.schema,
+        "docs/agent/schemas/source-store-status-report.schema.json"
+    );
+    let cache_prune = report
+        .tools
+        .iter()
+        .find(|tool| tool.name == "uc.cache_prune")
+        .expect("mcp catalog should expose cache_prune descriptor");
+    assert!(cache_prune.mutates_state);
+    assert_eq!(
+        cache_prune.schema,
+        "docs/agent/schemas/source-store-prune-report.schema.json"
+    );
 }
 
 #[test]
@@ -974,11 +994,43 @@ fn report_schemas_match_nullable_option_output() {
         serde_json::json!(["string", "null"])
     );
     assert_eq!(
+        cache_status_schema["properties"]["expected"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    assert_eq!(
+        cache_status_schema["properties"]["found"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    assert_eq!(
+        cache_status_schema["properties"]["artifact_path"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    assert_eq!(
+        cache_status_schema["properties"]["log_path"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    assert_eq!(
         cache_status_schema["additionalProperties"],
         serde_json::json!(false)
     );
     assert_eq!(
         cache_prune_schema["properties"]["root"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    assert_eq!(
+        cache_prune_schema["properties"]["expected"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    assert_eq!(
+        cache_prune_schema["properties"]["found"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    assert_eq!(
+        cache_prune_schema["properties"]["artifact_path"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    assert_eq!(
+        cache_prune_schema["properties"]["log_path"]["type"],
         serde_json::json!(["string", "null"])
     );
     assert_eq!(
