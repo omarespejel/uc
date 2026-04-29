@@ -55,7 +55,7 @@ diff -ruN a/src/db.rs b/src/db.rs
 +    preview
 +}
 +
-+fn uc_cairo214_size_trace_event(
++pub(crate) fn uc_cairo214_size_trace_event(
 +    db: &dyn Database,
 +    event: &str,
 +    function_id: ConcreteFunctionWithBodyId<'_>,
@@ -116,3 +116,23 @@ diff -ruN a/src/db.rs b/src/db.rs
      let code_size_estimator = lowering_group_input(db).code_size_estimator(db);
      if let Some(estimator) = code_size_estimator {
          estimator(db, function_id)
+diff -ruN a/src/inline/mod.rs b/src/inline/mod.rs
+--- a/src/inline/mod.rs	2026-04-29 12:16:00
++++ b/src/inline/mod.rs	2026-04-29 12:16:00
+@@ -15,7 +15,7 @@
+ use salsa::Database;
+ 
+ use crate::blocks::{Blocks, BlocksBuilder};
+-use crate::db::LoweringGroup;
++use crate::db::{LoweringGroup, uc_cairo214_size_trace_event};
+ use crate::diagnostic::{
+     LoweringDiagnostic, LoweringDiagnosticKind, LoweringDiagnostics, LoweringDiagnosticsBuilder,
+ };
+@@ -123,6 +123,7 @@
+     function_id: ConcreteFunctionWithBodyId<'_>,
+     inline_small_functions_threshold: usize,
+ ) -> Maybe<bool> {
++    uc_cairo214_size_trace_event(db, "estimate_size_callsite:inline_should_inline", function_id);
+     let weight_of_blocks = db.estimate_size(function_id)?;
+     Ok(weight_of_blocks < inline_small_functions_threshold.into_or_panic())
+ }
