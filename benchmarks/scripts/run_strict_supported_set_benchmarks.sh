@@ -62,6 +62,14 @@ validate_non_negative_number() {
   fi
 }
 
+validate_stamp() {
+  local value="$1"
+  if [[ ! "$value" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "Invalid stamp: $value (allowed: A-Z a-z 0-9 . _ -)" >&2
+    exit 2
+  fi
+}
+
 canonical_existing_file_path() {
   local label="$1"
   local path="$2"
@@ -127,6 +135,7 @@ while [[ $# -gt 0 ]]; do
     --stamp)
       require_option_value "$1" "${2-}"
       STAMP="$2"
+      validate_stamp "$STAMP"
       shift 2
       ;;
     --help|-h)
@@ -149,6 +158,7 @@ fi
 
 SOURCE_BENCHMARK_JSON="$(canonical_existing_file_path "benchmark JSON" "$SOURCE_BENCHMARK_JSON")"
 RESULTS_DIR="$(canonical_dir_path "results directory" "$RESULTS_DIR")"
+validate_stamp "$STAMP"
 
 if [[ ! -x "$UC_BIN" ]]; then
   echo "UC binary is missing or not executable: $UC_BIN" >&2
@@ -156,12 +166,30 @@ if [[ ! -x "$UC_BIN" ]]; then
 fi
 
 selected_cases_tsv="$RESULTS_DIR/strict-supported-set-$STAMP.tsv"
+selected_cases_json="$TMP_DIR/native-supported-cases.json"
 jq -r '
   .cases[]
   | select(.support_matrix.classification == "native_supported")
   | [.manifest_path, .tag]
   | @tsv
 ' "$SOURCE_BENCHMARK_JSON" > "$selected_cases_tsv"
+{
+  echo "["
+  first=1
+  while IFS=$'\t' read -r manifest_path tag; do
+    [[ -z "$manifest_path" || -z "$tag" ]] && continue
+    canonical_manifest_path="$(canonical_existing_file_path "selected manifest" "$manifest_path")"
+    if [[ "$first" -eq 0 ]]; then
+      echo ","
+    fi
+    jq -nc \
+      --arg manifest_path "$canonical_manifest_path" \
+      --arg tag "$tag" \
+      '{manifest_path: $manifest_path, tag: $tag}'
+    first=0
+  done < "$selected_cases_tsv"
+  echo "]"
+} > "$selected_cases_json"
 
 selected_case_count="$(wc -l < "$selected_cases_tsv" | tr -d '[:space:]')"
 if [[ "$selected_case_count" == "0" ]]; then
@@ -169,8 +197,11 @@ if [[ "$selected_case_count" == "0" ]]; then
   exit 1
 fi
 
-source_native_supported_count="$(jq -r '.summary.support_matrix.native_supported' "$SOURCE_BENCHMARK_JSON")"
-source_case_count="$(jq -r '.cases | length' "$SOURCE_BENCHMARK_JSON")"
+source_native_supported_count="$(jq '[
+  .cases[]
+  | select(.support_matrix.classification == "native_supported")
+] | length' "$SOURCE_BENCHMARK_JSON")"
+source_case_count="$(jq '[.cases[]] | length' "$SOURCE_BENCHMARK_JSON")"
 
 run_log="$RESULTS_DIR/strict-supported-set-$STAMP.log"
 "$REAL_REPO_BENCH_SCRIPT" \
@@ -197,8 +228,10 @@ generated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 replay_command="$(printf '%q ' "$0" --benchmark-json "$SOURCE_BENCHMARK_JSON" --uc-bin "$UC_BIN" --results-dir "$RESULTS_DIR" --runs "$RUNS" --cold-runs "$COLD_RUNS" --warm-settle-seconds "$WARM_SETTLE_SECONDS" --stamp "$STAMP" | sed 's/[[:space:]]*$//')"
 
 jq -n \
-  --slurpfile source "$SOURCE_BENCHMARK_JSON" \
+  --slurpfile selected_cases "$selected_cases_json" \
   --slurpfile rerun "$rerun_json" \
+  --argjson expected_runs "$RUNS" \
+  --argjson expected_cold_runs "$COLD_RUNS" \
   --arg generated_at "$generated_at" \
   --arg source_benchmark_json "$SOURCE_BENCHMARK_JSON" \
   --arg rerun_benchmark_json "$rerun_json" \
@@ -211,16 +244,21 @@ jq -n \
   --argjson source_native_supported_count "$source_native_supported_count" \
   --argjson source_case_count "$source_case_count" \
   '
+  def sorted_case_set:
+    map({manifest_path, tag}) | sort_by(.manifest_path, .tag);
   def safe_claim($selected_count):
     (.summary.support_matrix.native_supported == $selected_count)
     and (.summary.support_matrix.native_unsupported == 0)
     and (.summary.support_matrix.fallback_used == 0)
     and (.summary.support_matrix.build_failed == 0)
     and ((.summary.unstable_lane_count // 0) == 0)
-    and ([.cases[].benchmark_status] | all(. == "ok"));
+    and ([.cases[].benchmark_status] | all(. == "ok"))
+    and ((.cases | sorted_case_set) == ($selected_cases[0] | sorted_case_set));
   def guard_reason($selected_count):
     if $selected_count == 0 then
       "no native-supported cases were selected"
+    elif ((.cases | sorted_case_set) != ($selected_cases[0] | sorted_case_set)) then
+      "rerun case set did not match the selected native_supported source cases"
     elif .summary.support_matrix.native_supported != $selected_count then
       "one or more selected cases no longer classified as native_supported in the rerun"
     elif .summary.support_matrix.native_unsupported != 0 then
@@ -245,17 +283,19 @@ jq -n \
       expected: {
         selected_classification: "native_supported",
         selected_case_count: $selected_case_count,
-        runs: .runs,
-        cold_runs: .cold_runs,
+        runs: $expected_runs,
+        cold_runs: $expected_cold_runs,
         unstable_lane_count: 0,
         benchmark_status: "ok"
       },
       found: {
+        runs: .runs,
+        cold_runs: .cold_runs,
         support_matrix: .summary.support_matrix,
         unstable_lane_count: (.summary.unstable_lane_count // 0),
         benchmark_statuses: [.cases[].benchmark_status]
       },
-      fallback_used: false,
+      fallback_used: ((.summary.support_matrix.fallback_used // 0) != 0),
       replay_command: $replay_command,
       artifact_path: $artifact_path,
       log_path: $log_path,
@@ -267,7 +307,8 @@ jq -n \
         selected_cases_file: $selection_cases_file,
         rerun_benchmark_json: $rerun_benchmark_json,
         rerun_benchmark_markdown: $rerun_benchmark_markdown,
-        selected_tags: [.cases[].tag]
+        selected_cases: $selected_cases[0],
+        selected_tags: ($selected_cases[0] | map(.tag))
       },
       claim_guard: (
         . as $report

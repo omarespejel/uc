@@ -10,6 +10,17 @@
     "selection": {
       "type": "object",
       "additionalProperties": true,
+      "required": [
+        "source_benchmark_json",
+        "source_case_count",
+        "source_native_supported_count",
+        "selected_case_count",
+        "selected_cases_file",
+        "rerun_benchmark_json",
+        "rerun_benchmark_markdown",
+        "selected_cases",
+        "selected_tags"
+      ],
       "properties": {
         "source_benchmark_json": { "type": "string" },
         "source_case_count": { "type": "integer", "minimum": 0 },
@@ -18,6 +29,18 @@
         "selected_cases_file": { "type": "string" },
         "rerun_benchmark_json": { "type": "string" },
         "rerun_benchmark_markdown": { "type": "string" },
+        "selected_cases": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["manifest_path", "tag"],
+            "properties": {
+              "manifest_path": { "type": "string" },
+              "tag": { "type": "string" }
+            }
+          }
+        },
         "selected_tags": {
           "type": "array",
           "items": { "type": "string" }
@@ -27,6 +50,11 @@
     "claim_guard": {
       "type": "object",
       "additionalProperties": true,
+      "required": [
+        "safe_to_say_native_supported_speed_claim",
+        "reason",
+        "native_supported_speed_claim_text"
+      ],
       "properties": {
         "safe_to_say_native_supported_speed_claim": { "type": "boolean" },
         "reason": { "type": "string" },

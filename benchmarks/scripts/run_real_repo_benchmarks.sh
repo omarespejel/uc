@@ -62,6 +62,14 @@ validate_non_negative_number() {
   fi
 }
 
+validate_stamp() {
+  local value="$1"
+  if [[ ! "$value" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "Invalid stamp: $value (allowed: A-Z a-z 0-9 . _ -)" >&2
+    exit 2
+  fi
+}
+
 validate_timeout_secs() {
   local value="$1"
   if [[ ! "$value" =~ ^[0-9]+$ ]]; then
@@ -203,6 +211,7 @@ while [[ $# -gt 0 ]]; do
     --stamp)
       require_option_value "$1" "${2-}"
       STAMP="$2"
+      validate_stamp "$STAMP"
       shift 2
       ;;
     --cases-file)
@@ -233,6 +242,7 @@ done
 validate_positive_int "RUNS" "$RUNS"
 validate_positive_int "COLD_RUNS" "$COLD_RUNS"
 validate_non_negative_number "WARM_SETTLE_SECONDS" "$WARM_SETTLE_SECONDS"
+validate_stamp "$STAMP"
 
 if [[ "${#CASE_MANIFESTS[@]}" -eq 0 ]]; then
   echo "run_real_repo_benchmarks.sh requires at least one case via --case or --cases-file" >&2

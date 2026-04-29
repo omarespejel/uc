@@ -105,6 +105,7 @@ The emitted benchmark JSON now carries `schema_version=1` so it conforms to the
 checked-in benchmark report contract used by agent tooling.
 
 ## Strict Same-Window Rerun For The Native-Supported Subset
+
 ```bash
 ./benchmarks/scripts/run_strict_supported_set_benchmarks.sh \
   --uc-bin ./target/release/uc \
