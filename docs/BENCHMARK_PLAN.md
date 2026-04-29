@@ -35,6 +35,7 @@ Measure and prove that `uc` outperforms Scarb on real workflows while maintainin
 ## Execution Policy
 - Benchmarks are local-first. Reproduction must work from checked-in scripts plus pinned manifest paths; do not require GitHub Actions or hosted CI to verify the numbers.
 - Before comparing before/after performance claims, rerun both sides in the same binary/toolchain window on the same machine.
+- For real-repo launch-speed evidence, do not manually filter a prior mixed support-matrix artifact. Start from the mixed support artifact, extract only `native_supported` cases with `run_strict_supported_set_benchmarks.sh`, and use the emitted `claim_guard` instead of ad-hoc selection.
 - Deployed-contract claims must start from a reviewed source inventory, build a
   source index with `build_deployed_contract_source_index.sh`, generate a corpus
   with `generate_deployed_contract_corpus.sh`, and then go through
@@ -100,6 +101,15 @@ UC_NATIVE_TOOLCHAIN_2_14_BIN=/abs/path/to/uc-cairo214-helper \
 ./benchmarks/scripts/run_real_repo_benchmarks.sh \
   --uc-bin /abs/path/to/uc \
   --case /abs/path/to/repo/Scarb.toml repo-tag
+
+# Strict same-window rerun for only the native-supported subset of a prior
+# mixed support-matrix artifact.
+./benchmarks/scripts/run_strict_supported_set_benchmarks.sh \
+  --uc-bin /abs/path/to/uc \
+  --benchmark-json /abs/path/to/real-repo-bench-previous.json \
+  --results-dir benchmarks/results \
+  --runs 12 \
+  --cold-runs 12
 
 # Pinned deployed-contract corpus support matrix and guarded claim artifact
 ./benchmarks/scripts/build_deployed_contract_source_index.sh \

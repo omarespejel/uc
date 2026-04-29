@@ -79,6 +79,7 @@ Do not treat it as a human-only CLI wrapper around Scarb.
 - Read-only MCP catalog: `uc mcp serve`
 - Strict smoke benchmark: `make benchmark-strict-smoke`
 - Strict research benchmark: `make benchmark-strict-research`
+- Strict native-supported rerun from prior artifact: `benchmarks/scripts/run_strict_supported_set_benchmarks.sh --benchmark-json /abs/path/to/real-repo-bench.json --results-dir benchmarks/results --runs 12 --cold-runs 12`
 - Build deployed-contract source index: `benchmarks/scripts/build_deployed_contract_source_index.sh --inventory /abs/path/to/source-inventory.json --out /abs/path/to/pinned-deployed-contract-source-index.json`
 - Generate deployed-contract corpus: `benchmarks/scripts/generate_deployed_contract_corpus.sh --source-index /abs/path/to/source-index.json --out /abs/path/to/generated-corpus.json`
 - Run deployed-contract corpus evidence: `benchmarks/scripts/run_deployed_contract_corpus.sh --corpus /abs/path/to/generated-corpus.json`

@@ -9,7 +9,7 @@ RUNS="${RUNS:-5}"
 COLD_RUNS="${COLD_RUNS:-5}"
 CASE_TIMEOUT_SECS="${UC_REAL_REPO_BENCH_TIMEOUT_SECS:-0}"
 WARM_SETTLE_SECONDS="${WARM_SETTLE_SECONDS:-2.2}"
-STAMP="$(date +%Y%m%d-%H%M%S)"
+STAMP="${UC_REAL_REPO_BENCH_STAMP:-$(date +%Y%m%d-%H%M%S)}"
 TMP_DIR="$(mktemp -d)"
 declare -a CASE_MANIFESTS=()
 declare -a CASE_TAGS=()
@@ -27,6 +27,7 @@ Usage:
   run_real_repo_benchmarks.sh [--uc-bin /abs/path/to/uc] [--results-dir /abs/path]
     [--runs <n>] [--cold-runs <n>] [--timeout-secs <seconds>]
     [--warm-settle-seconds <seconds>]
+    [--stamp <id>]
     [--cases-file <tsv-with-manifest-and-tag>] [--case <manifest-path> <tag> ...]
 
   Provide at least one case via --case or --cases-file.
@@ -197,6 +198,11 @@ while [[ $# -gt 0 ]]; do
     --warm-settle-seconds)
       require_option_value "$1" "${2-}"
       WARM_SETTLE_SECONDS="$2"
+      shift 2
+      ;;
+    --stamp)
+      require_option_value "$1" "${2-}"
+      STAMP="$2"
       shift 2
       ;;
     --cases-file)
@@ -823,6 +829,7 @@ jq -s \
           }
       ];
     {
+    schema_version: 1,
     generated_at: $generated_at,
     uc_bin: $uc_bin,
     runs: $runs,

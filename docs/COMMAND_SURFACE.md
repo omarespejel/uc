@@ -31,17 +31,25 @@
 4. `uc benchmark`
 - Runs benchmark matrix harness script.
 
-5. `uc session-key`
+5. `benchmarks/scripts/run_strict_supported_set_benchmarks.sh`
+- Consumes a prior mixed real-repo benchmark artifact, extracts only the
+  `native_supported` cases, reruns them through the same-window real-repo
+  harness, and emits a strict supported-set artifact with selection provenance
+  and a guarded native-supported speed claim.
+- Use this wrapper for launch-speed evidence. Do not manually filter tags out of
+  a mixed support-matrix report.
+
+6. `uc session-key`
 - Generates deterministic session key from normalized input fields.
 
-6. `uc project inspect`
+7. `uc project inspect`
 - Reads a `Scarb.toml` and optional sibling `Scarb.lock` without mutating files.
 - Supports: `--manifest-path`, `--format json`, `--json`, `--report-path`.
 - Emits package entries, workspace summary, declared profiles, target summary, dependency/source origins, lockfile state, conservative offline-readiness status, requested toolchain, read-only native support when determinable, and stable diagnostics in one JSON report.
 - The report includes `readonly=true` and `mutation_status=none`; use this as the agent pre-build project-state surface.
 - The raw report is local evidence and can include absolute paths plus manifest/lockfile hashes; redact or avoid forwarding it when sharing outside the host.
 
-7. `uc support native`
+8. `uc support native`
 - Probes whether a manifest is eligible for native compile in the current `uc` binary.
 - Supports: `--manifest-path`, `--format text|json`, `--json`.
 - Returns a structured pre-build decision report so scripts and local benchmark harnesses can classify cases before measuring them.

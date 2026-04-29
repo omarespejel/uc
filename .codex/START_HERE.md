@@ -64,6 +64,7 @@ It must let agents:
 - Read-only MCP catalog: `uc mcp serve`
 - Strict smoke benchmark: `make benchmark-strict-smoke`
 - Strict research benchmark: `make benchmark-strict-research`
+- Strict native-supported rerun from prior artifact: `benchmarks/scripts/run_strict_supported_set_benchmarks.sh --benchmark-json /abs/path/to/real-repo-bench.json --results-dir benchmarks/results --runs 12 --cold-runs 12`
 
 ## Documents
 - Product: `docs/PRODUCT_CHARTER.md`

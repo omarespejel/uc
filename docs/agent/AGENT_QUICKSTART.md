@@ -261,6 +261,27 @@ before speed work. `UCO3001` marks `native_frontend_compile_ms` as the likely
 next acceleration target. `UCO5001` means the diagnostic payload is not yet
 safe enough for automated remediation.
 
+For strict launch-speed evidence from a mixed real-repo artifact:
+
+```sh
+./benchmarks/scripts/run_strict_supported_set_benchmarks.sh \
+  --benchmark-json /abs/path/to/real-repo-bench.json \
+  --results-dir benchmarks/results \
+  --runs 12 \
+  --cold-runs 12
+```
+
+Read:
+
+- `.selection.source_benchmark_json`
+- `.selection.selected_case_count`
+- `.claim_guard.safe_to_say_native_supported_speed_claim`
+- `.claim_guard.native_supported_speed_claim_text`
+
+Only use `.claim_guard.native_supported_speed_claim_text` when the guard is
+true. If the guard is false, report `.claim_guard.reason` and keep the rerun
+artifact as diagnostic support evidence only.
+
 ## Stop Conditions
 
 Stop and ask for human permission before:
