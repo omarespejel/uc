@@ -3722,8 +3722,8 @@ starknet = "={requested_version}"
         "error should reject daemon helper routing: {rendered}"
     );
     assert!(
-        rendered.contains(&helper_path.display().to_string()),
-        "error should name the helper that cannot be carried into the daemon request: {rendered}"
+        rendered.contains("matching helper daemon binary"),
+        "error should require the matching helper daemon binary: {rendered}"
     );
     assert!(
         native_error_allows_scarb_fallback(&err),
@@ -3731,6 +3731,85 @@ starknet = "={requested_version}"
     );
 
     fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_socket_path_for_external_helper_is_stable_and_helper_scoped() {
+    let _guard = integration_env_lock().lock().unwrap();
+    let dir = unique_test_dir("uc-helper-daemon-socket");
+    let _cleanup = TestDirCleanup::new(&dir);
+    let helper_a = dir.join("uc-helper-a");
+    let helper_b = dir.join("uc-helper-b");
+    fs::write(&helper_a, "#!/bin/sh\n").expect("write helper a");
+    fs::write(&helper_b, "#!/bin/sh\n").expect("write helper b");
+    let socket_a_first =
+        daemon_socket_path_for_external_helper(&helper_a).expect("helper socket path");
+    let socket_a_second =
+        daemon_socket_path_for_external_helper(&helper_a).expect("helper socket path");
+    let socket_b = daemon_socket_path_for_external_helper(&helper_b).expect("helper socket path");
+
+    assert_eq!(socket_a_first, socket_a_second);
+    assert_ne!(socket_a_first, socket_b);
+    assert!(
+        socket_a_first
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value == "sock"),
+        "helper daemon socket should use a unix socket suffix: {}",
+        socket_a_first.display()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn build_uc_build_command_sets_helper_scoped_daemon_socket_override() {
+    let dir = unique_test_dir("uc-helper-build-command");
+    let _cleanup = TestDirCleanup::new(&dir);
+    let helper_path = dir.join("uc-helper-bin");
+    fs::write(&helper_path, "#!/bin/sh\n").expect("write helper");
+    let expected_socket =
+        daemon_socket_path_for_external_helper(&helper_path).expect("helper socket path");
+    let (command, _command_vec) = build_uc_build_command(
+        &helper_path,
+        &BuildCommonArgs {
+            manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
+            package: None,
+            workspace: false,
+            features: Vec::new(),
+            offline: true,
+            release: false,
+            profile: None,
+        },
+        Path::new("/tmp/workspace/Scarb.toml"),
+        EngineArg::Uc,
+        DaemonModeArg::Require,
+        None,
+        Some(helper_path.to_str().expect("helper path should be utf-8")),
+    )
+    .expect("helper build command should be constructible");
+    let envs = command
+        .get_envs()
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().to_string(),
+                value.map(|entry| entry.to_string_lossy().to_string()),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    assert_eq!(
+        envs.get("UC_NATIVE_TOOLCHAIN_HELPER_ACTIVE"),
+        Some(&Some("1".to_string()))
+    );
+    assert_eq!(
+        envs.get("UC_NATIVE_TOOLCHAIN_HELPER_PATH"),
+        Some(&Some(helper_path.display().to_string()))
+    );
+    assert_eq!(
+        envs.get("UC_DAEMON_SOCKET_PATH"),
+        Some(&Some(expected_socket.display().to_string()))
+    );
 }
 
 #[cfg(feature = "native-compile")]

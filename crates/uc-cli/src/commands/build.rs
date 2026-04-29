@@ -743,7 +743,8 @@ pub(crate) fn build_plan_report_from_args(args: &BuildArgs) -> Result<BuildPlanR
                                 args.daemon_mode,
                                 None,
                                 Some(&helper_display),
-                            );
+                            )
+                            .expect("external helper build plan command should be constructible");
                             command_vec
                         })
                 } else {
@@ -1669,7 +1670,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             daemon_mode,
                             helper_report_path.as_deref(),
                             Some(&helper_display),
-                        );
+                        )?;
                         let run = run_command(command, command_vec, write_report)?;
                         if !emit_json {
                             replay_output(&run.stdout, &run.stderr)?;
