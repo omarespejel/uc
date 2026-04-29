@@ -45,6 +45,29 @@ Read:
 - `.diagnostics[].next_commands`
 - `.diagnostics[].safe_automated_action`
 
+## Build Plan
+
+```sh
+uc build --engine uc --daemon-mode off --manifest-path /abs/path/to/Scarb.toml --plan-only --json
+```
+
+Read:
+
+- `.status`
+- `.planned_compile_backend`
+- `.execution_driver`
+- `.fallback_allowed`
+- `.daemon_planned`
+- `.daemon_autostart_allowed`
+- `.session_key`
+- `.strict_invalidation_key`
+- `.side_effects[].kind`
+- `.native_support.decision_status`
+- `.diagnostics[].code`
+
+If `.status == "build_blocked"`, stop before execution and fix the reported input or
+toolchain problem. Do not infer build readiness from terminal text alone.
+
 ## Doctor Probe
 
 ```sh

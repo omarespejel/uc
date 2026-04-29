@@ -30,6 +30,7 @@ Already in this PR or required before launch:
 
 - `uc support native --format json` emits stable support reports.
 - `uc build --json` and `--report-path` carry build diagnostics.
+- `uc build --plan-only --json` emits the chosen execution path before side effects begin.
 - `uc build --record-failure <path>` writes a redacted, replay-safe failure bundle on build errors.
 - `uc replay <bundle>` reads that bundle and is dry-run by default.
 - `uc agent eval --manifest-path <Scarb.toml>` returns a decision agents can act on before compiling.
@@ -115,11 +116,12 @@ Agents should start with support probing, not build-and-guess:
 ```sh
 uc project inspect --manifest-path Scarb.toml --format json
 uc support native --manifest-path Scarb.toml --format json
+uc build --engine uc --daemon-mode off --manifest-path Scarb.toml --plan-only --json
 uc agent eval --manifest-path Scarb.toml
 ./scripts/doctor.sh --uc-bin ./target/release/uc --manifest-path /abs/path/to/Scarb.toml
 ```
 
-Agents should treat `uc project inspect`, `uc support native`, and `uc agent eval` as the stable pre-build surfaces.
+Agents should treat `uc project inspect`, `uc support native`, `uc build --plan-only`, and `uc agent eval` as the stable pre-build surfaces.
 
 If the diagnostic says `safe_automated_action=build_helper_lane`, the agent may run:
 

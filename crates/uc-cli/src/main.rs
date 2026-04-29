@@ -510,6 +510,16 @@ enum DaemonModeArg {
     Require,
 }
 
+impl DaemonModeArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Auto => "auto",
+            Self::Require => "require",
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum BuildCompileBackend {
     Scarb,
@@ -1056,6 +1066,9 @@ struct BuildArgs {
     #[arg(long)]
     json: bool,
 
+    #[arg(long, conflicts_with = "record_failure")]
+    plan_only: bool,
+
     #[arg(long)]
     report_path: Option<PathBuf>,
 
@@ -1360,6 +1373,66 @@ struct BuildReport {
     native_toolchain: Option<NativeToolchainReport>,
     #[serde(default)]
     diagnostics: Vec<NativeDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum BuildPlanStatus {
+    Ready,
+    BuildBlocked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum BuildPlanNetworkIntent {
+    Allowed,
+    Forbidden,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum BuildPlanExecutionDriver {
+    ScarbDirect,
+    UcLocal,
+    UcDaemon,
+    ExternalHelper,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct BuildPlanSideEffect {
+    kind: String,
+    description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BuildPlanReport {
+    #[serde(default = "uc_agent_json_schema_version")]
+    schema_version: u32,
+    generated_at_epoch_ms: u64,
+    status: BuildPlanStatus,
+    manifest_path: String,
+    workspace_root: Option<String>,
+    profile: Option<String>,
+    engine: String,
+    daemon_mode: String,
+    offline: bool,
+    network_intent: BuildPlanNetworkIntent,
+    command: Vec<String>,
+    subprocess_command: Option<Vec<String>>,
+    planned_compile_backend: Option<String>,
+    execution_driver: Option<BuildPlanExecutionDriver>,
+    daemon_planned: bool,
+    daemon_autostart_allowed: bool,
+    fallback_allowed: bool,
+    session_key: Option<String>,
+    strict_invalidation_key: Option<String>,
+    native_toolchain: Option<NativeToolchainReport>,
+    native_support: Option<NativeSupportReport>,
+    #[serde(default)]
+    diagnostics: Vec<NativeDiagnostic>,
+    #[serde(default)]
+    side_effects: Vec<BuildPlanSideEffect>,
+    blocked_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

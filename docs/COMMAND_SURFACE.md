@@ -115,8 +115,9 @@ The intended primary surface for agents is:
   - Must expose expected/found toolchain details and policy decisions.
 
 - `uc build --plan-only`
-  - Status: planned (not yet implemented)
+  - Status: implemented
   - Emits the execution plan and expected side effects without performing the build.
+  - Reports planned backend, execution driver, fallback policy, daemon posture, and session/invalidation keys when they are determinable without running the build.
 
 - `uc explain <id>`
   - Status: planned (not yet implemented)

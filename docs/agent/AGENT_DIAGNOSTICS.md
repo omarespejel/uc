@@ -4,7 +4,7 @@ This document is the stable contract for machine-readable `uc` diagnostics. Huma
 
 ## Contract
 
-Every agent-facing diagnostic emitted by `uc project inspect --format json`, `uc support native --format json`, `uc build --json`, or a build report must include:
+Every agent-facing diagnostic emitted by `uc project inspect --format json`, `uc support native --format json`, `uc build --plan-only --json`, `uc build --json`, or a build report must include:
 
 - `schema_version`: integer schema version. Current version: `1`.
 - `code`: stable diagnostic code such as `UCN1004`.
