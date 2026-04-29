@@ -179,6 +179,6 @@ Native auto mode still falls back to Scarb only when the failure class is explic
 
 ## Next Expansion
 - Add more native toolchain helper lanes beyond Cairo `2.14`.
-- Add first-party `resolve`, `fetch`, `toolchain ensure`, and `build --plan-only` surfaces behind stable JSON/report contracts.
+- Expand `resolve` beyond `--locked`, add first-party `fetch` and `toolchain ensure`, and keep hardening the implemented `build --plan-only` surface behind stable JSON/report contracts.
 - Add native `uc` compile engine implementation behind the existing command interface.
 - Keep `compare-build` as mandatory gate while deeper frontend-compile optimizations mature.
