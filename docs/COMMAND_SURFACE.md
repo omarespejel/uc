@@ -90,6 +90,24 @@
   - `offline_readiness_before` and `offline_readiness_after`
 - `uc fetch` currently requires `--locked`; there is no implicit mutable resolution mode yet.
 
+1. `uc toolchain ensure`
+- Ensures the native Cairo/helper lane selected from the manifest is locally available.
+- Supports: `--manifest-path`, `--format json`, `--json`, `--report-path`.
+- Behavior:
+  - If the requested lane matches the builtin compiler, the command is a structured no-op.
+  - If a usable external helper is already configured or discoverable at the default helper path, the command is a structured no-op.
+  - If the lane is productized but missing or invalid, `uc` explicitly runs the checked-in helper builder and then revalidates the lane.
+  - If the lane is not productized or the manifest cannot be inspected safely, the command returns `build_blocked` with stable diagnostics.
+- Emits a stable ensure report with:
+  - top-level `status` (`ready` or `build_blocked`)
+  - `execution_driver` (`uc_builtin`, `uc_external_helper`, or `helper_builder_script`)
+  - selected `toolchain`
+  - `ensured_now`
+  - `mutation_status`
+  - `subprocess_commands`
+  - `blocked_reason`
+- Productized helper lanes are now discoverable from their default output path under `~/.uc/toolchain-helpers/...` even when the corresponding `UC_NATIVE_TOOLCHAIN_<major>_<minor>_BIN` env var is unset.
+
 1. `uc migrate`
 - Analyzes `Scarb.toml` and emits a migration readiness report.
 - Optional `--emit-uc-toml <path>` generates a starter `Uc.toml` scaffold.
@@ -111,7 +129,7 @@
 
 1. `uc mcp serve`
 - Emits the read-only MCP command/resource catalog as JSON.
-- Covers `doctor`, `project_inspect`, `support_native`, `explain_diagnostic`, `select_toolchain`, `benchmark_report`, and `profile_native_frontend`.
+- Covers `doctor`, `project_inspect`, `support_native`, `toolchain_ensure`, `explain_diagnostic`, `select_toolchain`, `benchmark_report`, and `profile_native_frontend`.
 - This is intentionally read-only: mutable actions stay behind `uc agent safe-action --execute`.
 
 1. `uc daemon`
@@ -143,9 +161,9 @@ The intended primary surface for agents is:
   - Reports what was materialized, what was reused, and what is still missing.
 
 - `uc toolchain ensure`
-  - Status: planned (not yet implemented)
+  - Status: implemented
   - Ensures required Cairo/helper lanes exist.
-  - Must expose expected/found toolchain details and policy decisions.
+  - Reports expected/found toolchain details, helper-builder subprocesses, and whether the lane was ensured during the command.
 
 - `uc build --plan-only`
   - Status: implemented
@@ -191,6 +209,10 @@ Native auto mode still falls back to Scarb only when the failure class is explic
 
 Agents should treat the `uc` source store as the authoritative local fetch surface and the current `execution_driver` as part of the rollout evidence, not as hidden behavior.
 
+## Toolchain Ensure Note
+
+`uc toolchain ensure` is the explicit mutable toolchain-acquisition surface. It is allowed to build a productized helper lane because the mutation is requested directly by the command, not implied by a support probe or build.
+
 ## Helper Lane Operations
 
 - `./scripts/build_native_toolchain_helper.sh --lane 2.14`
@@ -204,6 +226,6 @@ Agents should treat the `uc` source store as the authoritative local fetch surfa
 
 ## Next Expansion
 - Add more native toolchain helper lanes beyond Cairo `2.14`.
-- Expand `resolve` beyond `--locked`, add first-party `fetch` and `toolchain ensure`, and keep hardening the implemented `build --plan-only` surface behind stable JSON/report contracts.
+- Expand `resolve` beyond `--locked` and keep hardening the implemented `fetch`, `toolchain ensure`, and `build --plan-only` surfaces behind stable JSON/report contracts.
 - Add native `uc` compile engine implementation behind the existing command interface.
 - Keep `compare-build` as mandatory gate while deeper frontend-compile optimizations mature.

@@ -31,6 +31,12 @@ uc fetch --locked --manifest-path Scarb.toml --format json | jq
 uc cache status --format json | jq
 ```
 
+## Ensure Native Toolchain
+
+```sh
+uc toolchain ensure --manifest-path Scarb.toml --format json | jq
+```
+
 ## Build With Native First
 
 ```sh

@@ -635,6 +635,35 @@ fn fetch_cli_accepts_locked_offline_json_and_report_path() {
 }
 
 #[test]
+fn toolchain_ensure_cli_accepts_json_and_report_path() {
+    let cli = Cli::try_parse_from([
+        "uc",
+        "toolchain",
+        "ensure",
+        "--manifest-path",
+        "/tmp/workspace/Scarb.toml",
+        "--format",
+        "json",
+        "--report-path",
+        "/tmp/toolchain-ensure.json",
+    ])
+    .expect("toolchain ensure args should parse");
+    let Commands::Toolchain(args) = cli.command else {
+        panic!("expected toolchain command");
+    };
+    let ToolchainCommand::Ensure(args) = args.command;
+    assert_eq!(
+        args.manifest_path,
+        Some(PathBuf::from("/tmp/workspace/Scarb.toml"))
+    );
+    assert_eq!(args.format, ToolchainEnsureFormatArg::Json);
+    assert_eq!(
+        args.report_path,
+        Some(PathBuf::from("/tmp/toolchain-ensure.json"))
+    );
+}
+
+#[test]
 fn cache_status_cli_accepts_json_and_report_path() {
     let cli = Cli::try_parse_from([
         "uc",
@@ -1120,6 +1149,175 @@ fn fetch_report_from_args_marks_missing_manifest_build_blocked() {
     assert_eq!(
         report.blocked_reason.as_deref(),
         Some("manifest_path_resolution_failed")
+    );
+}
+
+#[test]
+fn toolchain_ensure_report_from_args_marks_missing_manifest_build_blocked() {
+    let dir = unique_test_dir("uc-toolchain-ensure-missing-manifest");
+    let _cleanup = TestDirCleanup::new(&dir);
+    let missing_manifest = dir.join("missing").join("Scarb.toml");
+    let report = toolchain_ensure_report_from_args(&ToolchainEnsureArgs {
+        manifest_path: Some(missing_manifest.clone()),
+        format: ToolchainEnsureFormatArg::Json,
+        json: false,
+        report_path: None,
+    })
+    .expect("missing manifest should still produce a structured toolchain ensure report");
+    assert_eq!(report.status, ToolchainEnsureStatus::BuildBlocked);
+    assert_eq!(report.manifest_path, missing_manifest.display().to_string());
+    assert_eq!(
+        report.blocked_reason.as_deref(),
+        Some("manifest_path_resolution_failed")
+    );
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "UCN1100"),
+        "toolchain ensure should surface manifest resolution diagnostics: {report:#?}"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn toolchain_ensure_report_from_manifest_path_marks_builtin_lane_ready() {
+    let _guard = integration_env_lock().lock().unwrap();
+    let dir = unique_test_dir("uc-toolchain-ensure-builtin-ready");
+    let _cleanup = TestDirCleanup::new(&dir);
+    let manifest_path = dir.join("Scarb.toml");
+    let (compiler_major, compiler_minor) =
+        parse_cairo_version_major_minor(native_cairo_lang_compiler_version())
+            .expect("compiler version should parse");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+cairo-version = "{compiler_major}.{compiler_minor}.0"
+"#
+        ),
+    )
+    .expect("write manifest");
+
+    let report = toolchain_ensure_report_from_manifest_path(&manifest_path)
+        .expect("builtin toolchain ensure should succeed");
+    assert_eq!(report.status, ToolchainEnsureStatus::Ready);
+    assert!(!report.ensured_now);
+    assert_eq!(
+        report.execution_driver,
+        Some(ToolchainEnsureExecutionDriver::UcBuiltin)
+    );
+    assert_eq!(report.mutation_status, "none");
+    assert!(report.blocked_reason.is_none());
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn toolchain_ensure_report_from_manifest_path_builds_productized_helper_to_default_path() {
+    let guard = integration_env_lock().lock().unwrap();
+    let dir = unique_test_dir("uc-toolchain-ensure-build-helper");
+    let _cleanup = TestDirCleanup::new(&dir);
+    let manifest_path = dir.join("Scarb.toml");
+    let current = parse_cairo_version_major_minor(native_cairo_lang_compiler_version())
+        .expect("compiler version should parse");
+    let requested_major_minor = productized_native_toolchain_helper_lanes()
+        .into_iter()
+        .find(|lane| {
+            parse_cairo_version_major_minor(lane)
+                .is_some_and(|lane_version| lane_version != current)
+        })
+        .expect("expected a productized helper lane different from the builtin compiler");
+    let helper_env = native_toolchain_env_var_name_for_major_minor(&requested_major_minor);
+    let fake_home = dir.join("home");
+    fs::create_dir_all(&fake_home).expect("create fake home");
+    let fake_script = dir.join("build_helper.sh");
+    fs::write(
+        &fake_script,
+        r#"#!/bin/sh
+set -eu
+lane=""
+output=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --lane)
+      lane="$2"
+      shift 2
+      ;;
+    --output)
+      output="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+if [ -z "$output" ]; then
+  digits=$(printf '%s' "$lane" | tr -d '.')
+  output="$HOME/.uc/toolchain-helpers/uc-cairo${digits}-helper/bin/uc"
+fi
+mkdir -p "$(dirname "$output")"
+printf '#!/bin/sh\nexit 0\n' > "$output"
+chmod +x "$output"
+"#,
+    )
+    .expect("write fake helper script");
+    #[cfg(unix)]
+    {
+        let permissions = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+        fs::set_permissions(&fake_script, permissions).expect("chmod fake helper script");
+    }
+    let _helper = ScopedDynamicEnvVar::unset_with_lock(&guard, &helper_env);
+    let _home = ScopedEnvVar::set_with_lock(&guard, "HOME", &fake_home);
+    let _script =
+        ScopedEnvVar::set_with_lock(&guard, "UC_TOOLCHAIN_HELPER_BUILD_SCRIPT", &fake_script);
+
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+cairo-version = "{requested_major_minor}.0"
+"#
+        ),
+    )
+    .expect("write manifest");
+
+    let report = toolchain_ensure_report_from_manifest_path(&manifest_path)
+        .expect("toolchain ensure should build the missing helper");
+    assert_eq!(report.status, ToolchainEnsureStatus::Ready);
+    assert!(report.ensured_now);
+    assert_eq!(
+        report.execution_driver,
+        Some(ToolchainEnsureExecutionDriver::HelperBuilderScript)
+    );
+    assert_eq!(report.mutation_status, "ensured");
+    assert!(report.blocked_reason.is_none());
+    let helper_path = report
+        .artifact_path
+        .as_ref()
+        .expect("ensured helper path should be reported");
+    assert!(Path::new(helper_path).is_file());
+
+    let (_requirement, selection) = select_native_toolchain_from_manifest_path(&manifest_path)
+        .expect("selection should succeed after ensure");
+    let selection = selection.expect("default helper path should be selected after ensure");
+    assert_eq!(
+        selection.toolchain.source,
+        NativeToolchainSource::ExternalHelper
+    );
+    assert_eq!(
+        selection
+            .toolchain
+            .binary_path
+            .as_deref()
+            .expect("helper path should be present"),
+        helper_path
     );
 }
 
@@ -4840,7 +5038,10 @@ cairo-version = "{compiler_major}.{compiler_minor}.0"
         panic!("expected at least one productized external helper lane different from the builtin compiler lane; unsupported-helper path was not exercised");
     };
     let helper_env = native_toolchain_env_var_name_for_major_minor(&requested_major_minor);
+    let fake_home = dir.join("home");
+    fs::create_dir_all(&fake_home).expect("create fake home");
     let _helper = ScopedDynamicEnvVar::unset_with_lock(&_guard, helper_env);
+    let _home = ScopedEnvVar::set_with_lock(&_guard, "HOME", &fake_home);
 
     fs::write(
         &manifest_path,
@@ -4991,7 +5192,10 @@ fn build_plan_report_from_args_marks_missing_helper_as_uc_scarb_plan() {
         })
         .expect("expected a productized helper lane different from the builtin compiler");
     let helper_env = native_toolchain_env_var_name_for_major_minor(&requested_major_minor);
+    let fake_home = dir.join("home");
+    fs::create_dir_all(&fake_home).expect("create fake home");
     let _helper = ScopedDynamicEnvVar::unset_with_lock(&_guard, helper_env);
+    let _home = ScopedEnvVar::set_with_lock(&_guard, "HOME", &fake_home);
     fs::write(
         &manifest_path,
         format!(
@@ -5326,6 +5530,9 @@ fn native_support_report_from_manifest_path_reports_missing_toolchain_helper_dia
     let requested_major_minor = format_cairo_version_major_minor(requested);
     let requested_version = format!("{requested_major_minor}.0");
     let helper_env = native_toolchain_env_var_name_for_major_minor(&requested_major_minor);
+    let fake_home = unique_test_dir("uc-native-support-missing-helper-home");
+    let _home_cleanup = TestDirCleanup::new(&fake_home);
+    let _home = ScopedEnvVar::set_with_lock(&_guard, "HOME", &fake_home);
     let _helper = ScopedDynamicEnvVar::unset_with_lock(&_guard, helper_env.clone());
 
     let dir = unique_test_dir("uc-native-support-missing-helper");
@@ -5413,6 +5620,9 @@ fn native_support_report_json_contract_includes_doctor_fields() {
     let requested_major_minor = format_cairo_version_major_minor(requested);
     let requested_version = format!("{requested_major_minor}.0");
     let helper_env = native_toolchain_env_var_name_for_major_minor(&requested_major_minor);
+    let fake_home = unique_test_dir("uc-native-support-json-contract-home");
+    let _home_cleanup = TestDirCleanup::new(&fake_home);
+    let _home = ScopedEnvVar::set_with_lock(&_guard, "HOME", &fake_home);
     let _helper = ScopedDynamicEnvVar::unset_with_lock(&_guard, helper_env.clone());
 
     let dir = unique_test_dir("uc-native-support-json-contract");

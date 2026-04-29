@@ -87,12 +87,17 @@ Implemented slices:
 - `uc fetch --locked` explicitly hydrates the locked dependency graph into the
   shared `uc` source store and reports what was materialized, reused, or still
   missing.
+- `uc toolchain ensure` explicitly ensures the selected Cairo/helper lane exists
+  locally and reports whether the lane was already available or had to be built
+  during the command.
 
 Next hardening for this phase:
 
 - add lockfile drift fixtures from the reviewed corpus
 - harden the shared source-store lifecycle and prune policy with larger corpus
   fixtures
+- extend helper-lane coverage beyond the current productized set and keep the
+  ensure/build-helper contract deterministic
 - keep `--locked` explicit until a separate policy-governed networked resolve
   mode exists
 

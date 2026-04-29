@@ -95,6 +95,31 @@ state first. Use `.missing_entries` and `.source_store` directly instead of
 guessing from terminal output whether the local dependency graph is actually
 hydrated.
 
+## Toolchain Ensure
+
+```sh
+uc toolchain ensure --manifest-path /abs/path/to/Scarb.toml --format json
+```
+
+Read:
+
+- `.status`
+- `.execution_driver`
+- `.toolchain.requested_version`
+- `.toolchain.requested_major_minor`
+- `.toolchain.source`
+- `.ensured_now`
+- `.mutation_status`
+- `.artifact_path`
+- `.blocked_reason`
+- `.subprocess_commands`
+- `.diagnostics[].code`
+
+If `.status == "build_blocked"`, stop before build and fix the toolchain issue
+first. If `.ensured_now == true`, persist `.artifact_path` as local evidence for
+the ensured helper lane and rerun `uc support native` only if you need the full
+probe payload.
+
 ## Build Plan
 
 ```sh
