@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 BENCH_SCRIPT="$SCRIPT_DIR/../run_real_repo_benchmarks.sh"
+STRICT_BENCH_SCRIPT="$SCRIPT_DIR/../run_strict_supported_set_benchmarks.sh"
 
 TEST_TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEST_TMP_DIR"' EXIT
@@ -351,6 +352,13 @@ test_real_repo_benchmark_accepts_cases_file() {
 
   local json_path
   json_path="$(awk -F': ' '/Benchmark JSON:/ {print $2}' <<<"$stdout_text")"
+  local schema_version
+  schema_version="$(jq -r '.schema_version' "$json_path")"
+  if [[ "$schema_version" != "1" ]]; then
+    echo "expected benchmark report schema_version=1" >&2
+    cat "$json_path" >&2
+    return 1
+  fi
   [[ -f "$json_path" ]] || { echo "missing json report: $json_path" >&2; return 1; }
 
   local supported_count unsupported_count
@@ -359,6 +367,51 @@ test_real_repo_benchmark_accepts_cases_file() {
   if [[ "$supported_count" != "1" || "$unsupported_count" != "1" ]]; then
     echo "expected cases file to populate support matrix" >&2
     cat "$json_path" >&2
+    return 1
+  fi
+}
+
+test_real_repo_benchmark_accepts_explicit_stamp() {
+  local cases_root="$TEST_TMP_DIR/stamp-cases"
+  local mock_bin_dir="$TEST_TMP_DIR/stamp-mock-bin"
+  local mock_uc="$mock_bin_dir/uc"
+  local mock_scarb="$mock_bin_dir/scarb"
+  local results_dir="$TEST_TMP_DIR/stamp-results"
+  local canonical_results_dir
+  local stamp="custom-stamp"
+  mkdir -p "$mock_bin_dir" "$results_dir"
+  canonical_results_dir="$(cd "$results_dir" && pwd -P)"
+  write_mock_uc_bin "$mock_uc"
+  write_mock_scarb_bin "$mock_scarb"
+  write_manifest_case "$cases_root" "stamp-supported"
+
+  local stdout_text
+  stdout_text="$(
+    PATH="$mock_bin_dir:$PATH" \
+    MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/stamp-uc.args" \
+    MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/stamp-scarb.args" \
+    "$BENCH_SCRIPT" \
+      --uc-bin "$mock_uc" \
+      --results-dir "$results_dir" \
+      --runs 1 \
+      --cold-runs 1 \
+      --warm-settle-seconds 0 \
+      --stamp "$stamp" \
+      --case "$cases_root/stamp-supported/Scarb.toml" stamp-supported
+  )"
+
+  local json_path
+  local md_path
+  json_path="$(awk -F': ' '/Benchmark JSON:/ {print $2}' <<<"$stdout_text")"
+  md_path="$(awk -F': ' '/Benchmark Markdown:/ {print $2}' <<<"$stdout_text")"
+  if [[ "$json_path" != "$canonical_results_dir/real-repo-bench-$stamp.json" ]]; then
+    echo "expected benchmark JSON path to use explicit stamp" >&2
+    echo "actual: $json_path" >&2
+    return 1
+  fi
+  if [[ "$md_path" != "$canonical_results_dir/real-repo-bench-$stamp.md" ]]; then
+    echo "expected benchmark Markdown path to use explicit stamp" >&2
+    echo "actual: $md_path" >&2
     return 1
   fi
 }
@@ -813,6 +866,111 @@ test_real_repo_benchmark_instability_state_is_manifest_specific() {
   fi
 }
 
+test_strict_supported_set_benchmark_reruns_only_native_supported_cases() {
+  local cases_root="$TEST_TMP_DIR/strict-supported-cases"
+  local mock_bin_dir="$TEST_TMP_DIR/strict-supported-mock-bin"
+  local mock_uc="$mock_bin_dir/uc"
+  local mock_scarb="$mock_bin_dir/scarb"
+  local results_dir="$TEST_TMP_DIR/strict-supported-results"
+  local source_bench_json="$TEST_TMP_DIR/source-benchmark.json"
+  mkdir -p "$mock_bin_dir" "$results_dir"
+  write_mock_uc_bin "$mock_uc"
+  write_mock_scarb_bin "$mock_scarb"
+  write_manifest_case "$cases_root" "strict-supported"
+
+  cat > "$source_bench_json" <<JSON
+{
+  "schema_version": 1,
+  "summary": {
+    "support_matrix": {
+      "native_supported": 1,
+      "native_unsupported": 1,
+      "fallback_used": 1,
+      "build_failed": 1
+    }
+  },
+  "cases": [
+    {
+      "tag": "strict-supported",
+      "manifest_path": "$cases_root/strict-supported/Scarb.toml",
+      "support_matrix": { "classification": "native_supported" }
+    },
+    {
+      "tag": "strict-unsupported",
+      "manifest_path": "$cases_root/strict-unsupported/Scarb.toml",
+      "support_matrix": { "classification": "native_unsupported" }
+    },
+    {
+      "tag": "strict-fallback",
+      "manifest_path": "$cases_root/strict-fallback/Scarb.toml",
+      "support_matrix": { "classification": "fallback_used" }
+    },
+    {
+      "tag": "strict-failed",
+      "manifest_path": "$cases_root/strict-failed/Scarb.toml",
+      "support_matrix": { "classification": "build_failed" }
+    }
+  ]
+}
+JSON
+
+  local stdout_text
+  stdout_text="$(
+    PATH="$mock_bin_dir:$PATH" \
+    MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/strict-supported-uc.args" \
+    MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/strict-supported-scarb.args" \
+    "$STRICT_BENCH_SCRIPT" \
+      --benchmark-json "$source_bench_json" \
+      --uc-bin "$mock_uc" \
+      --results-dir "$results_dir" \
+      --runs 1 \
+      --cold-runs 1 \
+      --warm-settle-seconds 0 \
+      --stamp strict-supported-smoke
+  )"
+
+  local strict_json
+  local strict_md
+  strict_json="$(awk -F': ' '/Strict benchmark JSON:/ {print $2}' <<<"$stdout_text")"
+  strict_md="$(awk -F': ' '/Strict benchmark Markdown:/ {print $2}' <<<"$stdout_text")"
+  if [[ ! -f "$strict_json" || ! -f "$strict_md" ]]; then
+    echo "expected strict supported-set artifacts to exist" >&2
+    echo "$stdout_text" >&2
+    return 1
+  fi
+
+  local selected_count
+  selected_count="$(jq -r '.selection.selected_case_count' "$strict_json")"
+  local safe_claim
+  safe_claim="$(jq -r '.claim_guard.safe_to_say_native_supported_speed_claim' "$strict_json")"
+  local claim_text
+  claim_text="$(jq -r '.claim_guard.native_supported_speed_claim_text' "$strict_json")"
+  if [[ "$selected_count" != "1" || "$safe_claim" != "true" ]]; then
+    echo "expected exactly one selected native-supported case with a safe claim" >&2
+    cat "$strict_json" >&2
+    return 1
+  fi
+  assert_contains "$claim_text" "Every case in this strict same-window native-supported rerun"
+
+  local selected_tags
+  selected_tags="$(jq -r '.selection.selected_tags[]' "$strict_json")"
+  if [[ "$selected_tags" != "strict-supported" ]]; then
+    echo "expected strict rerun to keep only the native-supported tag" >&2
+    cat "$strict_json" >&2
+    return 1
+  fi
+
+  local uc_args
+  uc_args="$(cat "$TEST_TMP_DIR/strict-supported-uc.args")"
+  if grep -q "strict-unsupported/Scarb.toml" <<<"$uc_args" || \
+     grep -q "strict-fallback/Scarb.toml" <<<"$uc_args" || \
+     grep -q "strict-failed/Scarb.toml" <<<"$uc_args"; then
+    echo "strict supported-set rerun should not probe or build non-native-supported cases" >&2
+    echo "$uc_args" >&2
+    return 1
+  fi
+}
+
 run_test "real_repo_benchmark_rejects_missing_case_values" \
   test_real_repo_benchmark_rejects_missing_case_values
 run_test "real_repo_benchmark_rejects_zero_runs_from_environment" \
@@ -823,6 +981,8 @@ run_test "real_repo_benchmark_rejects_directory_uc_bin" \
   test_real_repo_benchmark_rejects_directory_uc_bin
 run_test "real_repo_benchmark_accepts_cases_file" \
   test_real_repo_benchmark_accepts_cases_file
+run_test "real_repo_benchmark_accepts_explicit_stamp" \
+  test_real_repo_benchmark_accepts_explicit_stamp
 run_test "real_repo_benchmark_canonicalizes_relative_paths" \
   test_real_repo_benchmark_canonicalizes_relative_paths
 run_test "real_repo_benchmark_rejects_malformed_cases_file_rows" \
@@ -839,3 +999,5 @@ run_test "real_repo_benchmark_keeps_unstable_lanes_on_partial_failures" \
   test_real_repo_benchmark_keeps_unstable_lanes_on_partial_failures
 run_test "real_repo_benchmark_instability_state_is_manifest_specific" \
   test_real_repo_benchmark_instability_state_is_manifest_specific
+run_test "strict_supported_set_benchmark_reruns_only_native_supported_cases" \
+  test_strict_supported_set_benchmark_reruns_only_native_supported_cases

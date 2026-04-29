@@ -7,6 +7,32 @@
   "required": ["schema_version", "summary", "cases"],
   "properties": {
     "schema_version": { "const": 1 },
+    "selection": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "source_benchmark_json": { "type": "string" },
+        "source_case_count": { "type": "integer", "minimum": 0 },
+        "source_native_supported_count": { "type": "integer", "minimum": 0 },
+        "selected_case_count": { "type": "integer", "minimum": 0 },
+        "selected_cases_file": { "type": "string" },
+        "rerun_benchmark_json": { "type": "string" },
+        "rerun_benchmark_markdown": { "type": "string" },
+        "selected_tags": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "claim_guard": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "safe_to_say_native_supported_speed_claim": { "type": "boolean" },
+        "reason": { "type": "string" },
+        "native_supported_speed_claim_text": { "type": ["string", "null"] }
+      }
+    },
     "summary": {
       "type": "object",
       "additionalProperties": true,

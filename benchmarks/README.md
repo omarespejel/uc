@@ -101,6 +101,33 @@ If dependency prefetch fails before classification, the harness records that
 manifest as a per-case `build_failed` row with the `scarb --offline fetch` log
 path instead of aborting the entire corpus sweep.
 
+The emitted benchmark JSON now carries `schema_version=1` so it conforms to the
+checked-in benchmark report contract used by agent tooling.
+
+## Strict Same-Window Rerun For The Native-Supported Subset
+```bash
+./benchmarks/scripts/run_strict_supported_set_benchmarks.sh \
+  --uc-bin ./target/release/uc \
+  --benchmark-json /abs/path/to/real-repo-bench-previous.json \
+  --results-dir benchmarks/results \
+  --runs 12 \
+  --cold-runs 12
+```
+
+This wrapper takes a prior mixed support-matrix artifact, extracts only the
+`native_supported` rows, reruns them through `run_real_repo_benchmarks.sh` in
+the same window, and emits a new strict artifact with:
+
+- selection provenance back to the source benchmark JSON,
+- the rerun artifact paths,
+- explicit `claim_guard.safe_to_say_native_supported_speed_claim`,
+- guarded claim text that is only populated when every selected case stayed
+  native-supported, benchmarked successfully, and passed the stability guard.
+
+Use this wrapper for launch-speed evidence. Do not manually copy tags out of a
+mixed support artifact and do not quote speed claims from the mixed artifact
+itself.
+
 ## Build Deployed-Contract Source Index From Inventory
 
 ```bash
