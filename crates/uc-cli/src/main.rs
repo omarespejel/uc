@@ -1074,6 +1074,8 @@ struct SourceStoreStatusReport {
     #[serde(default = "uc_agent_json_schema_version")]
     schema_version: u32,
     generated_at_epoch_ms: u64,
+    readonly: bool,
+    mutation_status: String,
     root: Option<String>,
     available: bool,
     writable: bool,
@@ -1084,6 +1086,12 @@ struct SourceStoreStatusReport {
     what_happened: String,
     why: String,
     retryable: bool,
+    expected: Option<String>,
+    found: Option<String>,
+    fallback_used: bool,
+    replay_command: String,
+    artifact_path: Option<String>,
+    log_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1091,6 +1099,8 @@ struct SourceStorePruneReport {
     #[serde(default = "uc_agent_json_schema_version")]
     schema_version: u32,
     generated_at_epoch_ms: u64,
+    readonly: bool,
+    mutation_status: String,
     root: Option<String>,
     available: bool,
     writable: bool,
@@ -1105,6 +1115,12 @@ struct SourceStorePruneReport {
     what_happened: String,
     why: String,
     retryable: bool,
+    expected: Option<String>,
+    found: Option<String>,
+    fallback_used: bool,
+    replay_command: String,
+    artifact_path: Option<String>,
+    log_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -5861,6 +5877,8 @@ fn source_store_status_report() -> Result<SourceStoreStatusReport> {
         return Ok(SourceStoreStatusReport {
             schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
             generated_at_epoch_ms: epoch_ms_u64().unwrap_or(0),
+            readonly: true,
+            mutation_status: "none".to_string(),
             root: None,
             available: false,
             writable: false,
@@ -5871,6 +5889,12 @@ fn source_store_status_report() -> Result<SourceStoreStatusReport> {
             what_happened: "uc source store root is not configured.".to_string(),
             why: "HOME and UC_SOURCE_STORE_DIR were both unavailable.".to_string(),
             retryable: false,
+            expected: Some("a configured uc source-store root".to_string()),
+            found: Some("no HOME or UC_SOURCE_STORE_DIR value".to_string()),
+            fallback_used: false,
+            replay_command: "uc cache status --format json".to_string(),
+            artifact_path: None,
+            log_path: None,
         });
     };
     let _lock = acquire_cache_lock(&root)?;
@@ -5878,6 +5902,8 @@ fn source_store_status_report() -> Result<SourceStoreStatusReport> {
     Ok(SourceStoreStatusReport {
         schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
         generated_at_epoch_ms: epoch_ms_u64()?,
+        readonly: true,
+        mutation_status: "none".to_string(),
         root: Some(root.display().to_string()),
         available: scan.available,
         writable: scan.writable,
@@ -5891,6 +5917,15 @@ fn source_store_status_report() -> Result<SourceStoreStatusReport> {
         ),
         why: "The source store keeps fetched registry and git package roots available for later locked offline work.".to_string(),
         retryable: true,
+        expected: Some("source-store inventory with a known byte budget".to_string()),
+        found: Some(format!(
+            "entry_count={}, total_bytes={}, invalid_entry_count={}",
+            scan.entry_count, scan.total_bytes, scan.invalid_entry_count
+        )),
+        fallback_used: false,
+        replay_command: "uc cache status --format json".to_string(),
+        artifact_path: None,
+        log_path: None,
     })
 }
 
@@ -5899,6 +5934,8 @@ fn source_store_prune_report(max_bytes_override: Option<u64>) -> Result<SourceSt
         return Ok(SourceStorePruneReport {
             schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
             generated_at_epoch_ms: epoch_ms_u64().unwrap_or(0),
+            readonly: false,
+            mutation_status: "none".to_string(),
             root: None,
             available: false,
             writable: false,
@@ -5915,6 +5952,15 @@ fn source_store_prune_report(max_bytes_override: Option<u64>) -> Result<SourceSt
                     .to_string(),
             why: "HOME and UC_SOURCE_STORE_DIR were both unavailable.".to_string(),
             retryable: false,
+            expected: Some("a configured uc source-store root before pruning".to_string()),
+            found: Some("no HOME or UC_SOURCE_STORE_DIR value".to_string()),
+            fallback_used: false,
+            replay_command: match max_bytes_override {
+                Some(max_bytes) => format!("uc cache prune --format json --max-bytes {max_bytes}"),
+                None => "uc cache prune --format json".to_string(),
+            },
+            artifact_path: None,
+            log_path: None,
         });
     };
     fs::create_dir_all(source_store_entries_root(&root))
@@ -5942,6 +5988,12 @@ fn source_store_prune_report(max_bytes_override: Option<u64>) -> Result<SourceSt
     Ok(SourceStorePruneReport {
         schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
         generated_at_epoch_ms: epoch_ms_u64()?,
+        readonly: false,
+        mutation_status: if removed_keys.is_empty() {
+            "none".to_string()
+        } else {
+            "source_store_pruned".to_string()
+        },
         root: Some(root.display().to_string()),
         available: true,
         writable: true,
@@ -5960,6 +6012,18 @@ fn source_store_prune_report(max_bytes_override: Option<u64>) -> Result<SourceSt
         ),
         why: "The source store is shared across workspaces and needs bounded size for deterministic local operation.".to_string(),
         retryable: true,
+        expected: Some(format!("source-store total bytes at or below {max_bytes}")),
+        found: Some(format!(
+            "entry_count_before={}, entry_count_after={}, total_bytes_before={}, total_bytes_after={}, removed_bytes={}",
+            before.entry_count, entry_count_after, before.total_bytes, total_after, removed_bytes
+        )),
+        fallback_used: false,
+        replay_command: match max_bytes_override {
+            Some(max_bytes) => format!("uc cache prune --format json --max-bytes {max_bytes}"),
+            None => "uc cache prune --format json".to_string(),
+        },
+        artifact_path: None,
+        log_path: None,
     })
 }
 

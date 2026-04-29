@@ -29,6 +29,11 @@ uc resolve --locked --manifest-path Scarb.toml --format json | jq
 ```sh
 uc fetch --locked --manifest-path Scarb.toml --format json | jq
 uc cache status --format json | jq
+```
+
+## Optional Cache Maintenance
+
+```sh
 uc cache prune --format json | jq
 ```
 

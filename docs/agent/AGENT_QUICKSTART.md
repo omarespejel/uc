@@ -102,7 +102,7 @@ uc cache status --format json
 uc cache prune --format json
 ```
 
-Read:
+Read from `uc cache status`:
 
 - `.root`
 - `.available`
@@ -111,6 +111,15 @@ Read:
 - `.total_bytes`
 - `.max_bytes`
 - `.invalid_entry_count`
+
+Read from `uc cache prune`:
+
+- `.entry_count_before`
+- `.entry_count_after`
+- `.total_bytes_before`
+- `.total_bytes_after`
+- `.removed_entry_count`
+- `.removed_bytes`
 
 Use `uc cache status` before forcing offline fetch/build flows. Use
 `uc cache prune` only as an explicit maintenance step; do not assume pruning is

@@ -54,6 +54,9 @@ It must let agents:
 - Read-only project inspection: `uc project inspect --manifest-path /abs/path/to/Scarb.toml --format json`
 - Agent support decision: `uc support native --manifest-path /abs/path/to/Scarb.toml --format json`
 - Locked resolve report: `uc resolve --locked --manifest-path /abs/path/to/Scarb.toml --format json`
+- Locked fetch report: `uc fetch --locked --manifest-path /abs/path/to/Scarb.toml --format json`
+- Source-store inventory: `uc cache status --format json`
+- Source-store prune: `uc cache prune --format json`
 - Explicit toolchain ensure: `uc toolchain ensure --manifest-path /abs/path/to/Scarb.toml --format json`
 - Dry-run safe remediation: `uc agent safe-action build-helper-lane --lane 2.14`
 - Replayable build failure capture: `uc build --engine uc --daemon-mode off --manifest-path /abs/path/to/Scarb.toml --record-failure /abs/path/to/uc-failure.json`
