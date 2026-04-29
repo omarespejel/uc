@@ -37,7 +37,7 @@ Already in this PR or required before launch:
 - `uc mcp serve` emits the read-only command/resource catalog for MCP adapters.
 - `uc project inspect --manifest-path <Scarb.toml> --format json` emits read-only package, workspace, target, dependency, lockfile, and toolchain state.
 - Native support details are included only when exact lane data is available; if read-only inspect skips native probing, use `UCP1005` as the signal to run `uc support native` for full probing.
-- Native support reports include toolchain selection metadata.
+- Native support reports include toolchain selection metadata plus agent-facing `decision_status` values `native_supported`, `native_unsupported`, `fallback_likely`, and `build_blocked`.
 - Diagnostics include schema version, docs URL, next commands, safe automated action, retryability, fallback status, expected toolchain, and found toolchain.
 - Real-repo benchmarks include native support classification and fallback status.
 - `scripts/doctor.sh --uc-bin <path> --manifest-path <Scarb.toml>` probes support before measurement.

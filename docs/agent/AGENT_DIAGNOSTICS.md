@@ -22,6 +22,13 @@ Every agent-facing diagnostic emitted by `uc project inspect --format json`, `uc
 - `toolchain_expected`: expected Cairo/toolchain lane when relevant.
 - `toolchain_found`: found compiler/helper/path when relevant.
 
+For `uc support native --format json`, agents should key their pre-build routing on `decision_status`:
+
+- `native_supported`: native path is ready now.
+- `native_unsupported`: keep the workload outside native claims until compatibility work lands.
+- `fallback_likely`: native is not ready now, but Scarb compatibility fallback is likely to work.
+- `build_blocked`: the support probe itself could not complete; fix the blocking input or helper issue before routing further.
+
 ## Codes
 
 ### UCN0001
@@ -87,6 +94,38 @@ Native toolchain helper lane is not productized.
 - Category: `toolchain_lane_unsupported`
 - Safe action: `manual_legacy_adapter_required`
 - Agent behavior: do not run the helper builder for this lane. Keep the workload in the support matrix as `native_unsupported` unless a reviewed compatible helper binary is explicitly supplied or a dedicated compatibility adapter lands.
+
+### UCN1100
+
+Manifest path could not be resolved.
+
+- Category: `manifest_path`
+- Safe action: `manual_manifest_fix_required`
+- Agent behavior: stop before build; fix the requested path or rerun from the intended project root.
+
+### UCN1101
+
+Project manifest could not be read.
+
+- Category: `manifest_read`
+- Safe action: `manual_manifest_fix_required`
+- Agent behavior: stop before build; ensure `Scarb.toml` exists, is readable, and is valid UTF-8.
+
+### UCN1102
+
+Project manifest TOML could not be parsed.
+
+- Category: `manifest_parse`
+- Safe action: `manual_manifest_fix_required`
+- Agent behavior: stop before build; fix the TOML syntax or manifest structure, then rerun support probing.
+
+### UCN1103
+
+External helper native support probe failed.
+
+- Category: `toolchain_helper_probe`
+- Safe action: `rebuild_helper_lane`
+- Agent behavior: rebuild the helper lane or inspect the helper directly before trusting the lane.
 
 ### UCP1000
 

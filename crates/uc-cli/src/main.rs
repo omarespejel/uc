@@ -555,6 +555,16 @@ enum NativeSupportStatus {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+enum NativeSupportDecisionStatus {
+    NativeSupported,
+    NativeUnsupported,
+    FallbackLikely,
+    #[default]
+    BuildBlocked,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum NativeToolchainRequestSource {
@@ -636,6 +646,8 @@ struct NativeSupportReport {
     schema_version: u32,
     manifest_path: String,
     status: NativeSupportStatus,
+    #[serde(default)]
+    decision_status: NativeSupportDecisionStatus,
     supported: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
@@ -781,9 +793,19 @@ struct ProjectToolchainSummary {
     requested_version: Option<String>,
     requested_major_minor: Option<String>,
     request_source: Option<NativeToolchainRequestSource>,
-    native_status: NativeSupportStatus,
+    native_status: ProjectNativeSupportStatus,
     native_supported: bool,
     fallback_used: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ProjectNativeSupportStatus {
+    NativeSupported,
+    NativeUnsupported,
+    FallbackLikely,
+    BuildBlocked,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3405,8 +3427,8 @@ fn project_toolchain_summary(
     native_support: Option<&NativeSupportReport>,
 ) -> ProjectToolchainSummary {
     let native_status = native_support
-        .map(|support| support.status.clone())
-        .unwrap_or(NativeSupportStatus::Unavailable);
+        .map(|support| project_native_support_status_from_report(Some(support)))
+        .unwrap_or(ProjectNativeSupportStatus::Unavailable);
     let native_supported = native_support
         .map(|support| support.supported)
         .unwrap_or(false);
@@ -3634,6 +3656,83 @@ fn project_agent_diagnostic(
         toolchain_expected,
         toolchain_found,
     }
+}
+
+fn native_support_issue_kind_is_fallback_likely(issue_kind: &str) -> bool {
+    matches!(
+        issue_kind,
+        "unparseable_compiler_version"
+            | "compiler_version_mismatch"
+            | "missing_toolchain_helper"
+            | "invalid_toolchain_helper"
+    )
+}
+
+fn native_support_diagnostic_code_is_fallback_likely(code: &str) -> bool {
+    matches!(code, "UCN1001" | "UCN1003" | "UCN1004" | "UCN1005")
+}
+
+fn native_support_decision_status_from_report(
+    supported: bool,
+    status: &NativeSupportStatus,
+    issue_kind: Option<&str>,
+    diagnostics: &[NativeDiagnostic],
+) -> NativeSupportDecisionStatus {
+    if supported || matches!(status, NativeSupportStatus::Supported) {
+        return NativeSupportDecisionStatus::NativeSupported;
+    }
+    if matches!(status, NativeSupportStatus::Unavailable) {
+        return NativeSupportDecisionStatus::BuildBlocked;
+    }
+    if issue_kind.is_some_and(native_support_issue_kind_is_fallback_likely)
+        || diagnostics
+            .iter()
+            .any(|diagnostic| native_support_diagnostic_code_is_fallback_likely(&diagnostic.code))
+    {
+        return NativeSupportDecisionStatus::FallbackLikely;
+    }
+    NativeSupportDecisionStatus::NativeUnsupported
+}
+
+fn refresh_native_support_report_decision_status(report: &mut NativeSupportReport) {
+    report.decision_status = native_support_decision_status_from_report(
+        report.supported,
+        &report.status,
+        report.issue_kind.as_deref(),
+        &report.diagnostics,
+    );
+}
+
+fn project_native_support_status_from_report(
+    support: Option<&NativeSupportReport>,
+) -> ProjectNativeSupportStatus {
+    match support.map(|report| report.decision_status) {
+        Some(NativeSupportDecisionStatus::NativeSupported) => {
+            ProjectNativeSupportStatus::NativeSupported
+        }
+        Some(NativeSupportDecisionStatus::NativeUnsupported) => {
+            ProjectNativeSupportStatus::NativeUnsupported
+        }
+        Some(NativeSupportDecisionStatus::FallbackLikely) => {
+            ProjectNativeSupportStatus::FallbackLikely
+        }
+        Some(NativeSupportDecisionStatus::BuildBlocked) => ProjectNativeSupportStatus::BuildBlocked,
+        None => ProjectNativeSupportStatus::Unavailable,
+    }
+}
+
+fn best_effort_manifest_path_display(manifest_path: &Option<PathBuf>) -> String {
+    let requested = manifest_path
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("Scarb.toml"));
+    if requested.is_absolute() {
+        return requested.display().to_string();
+    }
+    std::env::current_dir()
+        .ok()
+        .map(|cwd| cwd.join(&requested).display().to_string())
+        .unwrap_or_else(|| requested.display().to_string())
 }
 
 fn run_agent_eval(args: AgentEvalArgs) -> Result<()> {
@@ -4366,9 +4465,18 @@ fn run_support(args: SupportArgs) -> Result<()> {
     }
 }
 
+fn native_support_report_from_args(args: &NativeSupportArgs) -> Result<NativeSupportReport> {
+    match resolve_manifest_path(&args.manifest_path) {
+        Ok(manifest_path) => native_support_report_from_manifest_path(&manifest_path),
+        Err(err) => Ok(native_support_manifest_path_resolution_blocked_report(
+            &args.manifest_path,
+            &err,
+        )),
+    }
+}
+
 fn run_native_support(args: NativeSupportArgs) -> Result<()> {
-    let manifest_path = resolve_manifest_path(&args.manifest_path)?;
-    let report = native_support_report_from_manifest_path(&manifest_path)?;
+    let report = native_support_report_from_args(&args)?;
     let format = if args.json {
         SupportFormatArg::Json
     } else {
@@ -4376,13 +4484,18 @@ fn run_native_support(args: NativeSupportArgs) -> Result<()> {
     };
     match format {
         SupportFormatArg::Text => {
-            if report.supported {
-                println!("supported");
-            } else {
-                println!(
-                    "unsupported: {}",
-                    report.reason.as_deref().unwrap_or("unknown reason")
-                );
+            let reason = report.reason.as_deref().unwrap_or("unknown reason");
+            match report.decision_status {
+                NativeSupportDecisionStatus::NativeSupported => println!("native_supported"),
+                NativeSupportDecisionStatus::NativeUnsupported => {
+                    println!("native_unsupported: {reason}");
+                }
+                NativeSupportDecisionStatus::FallbackLikely => {
+                    println!("fallback_likely: {reason}");
+                }
+                NativeSupportDecisionStatus::BuildBlocked => {
+                    println!("build_blocked: {reason}");
+                }
             }
         }
         SupportFormatArg::Json => {
@@ -5279,6 +5392,13 @@ impl NativeCompileSupportIssue {
             } => (Some(requested.clone()), Some(path.clone())),
         };
         let code = self.code();
+        let retryable = matches!(
+            self,
+            Self::UnparseableCompilerVersion { .. }
+                | Self::CompilerVersionMismatch { .. }
+                | Self::MissingToolchainHelper { .. }
+                | Self::InvalidToolchainHelper { .. }
+        );
         NativeDiagnostic {
             schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
             code: code.to_string(),
@@ -5291,7 +5411,7 @@ impl NativeCompileSupportIssue {
             how_to_fix: self.how_to_fix(),
             next_commands: self.next_commands(),
             safe_automated_action: self.safe_automated_action().to_string(),
-            retryable: false,
+            retryable,
             fallback_used: false,
             toolchain_expected,
             toolchain_found,
@@ -5495,6 +5615,17 @@ fn select_native_toolchain_from_manifest_path(
         manifest_path,
         "failed to parse manifest for native support probe",
     )?;
+    select_native_toolchain_from_manifest_value(manifest_path, &manifest)
+}
+
+#[cfg(feature = "native-compile")]
+fn select_native_toolchain_from_manifest_value(
+    manifest_path: &Path,
+    manifest: &TomlValue,
+) -> Result<(
+    NativeToolchainRequirement,
+    std::result::Result<NativeToolchainSelection, NativeCompileSupportIssue>,
+)> {
     let requirement = resolve_native_toolchain_requirement(manifest_path, &manifest)?;
     let selection = select_native_toolchain_from_requirement(&requirement)?;
     Ok((requirement, selection))
@@ -5508,30 +5639,63 @@ fn native_compile_support_reason(manifest_path: &Path) -> Result<Option<String>>
 
 #[cfg(feature = "native-compile")]
 fn native_support_report_from_manifest_path(manifest_path: &Path) -> Result<NativeSupportReport> {
-    let manifest_text = read_text_file_with_limit(manifest_path, MAX_MANIFEST_BYTES, "manifest")?;
-    let manifest = parse_manifest_toml(
+    let compiler_version = Some(native_cairo_lang_compiler_version().to_string());
+    let manifest_text =
+        match read_text_file_with_limit(manifest_path, MAX_MANIFEST_BYTES, "manifest") {
+            Ok(text) => text,
+            Err(err) => {
+                return Ok(native_support_manifest_read_blocked_report(
+                    manifest_path,
+                    compiler_version,
+                    &err,
+                ))
+            }
+        };
+    let manifest = match parse_manifest_toml(
         &manifest_text,
         manifest_path,
         "failed to parse manifest for native support probe",
-    )?;
+    ) {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            return Ok(native_support_manifest_parse_blocked_report(
+                manifest_path,
+                compiler_version,
+                &err,
+            ))
+        }
+    };
     let package_cairo_version = manifest_package_cairo_version(&manifest);
-    let (requirement, selection) = select_native_toolchain_from_manifest_path(manifest_path)?;
+    let (requirement, selection) =
+        select_native_toolchain_from_manifest_value(manifest_path, &manifest)?;
     match selection {
         Ok(selection) => {
             if let Some(helper_path) = selection.helper_path.as_ref() {
                 let mut report =
-                    load_native_support_report_from_helper(helper_path, manifest_path)?;
+                    match load_native_support_report_from_helper(helper_path, manifest_path) {
+                        Ok(report) => report,
+                        Err(err) => {
+                            return Ok(native_support_external_helper_probe_blocked_report(
+                                manifest_path,
+                                selection.toolchain.clone(),
+                                helper_path,
+                                &err,
+                            ))
+                        }
+                    };
                 report.manifest_path = manifest_path.display().to_string();
                 report.package_cairo_version = package_cairo_version;
                 let mut toolchain = selection.toolchain;
                 toolchain.compiler_version = report.compiler_version.clone();
                 report.toolchain = Some(toolchain);
+                refresh_native_support_report_decision_status(&mut report);
                 return Ok(report);
             }
-            Ok(NativeSupportReport {
+            let mut report = NativeSupportReport {
                 schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
                 manifest_path: manifest_path.display().to_string(),
                 status: NativeSupportStatus::Supported,
+                decision_status: NativeSupportDecisionStatus::NativeSupported,
                 supported: true,
                 reason: None,
                 compiler_version: Some(native_cairo_lang_compiler_version().to_string()),
@@ -5539,29 +5703,37 @@ fn native_support_report_from_manifest_path(manifest_path: &Path) -> Result<Nati
                 issue_kind: None,
                 toolchain: Some(selection.toolchain),
                 diagnostics: Vec::new(),
-            })
+            };
+            refresh_native_support_report_decision_status(&mut report);
+            Ok(report)
         }
-        Err(issue) => Ok(NativeSupportReport {
-            schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
-            manifest_path: manifest_path.display().to_string(),
-            status: NativeSupportStatus::Unsupported,
-            supported: false,
-            reason: Some(issue.reason()),
-            compiler_version: Some(native_cairo_lang_compiler_version().to_string()),
-            package_cairo_version,
-            issue_kind: Some(issue.kind().to_string()),
-            toolchain: Some(native_toolchain_report_for_issue(&requirement, &issue)),
-            diagnostics: vec![issue.diagnostic()],
-        }),
+        Err(issue) => {
+            let mut report = NativeSupportReport {
+                schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+                manifest_path: manifest_path.display().to_string(),
+                status: NativeSupportStatus::Unsupported,
+                decision_status: NativeSupportDecisionStatus::NativeUnsupported,
+                supported: false,
+                reason: Some(issue.reason()),
+                compiler_version: Some(native_cairo_lang_compiler_version().to_string()),
+                package_cairo_version,
+                issue_kind: Some(issue.kind().to_string()),
+                toolchain: Some(native_toolchain_report_for_issue(&requirement, &issue)),
+                diagnostics: vec![issue.diagnostic()],
+            };
+            refresh_native_support_report_decision_status(&mut report);
+            Ok(report)
+        }
     }
 }
 
 #[cfg(not(feature = "native-compile"))]
 fn native_support_report_from_manifest_path(manifest_path: &Path) -> Result<NativeSupportReport> {
-    Ok(NativeSupportReport {
+    let mut report = NativeSupportReport {
         schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
         manifest_path: manifest_path.display().to_string(),
         status: NativeSupportStatus::Unavailable,
+        decision_status: NativeSupportDecisionStatus::BuildBlocked,
         supported: false,
         reason: Some(
             "native compile support probing is unavailable because this uc binary was built without native-compile".to_string(),
@@ -5594,7 +5766,9 @@ fn native_support_report_from_manifest_path(manifest_path: &Path) -> Result<Nati
             toolchain_expected: None,
             toolchain_found: None,
         }],
-    })
+    };
+    refresh_native_support_report_decision_status(&mut report);
+    Ok(report)
 }
 
 #[cfg(all(feature = "native-compile", test))]
@@ -14860,6 +15034,192 @@ fn build_uc_support_native_json_command(
     (command, command_vec)
 }
 
+fn native_support_blocked_report(
+    manifest_path: String,
+    issue_kind: &str,
+    compiler_version: Option<String>,
+    toolchain: Option<NativeToolchainReport>,
+    diagnostic: NativeDiagnostic,
+) -> NativeSupportReport {
+    let reason = Some(diagnostic.why.clone());
+    let mut report = NativeSupportReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        manifest_path,
+        status: NativeSupportStatus::Unavailable,
+        decision_status: NativeSupportDecisionStatus::BuildBlocked,
+        supported: false,
+        reason,
+        compiler_version,
+        package_cairo_version: None,
+        issue_kind: Some(issue_kind.to_string()),
+        toolchain,
+        diagnostics: vec![diagnostic],
+    };
+    refresh_native_support_report_decision_status(&mut report);
+    report
+}
+
+fn native_support_manifest_path_resolution_blocked_report(
+    manifest_path: &Option<PathBuf>,
+    err: &anyhow::Error,
+) -> NativeSupportReport {
+    let manifest_display = best_effort_manifest_path_display(manifest_path);
+    let what_happened = format!("uc could not resolve the manifest path for `{manifest_display}`.");
+    let why = format!("{err:#}");
+    let next_commands = vec![
+        "pwd".to_string(),
+        format!("ls {}", shell_escape_command_arg(&manifest_display)),
+    ];
+    native_support_blocked_report(
+        manifest_display,
+        "manifest_path_resolution_failed",
+        None,
+        None,
+        project_agent_diagnostic(
+            "UCN1100",
+            "manifest_path",
+            NativeDiagnosticSeverity::Error,
+            "Manifest path could not be resolved",
+            what_happened,
+            why,
+            vec![
+                "Pass an existing Scarb.toml path with --manifest-path.".to_string(),
+                "If you intended to use the default manifest, run the command from the project root.".to_string(),
+            ],
+            next_commands,
+            "manual_manifest_fix_required",
+            true,
+            false,
+            None,
+            None,
+        ),
+    )
+}
+
+fn native_support_manifest_read_blocked_report(
+    manifest_path: &Path,
+    compiler_version: Option<String>,
+    err: &anyhow::Error,
+) -> NativeSupportReport {
+    native_support_blocked_report(
+        manifest_path.display().to_string(),
+        "manifest_read_failed",
+        compiler_version,
+        None,
+        project_agent_diagnostic(
+            "UCN1101",
+            "manifest_read",
+            NativeDiagnosticSeverity::Error,
+            "Project manifest could not be read",
+            format!(
+                "uc could not read the manifest at `{}` during native support probing.",
+                manifest_path.display()
+            ),
+            format!("{err:#}"),
+            vec!["Ensure the manifest exists, is readable, and is valid UTF-8.".to_string()],
+            vec![format!(
+                "uc support native --manifest-path {} --json",
+                shell_escape_command_arg(&manifest_path.display().to_string())
+            )],
+            "manual_manifest_fix_required",
+            true,
+            false,
+            None,
+            None,
+        ),
+    )
+}
+
+fn native_support_manifest_parse_blocked_report(
+    manifest_path: &Path,
+    compiler_version: Option<String>,
+    err: &anyhow::Error,
+) -> NativeSupportReport {
+    native_support_blocked_report(
+        manifest_path.display().to_string(),
+        "manifest_parse_failed",
+        compiler_version,
+        None,
+        project_agent_diagnostic(
+            "UCN1102",
+            "manifest_parse",
+            NativeDiagnosticSeverity::Error,
+            "Project manifest TOML could not be parsed",
+            format!(
+                "uc read `{}` but could not parse it as a Scarb manifest during native support probing.",
+                manifest_path.display()
+            ),
+            format!("{err:#}"),
+            vec![
+                "Fix the TOML syntax or manifest structure, then rerun native support probing."
+                    .to_string(),
+            ],
+            vec![
+                format!(
+                    "uc support native --manifest-path {} --json",
+                    shell_escape_command_arg(&manifest_path.display().to_string())
+                ),
+            ],
+            "manual_manifest_fix_required",
+            true,
+            false,
+            None,
+            None,
+        ),
+    )
+}
+
+#[cfg(feature = "native-compile")]
+fn native_support_external_helper_probe_blocked_report(
+    manifest_path: &Path,
+    toolchain: NativeToolchainReport,
+    helper_path: &Path,
+    err: &anyhow::Error,
+) -> NativeSupportReport {
+    let expected = toolchain
+        .requested_major_minor
+        .clone()
+        .or_else(|| toolchain.requested_version.clone());
+    let found = Some(helper_path.display().to_string());
+    let lane = expected.clone().unwrap_or_else(|| "<lane>".to_string());
+    native_support_blocked_report(
+        manifest_path.display().to_string(),
+        "external_helper_probe_failed",
+        Some(native_cairo_lang_compiler_version().to_string()),
+        Some(toolchain),
+        project_agent_diagnostic(
+            "UCN1103",
+            "toolchain_helper_probe",
+            NativeDiagnosticSeverity::Error,
+            "External helper native support probe failed",
+            format!(
+                "uc selected the external helper `{}` for native support probing, but that helper did not return a usable support report.",
+                helper_path.display()
+            ),
+            format!("{err:#}"),
+            vec![
+                format!(
+                    "Rebuild the helper lane for Cairo {lane} if the helper is stale or incompatible."
+                ),
+                "If the helper is intentionally custom, run it directly and inspect its JSON output."
+                    .to_string(),
+            ],
+            vec![
+                format!("./scripts/build_native_toolchain_helper.sh --lane {lane}"),
+                format!(
+                    "uc support native --manifest-path {} --json",
+                    shell_escape_command_arg(&manifest_path.display().to_string())
+                ),
+            ],
+            "rebuild_helper_lane",
+            true,
+            false,
+            expected,
+            found,
+        ),
+    )
+}
+
 #[cfg(feature = "native-compile")]
 fn load_native_support_report_from_helper(
     helper_path: &Path,
@@ -14877,12 +15237,15 @@ fn load_native_support_report_from_helper(
             run.stderr.trim()
         );
     }
-    serde_json::from_str::<NativeSupportReport>(run.stdout.trim()).with_context(|| {
-        format!(
-            "failed to decode native support report from helper {}",
-            helper_path.display()
-        )
-    })
+    let mut report =
+        serde_json::from_str::<NativeSupportReport>(run.stdout.trim()).with_context(|| {
+            format!(
+                "failed to decode native support report from helper {}",
+                helper_path.display()
+            )
+        })?;
+    refresh_native_support_report_decision_status(&mut report);
+    Ok(report)
 }
 
 fn build_uc_build_command(

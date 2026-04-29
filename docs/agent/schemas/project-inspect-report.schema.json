@@ -138,7 +138,15 @@
         "requested_version": { "type": ["string", "null"] },
         "requested_major_minor": { "type": ["string", "null"] },
         "request_source": { "type": ["string", "null"] },
-        "native_status": { "enum": ["supported", "unsupported", "unavailable"] },
+        "native_status": {
+          "enum": [
+            "native_supported",
+            "native_unsupported",
+            "fallback_likely",
+            "build_blocked",
+            "unavailable"
+          ]
+        },
         "native_supported": { "type": "boolean" },
         "fallback_used": { "const": false }
       }

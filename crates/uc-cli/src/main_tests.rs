@@ -1470,6 +1470,7 @@ fn agent_eval_decision_runs_safe_action_for_helper_lane_failure() {
         schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
         manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
         status: NativeSupportStatus::Unsupported,
+        decision_status: NativeSupportDecisionStatus::FallbackLikely,
         supported: false,
         reason: Some("helper missing".to_string()),
         compiler_version: Some("2.16.0".to_string()),
@@ -1521,6 +1522,7 @@ fn agent_eval_decision_shell_escapes_next_command_paths() {
         schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
         manifest_path: "/tmp/My Project/Scarb.toml".to_string(),
         status: NativeSupportStatus::Supported,
+        decision_status: NativeSupportDecisionStatus::NativeSupported,
         supported: true,
         reason: None,
         compiler_version: Some("2.16.0".to_string()),
@@ -1546,6 +1548,7 @@ fn agent_eval_decision_uses_manifest_path_for_manifest_safe_actions() {
         schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
         manifest_path: "/tmp/My Project/Scarb.toml".to_string(),
         status: NativeSupportStatus::Unsupported,
+        decision_status: NativeSupportDecisionStatus::FallbackLikely,
         supported: false,
         reason: Some("cache refresh needed".to_string()),
         compiler_version: Some("2.16.0".to_string()),
@@ -1594,6 +1597,7 @@ fn agent_eval_decision_selects_first_runnable_safe_action() {
         schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
         manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
         status: NativeSupportStatus::Unsupported,
+        decision_status: NativeSupportDecisionStatus::FallbackLikely,
         supported: false,
         reason: Some("helper missing".to_string()),
         compiler_version: Some("2.16.0".to_string()),
@@ -2214,6 +2218,7 @@ starknet = "={requested_version}"
             schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
             manifest_path: manifest_path.display().to_string(),
             status: NativeSupportStatus::Supported,
+            decision_status: NativeSupportDecisionStatus::NativeSupported,
             supported: true,
             reason: None,
             compiler_version: Some(requested_version.to_string()),
@@ -3884,6 +3889,10 @@ edition = "2023_01"
     let report = native_support_report_from_manifest_path(&manifest_path)
         .expect("legacy manifest should still produce a report");
     assert_eq!(report.status, NativeSupportStatus::Unsupported);
+    assert_eq!(
+        report.decision_status,
+        NativeSupportDecisionStatus::NativeUnsupported
+    );
     assert!(!report.supported);
     assert_eq!(
         report.issue_kind.as_deref(),
@@ -3921,6 +3930,10 @@ starknet = "=2.5.x"
     let report = native_support_report_from_manifest_path(&manifest_path)
         .expect("invalid pinned dependency should still produce a report");
     assert_eq!(report.status, NativeSupportStatus::Unsupported);
+    assert_eq!(
+        report.decision_status,
+        NativeSupportDecisionStatus::NativeUnsupported
+    );
     assert!(!report.supported);
     assert_eq!(
         report.issue_kind.as_deref(),
@@ -3942,6 +3955,72 @@ starknet = "=2.5.x"
             .contains("unsupported constraint `=2.5.x`"),
         "report should classify malformed pinned dependency versions as unsupported constraints"
     );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn native_support_report_from_args_marks_missing_manifest_build_blocked() {
+    let dir = unique_test_dir("uc-native-support-missing-manifest");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let missing_manifest_path = dir.join("Scarb.toml");
+    let report = native_support_report_from_args(&NativeSupportArgs {
+        manifest_path: Some(missing_manifest_path.clone()),
+        format: SupportFormatArg::Json,
+        json: false,
+    })
+    .expect("missing manifest should still produce a blocked support report");
+
+    assert_eq!(report.status, NativeSupportStatus::Unavailable);
+    assert_eq!(
+        report.decision_status,
+        NativeSupportDecisionStatus::BuildBlocked
+    );
+    assert_eq!(
+        report.issue_kind.as_deref(),
+        Some("manifest_path_resolution_failed")
+    );
+    let diagnostic = report
+        .diagnostics
+        .first()
+        .expect("blocked support report should include a diagnostic");
+    assert_eq!(diagnostic.code, "UCN1100");
+    assert!(diagnostic.retryable);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn native_support_report_from_manifest_path_marks_parse_error_build_blocked() {
+    let dir = unique_test_dir("uc-native-support-parse-blocked");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let manifest_path = dir.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+cairo-version = "2.14.0
+"#,
+    )
+    .expect("write invalid manifest");
+
+    let report = native_support_report_from_manifest_path(&manifest_path)
+        .expect("manifest parse failure should still produce a blocked support report");
+    assert_eq!(report.status, NativeSupportStatus::Unavailable);
+    assert_eq!(
+        report.decision_status,
+        NativeSupportDecisionStatus::BuildBlocked
+    );
+    assert_eq!(report.issue_kind.as_deref(), Some("manifest_parse_failed"));
+    let diagnostic = report
+        .diagnostics
+        .first()
+        .expect("blocked support report should include a diagnostic");
+    assert_eq!(diagnostic.code, "UCN1102");
+    assert!(diagnostic.retryable);
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -3972,6 +4051,10 @@ cairo-version = "{compiler_major}.{compiler_minor}.0"
     let supported_report = native_support_report_from_manifest_path(&manifest_path)
         .expect("supported manifest should probe successfully");
     assert_eq!(supported_report.status, NativeSupportStatus::Supported);
+    assert_eq!(
+        supported_report.decision_status,
+        NativeSupportDecisionStatus::NativeSupported
+    );
     assert!(supported_report.supported);
     assert!(supported_report.reason.is_none());
 
@@ -4004,6 +4087,10 @@ cairo-version = "{requested_major_minor}.0"
     let unsupported_report = native_support_report_from_manifest_path(&manifest_path)
         .expect("unsupported manifest should still produce a report");
     assert_eq!(unsupported_report.status, NativeSupportStatus::Unsupported);
+    assert_eq!(
+        unsupported_report.decision_status,
+        NativeSupportDecisionStatus::FallbackLikely
+    );
     assert!(!unsupported_report.supported);
     assert_eq!(
         unsupported_report.issue_kind.as_deref(),
@@ -4096,6 +4183,7 @@ version = "{requested_version}"
             schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
             manifest_path: manifest_path.display().to_string(),
             status: NativeSupportStatus::Supported,
+            decision_status: NativeSupportDecisionStatus::NativeSupported,
             supported: true,
             reason: None,
             compiler_version: Some(requested_version.clone()),
@@ -4162,6 +4250,7 @@ cairo-version = "{requested_version}"
             schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
             manifest_path: manifest_path.display().to_string(),
             status: NativeSupportStatus::Supported,
+            decision_status: NativeSupportDecisionStatus::NativeSupported,
             supported: true,
             reason: None,
             compiler_version: Some(requested_version.clone()),
@@ -4184,6 +4273,10 @@ cairo-version = "{requested_version}"
     let report = native_support_report_from_manifest_path(&manifest_path)
         .expect("helper-backed report should be returned");
     assert_eq!(report.status, NativeSupportStatus::Supported);
+    assert_eq!(
+        report.decision_status,
+        NativeSupportDecisionStatus::NativeSupported
+    );
     assert!(report.supported);
     let toolchain = report.toolchain.expect("toolchain should be populated");
     assert_eq!(toolchain.source, NativeToolchainSource::ExternalHelper);
@@ -4313,6 +4406,10 @@ cairo-version = "{requested_version}"
     assert_eq!(report.schema_version, UC_AGENT_JSON_SCHEMA_VERSION);
     assert_eq!(report.status, NativeSupportStatus::Unsupported);
     assert_eq!(
+        report.decision_status,
+        NativeSupportDecisionStatus::FallbackLikely
+    );
+    assert_eq!(
         report.issue_kind.as_deref(),
         Some("missing_toolchain_helper")
     );
@@ -4396,6 +4493,7 @@ cairo-version = "{requested_version}"
     let json = serde_json::to_value(&report).expect("support report should serialize");
     assert_eq!(json["schema_version"], UC_AGENT_JSON_SCHEMA_VERSION);
     assert_eq!(json["status"], "unsupported");
+    assert_eq!(json["decision_status"], "fallback_likely");
     assert_eq!(json["supported"], false);
     assert_eq!(json["issue_kind"], "missing_toolchain_helper");
     assert_eq!(json["diagnostics"][0]["code"], "UCN1004");
@@ -4407,7 +4505,7 @@ cairo-version = "{requested_version}"
         json["diagnostics"][0]["category"],
         "toolchain_lane_unavailable"
     );
-    assert_eq!(json["diagnostics"][0]["retryable"], false);
+    assert_eq!(json["diagnostics"][0]["retryable"], true);
     assert_eq!(json["diagnostics"][0]["fallback_used"], false);
     assert_eq!(
         json["diagnostics"][0]["safe_automated_action"],
@@ -4523,6 +4621,10 @@ starknet = "={requested_version}"
     let report = native_support_report_from_manifest_path(&manifest_path)
         .expect("unproductized helper lane should still return support JSON");
     assert_eq!(report.status, NativeSupportStatus::Unsupported);
+    assert_eq!(
+        report.decision_status,
+        NativeSupportDecisionStatus::NativeUnsupported
+    );
     assert!(!report.supported);
     assert_eq!(
         report.issue_kind.as_deref(),
@@ -4623,6 +4725,10 @@ cairo-version = "{requested_version}"
     let report = native_support_report_from_manifest_path(&manifest_path)
         .expect("invalid unproductized helper should still return support JSON");
     assert_eq!(report.status, NativeSupportStatus::Unsupported);
+    assert_eq!(
+        report.decision_status,
+        NativeSupportDecisionStatus::NativeUnsupported
+    );
     assert_eq!(
         report.issue_kind.as_deref(),
         Some("unsupported_toolchain_helper_lane")
@@ -4787,6 +4893,7 @@ starknet = "={requested_version}"
             schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
             manifest_path: manifest_path.display().to_string(),
             status: NativeSupportStatus::Supported,
+            decision_status: NativeSupportDecisionStatus::NativeSupported,
             supported: true,
             reason: None,
             compiler_version: Some(requested_version.to_string()),
@@ -4801,6 +4908,10 @@ starknet = "={requested_version}"
     let report = native_support_report_from_manifest_path(&manifest_path)
         .expect("reviewed external helper should be allowed even for unproductized lanes");
     assert_eq!(report.status, NativeSupportStatus::Supported);
+    assert_eq!(
+        report.decision_status,
+        NativeSupportDecisionStatus::NativeSupported
+    );
     assert!(report.supported);
     let toolchain = report.toolchain.expect("toolchain should be populated");
     assert_eq!(toolchain.source, NativeToolchainSource::ExternalHelper);
