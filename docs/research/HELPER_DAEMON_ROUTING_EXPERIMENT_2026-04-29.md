@@ -28,8 +28,14 @@ Targeted tests:
 Artifacts:
 
 - lane `daemon-helper-warm-20260429`: `benchmarks/results/daemon-helper-warm-20260429.json`
+  baseline helper-backed warm lane with `--daemon-mode off`; measures second-run cache-hit behavior on
+  fresh temp copies.
 - lane `daemon-helper-require-warm-20260429`: `benchmarks/results/daemon-helper-require-warm-20260429.json`
+  helper-daemon warm lane with `--daemon-mode require`; compares the same second-run helper-backed
+  cache-hit scenario against the baseline lane.
 - lane `daemon-helper-glint-20260429`: `benchmarks/results/daemon-helper-glint-20260429.json`
+  focused single-case follow-up lane for `glint_contracts`; confirms the helper-daemon warm path on
+  an additional helper-backed workload.
 
 Helper lane rebuilt from this branch before measurement:
 
@@ -53,7 +59,8 @@ source comparison:
 
 - `monero_atomic_swap`: `33.117ms` off vs `32.122ms` require (`1.03x`)
 - `braavos_account`: `43.997ms` off vs `42.904ms` require (`1.03x`)
-- `glint_contracts`: `30.862ms` off vs `29.035ms` require (`1.06x`)
+- `glint_contracts`: `30.862ms` off vs `29.035ms` require (`1.06x`) from the focused
+  `daemon-helper-glint-20260429` follow-up lane
 - `zcash_relay`: `27.732ms` off vs `41.289ms` require (`0.67x`)
 
 ## Conclusion
