@@ -27,20 +27,29 @@ Targeted tests:
 
 Artifacts:
 
-- warm comparison source: `benchmarks/results/daemon-helper-warm-20260429.json`
-- explicit helper-daemon rerun: `benchmarks/results/daemon-helper-require-warm-20260429.json`
-- additional helper-backed case: `benchmarks/results/daemon-helper-glint-20260429.json`
+- lane `daemon-helper-warm-20260429`: `benchmarks/results/daemon-helper-warm-20260429.json`
+- lane `daemon-helper-require-warm-20260429`: `benchmarks/results/daemon-helper-require-warm-20260429.json`
+- lane `daemon-helper-glint-20260429`: `benchmarks/results/daemon-helper-glint-20260429.json`
 
 Helper lane rebuilt from this branch before measurement:
 
 - `<HOME>/.uc/toolchain-helpers/uc-cairo214-helper/bin/uc`
+
+Run conditions:
+
+- host class: local macOS Apple Silicon workstation (`Darwin arm64`, `Apple M3 Pro`)
+- native mode: `UC_NATIVE_BUILD_MODE=require`
+- toolchain lane: external helper Cairo `2.14`
+- scenario: helper-backed native builds on fresh temp copies with second-run warm comparisons
+- daemon comparison: `--daemon-mode off` vs `--daemon-mode require`
 
 ## Result
 
 With the helper daemon explicitly started on its scoped socket, second-run warm builds stayed on
 `uc_native_external_helper` with `daemon_used=true` and `cache_hit=true` for all measured cases.
 
-Warm second-run results:
+Warm second-run results under lane `daemon-helper-require-warm-20260429` versus the `daemon-helper-warm-20260429`
+source comparison:
 
 - `monero_atomic_swap`: `33.117ms` off vs `32.122ms` require (`1.03x`)
 - `braavos_account`: `43.997ms` off vs `42.904ms` require (`1.03x`)
