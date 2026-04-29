@@ -425,6 +425,429 @@ fn load_build_report(path: &Path) -> Result<BuildReport> {
         .with_context(|| format!("failed to parse build report {}", path.display()))
 }
 
+fn build_plan_side_effect(kind: &str, description: impl Into<String>) -> BuildPlanSideEffect {
+    BuildPlanSideEffect {
+        kind: kind.to_string(),
+        description: description.into(),
+    }
+}
+
+fn build_plan_network_intent(offline: bool) -> BuildPlanNetworkIntent {
+    if offline {
+        BuildPlanNetworkIntent::Forbidden
+    } else {
+        BuildPlanNetworkIntent::Allowed
+    }
+}
+
+fn build_plan_command(args: &BuildArgs, manifest_path: &Path) -> Vec<String> {
+    let mut command = vec!["uc".to_string(), "build".to_string()];
+    command.push("--manifest-path".to_string());
+    command.push(manifest_path.display().to_string());
+    command.push("--engine".to_string());
+    command.push(args.engine.as_str().to_string());
+    command.push("--daemon-mode".to_string());
+    command.push(args.daemon_mode.as_str().to_string());
+    if args.common.offline {
+        command.push("--offline".to_string());
+    }
+    if args.common.release {
+        command.push("--release".to_string());
+    }
+    if let Some(profile) = &args.common.profile {
+        command.push("--profile".to_string());
+        command.push(profile.clone());
+    }
+    if let Some(package) = &args.common.package {
+        command.push("--package".to_string());
+        command.push(package.clone());
+    }
+    if args.common.workspace {
+        command.push("--workspace".to_string());
+    }
+    if !args.common.features.is_empty() {
+        command.push("--features".to_string());
+        command.push(args.common.features.join(","));
+    }
+    command
+}
+
+fn emit_build_plan_report(args: &BuildArgs, report: &BuildPlanReport) -> Result<()> {
+    if let Some(path) = args.report_path.as_ref() {
+        write_json_report(path, report)?;
+    }
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string(report).context("failed to serialize build plan report")?
+        );
+    } else if args.report_path.is_none() {
+        println!(
+            "status: {}",
+            match report.status {
+                BuildPlanStatus::Ready => "ready",
+                BuildPlanStatus::BuildBlocked => "build_blocked",
+            }
+        );
+        if let Some(backend) = report.planned_compile_backend.as_deref() {
+            println!("planned_compile_backend: {backend}");
+        }
+        if let Some(driver) = report.execution_driver.as_ref() {
+            println!(
+                "execution_driver: {}",
+                serde_json::to_string(driver)
+                    .context("failed to render build plan execution driver")?
+                    .trim_matches('"')
+            );
+        }
+        println!(
+            "network_intent: {}",
+            serde_json::to_string(&report.network_intent)
+                .context("failed to render build plan network intent")?
+                .trim_matches('"')
+        );
+        println!("fallback_allowed: {}", report.fallback_allowed);
+        if let Some(session_key) = report.session_key.as_deref() {
+            println!("session_key: {session_key}");
+        }
+        if let Some(reason) = report.blocked_reason.as_deref() {
+            println!("blocked_reason: {reason}");
+        }
+    }
+    Ok(())
+}
+
+fn build_plan_blocked_report(
+    args: &BuildArgs,
+    manifest_path: String,
+    workspace_root: Option<String>,
+    profile: Option<String>,
+    native_toolchain: Option<NativeToolchainReport>,
+    native_support: Option<NativeSupportReport>,
+    diagnostics: Vec<NativeDiagnostic>,
+    blocked_reason: String,
+) -> Result<BuildPlanReport> {
+    Ok(BuildPlanReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        generated_at_epoch_ms: epoch_ms_u64()?,
+        status: BuildPlanStatus::BuildBlocked,
+        manifest_path: manifest_path.clone(),
+        workspace_root,
+        profile,
+        engine: args.engine.as_str().to_string(),
+        daemon_mode: args.daemon_mode.as_str().to_string(),
+        offline: args.common.offline,
+        network_intent: build_plan_network_intent(args.common.offline),
+        command: if manifest_path.is_empty() {
+            vec!["uc".to_string(), "build".to_string()]
+        } else {
+            build_plan_command(args, Path::new(&manifest_path))
+        },
+        subprocess_command: None,
+        planned_compile_backend: None,
+        execution_driver: None,
+        daemon_planned: false,
+        daemon_autostart_allowed: false,
+        fallback_allowed: false,
+        session_key: None,
+        strict_invalidation_key: None,
+        native_toolchain,
+        native_support,
+        diagnostics,
+        side_effects: Vec::new(),
+        blocked_reason: Some(blocked_reason),
+    })
+}
+
+pub(crate) fn build_plan_report_from_args(args: &BuildArgs) -> Result<BuildPlanReport> {
+    let manifest_path = match resolve_manifest_path(&args.common.manifest_path) {
+        Ok(path) => path,
+        Err(err) => {
+            let support = native_support_manifest_path_resolution_blocked_report(
+                &args.common.manifest_path,
+                &err,
+            );
+            return build_plan_blocked_report(
+                args,
+                support.manifest_path.clone(),
+                None,
+                None,
+                support.toolchain.clone(),
+                Some(support.clone()),
+                support.diagnostics.clone(),
+                support.reason.clone().unwrap_or_else(|| format!("{err:#}")),
+            );
+        }
+    };
+    let workspace_root = metadata_cache_workspace_root(&manifest_path)?;
+    let profile = effective_profile(&args.common);
+    let command = build_plan_command(args, &manifest_path);
+    let manifest_display = manifest_path.display().to_string();
+    let workspace_display = workspace_root.display().to_string();
+
+    match args.engine {
+        EngineArg::Scarb => {
+            let compiler_version = compiler_version_for_backend(BuildCompileBackend::Scarb)?;
+            let (plan, _) = prepare_daemon_build_plan_with_compiler_version(
+                &args.common,
+                &manifest_path,
+                BuildCompileBackend::Scarb,
+                &compiler_version,
+            )?;
+            let (_scarb_command, subprocess_command) =
+                scarb_build_command(&args.common, &manifest_path);
+            Ok(BuildPlanReport {
+                schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+                generated_at_epoch_ms: epoch_ms_u64()?,
+                status: BuildPlanStatus::Ready,
+                manifest_path: manifest_display,
+                workspace_root: Some(workspace_display),
+                profile: Some(profile.clone()),
+                engine: args.engine.as_str().to_string(),
+                daemon_mode: args.daemon_mode.as_str().to_string(),
+                offline: args.common.offline,
+                network_intent: build_plan_network_intent(args.common.offline),
+                command,
+                subprocess_command: Some(subprocess_command),
+                planned_compile_backend: Some("scarb".to_string()),
+                execution_driver: Some(BuildPlanExecutionDriver::ScarbDirect),
+                daemon_planned: false,
+                daemon_autostart_allowed: false,
+                fallback_allowed: false,
+                session_key: Some(plan.session_key),
+                strict_invalidation_key: Some(plan.strict_invalidation_key),
+                native_toolchain: None,
+                native_support: None,
+                diagnostics: Vec::new(),
+                side_effects: vec![
+                    build_plan_side_effect(
+                        "artifact_write",
+                        format!("Would write Scarb build artifacts under target/{profile}."),
+                    ),
+                    build_plan_side_effect(
+                        "subprocess_spawn",
+                        "Would spawn a direct `scarb build` subprocess.".to_string(),
+                    ),
+                ],
+                blocked_reason: None,
+            })
+        }
+        EngineArg::Uc => {
+            let support = native_support_report_from_manifest_path(&manifest_path)?;
+            let support_reason = support.reason.clone();
+            let diagnostics = support.diagnostics.clone();
+            let native_toolchain = support.toolchain.clone();
+            if matches!(
+                support.decision_status,
+                NativeSupportDecisionStatus::BuildBlocked
+            ) {
+                return build_plan_blocked_report(
+                    args,
+                    manifest_display,
+                    Some(workspace_display),
+                    Some(profile.clone()),
+                    native_toolchain,
+                    Some(support.clone()),
+                    diagnostics,
+                    support_reason.unwrap_or_else(|| {
+                        "build planning stopped because native support probing was blocked"
+                            .to_string()
+                    }),
+                );
+            }
+
+            let configured_native_mode = native_build_mode();
+            let disallow_native_fallback = native_disallow_scarb_fallback();
+            if matches!(configured_native_mode, NativeBuildMode::Require)
+                && !matches!(
+                    support.decision_status,
+                    NativeSupportDecisionStatus::NativeSupported
+                )
+            {
+                return build_plan_blocked_report(
+                    args,
+                    manifest_display,
+                    Some(workspace_display),
+                    Some(profile.clone()),
+                    native_toolchain,
+                    Some(support.clone()),
+                    diagnostics,
+                    support_reason.unwrap_or_else(|| {
+                        "native compile mode is require, but the manifest is not native-supported"
+                            .to_string()
+                    }),
+                );
+            }
+
+            let fallback_allowed = matches!(configured_native_mode, NativeBuildMode::Auto)
+                && !disallow_native_fallback;
+            let use_external_helper = configured_native_mode != NativeBuildMode::Off
+                && matches!(
+                    support.decision_status,
+                    NativeSupportDecisionStatus::NativeSupported
+                )
+                && native_toolchain.as_ref().is_some_and(|toolchain| {
+                    matches!(toolchain.source, NativeToolchainSource::ExternalHelper)
+                });
+            let compile_backend = if matches!(configured_native_mode, NativeBuildMode::Off)
+                || !matches!(
+                    support.decision_status,
+                    NativeSupportDecisionStatus::NativeSupported
+                ) {
+                BuildCompileBackend::Scarb
+            } else {
+                BuildCompileBackend::Native
+            };
+            let execution_driver = if use_external_helper {
+                BuildPlanExecutionDriver::ExternalHelper
+            } else if compile_backend == BuildCompileBackend::Native
+                && !matches!(args.daemon_mode, DaemonModeArg::Off)
+            {
+                BuildPlanExecutionDriver::UcDaemon
+            } else {
+                BuildPlanExecutionDriver::UcLocal
+            };
+            let daemon_planned = matches!(execution_driver, BuildPlanExecutionDriver::UcDaemon);
+            let effective_native_mode = if compile_backend == BuildCompileBackend::Native {
+                configured_native_mode
+            } else {
+                NativeBuildMode::Off
+            };
+            let daemon_autostart_allowed = daemon_planned
+                && daemon_autostart_policy(
+                    args.daemon_mode,
+                    effective_native_mode,
+                    daemon_socket_override_present_for_client(),
+                );
+            let planned_compile_backend = build_report_compile_backend_label(
+                args.engine,
+                compile_backend,
+                use_external_helper,
+                &diagnostics,
+            )
+            .to_string();
+
+            let subprocess_command =
+                if matches!(execution_driver, BuildPlanExecutionDriver::ExternalHelper) {
+                    native_toolchain
+                        .as_ref()
+                        .and_then(|toolchain| toolchain.binary_path.as_deref())
+                        .map(PathBuf::from)
+                        .map(|helper_path| {
+                            let helper_display = helper_path.display().to_string();
+                            let (_command, command_vec) = build_uc_build_command(
+                                &helper_path,
+                                &args.common,
+                                &manifest_path,
+                                EngineArg::Uc,
+                                args.daemon_mode,
+                                None,
+                                Some(&helper_display),
+                            );
+                            command_vec
+                        })
+                } else {
+                    None
+                };
+
+            let (session_key, strict_invalidation_key) =
+                if matches!(execution_driver, BuildPlanExecutionDriver::ExternalHelper) {
+                    (None, None)
+                } else {
+                    let compiler_version = compiler_version_for_backend(compile_backend)?;
+                    let (plan, _) = prepare_daemon_build_plan_with_compiler_version(
+                        &args.common,
+                        &manifest_path,
+                        compile_backend,
+                        &compiler_version,
+                    )?;
+                    (Some(plan.session_key), Some(plan.strict_invalidation_key))
+                };
+
+            let mut side_effects = vec![build_plan_side_effect(
+                "artifact_write",
+                format!("Would write build artifacts under target/{profile}."),
+            )];
+            match execution_driver {
+                BuildPlanExecutionDriver::UcLocal => {
+                    side_effects.push(build_plan_side_effect(
+                        "local_cache_write",
+                        "Would update the local uc build cache.".to_string(),
+                    ));
+                    if compile_backend == BuildCompileBackend::Scarb {
+                        side_effects.push(build_plan_side_effect(
+                            "subprocess_spawn",
+                            "Would spawn Scarb through uc's local build path.".to_string(),
+                        ));
+                    } else {
+                        side_effects.push(build_plan_side_effect(
+                            "native_session_write",
+                            "Would persist native compile session state for reuse.".to_string(),
+                        ));
+                    }
+                }
+                BuildPlanExecutionDriver::UcDaemon => {
+                    side_effects.push(build_plan_side_effect(
+                        "daemon_request",
+                        "Would send the build through the uc daemon path.".to_string(),
+                    ));
+                    side_effects.push(build_plan_side_effect(
+                        "daemon_shared_cache_write",
+                        "Would update the daemon shared cache entry for this build session."
+                            .to_string(),
+                    ));
+                    if daemon_autostart_allowed {
+                        side_effects.push(build_plan_side_effect(
+                            "daemon_autostart_attempt",
+                            "Would auto-start the daemon if the default socket is absent."
+                                .to_string(),
+                        ));
+                    }
+                }
+                BuildPlanExecutionDriver::ExternalHelper => {
+                    side_effects.push(build_plan_side_effect(
+                        "subprocess_spawn",
+                        "Would spawn the selected external helper binary.".to_string(),
+                    ));
+                }
+                BuildPlanExecutionDriver::ScarbDirect => {}
+            }
+
+            Ok(BuildPlanReport {
+                schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+                generated_at_epoch_ms: epoch_ms_u64()?,
+                status: BuildPlanStatus::Ready,
+                manifest_path: manifest_display,
+                workspace_root: Some(workspace_display),
+                profile: Some(profile.clone()),
+                engine: args.engine.as_str().to_string(),
+                daemon_mode: args.daemon_mode.as_str().to_string(),
+                offline: args.common.offline,
+                network_intent: build_plan_network_intent(args.common.offline),
+                command,
+                subprocess_command,
+                planned_compile_backend: Some(planned_compile_backend),
+                execution_driver: Some(execution_driver),
+                daemon_planned,
+                daemon_autostart_allowed,
+                fallback_allowed,
+                session_key,
+                strict_invalidation_key,
+                native_toolchain,
+                native_support: Some(support),
+                diagnostics,
+                side_effects,
+                blocked_reason: None,
+            })
+        }
+    }
+}
+
+fn run_build_plan(args: BuildArgs) -> Result<()> {
+    let report = build_plan_report_from_args(&args)?;
+    emit_build_plan_report(&args, &report)
+}
+
 fn daemon_probe_hint_root_dir(workspace_root: &Path) -> Result<PathBuf> {
     let hint_dir = workspace_root.join(".uc/cache/probe-hints");
     ensure_path_within_root(
@@ -1176,6 +1599,9 @@ fn maybe_autostart_daemon_for_build(
 }
 
 pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
+    if args.plan_only {
+        return run_build_plan(args);
+    }
     let common = args.common;
     let emit_json = args.json;
     let report_path = args.report_path;

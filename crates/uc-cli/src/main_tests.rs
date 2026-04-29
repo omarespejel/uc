@@ -411,6 +411,15 @@ fn build_cli_accepts_json_flag() {
 }
 
 #[test]
+fn build_cli_accepts_plan_only_flag() {
+    let cli = Cli::try_parse_from(["uc", "build", "--plan-only"]).expect("build args should parse");
+    let Commands::Build(args) = cli.command else {
+        panic!("expected build command");
+    };
+    assert!(args.plan_only);
+}
+
+#[test]
 fn build_cli_accepts_record_failure_path() {
     let cli = Cli::try_parse_from(["uc", "build", "--record-failure", "/tmp/uc-failure.json"])
         .expect("build args should parse");
@@ -420,6 +429,23 @@ fn build_cli_accepts_record_failure_path() {
     assert_eq!(
         args.record_failure,
         Some(PathBuf::from("/tmp/uc-failure.json"))
+    );
+}
+
+#[test]
+fn build_cli_rejects_plan_only_with_record_failure() {
+    let err = Cli::try_parse_from([
+        "uc",
+        "build",
+        "--plan-only",
+        "--record-failure",
+        "/tmp/uc-failure.json",
+    ])
+    .expect_err("conflicting plan-only and record-failure flags should fail");
+    let message = err.to_string();
+    assert!(
+        message.contains("--plan-only") && message.contains("--record-failure"),
+        "unexpected clap error: {message}"
     );
 }
 
@@ -607,6 +633,10 @@ fn report_schemas_match_nullable_option_output() {
         "../../../docs/agent/schemas/replay-report.schema.json"
     ))
     .expect("replay report schema should parse");
+    let build_plan_schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../docs/agent/schemas/build-plan-report.schema.json"
+    ))
+    .expect("build plan report schema should parse");
     assert_eq!(
         replay_schema["properties"]["manifest_path"]["type"],
         serde_json::json!(["string", "null"])
@@ -672,6 +702,22 @@ fn report_schemas_match_nullable_option_output() {
             "{optional_field} should stay optional in safe-action schema"
         );
     }
+    assert_eq!(
+        build_plan_schema["properties"]["workspace_root"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    assert_eq!(
+        build_plan_schema["properties"]["planned_compile_backend"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    assert_eq!(
+        build_plan_schema["properties"]["session_key"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    assert_eq!(
+        build_plan_schema["properties"]["blocked_reason"]["type"],
+        serde_json::json!(["string", "null"])
+    );
 }
 
 #[test]
@@ -1755,6 +1801,7 @@ fn write_failure_bundle_preserves_missing_manifest_cli_path() {
         engine: EngineArg::Uc,
         daemon_mode: DaemonModeArg::Off,
         json: false,
+        plan_only: false,
         report_path: None,
         record_failure: Some(bundle_path.clone()),
     };
@@ -4106,6 +4153,177 @@ cairo-version = "{requested_major_minor}.0"
     );
 }
 
+#[test]
+fn build_plan_report_from_args_marks_missing_manifest_build_blocked() {
+    let dir = unique_test_dir("uc-build-plan-missing-manifest");
+    let _cleanup = TestDirCleanup::new(&dir);
+    let missing_manifest = dir.join("missing").join("Scarb.toml");
+    let report = commands::build_plan_report_from_args(&BuildArgs {
+        common: BuildCommonArgs {
+            manifest_path: Some(missing_manifest.clone()),
+            package: None,
+            workspace: false,
+            features: Vec::new(),
+            offline: false,
+            release: false,
+            profile: None,
+        },
+        engine: EngineArg::Uc,
+        daemon_mode: DaemonModeArg::Off,
+        json: true,
+        plan_only: true,
+        report_path: None,
+        record_failure: None,
+    })
+    .expect("missing manifest should still produce a structured build plan report");
+    assert_eq!(report.status, BuildPlanStatus::BuildBlocked);
+    assert_eq!(report.manifest_path, missing_manifest.display().to_string());
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "UCN1100"),
+        "build plan should surface manifest resolution diagnostics: {report:#?}"
+    );
+    assert!(report.blocked_reason.is_some());
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn build_plan_report_from_args_marks_builtin_native_ready_plan() {
+    let _guard = integration_env_lock().lock().unwrap();
+    let dir = unique_test_dir("uc-build-plan-native-ready");
+    let _cleanup = TestDirCleanup::new(&dir);
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let manifest_path = dir.join("Scarb.toml");
+    let (compiler_major, compiler_minor) =
+        parse_cairo_version_major_minor(native_cairo_lang_compiler_version())
+            .expect("compiler version should parse");
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+cairo-version = "{compiler_major}.{compiler_minor}.0"
+"#
+        ),
+    )
+    .expect("write manifest");
+
+    let report = commands::build_plan_report_from_args(&BuildArgs {
+        common: BuildCommonArgs {
+            manifest_path: Some(manifest_path.clone()),
+            package: None,
+            workspace: false,
+            features: Vec::new(),
+            offline: true,
+            release: false,
+            profile: None,
+        },
+        engine: EngineArg::Uc,
+        daemon_mode: DaemonModeArg::Off,
+        json: true,
+        plan_only: true,
+        report_path: None,
+        record_failure: None,
+    })
+    .expect("supported manifest should produce a build plan");
+    assert_eq!(report.status, BuildPlanStatus::Ready);
+    assert_eq!(report.planned_compile_backend.as_deref(), Some("uc_native"));
+    assert_eq!(
+        report.execution_driver,
+        Some(BuildPlanExecutionDriver::UcLocal)
+    );
+    assert_eq!(report.network_intent, BuildPlanNetworkIntent::Forbidden);
+    assert!(report.fallback_allowed);
+    assert!(report.session_key.is_some());
+    assert!(report.strict_invalidation_key.is_some());
+    assert_eq!(
+        report
+            .native_support
+            .as_ref()
+            .map(|support| support.decision_status),
+        Some(NativeSupportDecisionStatus::NativeSupported)
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn build_plan_report_from_args_marks_missing_helper_as_uc_scarb_plan() {
+    let _guard = integration_env_lock().lock().unwrap();
+    let dir = unique_test_dir("uc-build-plan-missing-helper");
+    let _cleanup = TestDirCleanup::new(&dir);
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let manifest_path = dir.join("Scarb.toml");
+    let current = parse_cairo_version_major_minor(native_cairo_lang_compiler_version())
+        .expect("compiler version should parse");
+    let requested_major_minor = productized_native_toolchain_helper_lanes()
+        .into_iter()
+        .find(|lane| {
+            parse_cairo_version_major_minor(lane)
+                .is_some_and(|lane_version| lane_version != current)
+        })
+        .expect("expected a productized helper lane different from the builtin compiler");
+    let helper_env = native_toolchain_env_var_name_for_major_minor(&requested_major_minor);
+    let _helper = ScopedDynamicEnvVar::unset_with_lock(&_guard, helper_env);
+    fs::write(
+        &manifest_path,
+        format!(
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+cairo-version = "{requested_major_minor}.0"
+"#
+        ),
+    )
+    .expect("write manifest");
+
+    let _mode = ScopedEnvVar::set_with_lock(&_guard, "UC_NATIVE_BUILD_MODE", "auto");
+    let _disallow = ScopedEnvVar::unset_with_lock(&_guard, "UC_NATIVE_DISALLOW_SCARB_FALLBACK");
+    let report = commands::build_plan_report_from_args(&BuildArgs {
+        common: BuildCommonArgs {
+            manifest_path: Some(manifest_path),
+            package: None,
+            workspace: false,
+            features: Vec::new(),
+            offline: false,
+            release: false,
+            profile: None,
+        },
+        engine: EngineArg::Uc,
+        daemon_mode: DaemonModeArg::Off,
+        json: true,
+        plan_only: true,
+        report_path: None,
+        record_failure: None,
+    })
+    .expect("missing helper should still produce a plan");
+    assert_eq!(report.status, BuildPlanStatus::Ready);
+    assert_eq!(report.planned_compile_backend.as_deref(), Some("uc_scarb"));
+    assert_eq!(
+        report.execution_driver,
+        Some(BuildPlanExecutionDriver::UcLocal)
+    );
+    assert!(report.fallback_allowed);
+    assert_eq!(
+        report
+            .native_support
+            .as_ref()
+            .map(|support| support.decision_status),
+        Some(NativeSupportDecisionStatus::FallbackLikely)
+    );
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "UCN1004"),
+        "plan should surface the missing-helper diagnostic: {report:#?}"
+    );
+}
+
 #[cfg(feature = "native-compile")]
 #[test]
 fn productized_native_toolchain_helper_lanes_match_workspace_metadata() {
@@ -4348,6 +4566,7 @@ cairo-version = "{requested_version}"
         engine: EngineArg::Uc,
         daemon_mode: DaemonModeArg::Off,
         json: false,
+        plan_only: false,
         report_path: Some(report_path.clone()),
         record_failure: None,
     })

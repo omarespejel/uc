@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/omarespejel/uc/docs/agent/schemas/build-plan-report.schema.json",
+  "title": "uc BuildPlanReport",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "generated_at_epoch_ms",
+    "status",
+    "manifest_path",
+    "workspace_root",
+    "profile",
+    "engine",
+    "daemon_mode",
+    "offline",
+    "network_intent",
+    "command",
+    "subprocess_command",
+    "planned_compile_backend",
+    "execution_driver",
+    "daemon_planned",
+    "daemon_autostart_allowed",
+    "fallback_allowed",
+    "session_key",
+    "strict_invalidation_key",
+    "native_toolchain",
+    "native_support",
+    "diagnostics",
+    "side_effects",
+    "blocked_reason"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "generated_at_epoch_ms": { "type": "integer" },
+    "status": { "enum": ["ready", "build_blocked"] },
+    "manifest_path": { "type": "string" },
+    "workspace_root": { "type": ["string", "null"] },
+    "profile": { "type": ["string", "null"] },
+    "engine": { "type": "string" },
+    "daemon_mode": { "type": "string" },
+    "offline": { "type": "boolean" },
+    "network_intent": { "enum": ["allowed", "forbidden"] },
+    "command": { "type": "array", "items": { "type": "string" } },
+    "subprocess_command": {
+      "type": ["array", "null"],
+      "items": { "type": "string" }
+    },
+    "planned_compile_backend": { "type": ["string", "null"] },
+    "execution_driver": {
+      "type": ["string", "null"],
+      "enum": ["scarb_direct", "uc_local", "uc_daemon", "external_helper", null]
+    },
+    "daemon_planned": { "type": "boolean" },
+    "daemon_autostart_allowed": { "type": "boolean" },
+    "fallback_allowed": { "type": "boolean" },
+    "session_key": { "type": ["string", "null"] },
+    "strict_invalidation_key": { "type": ["string", "null"] },
+    "native_toolchain": {
+      "anyOf": [
+        { "type": "null" },
+        { "type": "object" }
+      ]
+    },
+    "native_support": {
+      "anyOf": [
+        { "type": "null" },
+        { "$ref": "native-support-report.schema.json" }
+      ]
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": { "$ref": "native-diagnostic.schema.json" }
+    },
+    "side_effects": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "description"],
+        "properties": {
+          "kind": { "type": "string" },
+          "description": { "type": "string" }
+        }
+      }
+    },
+    "blocked_reason": { "type": ["string", "null"] }
+  }
+}

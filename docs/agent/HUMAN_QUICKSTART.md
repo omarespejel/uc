@@ -24,6 +24,12 @@ uc support native --manifest-path Scarb.toml --format json | jq
 uc build --engine uc --daemon-mode off --manifest-path Scarb.toml
 ```
 
+## Inspect The Build Plan First
+
+```sh
+uc build --engine uc --daemon-mode off --manifest-path Scarb.toml --plan-only --json | jq
+```
+
 ## Write A Build Report
 
 ```sh
