@@ -3,7 +3,7 @@
   "$id": "https://github.com/omarespejel/uc/docs/agent/schemas/fetch-report.schema.json",
   "title": "uc FetchReport",
   "type": "object",
-  "additionalProperties": true,
+  "additionalProperties": false,
   "required": [
     "schema_version",
     "generated_at_epoch_ms",
@@ -62,6 +62,7 @@
     "toolchain": { "type": "object" },
     "source_store": {
       "type": "object",
+      "additionalProperties": false,
       "required": [
         "root",
         "available",
@@ -118,6 +119,7 @@
   "$defs": {
     "fetchEntry": {
       "type": "object",
+      "additionalProperties": false,
       "required": [
         "name",
         "version",

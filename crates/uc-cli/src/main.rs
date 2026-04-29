@@ -6863,8 +6863,8 @@ fn run_mcp(args: McpArgs) -> Result<()> {
     }
 }
 
-fn run_mcp_serve(args: McpServeArgs) -> Result<()> {
-    let report = McpCatalogReport {
+fn mcp_catalog_report() -> Result<McpCatalogReport> {
+    Ok(McpCatalogReport {
         schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
         generated_at_epoch_ms: epoch_ms_u64()?,
         readonly: true,
@@ -6951,6 +6951,37 @@ fn run_mcp_serve(args: McpServeArgs) -> Result<()> {
                 schema: "docs/agent/schemas/fetch-report.schema.json".to_string(),
             },
             McpToolDescriptor {
+                name: "uc.cache_status".to_string(),
+                description:
+                    "Inspect the shared uc source-store inventory and budget state.".to_string(),
+                command: vec![
+                    "uc".to_string(),
+                    "cache".to_string(),
+                    "status".to_string(),
+                    "--format".to_string(),
+                    "json".to_string(),
+                ],
+                mutates_state: false,
+                schema: "docs/agent/schemas/source-store-status-report.schema.json"
+                    .to_string(),
+            },
+            McpToolDescriptor {
+                name: "uc.cache_prune".to_string(),
+                description:
+                    "Prune the shared uc source store back under the configured byte budget."
+                        .to_string(),
+                command: vec![
+                    "uc".to_string(),
+                    "cache".to_string(),
+                    "prune".to_string(),
+                    "--format".to_string(),
+                    "json".to_string(),
+                ],
+                mutates_state: true,
+                schema: "docs/agent/schemas/source-store-prune-report.schema.json"
+                    .to_string(),
+            },
+            McpToolDescriptor {
                 name: "uc.toolchain_ensure".to_string(),
                 description: "Ensure the selected Cairo/helper lane exists locally before build.".to_string(),
                 command: vec![
@@ -7012,7 +7043,11 @@ fn run_mcp_serve(args: McpServeArgs) -> Result<()> {
                 schema: "AGENTS.md".to_string(),
             },
         ],
-    };
+    })
+}
+
+fn run_mcp_serve(args: McpServeArgs) -> Result<()> {
+    let report = mcp_catalog_report()?;
     emit_json_value(args.report_path.as_deref(), &report)
 }
 

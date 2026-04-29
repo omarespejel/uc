@@ -552,6 +552,31 @@ fn mcp_serve_cli_accepts_report_path() {
 }
 
 #[test]
+fn mcp_catalog_report_includes_source_store_tools() {
+    let report = mcp_catalog_report().expect("mcp catalog should build");
+    let tool_names = report
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        tool_names.contains(&"uc.cache_status"),
+        "mcp catalog should expose source-store status"
+    );
+    assert!(
+        tool_names.contains(&"uc.cache_prune"),
+        "mcp catalog should expose source-store prune"
+    );
+    assert!(
+        report
+            .resources
+            .iter()
+            .any(|resource| resource.uri == "uc://source-store/status"),
+        "mcp catalog should keep the source-store status resource"
+    );
+}
+
+#[test]
 fn project_inspect_cli_accepts_json_format_and_report_path() {
     let cli = Cli::try_parse_from([
         "uc",
@@ -933,12 +958,32 @@ fn report_schemas_match_nullable_option_output() {
         serde_json::json!(["string", "null"])
     );
     assert_eq!(
+        fetch_schema["additionalProperties"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        fetch_schema["properties"]["source_store"]["additionalProperties"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        fetch_schema["$defs"]["fetchEntry"]["additionalProperties"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
         cache_status_schema["properties"]["root"]["type"],
         serde_json::json!(["string", "null"])
     );
     assert_eq!(
+        cache_status_schema["additionalProperties"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
         cache_prune_schema["properties"]["root"]["type"],
         serde_json::json!(["string", "null"])
+    );
+    assert_eq!(
+        cache_prune_schema["additionalProperties"],
+        serde_json::json!(false)
     );
 }
 

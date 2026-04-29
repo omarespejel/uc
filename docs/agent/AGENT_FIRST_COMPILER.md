@@ -31,6 +31,8 @@ Already in this PR or required before launch:
 - `uc support native --format json` emits stable support reports.
 - `uc build --json` and `--report-path` carry build diagnostics.
 - `uc build --plan-only --json` emits the chosen execution path before side effects begin.
+- `uc fetch --locked --format json` hydrates locked package roots into the shared `uc` source store with explicit driver and offline-readiness reporting.
+- `uc cache status --format json` and `uc cache prune --format json` expose the source-store inventory and budget lifecycle directly to agents.
 - `uc toolchain ensure --format json` explicitly ensures the selected builtin/helper lane before build time.
 - `uc build --record-failure <path>` writes a redacted, replay-safe failure bundle on build errors.
 - `uc replay <bundle>` reads that bundle and is dry-run by default.
@@ -56,8 +58,8 @@ Already in this PR or required before launch:
    - Add bundle schema validation in the replay path.
 
 2. `uc-mcp-stdio`
-   - Wrap the read-only catalog in a real stdio MCP JSON-RPC server.
-   - Keep mutable actions out of MCP until permission gates are explicit.
+   - Wrap the catalog in a real stdio MCP JSON-RPC server.
+   - Preserve `mutates_state` signaling so adapters can gate mutable actions explicitly.
 
 3. `agent-eval-fixtures`
    - Check in fixture manifests for missing helper lanes, unsupported manifests, fallback activation, stale cache, and benchmark unsupported cases.
@@ -77,9 +79,12 @@ Already in this PR or required before launch:
 
 ## MCP Shape
 
-Read-only MCP tools should eventually expose:
+MCP tools should eventually expose:
 
 - `uc.doctor`
+- `uc.fetch`
+- `uc.cache_status`
+- `uc.cache_prune`
 - `uc.support_native`
 - `uc.explain_diagnostic`
 - `uc.select_toolchain`
@@ -92,6 +97,7 @@ MCP resources should expose:
 - `uc://support/native-matrix/latest`
 - `uc://benchmarks/latest`
 - `uc://toolchains/native`
+- `uc://source-store/status`
 - `uc://repo/policy`
 
 ## Human Workflow

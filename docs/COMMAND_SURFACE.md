@@ -84,11 +84,30 @@
   - top-level `status` (`ready` or `build_blocked`)
   - top-level `blocked_reason` (`null` when fully hydrated; otherwise the authoritative blocked cause)
   - `network_intent` (`allowed` online, `forbidden` offline)
-  - `execution_driver` (`scarb_direct` in the current implementation)
+  - `execution_driver` (`uc_local` for local no-op hydration; otherwise `scarb_direct` when Scarb performed fetch or offline metadata replay)
   - `source_store` summary
   - `fetched_entries` and `missing_entries`
   - `offline_readiness_before` and `offline_readiness_after`
 - `uc fetch` currently requires `--locked`; there is no implicit mutable resolution mode yet.
+
+1. `uc cache status`
+- Reads the current shared source-store inventory.
+- Supports: `--format json`, `--json`, `--report-path`.
+- Emits:
+  - source-store root
+  - availability / writability
+  - entry counts and total bytes
+  - invalid entry count
+  - configured byte budget
+
+1. `uc cache prune`
+- Prunes the shared source store to the configured byte budget.
+- Supports: `--max-bytes`, `--format json`, `--json`, `--report-path`.
+- Emits:
+  - pre/post entry counts
+  - pre/post byte totals
+  - removed entry count and keys
+  - configured byte budget used for pruning
 
 1. `uc toolchain ensure`
 - Ensures the native Cairo/helper lane selected from the manifest is locally available.
@@ -130,8 +149,8 @@
 
 1. `uc mcp serve`
 - Emits the read-only MCP command/resource catalog as JSON.
-- Covers `doctor`, `project_inspect`, `support_native`, `toolchain_ensure`, `explain_diagnostic`, `select_toolchain`, `benchmark_report`, and `profile_native_frontend`.
-- This is intentionally read-only: mutable actions stay behind `uc agent safe-action --execute`.
+- Covers `doctor`, `project_inspect`, `support_native`, `explain_diagnostic`, `select_toolchain`, `fetch`, `cache_status`, `cache_prune`, `toolchain_ensure`, `benchmark_report`, and `profile_native_frontend`.
+- The catalog itself is read-only; adapters must honor each tool's `mutates_state` flag before executing mutable surfaces such as `fetch`, `cache prune`, or `toolchain ensure`.
 
 1. `uc daemon`
 - `start`: launches local background daemon (`~/.uc/daemon/uc.sock` by default).
@@ -160,6 +179,14 @@ The intended primary surface for agents is:
   - Status: implemented for `--locked`
   - Explicit source acquisition into the shared store.
   - Reports what was materialized, what was reused, and what is still missing.
+
+- `uc cache status`
+  - Status: implemented
+  - Read-only inventory of the shared source store.
+
+- `uc cache prune`
+  - Status: implemented
+  - Explicit source-store budget enforcement.
 
 - `uc toolchain ensure`
   - Status: implemented
