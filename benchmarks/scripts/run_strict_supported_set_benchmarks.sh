@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 ROOT_DIR="$(git -C "$SCRIPT_DIR/../.." rev-parse --show-toplevel 2>/dev/null || (cd "$SCRIPT_DIR/../.." && pwd -P))"
-REAL_REPO_BENCH_SCRIPT="$SCRIPT_DIR/run_real_repo_benchmarks.sh"
+REAL_REPO_BENCH_SCRIPT="${REAL_REPO_BENCH_SCRIPT:-$SCRIPT_DIR/run_real_repo_benchmarks.sh}"
 
 UC_BIN="${UC_BIN:-$ROOT_DIR/target/release/uc}"
 RESULTS_DIR="$ROOT_DIR/benchmarks/results"
@@ -67,6 +67,20 @@ validate_stamp() {
   if [[ ! "$value" =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "Invalid stamp: $value (allowed: A-Z a-z 0-9 . _ -)" >&2
     exit 2
+  fi
+}
+
+validate_benchmark_schema() {
+  local label="$1"
+  local path="$2"
+  local require_summary="${3:-0}"
+  if ! jq -e '.schema_version == 1 and (.cases | type == "array")' "$path" >/dev/null; then
+    echo "Unsupported benchmark schema in $label (expected schema_version=1 with array cases): $path" >&2
+    exit 1
+  fi
+  if [[ "$require_summary" == "1" ]] && ! jq -e '(.summary | type) == "object"' "$path" >/dev/null; then
+    echo "Unsupported benchmark schema in $label (expected summary object for rerun artifact): $path" >&2
+    exit 1
   fi
 }
 
@@ -159,6 +173,7 @@ fi
 SOURCE_BENCHMARK_JSON="$(canonical_existing_file_path "benchmark JSON" "$SOURCE_BENCHMARK_JSON")"
 RESULTS_DIR="$(canonical_dir_path "results directory" "$RESULTS_DIR")"
 validate_stamp "$STAMP"
+validate_benchmark_schema "source artifact" "$SOURCE_BENCHMARK_JSON"
 
 if [[ ! -x "$UC_BIN" ]]; then
   echo "UC binary is missing or not executable: $UC_BIN" >&2
@@ -221,6 +236,7 @@ if [[ -z "$rerun_json" || -z "$rerun_md" ]]; then
 fi
 rerun_json="$(canonical_existing_file_path "rerun benchmark JSON" "$rerun_json")"
 rerun_md="$(canonical_existing_file_path "rerun benchmark Markdown" "$rerun_md")"
+validate_benchmark_schema "rerun artifact" "$rerun_json" 1
 
 strict_json="$RESULTS_DIR/strict-supported-set-$STAMP.json"
 strict_md="$RESULTS_DIR/strict-supported-set-$STAMP.md"

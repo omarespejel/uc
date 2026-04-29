@@ -1008,6 +1008,126 @@ JSON
   fi
 }
 
+test_strict_supported_set_rejects_unsupported_source_schema() {
+  local cases_root="$TEST_TMP_DIR/strict-schema-source-cases"
+  local mock_bin_dir="$TEST_TMP_DIR/strict-schema-source-mock-bin"
+  local mock_uc="$mock_bin_dir/uc"
+  local mock_scarb="$mock_bin_dir/scarb"
+  local results_dir="$TEST_TMP_DIR/strict-schema-source-results"
+  local source_bench_json="$TEST_TMP_DIR/strict-schema-source.json"
+  local stderr_path="$TEST_TMP_DIR/strict-schema-source.err"
+  mkdir -p "$mock_bin_dir" "$results_dir"
+  write_mock_uc_bin "$mock_uc"
+  write_mock_scarb_bin "$mock_scarb"
+  write_manifest_case "$cases_root" "strict-supported"
+
+  cat > "$source_bench_json" <<JSON
+{
+  "schema_version": 0,
+  "cases": [
+    {
+      "tag": "strict-supported",
+      "manifest_path": "$cases_root/strict-supported/Scarb.toml",
+      "support_matrix": { "classification": "native_supported" }
+    }
+  ]
+}
+JSON
+
+  if PATH="$mock_bin_dir:$PATH" \
+    MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/strict-schema-source-uc.args" \
+    MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/strict-schema-source-scarb.args" \
+    "$STRICT_BENCH_SCRIPT" \
+      --benchmark-json "$source_bench_json" \
+      --uc-bin "$mock_uc" \
+      --results-dir "$results_dir" \
+      --runs 1 \
+      --cold-runs 1 \
+      --warm-settle-seconds 0 \
+      --stamp strict-bad-source \
+      >"$TEST_TMP_DIR/strict-schema-source.out" 2>"$stderr_path"; then
+    echo "expected strict benchmark wrapper to reject unsupported source schema" >&2
+    return 1
+  fi
+
+  if ! grep -q "Unsupported benchmark schema in source artifact" "$stderr_path"; then
+    echo "expected unsupported source schema validation message" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+}
+
+test_strict_supported_set_rejects_unsupported_rerun_schema() {
+  local cases_root="$TEST_TMP_DIR/strict-schema-rerun-cases"
+  local mock_bin_dir="$TEST_TMP_DIR/strict-schema-rerun-mock-bin"
+  local mock_uc="$mock_bin_dir/uc"
+  local mock_scarb="$mock_bin_dir/scarb"
+  local results_dir="$TEST_TMP_DIR/strict-schema-rerun-results"
+  local source_bench_json="$TEST_TMP_DIR/strict-schema-rerun-source.json"
+  local stderr_path="$TEST_TMP_DIR/strict-schema-rerun.err"
+  local fake_rerun_dir="$TEST_TMP_DIR/strict-schema-rerun-fake"
+  local fake_rerun_script="$fake_rerun_dir/fake-rerun.sh"
+  local bad_rerun_json="$fake_rerun_dir/bad-rerun.json"
+  local bad_rerun_md="$fake_rerun_dir/bad-rerun.md"
+  mkdir -p "$mock_bin_dir" "$results_dir" "$fake_rerun_dir"
+  write_mock_uc_bin "$mock_uc"
+  write_mock_scarb_bin "$mock_scarb"
+  write_manifest_case "$cases_root" "strict-supported"
+
+  cat > "$source_bench_json" <<JSON
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "tag": "strict-supported",
+      "manifest_path": "$cases_root/strict-supported/Scarb.toml",
+      "support_matrix": { "classification": "native_supported" }
+    }
+  ]
+}
+JSON
+
+  cat > "$bad_rerun_json" <<JSON
+{
+  "schema_version": 0,
+  "cases": []
+}
+JSON
+  cat > "$bad_rerun_md" <<'MD'
+# bad rerun
+MD
+  cat > "$fake_rerun_script" <<SH
+#!/usr/bin/env bash
+set -euo pipefail
+echo "Benchmark JSON: $bad_rerun_json"
+echo "Benchmark Markdown: $bad_rerun_md"
+SH
+  chmod +x "$fake_rerun_script"
+
+  if PATH="$mock_bin_dir:$PATH" \
+    REAL_REPO_BENCH_SCRIPT="$fake_rerun_script" \
+    MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/strict-schema-rerun-uc.args" \
+    MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/strict-schema-rerun-scarb.args" \
+    "$STRICT_BENCH_SCRIPT" \
+      --benchmark-json "$source_bench_json" \
+      --uc-bin "$mock_uc" \
+      --results-dir "$results_dir" \
+      --runs 1 \
+      --cold-runs 1 \
+      --warm-settle-seconds 0 \
+      --stamp strict-bad-rerun \
+      >"$TEST_TMP_DIR/strict-schema-rerun.out" 2>"$stderr_path"; then
+    echo "expected strict benchmark wrapper to reject unsupported rerun schema" >&2
+    return 1
+  fi
+
+  if ! grep -q "Unsupported benchmark schema in rerun artifact" "$stderr_path"; then
+    echo "expected unsupported rerun schema validation message" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+}
+
 run_test "real_repo_benchmark_rejects_missing_case_values" \
   test_real_repo_benchmark_rejects_missing_case_values
 run_test "real_repo_benchmark_rejects_zero_runs_from_environment" \
@@ -1040,3 +1160,7 @@ run_test "real_repo_benchmark_instability_state_is_manifest_specific" \
   test_real_repo_benchmark_instability_state_is_manifest_specific
 run_test "strict_supported_set_benchmark_reruns_only_native_supported_cases" \
   test_strict_supported_set_benchmark_reruns_only_native_supported_cases
+run_test "strict_supported_set_rejects_unsupported_source_schema" \
+  test_strict_supported_set_rejects_unsupported_source_schema
+run_test "strict_supported_set_rejects_unsupported_rerun_schema" \
+  test_strict_supported_set_rejects_unsupported_rerun_schema
