@@ -40,7 +40,7 @@
     },
     "toolchain": {
       "type": ["object", "null"],
-      "required": ["edition", "requested_version", "requested_major_minor", "source"],
+      "required": ["edition", "source"],
       "properties": {
         "edition": { "type": "string" },
         "requested_version": { "type": ["string", "null"] },
