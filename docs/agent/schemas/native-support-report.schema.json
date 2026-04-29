@@ -8,6 +8,7 @@
     "schema_version",
     "manifest_path",
     "status",
+    "decision_status",
     "supported",
     "diagnostics"
   ],
@@ -15,6 +16,14 @@
     "schema_version": { "const": 1 },
     "manifest_path": { "type": "string", "minLength": 1 },
     "status": { "enum": ["supported", "unsupported", "unavailable"] },
+    "decision_status": {
+      "enum": [
+        "native_supported",
+        "native_unsupported",
+        "fallback_likely",
+        "build_blocked"
+      ]
+    },
     "supported": { "type": "boolean" },
     "reason": { "type": "string" },
     "compiler_version": { "type": "string" },

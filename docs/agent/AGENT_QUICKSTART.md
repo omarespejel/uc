@@ -35,6 +35,7 @@ uc support native --manifest-path /abs/path/to/Scarb.toml --format json
 Read:
 
 - `.supported`
+- `.decision_status`
 - `.status`
 - `.issue_kind`
 - `.toolchain.requested_version`

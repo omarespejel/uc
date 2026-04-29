@@ -44,12 +44,18 @@
 7. `uc support native`
 - Probes whether a manifest is eligible for native compile in the current `uc` binary.
 - Supports: `--manifest-path`, `--format text|json`, `--json`.
-- Returns a structured reason for ineligible manifests so scripts and local benchmark harnesses can classify cases before measuring them.
+- Returns a structured pre-build decision report so scripts and local benchmark harnesses can classify cases before measuring them.
 - Native support JSON includes selected toolchain lane and stable diagnostics for:
   - exact `cairo-version` mismatches
   - unsupported manifest constraints
   - missing or invalid external helper lanes
   - unparseable compiler versions
+  - manifest-path, manifest-read, manifest-parse, and helper-probe blocked states
+- `status` remains the low-level probe status (`supported`, `unsupported`, `unavailable`) for compatibility, while `decision_status` is the agent-facing state:
+  - `native_supported`
+  - `native_unsupported`
+  - `fallback_likely`
+  - `build_blocked`
 
 8. `uc migrate`
 - Analyzes `Scarb.toml` and emits a migration readiness report.
@@ -91,7 +97,7 @@ The intended primary surface for agents is:
 - `uc support native`
   - Status: implemented
   - Pre-build native support classification.
-  - Must report native-supported, native-unsupported, fallback-likely, or build-blocked with reason codes.
+  - Reports agent-facing `decision_status` values `native_supported`, `native_unsupported`, `fallback_likely`, or `build_blocked`, with reason codes and remediation diagnostics.
 
 - `uc resolve`
   - Status: planned (not yet implemented)
