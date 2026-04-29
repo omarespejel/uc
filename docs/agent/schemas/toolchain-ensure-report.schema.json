@@ -3,7 +3,7 @@
   "$id": "https://github.com/omarespejel/uc/docs/agent/schemas/toolchain-ensure-report.schema.json",
   "title": "uc ToolchainEnsureReport",
   "type": "object",
-  "additionalProperties": true,
+  "additionalProperties": false,
   "required": [
     "schema_version",
     "generated_at_epoch_ms",
@@ -43,24 +43,23 @@
       "required": ["edition", "source"],
       "properties": {
         "edition": { "type": "string" },
-        "requested_version": { "type": ["string", "null"] },
-        "requested_major_minor": { "type": ["string", "null"] },
+        "requested_version": { "type": "string" },
+        "requested_major_minor": { "type": "string" },
         "request_source": {
-          "type": ["string", "null"],
+          "type": "string",
           "enum": [
             "package_cairo_version",
             "manifest_dependency_version",
             "lockfile_dependency_version",
-            "scarb_metadata_dependency_version",
-            null
+            "scarb_metadata_dependency_version"
           ]
         },
         "source": {
           "type": "string",
           "enum": ["builtin", "external_helper"]
         },
-        "binary_path": { "type": ["string", "null"] },
-        "compiler_version": { "type": ["string", "null"] }
+        "binary_path": { "type": "string" },
+        "compiler_version": { "type": "string" }
       },
       "additionalProperties": false
     },
