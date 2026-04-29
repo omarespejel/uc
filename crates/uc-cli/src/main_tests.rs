@@ -1214,7 +1214,7 @@ cairo-version = "{compiler_major}.{compiler_minor}.0"
     assert!(report.blocked_reason.is_none());
 }
 
-#[cfg(feature = "native-compile")]
+#[cfg(all(feature = "native-compile", unix))]
 #[test]
 fn toolchain_ensure_report_from_manifest_path_builds_productized_helper_to_default_path() {
     let guard = integration_env_lock().lock().unwrap();

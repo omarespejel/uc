@@ -38,7 +38,32 @@
       "type": ["string", "null"],
       "enum": ["uc_builtin", "uc_external_helper", "helper_builder_script", null]
     },
-    "toolchain": { "type": ["object", "null"] },
+    "toolchain": {
+      "type": ["object", "null"],
+      "required": ["edition", "requested_version", "requested_major_minor", "source"],
+      "properties": {
+        "edition": { "type": "string" },
+        "requested_version": { "type": ["string", "null"] },
+        "requested_major_minor": { "type": ["string", "null"] },
+        "request_source": {
+          "type": ["string", "null"],
+          "enum": [
+            "package_cairo_version",
+            "manifest_dependency_version",
+            "lockfile_dependency_version",
+            "scarb_metadata_dependency_version",
+            null
+          ]
+        },
+        "source": {
+          "type": "string",
+          "enum": ["builtin", "external_helper"]
+        },
+        "binary_path": { "type": ["string", "null"] },
+        "compiler_version": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
     "ensured_now": { "type": "boolean" },
     "expected": { "type": ["string", "null"] },
     "found": { "type": ["string", "null"] },

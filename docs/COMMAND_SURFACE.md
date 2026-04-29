@@ -100,12 +100,13 @@
   - If the lane is not productized or the manifest cannot be inspected safely, the command returns `build_blocked` with stable diagnostics.
 - Emits a stable ensure report with:
   - top-level `status` (`ready` or `build_blocked`)
-  - `execution_driver` (`uc_builtin`, `uc_external_helper`, or `helper_builder_script`)
+  - `execution_driver` (`uc_builtin`, `uc_external_helper`, `helper_builder_script`, or `null` when no driver ran)
   - selected `toolchain`
   - `ensured_now`
   - `mutation_status`
   - `subprocess_commands`
   - `blocked_reason`
+  - consumers must treat `execution_driver=null` as valid for blocked pre-driver states and rely on `status` plus `toolchain` for control flow
 - Productized helper lanes are now discoverable from their default output path under `~/.uc/toolchain-helpers/...` even when the corresponding `UC_NATIVE_TOOLCHAIN_<major>_<minor>_BIN` env var is unset.
 
 1. `uc migrate`
