@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/omarespejel/uc/docs/agent/schemas/source-store-prune-report.schema.json",
+  "title": "uc SourceStorePruneReport",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "generated_at_epoch_ms",
+    "root",
+    "available",
+    "writable",
+    "max_bytes",
+    "entry_count_before",
+    "entry_count_after",
+    "total_bytes_before",
+    "total_bytes_after",
+    "removed_entry_count",
+    "removed_bytes",
+    "removed_keys",
+    "what_happened",
+    "why",
+    "retryable"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "generated_at_epoch_ms": { "type": "integer" },
+    "root": { "type": ["string", "null"] },
+    "available": { "type": "boolean" },
+    "writable": { "type": "boolean" },
+    "max_bytes": { "type": "integer" },
+    "entry_count_before": { "type": "integer" },
+    "entry_count_after": { "type": "integer" },
+    "total_bytes_before": { "type": "integer" },
+    "total_bytes_after": { "type": "integer" },
+    "removed_entry_count": { "type": "integer" },
+    "removed_bytes": { "type": "integer" },
+    "removed_keys": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "what_happened": { "type": "string" },
+    "why": { "type": "string" },
+    "retryable": { "type": "boolean" }
+  }
+}

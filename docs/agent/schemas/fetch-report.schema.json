@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/omarespejel/uc/docs/agent/schemas/fetch-report.schema.json",
+  "title": "uc FetchReport",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "generated_at_epoch_ms",
+    "manifest_path",
+    "workspace_root",
+    "readonly",
+    "mutation_status",
+    "mode",
+    "status",
+    "offline",
+    "network_intent",
+    "execution_driver",
+    "package",
+    "dependencies",
+    "source_origins",
+    "lockfile",
+    "lockfile_sync",
+    "offline_readiness_before",
+    "offline_readiness_after",
+    "toolchain",
+    "source_store",
+    "fetched_entries",
+    "missing_entries",
+    "what_happened",
+    "why",
+    "retryable",
+    "expected",
+    "found",
+    "fallback_used",
+    "replay_command",
+    "artifact_path",
+    "log_path",
+    "blocked_reason",
+    "subprocess_commands",
+    "diagnostics"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "generated_at_epoch_ms": { "type": "integer" },
+    "manifest_path": { "type": "string" },
+    "workspace_root": { "type": "string" },
+    "readonly": { "type": "boolean" },
+    "mutation_status": { "type": "string" },
+    "mode": { "const": "locked" },
+    "status": { "enum": ["ready", "build_blocked"] },
+    "offline": { "type": "boolean" },
+    "network_intent": { "enum": ["allowed", "forbidden"] },
+    "execution_driver": { "enum": ["uc_local", "scarb_direct"] },
+    "package": { "type": "object" },
+    "dependencies": { "type": "array", "items": { "type": "object" } },
+    "source_origins": { "type": "array", "items": { "type": "object" } },
+    "lockfile": { "type": "object" },
+    "lockfile_sync": { "type": "object" },
+    "offline_readiness_before": { "type": "object" },
+    "offline_readiness_after": { "type": "object" },
+    "toolchain": { "type": "object" },
+    "source_store": {
+      "type": "object",
+      "required": [
+        "root",
+        "available",
+        "writable",
+        "entry_count",
+        "total_bytes",
+        "imported_entry_count",
+        "imported_bytes",
+        "max_bytes",
+        "prune_supported"
+      ],
+      "properties": {
+        "root": { "type": ["string", "null"] },
+        "available": { "type": "boolean" },
+        "writable": { "type": "boolean" },
+        "entry_count": { "type": "integer" },
+        "total_bytes": { "type": "integer" },
+        "imported_entry_count": { "type": "integer" },
+        "imported_bytes": { "type": "integer" },
+        "max_bytes": { "type": "integer" },
+        "prune_supported": { "type": "boolean" }
+      }
+    },
+    "fetched_entries": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/fetchEntry" }
+    },
+    "missing_entries": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/fetchEntry" }
+    },
+    "what_happened": { "type": "string" },
+    "why": { "type": "string" },
+    "retryable": { "type": "boolean" },
+    "expected": { "type": ["string", "null"] },
+    "found": { "type": ["string", "null"] },
+    "fallback_used": { "type": "boolean" },
+    "replay_command": { "type": "string" },
+    "artifact_path": { "type": ["string", "null"] },
+    "log_path": { "type": ["string", "null"] },
+    "blocked_reason": { "type": ["string", "null"] },
+    "subprocess_commands": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": { "type": "string" }
+      }
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": { "$ref": "native-diagnostic.schema.json" }
+    }
+  },
+  "$defs": {
+    "fetchEntry": {
+      "type": "object",
+      "required": [
+        "name",
+        "version",
+        "source",
+        "source_kind",
+        "manifest_path",
+        "source_path",
+        "store_key",
+        "store_path",
+        "status",
+        "action",
+        "bytes_on_disk"
+      ],
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": ["string", "null"] },
+        "source": { "type": ["string", "null"] },
+        "source_kind": { "type": "string" },
+        "manifest_path": { "type": ["string", "null"] },
+        "source_path": { "type": ["string", "null"] },
+        "store_key": { "type": ["string", "null"] },
+        "store_path": { "type": ["string", "null"] },
+        "status": {
+          "enum": ["imported", "cache_hit", "local_reference", "missing"]
+        },
+        "action": { "type": "string" },
+        "bytes_on_disk": { "type": ["integer", "null"] }
+      }
+    }
+  }
+}

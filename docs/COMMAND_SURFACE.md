@@ -74,6 +74,22 @@
 - Agents should treat `blocked_reason` as the authoritative reason for stopping before fetch or build.
 - `uc resolve` currently requires `--locked`; there is no implicit networked resolution mode yet.
 
+1. `uc fetch`
+- Materializes the locked dependency graph into `uc`'s shared source store.
+- Supports: `--locked`, `--manifest-path`, `--offline`, `--format json`, `--json`, `--report-path`.
+- Behavior:
+  - In online mode, `uc` explicitly runs `scarb fetch` first, then replays `scarb metadata --offline` and imports the concrete package roots into the shared `uc` source store.
+  - In offline mode, `uc` skips the network fetch step and only imports sources that are already locally available.
+- Emits a stable fetch report with:
+  - top-level `status` (`ready` or `build_blocked`)
+  - top-level `blocked_reason` (`null` when fully hydrated; otherwise the authoritative blocked cause)
+  - `network_intent` (`allowed` online, `forbidden` offline)
+  - `execution_driver` (`scarb_direct` in the current implementation)
+  - `source_store` summary
+  - `fetched_entries` and `missing_entries`
+  - `offline_readiness_before` and `offline_readiness_after`
+- `uc fetch` currently requires `--locked`; there is no implicit mutable resolution mode yet.
+
 1. `uc migrate`
 - Analyzes `Scarb.toml` and emits a migration readiness report.
 - Optional `--emit-uc-toml <path>` generates a starter `Uc.toml` scaffold.
@@ -122,9 +138,9 @@ The intended primary surface for agents is:
   - Reports source origins, lockfile-sync status, and explicit `network_intent=forbidden`.
 
 - `uc fetch`
-  - Status: planned (not yet implemented)
-  - Source acquisition into the shared store.
-  - Must be separable from build.
+  - Status: implemented for `--locked`
+  - Explicit source acquisition into the shared store.
+  - Reports what was materialized, what was reused, and what is still missing.
 
 - `uc toolchain ensure`
   - Status: planned (not yet implemented)
@@ -165,6 +181,15 @@ The intended primary surface for agents is:
 - external helper lane via `UC_NATIVE_TOOLCHAIN_<major>_<minor>_BIN` for older Cairo majors/minors such as `2.14`
 
 Native auto mode still falls back to Scarb only when the failure class is explicitly marked fallback-eligible. The fallback path is now surfaced in build reports and benchmark support-matrix output instead of being inferred from logs.
+
+## Source Store Note
+
+`uc fetch` currently uses Scarb as the explicit networked resolver/fetch driver, but it does not stop there: it materializes the resulting locked package roots into `uc`'s own shared source store and exposes:
+
+- `uc cache status --format json`
+- `uc cache prune --format json`
+
+Agents should treat the `uc` source store as the authoritative local fetch surface and the current `execution_driver` as part of the rollout evidence, not as hidden behavior.
 
 ## Helper Lane Operations
 

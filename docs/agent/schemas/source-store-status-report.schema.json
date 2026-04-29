@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/omarespejel/uc/docs/agent/schemas/source-store-status-report.schema.json",
+  "title": "uc SourceStoreStatusReport",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "generated_at_epoch_ms",
+    "root",
+    "available",
+    "writable",
+    "entry_count",
+    "total_bytes",
+    "max_bytes",
+    "invalid_entry_count",
+    "what_happened",
+    "why",
+    "retryable"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "generated_at_epoch_ms": { "type": "integer" },
+    "root": { "type": ["string", "null"] },
+    "available": { "type": "boolean" },
+    "writable": { "type": "boolean" },
+    "entry_count": { "type": "integer" },
+    "total_bytes": { "type": "integer" },
+    "max_bytes": { "type": "integer" },
+    "invalid_entry_count": { "type": "integer" },
+    "what_happened": { "type": "string" },
+    "why": { "type": "string" },
+    "retryable": { "type": "boolean" }
+  }
+}

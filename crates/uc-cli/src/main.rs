@@ -232,8 +232,10 @@ const DEFAULT_UC_NATIVE_BUILD_MODE: &str = "auto";
 const DEFAULT_UC_NATIVE_DISALLOW_SCARB_FALLBACK: bool = false;
 #[cfg(all(feature = "native-compile", not(feature = "helper-cairo-214")))]
 const DEFAULT_UC_NATIVE_SKIP_UNUSED_IMPORT_DIAGNOSTICS: bool = true;
+const SOURCE_STORE_ENTRY_SCHEMA_VERSION: u32 = 1;
 const TOOLCHAIN_CHECK_CACHE_SCHEMA_VERSION: u32 = 1;
 const MAX_TOOLCHAIN_CHECK_CACHE_BYTES: u64 = 64 * 1024;
+const DEFAULT_SOURCE_STORE_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 /// Default Starknet CASM bytecode limit used by native compile.
 /// Mirrors the cairo-lang/scarb default used by contract class validation
 /// (81_290 as of cairo-lang 2.16.0 / Scarb 2.14.x) and can be overridden with
@@ -278,6 +280,7 @@ enum Commands {
     Agent(AgentArgs),
     Project(ProjectArgs),
     Resolve(ResolveArgs),
+    Fetch(FetchArgs),
     Cache(CacheArgs),
     Mcp(McpArgs),
     Support(SupportArgs),
@@ -327,6 +330,32 @@ struct ResolveArgs {
 
     #[arg(long, value_enum, default_value_t = ResolveFormatArg::Json)]
     format: ResolveFormatArg,
+
+    #[arg(long, conflicts_with = "format")]
+    json: bool,
+
+    #[arg(long)]
+    report_path: Option<PathBuf>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum FetchFormatArg {
+    Json,
+}
+
+#[derive(Args, Debug, Clone)]
+struct FetchArgs {
+    #[arg(long)]
+    manifest_path: Option<PathBuf>,
+
+    #[arg(long)]
+    locked: bool,
+
+    #[arg(long)]
+    offline: bool,
+
+    #[arg(long, value_enum, default_value_t = FetchFormatArg::Json)]
+    format: FetchFormatArg,
 
     #[arg(long, conflicts_with = "format")]
     json: bool,
@@ -498,12 +527,46 @@ struct CacheArgs {
 #[derive(Subcommand, Debug)]
 enum CacheCommand {
     Clean(CacheCleanArgs),
+    Status(CacheStatusArgs),
+    Prune(CachePruneArgs),
 }
 
 #[derive(Args, Debug, Clone)]
 struct CacheCleanArgs {
     #[arg(long)]
     manifest_path: Option<PathBuf>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum CacheFormatArg {
+    Json,
+}
+
+#[derive(Args, Debug, Clone)]
+struct CacheStatusArgs {
+    #[arg(long, value_enum, default_value_t = CacheFormatArg::Json)]
+    format: CacheFormatArg,
+
+    #[arg(long, conflicts_with = "format")]
+    json: bool,
+
+    #[arg(long)]
+    report_path: Option<PathBuf>,
+}
+
+#[derive(Args, Debug, Clone)]
+struct CachePruneArgs {
+    #[arg(long)]
+    max_bytes: Option<u64>,
+
+    #[arg(long, value_enum, default_value_t = CacheFormatArg::Json)]
+    format: CacheFormatArg,
+
+    #[arg(long, conflicts_with = "format")]
+    json: bool,
+
+    #[arg(long)]
+    report_path: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -882,6 +945,134 @@ struct ResolveReport {
     log_path: Option<String>,
     blocked_reason: Option<String>,
     diagnostics: Vec<NativeDiagnostic>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum FetchStatus {
+    Ready,
+    BuildBlocked,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum FetchExecutionDriver {
+    UcLocal,
+    ScarbDirect,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum FetchEntryStatus {
+    Imported,
+    CacheHit,
+    LocalReference,
+    Missing,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FetchStoreSummary {
+    root: Option<String>,
+    available: bool,
+    writable: bool,
+    entry_count: usize,
+    total_bytes: u64,
+    imported_entry_count: usize,
+    imported_bytes: u64,
+    max_bytes: u64,
+    prune_supported: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FetchEntryReport {
+    name: String,
+    version: Option<String>,
+    source: Option<String>,
+    source_kind: String,
+    manifest_path: Option<String>,
+    source_path: Option<String>,
+    store_key: Option<String>,
+    store_path: Option<String>,
+    status: FetchEntryStatus,
+    action: String,
+    bytes_on_disk: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FetchReport {
+    #[serde(default = "uc_agent_json_schema_version")]
+    schema_version: u32,
+    generated_at_epoch_ms: u64,
+    manifest_path: String,
+    workspace_root: String,
+    readonly: bool,
+    mutation_status: String,
+    mode: String,
+    status: FetchStatus,
+    offline: bool,
+    network_intent: ResolveNetworkIntent,
+    execution_driver: FetchExecutionDriver,
+    package: ProjectPackageSummary,
+    dependencies: Vec<ProjectDependencySummary>,
+    source_origins: Vec<ProjectSourceOriginSummary>,
+    lockfile: ProjectLockfileSummary,
+    lockfile_sync: ResolveLockfileSyncSummary,
+    offline_readiness_before: ProjectOfflineReadinessSummary,
+    offline_readiness_after: ProjectOfflineReadinessSummary,
+    toolchain: ProjectToolchainSummary,
+    source_store: FetchStoreSummary,
+    fetched_entries: Vec<FetchEntryReport>,
+    missing_entries: Vec<FetchEntryReport>,
+    what_happened: String,
+    why: String,
+    retryable: bool,
+    expected: Option<String>,
+    found: Option<String>,
+    fallback_used: bool,
+    replay_command: String,
+    artifact_path: Option<String>,
+    log_path: Option<String>,
+    blocked_reason: Option<String>,
+    subprocess_commands: Vec<Vec<String>>,
+    diagnostics: Vec<NativeDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SourceStoreStatusReport {
+    #[serde(default = "uc_agent_json_schema_version")]
+    schema_version: u32,
+    generated_at_epoch_ms: u64,
+    root: Option<String>,
+    available: bool,
+    writable: bool,
+    entry_count: usize,
+    total_bytes: u64,
+    max_bytes: u64,
+    invalid_entry_count: usize,
+    what_happened: String,
+    why: String,
+    retryable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SourceStorePruneReport {
+    #[serde(default = "uc_agent_json_schema_version")]
+    schema_version: u32,
+    generated_at_epoch_ms: u64,
+    root: Option<String>,
+    available: bool,
+    writable: bool,
+    max_bytes: u64,
+    entry_count_before: usize,
+    entry_count_after: usize,
+    total_bytes_before: u64,
+    total_bytes_after: u64,
+    removed_entry_count: usize,
+    removed_bytes: u64,
+    removed_keys: Vec<String>,
+    what_happened: String,
+    why: String,
+    retryable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1403,6 +1594,23 @@ struct NativeScarbMetadataDependencyRef {
     id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ScarbMetadataDocument {
+    #[serde(default)]
+    packages: Vec<ScarbMetadataPackage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScarbMetadataPackage {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+    manifest_path: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg(feature = "native-compile")]
 struct NativeCompileSessionSignature {
@@ -1857,6 +2065,22 @@ struct MetadataResultCacheFile {
     #[serde(default)]
     workspace_manifests_hash: String,
     run: CommandRun,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SourceStoreEntryFile {
+    schema_version: u32,
+    key: String,
+    name: String,
+    version: Option<String>,
+    source: Option<String>,
+    source_kind: String,
+    manifest_path: Option<String>,
+    source_path: String,
+    bytes_on_disk: u64,
+    file_count: u64,
+    imported_at_epoch_ms: u64,
+    last_access_epoch_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2359,6 +2583,7 @@ fn main() -> Result<()> {
         Commands::Agent(args) => run_agent(args),
         Commands::Project(args) => run_project(args),
         Commands::Resolve(args) => run_resolve(args),
+        Commands::Fetch(args) => run_fetch(args),
         Commands::Cache(args) => run_cache(args),
         Commands::Mcp(args) => run_mcp(args),
         Commands::Support(args) => run_support(args),
@@ -2425,6 +2650,21 @@ fn run_resolve(args: ResolveArgs) -> Result<()> {
     };
     match format {
         ResolveFormatArg::Json => emit_json_value(args.report_path.as_deref(), &report),
+    }
+}
+
+fn run_fetch(args: FetchArgs) -> Result<()> {
+    if !args.locked {
+        bail!("uc fetch currently requires --locked");
+    }
+    let report = fetch_report_from_args(&args)?;
+    let format = if args.json {
+        FetchFormatArg::Json
+    } else {
+        args.format
+    };
+    match format {
+        FetchFormatArg::Json => emit_json_value(args.report_path.as_deref(), &report),
     }
 }
 
@@ -2949,6 +3189,631 @@ fn resolve_manifest_path_resolution_blocked_report(
             None,
             None,
         )],
+    }
+}
+
+fn fetch_report_from_args(args: &FetchArgs) -> Result<FetchReport> {
+    match resolve_manifest_path(&args.manifest_path) {
+        Ok(manifest_path) => fetch_report_from_manifest_path(&manifest_path, args.offline),
+        Err(err) => Ok(fetch_manifest_path_resolution_blocked_report(
+            &args.manifest_path,
+            args.offline,
+            &err,
+        )),
+    }
+}
+
+fn fetch_report_from_manifest_path(manifest_path: &Path, offline: bool) -> Result<FetchReport> {
+    let resolve = resolve_report_from_manifest_path(manifest_path)?;
+    if resolve.status == ResolveStatus::BuildBlocked {
+        return Ok(fetch_blocked_report_from_resolve(&resolve, offline));
+    }
+
+    validate_scarb_toolchain()?;
+
+    let inspect =
+        project_inspect_report_from_manifest_path_with_native_support(manifest_path, false)?;
+    let source_store_root = ensure_source_store_root()?;
+    let mut subprocess_commands = Vec::new();
+    let remote_lockfile_package_count = inspect
+        .lockfile
+        .packages
+        .iter()
+        .filter(|package| package.source.is_some())
+        .count();
+
+    if inspect.offline_readiness.remote_dependency_count == 0 && remote_lockfile_package_count == 0 {
+        let store_scan = fetch_source_store_scan(&source_store_root)?;
+        let materialized = FetchMaterialization::default();
+        let offline_readiness_after =
+            fetch_offline_readiness_after_fetch(&resolve.offline_readiness, &materialized);
+        return Ok(FetchReport {
+            schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+            generated_at_epoch_ms: epoch_ms_u64()?,
+            manifest_path: resolve.manifest_path,
+            workspace_root: resolve.workspace_root,
+            readonly: false,
+            mutation_status: "none".to_string(),
+            mode: "locked".to_string(),
+            status: FetchStatus::Ready,
+            offline,
+            network_intent: if offline {
+                ResolveNetworkIntent::Forbidden
+            } else {
+                ResolveNetworkIntent::Allowed
+            },
+            execution_driver: FetchExecutionDriver::UcLocal,
+            package: resolve.package,
+            dependencies: resolve.dependencies,
+            source_origins: resolve.source_origins,
+            lockfile: resolve.lockfile,
+            lockfile_sync: resolve.lockfile_sync,
+            offline_readiness_before: resolve.offline_readiness,
+            offline_readiness_after,
+            toolchain: resolve.toolchain,
+            source_store: fetch_store_summary_from_scan(&source_store_root, &store_scan, 0, 0),
+            fetched_entries: Vec::new(),
+            missing_entries: Vec::new(),
+            what_happened: format!(
+                "uc found no remote locked dependencies to fetch for {}.",
+                manifest_path.display()
+            ),
+            why: "The project graph is already local, so locked fetch is a no-op.".to_string(),
+            retryable: true,
+            expected: Some("no remote locked dependencies requiring fetch".to_string()),
+            found: Some("remote_dependency_count=0".to_string()),
+            fallback_used: false,
+            replay_command: format!(
+                "uc fetch --locked --manifest-path {} --format json{}",
+                shell_escape_path(manifest_path),
+                if offline { " --offline" } else { "" }
+            ),
+            artifact_path: None,
+            log_path: None,
+            blocked_reason: None,
+            subprocess_commands,
+            diagnostics: Vec::new(),
+        });
+    }
+
+    if !offline {
+        let (fetch_command, fetch_command_vec) = scarb_fetch_command(manifest_path, offline);
+        subprocess_commands.push(fetch_command_vec.clone());
+        let fetch_run = run_command_capture(fetch_command, fetch_command_vec)?;
+        if fetch_run.exit_code != 0 {
+            let diagnostic = project_agent_diagnostic(
+                "UCF1001",
+                "fetch_driver",
+                NativeDiagnosticSeverity::Error,
+                "Scarb fetch failed",
+                format!(
+                    "uc could not fetch locked dependencies for {}.",
+                    manifest_path.display()
+                ),
+                bounded_error_summary(&fetch_run.stderr, "scarb fetch exited non-zero"),
+                vec![
+                    "Inspect the reported Scarb fetch failure and restore registry or git access."
+                        .to_string(),
+                    "Retry with --offline only after the locked dependency sources are already cached locally.".to_string(),
+                ],
+                vec![format!(
+                    "scarb --manifest-path {} fetch",
+                    shell_escape_path(manifest_path)
+                )],
+                "manual_fetch_fix_required",
+                true,
+                false,
+                None,
+                None,
+            );
+            let store_scan = fetch_source_store_scan(&source_store_root).unwrap_or_default();
+            return Ok(FetchReport {
+                schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+                generated_at_epoch_ms: epoch_ms_u64().unwrap_or(0),
+                manifest_path: resolve.manifest_path,
+                workspace_root: resolve.workspace_root,
+                readonly: false,
+                mutation_status: "external_fetch_failed".to_string(),
+                mode: "locked".to_string(),
+                status: FetchStatus::BuildBlocked,
+                offline,
+                network_intent: ResolveNetworkIntent::Allowed,
+                execution_driver: FetchExecutionDriver::ScarbDirect,
+                package: resolve.package,
+                dependencies: resolve.dependencies,
+                source_origins: resolve.source_origins,
+                lockfile: resolve.lockfile,
+                lockfile_sync: resolve.lockfile_sync,
+                offline_readiness_before: resolve.offline_readiness.clone(),
+                offline_readiness_after: resolve.offline_readiness,
+                toolchain: resolve.toolchain,
+                source_store: fetch_store_summary_from_scan(&source_store_root, &store_scan, 0, 0),
+                fetched_entries: Vec::new(),
+                missing_entries: Vec::new(),
+                what_happened: format!(
+                    "uc could not fetch locked dependencies for {}.",
+                    manifest_path.display()
+                ),
+                why: bounded_error_summary(&fetch_run.stderr, "scarb fetch exited non-zero"),
+                retryable: true,
+                expected: Some("scarb fetch succeeds for the locked dependency graph".to_string()),
+                found: Some(format!("exit_code={}", fetch_run.exit_code)),
+                fallback_used: false,
+                replay_command: format!(
+                    "uc fetch --locked --manifest-path {} --format json",
+                    shell_escape_path(manifest_path)
+                ),
+                artifact_path: None,
+                log_path: None,
+                blocked_reason: Some("scarb_fetch_failed".to_string()),
+                subprocess_commands,
+                diagnostics: vec![diagnostic],
+            });
+        }
+    }
+
+    let metadata_args = MetadataArgs {
+        manifest_path: Some(manifest_path.to_path_buf()),
+        format_version: 1,
+        daemon_mode: DaemonModeArg::Off,
+        offline: true,
+        global_cache_dir: None,
+        report_path: None,
+    };
+    let (metadata_command, metadata_command_vec) =
+        scarb_metadata_command(&metadata_args, manifest_path);
+    subprocess_commands.push(metadata_command_vec.clone());
+    let metadata_run = run_command_capture(metadata_command, metadata_command_vec)?;
+    if metadata_run.exit_code != 0 {
+        let diagnostic = project_agent_diagnostic(
+            "UCF1002",
+            "metadata_after_fetch",
+            NativeDiagnosticSeverity::Error,
+            "Offline metadata after fetch failed",
+            format!(
+                "uc could not read the fetched dependency graph for {} in offline mode.",
+                manifest_path.display()
+            ),
+            bounded_error_summary(&metadata_run.stderr, "scarb metadata --offline exited non-zero"),
+            vec![
+                "Ensure Scarb.lock is committed and the dependency graph can be resolved offline."
+                    .to_string(),
+                "Retry uc fetch without --offline so the underlying Scarb cache can be hydrated first.".to_string(),
+            ],
+            vec![format!(
+                "scarb --manifest-path {} --offline metadata --format-version 1",
+                shell_escape_path(manifest_path)
+            )],
+            "manual_fetch_fix_required",
+            true,
+            false,
+            None,
+            None,
+        );
+        let store_scan = fetch_source_store_scan(&source_store_root).unwrap_or_default();
+        return Ok(FetchReport {
+            schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+            generated_at_epoch_ms: epoch_ms_u64().unwrap_or(0),
+            manifest_path: resolve.manifest_path,
+            workspace_root: resolve.workspace_root,
+            readonly: false,
+            mutation_status: if offline {
+                "none".to_string()
+            } else {
+                "external_fetch_executed".to_string()
+            },
+            mode: "locked".to_string(),
+            status: FetchStatus::BuildBlocked,
+            offline,
+            network_intent: if offline {
+                ResolveNetworkIntent::Forbidden
+            } else {
+                ResolveNetworkIntent::Allowed
+            },
+            execution_driver: FetchExecutionDriver::ScarbDirect,
+            package: resolve.package,
+            dependencies: resolve.dependencies,
+            source_origins: resolve.source_origins,
+            lockfile: resolve.lockfile,
+            lockfile_sync: resolve.lockfile_sync,
+            offline_readiness_before: resolve.offline_readiness.clone(),
+            offline_readiness_after: resolve.offline_readiness,
+            toolchain: resolve.toolchain,
+            source_store: fetch_store_summary_from_scan(&source_store_root, &store_scan, 0, 0),
+            fetched_entries: Vec::new(),
+            missing_entries: Vec::new(),
+            what_happened: format!(
+                "uc could not read the fetched dependency graph for {} in offline mode.",
+                manifest_path.display()
+            ),
+            why: bounded_error_summary(
+                &metadata_run.stderr,
+                "scarb metadata --offline exited non-zero",
+            ),
+            retryable: true,
+            expected: Some(
+                "scarb metadata --offline succeeds after the locked graph is fetched".to_string(),
+            ),
+            found: Some(format!("exit_code={}", metadata_run.exit_code)),
+            fallback_used: false,
+            replay_command: format!(
+                "uc fetch --locked --manifest-path {} --format json{}",
+                shell_escape_path(manifest_path),
+                if offline { " --offline" } else { "" }
+            ),
+            artifact_path: None,
+            log_path: None,
+            blocked_reason: Some("metadata_after_fetch_failed".to_string()),
+            subprocess_commands,
+            diagnostics: vec![diagnostic],
+        });
+    }
+
+    let metadata = match parse_scarb_metadata_document(&metadata_run.stdout) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            let diagnostic = project_agent_diagnostic(
+                "UCF1003",
+                "metadata_decode",
+                NativeDiagnosticSeverity::Error,
+                "Fetched metadata JSON could not be decoded",
+                format!(
+                    "uc could not decode the fetched dependency graph for {}.",
+                    manifest_path.display()
+                ),
+                format!("{err:#}"),
+                vec![
+                    "Inspect the raw Scarb metadata output for progress lines or schema drift."
+                        .to_string(),
+                    "Retry with a supported Scarb version and keep the lockfile unchanged."
+                        .to_string(),
+                ],
+                vec![format!(
+                    "scarb --manifest-path {} --offline metadata --format-version 1",
+                    shell_escape_path(manifest_path)
+                )],
+                "manual_fetch_fix_required",
+                true,
+                false,
+                None,
+                None,
+            );
+            let store_scan = fetch_source_store_scan(&source_store_root).unwrap_or_default();
+            return Ok(FetchReport {
+                schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+                generated_at_epoch_ms: epoch_ms_u64().unwrap_or(0),
+                manifest_path: resolve.manifest_path,
+                workspace_root: resolve.workspace_root,
+                readonly: false,
+                mutation_status: if offline {
+                    "none".to_string()
+                } else {
+                    "external_fetch_executed".to_string()
+                },
+                mode: "locked".to_string(),
+                status: FetchStatus::BuildBlocked,
+                offline,
+                network_intent: if offline {
+                    ResolveNetworkIntent::Forbidden
+                } else {
+                    ResolveNetworkIntent::Allowed
+                },
+                execution_driver: FetchExecutionDriver::ScarbDirect,
+                package: resolve.package,
+                dependencies: resolve.dependencies,
+                source_origins: resolve.source_origins,
+                lockfile: resolve.lockfile,
+                lockfile_sync: resolve.lockfile_sync,
+                offline_readiness_before: resolve.offline_readiness.clone(),
+                offline_readiness_after: resolve.offline_readiness,
+                toolchain: resolve.toolchain,
+                source_store: fetch_store_summary_from_scan(&source_store_root, &store_scan, 0, 0),
+                fetched_entries: Vec::new(),
+                missing_entries: Vec::new(),
+                what_happened: format!(
+                    "uc could not decode the fetched dependency graph for {}.",
+                    manifest_path.display()
+                ),
+                why: format!("{err:#}"),
+                retryable: true,
+                expected: Some("valid JSON from scarb metadata --offline".to_string()),
+                found: Some("non-decodable metadata payload".to_string()),
+                fallback_used: false,
+                replay_command: format!(
+                    "uc fetch --locked --manifest-path {} --format json{}",
+                    shell_escape_path(manifest_path),
+                    if offline { " --offline" } else { "" }
+                ),
+                artifact_path: None,
+                log_path: None,
+                blocked_reason: Some("metadata_after_fetch_decode_failed".to_string()),
+                subprocess_commands,
+                diagnostics: vec![diagnostic],
+            });
+        }
+    };
+
+    let _store_lock = acquire_cache_lock(&source_store_root)?;
+    let materialized =
+        materialize_fetch_entries_into_source_store(&inspect, &metadata, &source_store_root)?;
+    let store_scan = fetch_source_store_scan(&source_store_root)?;
+    let offline_readiness_after =
+        fetch_offline_readiness_after_fetch(&resolve.offline_readiness, &materialized);
+    let source_store = fetch_store_summary_from_scan(
+        &source_store_root,
+        &store_scan,
+        materialized.imported_count,
+        materialized.imported_bytes,
+    );
+    let mutation_status = if materialized.imported_count > 0 {
+        "source_store_updated".to_string()
+    } else if offline {
+        "none".to_string()
+    } else {
+        "external_fetch_executed".to_string()
+    };
+    let what_happened = format!(
+        "uc fetched the locked dependency graph for {} and materialized {} remote package sources into the shared source store.",
+        manifest_path.display(),
+        materialized.imported_count
+    );
+    let why = if materialized.missing_entries.is_empty() {
+        "The lockfile resolved cleanly, Scarb exposed concrete package roots, and uc materialized those roots into its shared source store.".to_string()
+    } else {
+        "Some locked packages were still missing concrete source roots after fetch, so the source store is only partially hydrated.".to_string()
+    };
+    Ok(FetchReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        generated_at_epoch_ms: epoch_ms_u64()?,
+        manifest_path: resolve.manifest_path,
+        workspace_root: resolve.workspace_root,
+        readonly: false,
+        mutation_status,
+        mode: "locked".to_string(),
+        status: if materialized.missing_entries.is_empty() {
+            FetchStatus::Ready
+        } else {
+            FetchStatus::BuildBlocked
+        },
+        offline,
+        network_intent: if offline {
+            ResolveNetworkIntent::Forbidden
+        } else {
+            ResolveNetworkIntent::Allowed
+        },
+        execution_driver: FetchExecutionDriver::ScarbDirect,
+        package: resolve.package,
+        dependencies: resolve.dependencies,
+        source_origins: resolve.source_origins,
+        lockfile: resolve.lockfile,
+        lockfile_sync: resolve.lockfile_sync,
+        offline_readiness_before: resolve.offline_readiness,
+        offline_readiness_after,
+        toolchain: resolve.toolchain,
+        source_store,
+        fetched_entries: materialized.fetched_entries,
+        missing_entries: materialized.missing_entries.clone(),
+        what_happened,
+        why,
+        retryable: materialized.missing_entries.is_empty(),
+        expected: Some(
+            "all locked remote package sources materialized into the uc shared source store"
+                .to_string(),
+        ),
+        found: Some(format!(
+            "imported={}, cache_hits={}, missing={}",
+            materialized.imported_count,
+            materialized.cache_hit_count,
+            materialized.missing_entries.len()
+        )),
+        fallback_used: false,
+        replay_command: format!(
+            "uc fetch --locked --manifest-path {} --format json{}",
+            shell_escape_path(manifest_path),
+            if offline { " --offline" } else { "" }
+        ),
+        artifact_path: None,
+        log_path: None,
+        blocked_reason: if materialized.missing_entries.is_empty() {
+            None
+        } else {
+            Some("locked_sources_missing_after_fetch".to_string())
+        },
+        subprocess_commands,
+        diagnostics: if materialized.missing_entries.is_empty() {
+            Vec::new()
+        } else {
+            vec![project_agent_diagnostic(
+                "UCF1004",
+                "source_store_hydration",
+                NativeDiagnosticSeverity::Warn,
+                "Some locked sources are still missing after fetch",
+                format!(
+                    "uc could not materialize {} locked package sources into the shared source store.",
+                    materialized.missing_entries.len()
+                ),
+                "At least one locked package did not resolve to a concrete local package root after fetch and offline metadata replay.".to_string(),
+                vec![
+                    "Inspect the missing entries in the fetch report and verify the underlying Scarb cache content.".to_string(),
+                    "Retry without --offline if the local cache was incomplete.".to_string(),
+                ],
+                vec![format!(
+                    "uc fetch --locked --manifest-path {} --format json",
+                    shell_escape_path(manifest_path)
+                )],
+                "manual_fetch_fix_required",
+                true,
+                false,
+                None,
+                None,
+            )]
+        },
+    })
+}
+
+fn fetch_manifest_path_resolution_blocked_report(
+    manifest_path: &Option<PathBuf>,
+    offline: bool,
+    err: &anyhow::Error,
+) -> FetchReport {
+    let manifest_text = manifest_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "Scarb.toml".to_string());
+    FetchReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        generated_at_epoch_ms: epoch_ms_u64().unwrap_or(0),
+        manifest_path: manifest_text.clone(),
+        workspace_root: manifest_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| ".".to_string()),
+        readonly: false,
+        mutation_status: "none".to_string(),
+        mode: "locked".to_string(),
+        status: FetchStatus::BuildBlocked,
+        offline,
+        network_intent: if offline {
+            ResolveNetworkIntent::Forbidden
+        } else {
+            ResolveNetworkIntent::Allowed
+        },
+        execution_driver: FetchExecutionDriver::UcLocal,
+        package: ProjectPackageSummary::default(),
+        dependencies: Vec::new(),
+        source_origins: Vec::new(),
+        lockfile: ProjectLockfileSummary {
+            present: false,
+            path: manifest_path
+                .as_ref()
+                .and_then(|path| path.parent())
+                .map(|parent| parent.join("Scarb.lock").display().to_string()),
+            valid: false,
+            version: None,
+            size_bytes: None,
+            modified_unix_ms: None,
+            hash: None,
+            packages: Vec::new(),
+        },
+        lockfile_sync: ResolveLockfileSyncSummary {
+            status: ResolveLockfileSyncStatus::ManifestInvalid,
+            missing_dependencies: Vec::new(),
+            reasons: vec!["manifest_path_resolution_failed".to_string()],
+        },
+        offline_readiness_before: ProjectOfflineReadinessSummary {
+            status: ProjectOfflineReadinessStatus::Blocked,
+            readonly_native_source: false,
+            lockfile_present: false,
+            lockfile_valid: false,
+            remote_dependency_count: 0,
+            path_dependency_count: 0,
+            workspace_dependency_count: 0,
+            cache_state_known: false,
+            reasons: vec!["manifest_path_resolution_failed".to_string()],
+        },
+        offline_readiness_after: ProjectOfflineReadinessSummary {
+            status: ProjectOfflineReadinessStatus::Blocked,
+            readonly_native_source: false,
+            lockfile_present: false,
+            lockfile_valid: false,
+            remote_dependency_count: 0,
+            path_dependency_count: 0,
+            workspace_dependency_count: 0,
+            cache_state_known: false,
+            reasons: vec!["manifest_path_resolution_failed".to_string()],
+        },
+        toolchain: ProjectToolchainSummary {
+            edition: None,
+            requested_version: None,
+            requested_major_minor: None,
+            request_source: None,
+            native_status: ProjectNativeSupportStatus::BuildBlocked,
+            native_supported: false,
+            fallback_used: false,
+        },
+        source_store: empty_fetch_store_summary(),
+        fetched_entries: Vec::new(),
+        missing_entries: Vec::new(),
+        what_happened: format!("uc could not resolve the manifest path for {manifest_text}."),
+        why: format!("{err:#}"),
+        retryable: true,
+        expected: Some("an existing Scarb.toml path inside the active checkout".to_string()),
+        found: Some(manifest_text.clone()),
+        fallback_used: false,
+        replay_command: "uc fetch --locked --manifest-path <Scarb.toml> --format json".to_string(),
+        artifact_path: None,
+        log_path: None,
+        blocked_reason: Some("manifest_path_resolution_failed".to_string()),
+        subprocess_commands: Vec::new(),
+        diagnostics: vec![project_agent_diagnostic(
+            "UCN1100",
+            "manifest_path",
+            NativeDiagnosticSeverity::Error,
+            "Manifest path could not be resolved",
+            format!("uc could not resolve manifest path {manifest_text}."),
+            format!("{err:#}"),
+            vec![
+                "Use an absolute path to Scarb.toml or rerun from the intended workspace root."
+                    .to_string(),
+            ],
+            vec!["uc fetch --locked --manifest-path <Scarb.toml> --format json".to_string()],
+            "manual_manifest_fix_required",
+            true,
+            false,
+            None,
+            None,
+        )],
+    }
+}
+
+fn fetch_blocked_report_from_resolve(resolve: &ResolveReport, offline: bool) -> FetchReport {
+    FetchReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        generated_at_epoch_ms: resolve.generated_at_epoch_ms,
+        manifest_path: resolve.manifest_path.clone(),
+        workspace_root: resolve.workspace_root.clone(),
+        readonly: false,
+        mutation_status: "none".to_string(),
+        mode: "locked".to_string(),
+        status: FetchStatus::BuildBlocked,
+        offline,
+        network_intent: if offline {
+            ResolveNetworkIntent::Forbidden
+        } else {
+            ResolveNetworkIntent::Allowed
+        },
+        execution_driver: FetchExecutionDriver::UcLocal,
+        package: resolve.package.clone(),
+        dependencies: resolve.dependencies.clone(),
+        source_origins: resolve.source_origins.clone(),
+        lockfile: resolve.lockfile.clone(),
+        lockfile_sync: resolve.lockfile_sync.clone(),
+        offline_readiness_before: resolve.offline_readiness.clone(),
+        offline_readiness_after: resolve.offline_readiness.clone(),
+        toolchain: resolve.toolchain.clone(),
+        source_store: empty_fetch_store_summary(),
+        fetched_entries: Vec::new(),
+        missing_entries: Vec::new(),
+        what_happened: format!(
+            "uc stopped before fetching because locked resolve is blocked for {}.",
+            resolve.manifest_path
+        ),
+        why: resolve.why.clone(),
+        retryable: resolve.retryable,
+        expected: resolve.expected.clone(),
+        found: resolve.found.clone(),
+        fallback_used: false,
+        replay_command: format!(
+            "uc fetch --locked --manifest-path {} --format json{}",
+            shell_escape_command_arg(&resolve.manifest_path),
+            if offline { " --offline" } else { "" }
+        ),
+        artifact_path: None,
+        log_path: None,
+        blocked_reason: resolve.blocked_reason.clone(),
+        subprocess_commands: Vec::new(),
+        diagnostics: resolve.diagnostics.clone(),
     }
 }
 
@@ -4062,6 +4927,622 @@ fn resolve_offline_readiness_is_blocking(status: ProjectOfflineReadinessStatus) 
     )
 }
 
+#[derive(Debug, Default, Clone)]
+struct SourceStoreScanEntry {
+    key: String,
+    entry_dir: PathBuf,
+    bytes_on_disk: u64,
+    last_access_epoch_ms: u64,
+}
+
+#[derive(Debug, Default, Clone)]
+struct SourceStoreScan {
+    available: bool,
+    writable: bool,
+    entry_count: usize,
+    total_bytes: u64,
+    invalid_entry_count: usize,
+    entries: Vec<SourceStoreScanEntry>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct FetchMaterialization {
+    fetched_entries: Vec<FetchEntryReport>,
+    missing_entries: Vec<FetchEntryReport>,
+    imported_count: usize,
+    cache_hit_count: usize,
+    imported_bytes: u64,
+}
+
+fn source_store_max_bytes() -> u64 {
+    parse_env_u64("UC_SOURCE_STORE_MAX_BYTES", DEFAULT_SOURCE_STORE_MAX_BYTES)
+}
+
+fn source_store_root_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("UC_SOURCE_STORE_DIR") {
+        let path = PathBuf::from(path);
+        if !path.as_os_str().is_empty() {
+            return Some(path);
+        }
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".uc/source-store-v1"))
+}
+
+fn ensure_source_store_root() -> Result<PathBuf> {
+    let root = source_store_root_path()
+        .context("failed to resolve source store root (set UC_SOURCE_STORE_DIR or HOME)")?;
+    fs::create_dir_all(source_store_entries_root(&root))
+        .with_context(|| format!("failed to create source store root {}", root.display()))?;
+    Ok(root)
+}
+
+fn source_store_entries_root(root: &Path) -> PathBuf {
+    root.join("entries")
+}
+
+fn source_store_entry_dir(root: &Path, key: &str) -> PathBuf {
+    source_store_entries_root(root).join(key)
+}
+
+fn source_store_entry_metadata_path(entry_dir: &Path) -> PathBuf {
+    entry_dir.join("entry.json")
+}
+
+fn source_store_entry_source_path(entry_dir: &Path) -> PathBuf {
+    entry_dir.join("source")
+}
+
+fn source_store_source_kind(source: Option<&str>) -> String {
+    match source {
+        Some(source) if source.starts_with("git+") => "git".to_string(),
+        Some(source) if source.contains("/registry/std") || source.starts_with("std") => {
+            "std".to_string()
+        }
+        Some(_) => "registry".to_string(),
+        None => "path".to_string(),
+    }
+}
+
+fn source_store_entry_key(name: &str, version: Option<&str>, source: Option<&str>) -> String {
+    let mut hasher = Hasher::new();
+    hasher.update(b"uc-source-store-entry-v1");
+    hasher.update(name.as_bytes());
+    hasher.update(version.unwrap_or("").as_bytes());
+    hasher.update(source.unwrap_or("").as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+fn empty_fetch_store_summary() -> FetchStoreSummary {
+    FetchStoreSummary {
+        root: source_store_root_path().map(|path| path.display().to_string()),
+        available: false,
+        writable: false,
+        entry_count: 0,
+        total_bytes: 0,
+        imported_entry_count: 0,
+        imported_bytes: 0,
+        max_bytes: source_store_max_bytes(),
+        prune_supported: true,
+    }
+}
+
+fn fetch_store_summary_from_scan(
+    root: &Path,
+    scan: &SourceStoreScan,
+    imported_entry_count: usize,
+    imported_bytes: u64,
+) -> FetchStoreSummary {
+    FetchStoreSummary {
+        root: Some(root.display().to_string()),
+        available: scan.available,
+        writable: scan.writable,
+        entry_count: scan.entry_count,
+        total_bytes: scan.total_bytes,
+        imported_entry_count,
+        imported_bytes,
+        max_bytes: source_store_max_bytes(),
+        prune_supported: true,
+    }
+}
+
+fn source_store_status_report() -> Result<SourceStoreStatusReport> {
+    let Some(root) = source_store_root_path() else {
+        return Ok(SourceStoreStatusReport {
+            schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+            generated_at_epoch_ms: epoch_ms_u64().unwrap_or(0),
+            root: None,
+            available: false,
+            writable: false,
+            entry_count: 0,
+            total_bytes: 0,
+            max_bytes: source_store_max_bytes(),
+            invalid_entry_count: 0,
+            what_happened: "uc source store root is not configured.".to_string(),
+            why: "HOME and UC_SOURCE_STORE_DIR were both unavailable.".to_string(),
+            retryable: false,
+        });
+    };
+    let _lock = acquire_cache_lock(&root)?;
+    let scan = fetch_source_store_scan(&root)?;
+    Ok(SourceStoreStatusReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        generated_at_epoch_ms: epoch_ms_u64()?,
+        root: Some(root.display().to_string()),
+        available: scan.available,
+        writable: scan.writable,
+        entry_count: scan.entry_count,
+        total_bytes: scan.total_bytes,
+        max_bytes: source_store_max_bytes(),
+        invalid_entry_count: scan.invalid_entry_count,
+        what_happened: format!(
+            "uc scanned the shared source store at {}.",
+            root.display()
+        ),
+        why: "The source store keeps fetched registry and git package roots available for later locked offline work.".to_string(),
+        retryable: true,
+    })
+}
+
+fn source_store_prune_report(max_bytes_override: Option<u64>) -> Result<SourceStorePruneReport> {
+    let Some(root) = source_store_root_path() else {
+        return Ok(SourceStorePruneReport {
+            schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+            generated_at_epoch_ms: epoch_ms_u64().unwrap_or(0),
+            root: None,
+            available: false,
+            writable: false,
+            max_bytes: max_bytes_override.unwrap_or_else(source_store_max_bytes),
+            entry_count_before: 0,
+            entry_count_after: 0,
+            total_bytes_before: 0,
+            total_bytes_after: 0,
+            removed_entry_count: 0,
+            removed_bytes: 0,
+            removed_keys: Vec::new(),
+            what_happened:
+                "uc could not prune the source store because its root is not configured."
+                    .to_string(),
+            why: "HOME and UC_SOURCE_STORE_DIR were both unavailable.".to_string(),
+            retryable: false,
+        });
+    };
+    fs::create_dir_all(source_store_entries_root(&root))
+        .with_context(|| format!("failed to create source store root {}", root.display()))?;
+    let _lock = acquire_cache_lock(&root)?;
+    let before = fetch_source_store_scan(&root)?;
+    let max_bytes = max_bytes_override.unwrap_or_else(source_store_max_bytes);
+    let mut entries = before.entries.clone();
+    entries.sort_by_key(|entry| entry.last_access_epoch_ms);
+    let mut total_after = before.total_bytes;
+    let mut entry_count_after = before.entry_count;
+    let mut removed_bytes = 0_u64;
+    let mut removed_keys = Vec::new();
+    for entry in entries {
+        if total_after <= max_bytes {
+            break;
+        }
+        fs::remove_dir_all(&entry.entry_dir)
+            .with_context(|| format!("failed to prune {}", entry.entry_dir.display()))?;
+        total_after = total_after.saturating_sub(entry.bytes_on_disk);
+        entry_count_after = entry_count_after.saturating_sub(1);
+        removed_bytes = removed_bytes.saturating_add(entry.bytes_on_disk);
+        removed_keys.push(entry.key);
+    }
+    Ok(SourceStorePruneReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        generated_at_epoch_ms: epoch_ms_u64()?,
+        root: Some(root.display().to_string()),
+        available: true,
+        writable: true,
+        max_bytes,
+        entry_count_before: before.entry_count,
+        entry_count_after,
+        total_bytes_before: before.total_bytes,
+        total_bytes_after: total_after,
+        removed_entry_count: removed_keys.len(),
+        removed_bytes,
+        removed_keys,
+        what_happened: format!(
+            "uc pruned the shared source store at {} to stay within {} bytes.",
+            root.display(),
+            max_bytes
+        ),
+        why: "The source store is shared across workspaces and needs bounded size for deterministic local operation.".to_string(),
+        retryable: true,
+    })
+}
+
+fn fetch_source_store_scan(root: &Path) -> Result<SourceStoreScan> {
+    let entries_root = source_store_entries_root(root);
+    if !entries_root.exists() {
+        return Ok(SourceStoreScan {
+            available: false,
+            writable: root.exists(),
+            entry_count: 0,
+            total_bytes: 0,
+            invalid_entry_count: 0,
+            entries: Vec::new(),
+        });
+    }
+    let mut scan = SourceStoreScan {
+        available: true,
+        writable: root.exists(),
+        ..SourceStoreScan::default()
+    };
+    for child in fs::read_dir(&entries_root)
+        .with_context(|| format!("failed to read {}", entries_root.display()))?
+    {
+        let child = child?;
+        let entry_dir = child.path();
+        if !entry_dir.is_dir() {
+            continue;
+        }
+        let metadata_bytes = read_bytes_with_limit(
+            &source_store_entry_metadata_path(&entry_dir),
+            MAX_TOOLCHAIN_CHECK_CACHE_BYTES,
+            "source store entry metadata",
+        );
+        let metadata = match metadata_bytes {
+            Ok(bytes) => serde_json::from_slice::<SourceStoreEntryFile>(&bytes).ok(),
+            Err(_) => None,
+        };
+        if let Some(metadata) = metadata {
+            let bytes_on_disk = compute_tree_size_bytes(&entry_dir)?;
+            scan.total_bytes = scan.total_bytes.saturating_add(bytes_on_disk);
+            scan.entry_count += 1;
+            scan.entries.push(SourceStoreScanEntry {
+                key: metadata.key,
+                entry_dir,
+                bytes_on_disk,
+                last_access_epoch_ms: metadata.last_access_epoch_ms,
+            });
+        } else {
+            scan.invalid_entry_count += 1;
+        }
+    }
+    Ok(scan)
+}
+
+fn materialize_fetch_entries_into_source_store(
+    inspect: &ProjectInspectReport,
+    metadata: &ScarbMetadataDocument,
+    source_store_root: &Path,
+) -> Result<FetchMaterialization> {
+    let workspace_manifest_paths = inspect
+        .packages
+        .iter()
+        .map(|package| normalize_fingerprint_path(Path::new(&package.manifest_path)))
+        .collect::<HashSet<_>>();
+    let workspace_root_normalized = normalize_fingerprint_path(Path::new(&inspect.workspace_root));
+    let mut lockfile_sources = HashMap::new();
+    for package in &inspect.lockfile.packages {
+        if let Some(source) = package.source.as_ref() {
+            lockfile_sources.insert(
+                (
+                    package.name.clone(),
+                    package.version.clone().unwrap_or_default(),
+                    source.clone(),
+                ),
+                package,
+            );
+        }
+    }
+
+    let mut materialized = FetchMaterialization::default();
+    let mut seen_keys = HashSet::new();
+    for package in &metadata.packages {
+        let manifest_path = PathBuf::from(&package.manifest_path);
+        let manifest_key = normalize_fingerprint_path(&manifest_path);
+        if workspace_manifest_paths.contains(&manifest_key) {
+            continue;
+        }
+        let package_root = manifest_path
+            .parent()
+            .unwrap_or(&manifest_path)
+            .to_path_buf();
+        let normalized_root = normalize_fingerprint_path(&package_root);
+        let name = package.name.clone().unwrap_or_else(|| package.id.clone());
+        let version = package.version.clone();
+
+        let matched_source = lockfile_sources
+            .keys()
+            .find(|(locked_name, locked_version, _)| {
+                locked_name == &name && locked_version == &version.clone().unwrap_or_default()
+            })
+            .map(|(_, _, source)| source.clone());
+
+        if let Some(source) = matched_source {
+            let source_kind = source_store_source_kind(Some(&source));
+            let store_key = source_store_entry_key(&name, version.as_deref(), Some(&source));
+            if !seen_keys.insert(store_key.clone()) {
+                continue;
+            }
+            let store_dir = source_store_entry_dir(source_store_root, &store_key);
+            if store_dir.exists() {
+                source_store_touch_entry(&store_dir)?;
+                let bytes_on_disk = compute_tree_size_bytes(&store_dir)?;
+                materialized.cache_hit_count += 1;
+                materialized.fetched_entries.push(FetchEntryReport {
+                    name,
+                    version,
+                    source: Some(source),
+                    source_kind,
+                    manifest_path: Some(manifest_path.display().to_string()),
+                    source_path: Some(package_root.display().to_string()),
+                    store_key: Some(store_key),
+                    store_path: Some(
+                        source_store_entry_source_path(&store_dir)
+                            .display()
+                            .to_string(),
+                    ),
+                    status: FetchEntryStatus::CacheHit,
+                    action: "reused_uc_source_store_entry".to_string(),
+                    bytes_on_disk: Some(bytes_on_disk),
+                });
+                continue;
+            }
+            let write_stats = materialize_source_store_entry(
+                &store_dir,
+                &store_key,
+                &name,
+                version.as_deref(),
+                Some(&source),
+                &source_kind,
+                Some(&manifest_path),
+                &package_root,
+            )?;
+            materialized.imported_count += 1;
+            materialized.imported_bytes = materialized
+                .imported_bytes
+                .saturating_add(write_stats.bytes_on_disk);
+            materialized.fetched_entries.push(FetchEntryReport {
+                name,
+                version,
+                source: Some(source),
+                source_kind,
+                manifest_path: Some(manifest_path.display().to_string()),
+                source_path: Some(package_root.display().to_string()),
+                store_key: Some(store_key),
+                store_path: Some(
+                    source_store_entry_source_path(&store_dir)
+                        .display()
+                        .to_string(),
+                ),
+                status: FetchEntryStatus::Imported,
+                action: "materialized_into_uc_source_store".to_string(),
+                bytes_on_disk: Some(write_stats.bytes_on_disk),
+            });
+        } else if !normalized_root.starts_with(&workspace_root_normalized) {
+            materialized.fetched_entries.push(FetchEntryReport {
+                name,
+                version,
+                source: None,
+                source_kind: "path".to_string(),
+                manifest_path: Some(manifest_path.display().to_string()),
+                source_path: Some(package_root.display().to_string()),
+                store_key: None,
+                store_path: None,
+                status: FetchEntryStatus::LocalReference,
+                action: "referenced_local_dependency_path".to_string(),
+                bytes_on_disk: None,
+            });
+        }
+    }
+
+    for package in &inspect.lockfile.packages {
+        let Some(source) = package.source.as_ref() else {
+            continue;
+        };
+        let version = package.version.clone().unwrap_or_default();
+        let key = source_store_entry_key(&package.name, Some(version.as_str()), Some(source));
+        if seen_keys.contains(&key) {
+            continue;
+        }
+        materialized.missing_entries.push(FetchEntryReport {
+            name: package.name.clone(),
+            version: package.version.clone(),
+            source: Some(source.clone()),
+            source_kind: source_store_source_kind(Some(source)),
+            manifest_path: None,
+            source_path: None,
+            store_key: Some(key),
+            store_path: None,
+            status: FetchEntryStatus::Missing,
+            action: "missing_locked_source_root".to_string(),
+            bytes_on_disk: None,
+        });
+    }
+
+    materialized.fetched_entries.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.version.cmp(&right.version))
+    });
+    materialized.missing_entries.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.version.cmp(&right.version))
+    });
+    Ok(materialized)
+}
+
+fn source_store_touch_entry(entry_dir: &Path) -> Result<()> {
+    let metadata_path = source_store_entry_metadata_path(entry_dir);
+    let bytes = read_bytes_with_limit(
+        &metadata_path,
+        MAX_TOOLCHAIN_CHECK_CACHE_BYTES,
+        "source store entry metadata",
+    )?;
+    let mut entry: SourceStoreEntryFile = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", metadata_path.display()))?;
+    entry.last_access_epoch_ms = epoch_ms_u64()?;
+    atomic_write_bytes(
+        &metadata_path,
+        &serde_json::to_vec_pretty(&entry)?,
+        "source store entry metadata",
+    )?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SourceStoreWriteStats {
+    bytes_on_disk: u64,
+}
+
+fn materialize_source_store_entry(
+    store_dir: &Path,
+    store_key: &str,
+    name: &str,
+    version: Option<&str>,
+    source: Option<&str>,
+    source_kind: &str,
+    manifest_path: Option<&Path>,
+    package_root: &Path,
+) -> Result<SourceStoreWriteStats> {
+    let parent = store_dir
+        .parent()
+        .context("source store entry has no parent")?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let temp_dir = parent.join(format!(
+        ".tmp-{}-{}-{}",
+        store_key,
+        std::process::id(),
+        epoch_ms_u64().unwrap_or(0)
+    ));
+    if temp_dir.exists() {
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+    fs::create_dir_all(&temp_dir)
+        .with_context(|| format!("failed to create {}", temp_dir.display()))?;
+    let source_dir = source_store_entry_source_path(&temp_dir);
+    copy_tree(package_root, &source_dir)?;
+    let file_count = WalkDir::new(&source_dir)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
+        .count() as u64;
+    let entry = SourceStoreEntryFile {
+        schema_version: SOURCE_STORE_ENTRY_SCHEMA_VERSION,
+        key: store_key.to_string(),
+        name: name.to_string(),
+        version: version.map(str::to_string),
+        source: source.map(str::to_string),
+        source_kind: source_kind.to_string(),
+        manifest_path: manifest_path.map(|path| path.display().to_string()),
+        source_path: package_root.display().to_string(),
+        bytes_on_disk: 0,
+        file_count,
+        imported_at_epoch_ms: epoch_ms_u64()?,
+        last_access_epoch_ms: epoch_ms_u64()?,
+    };
+    let metadata_path = source_store_entry_metadata_path(&temp_dir);
+    atomic_write_bytes(
+        &metadata_path,
+        &serde_json::to_vec_pretty(&entry)?,
+        "source store entry metadata",
+    )?;
+    let bytes_on_disk = compute_tree_size_bytes(&temp_dir)?;
+    let mut entry = entry;
+    entry.bytes_on_disk = bytes_on_disk;
+    atomic_write_bytes(
+        &metadata_path,
+        &serde_json::to_vec_pretty(&entry)?,
+        "source store entry metadata",
+    )?;
+    fs::rename(&temp_dir, store_dir).with_context(|| {
+        format!(
+            "failed to move source store entry {} into place",
+            store_dir.display()
+        )
+    })?;
+    Ok(SourceStoreWriteStats { bytes_on_disk })
+}
+
+fn copy_tree(source_root: &Path, dest_root: &Path) -> Result<()> {
+    for entry in WalkDir::new(source_root) {
+        let entry = entry?;
+        let source_path = entry.path();
+        let relative = source_path
+            .strip_prefix(source_root)
+            .with_context(|| format!("failed to strip prefix {}", source_root.display()))?;
+        let dest_path = dest_root.join(relative);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&dest_path)
+                .with_context(|| format!("failed to create {}", dest_path.display()))?;
+        } else if entry.file_type().is_file() {
+            if let Some(parent) = dest_path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            match fs::hard_link(source_path, &dest_path) {
+                Ok(()) => {}
+                Err(_) => {
+                    fs::copy(source_path, &dest_path).with_context(|| {
+                        format!(
+                            "failed to copy {} to {}",
+                            source_path.display(),
+                            dest_path.display()
+                        )
+                    })?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn compute_tree_size_bytes(root: &Path) -> Result<u64> {
+    let mut total = 0_u64;
+    for entry in WalkDir::new(root) {
+        let entry = entry?;
+        if entry.file_type().is_file() {
+            total = total.saturating_add(entry.metadata()?.len());
+        }
+    }
+    Ok(total)
+}
+
+fn fetch_offline_readiness_after_fetch(
+    before: &ProjectOfflineReadinessSummary,
+    materialized: &FetchMaterialization,
+) -> ProjectOfflineReadinessSummary {
+    let mut after = before.clone();
+    after.cache_state_known = true;
+    after
+        .reasons
+        .retain(|reason| reason != "cache_state_unknown");
+    if materialized.missing_entries.is_empty() {
+        if before.status == ProjectOfflineReadinessStatus::Unverified {
+            after.status = ProjectOfflineReadinessStatus::Ready;
+        }
+        if after.reasons.is_empty() {
+            after
+                .reasons
+                .push("locked_sources_materialized".to_string());
+        }
+    } else {
+        after.status = ProjectOfflineReadinessStatus::Blocked;
+        after
+            .reasons
+            .push("locked_sources_missing_after_fetch".to_string());
+    }
+    after
+}
+
+fn bounded_error_summary(stderr: &str, fallback: &str) -> String {
+    let trimmed = stderr.trim();
+    if trimmed.is_empty() {
+        return fallback.to_string();
+    }
+    let max_chars = 400;
+    let mut summary = trimmed.chars().take(max_chars).collect::<String>();
+    if trimmed.chars().count() > max_chars {
+        summary.push_str("...");
+    }
+    summary
+}
+
 fn shell_escape_path(path: &Path) -> String {
     let raw = path.display().to_string();
     if raw
@@ -4645,6 +6126,21 @@ fn run_mcp_serve(args: McpServeArgs) -> Result<()> {
                 schema: "docs/agent/schemas/agent-eval-report.schema.json".to_string(),
             },
             McpToolDescriptor {
+                name: "uc.fetch".to_string(),
+                description: "Hydrate the locked dependency graph into the shared uc source store.".to_string(),
+                command: vec![
+                    "uc".to_string(),
+                    "fetch".to_string(),
+                    "--locked".to_string(),
+                    "--manifest-path".to_string(),
+                    "<Scarb.toml>".to_string(),
+                    "--format".to_string(),
+                    "json".to_string(),
+                ],
+                mutates_state: true,
+                schema: "docs/agent/schemas/fetch-report.schema.json".to_string(),
+            },
+            McpToolDescriptor {
                 name: "uc.benchmark_report".to_string(),
                 description: "Read benchmark reports with native-supported, unsupported, fallback-used, and build-failed classification.".to_string(),
                 command: vec!["benchmarks/results/<report>.json".to_string()],
@@ -4679,6 +6175,11 @@ fn run_mcp_serve(args: McpServeArgs) -> Result<()> {
                 uri: "uc://toolchains/native".to_string(),
                 description: "Productized native helper lanes and selection policy.".to_string(),
                 schema: "docs/NATIVE_TOOLCHAIN_HELPERS.md".to_string(),
+            },
+            McpResourceDescriptor {
+                uri: "uc://source-store/status".to_string(),
+                description: "Current shared source-store inventory and budget state.".to_string(),
+                schema: "docs/agent/schemas/source-store-status-report.schema.json".to_string(),
             },
             McpResourceDescriptor {
                 uri: "uc://repo/policy".to_string(),
@@ -7245,6 +8746,8 @@ fn run_daemon(args: DaemonArgs) -> Result<()> {
 fn run_cache(args: CacheArgs) -> Result<()> {
     match args.command {
         CacheCommand::Clean(clean) => run_cache_clean(clean),
+        CacheCommand::Status(status) => run_cache_status(status),
+        CacheCommand::Prune(prune) => run_cache_prune(prune),
     }
 }
 
@@ -7263,6 +8766,30 @@ fn run_cache_clean(args: CacheCleanArgs) -> Result<()> {
         .with_context(|| format!("failed to remove cache directory {}", cache_root.display()))?;
     println!("uc cache cleaned: {}", cache_root.display());
     Ok(())
+}
+
+fn run_cache_status(args: CacheStatusArgs) -> Result<()> {
+    let report = source_store_status_report()?;
+    let format = if args.json {
+        CacheFormatArg::Json
+    } else {
+        args.format
+    };
+    match format {
+        CacheFormatArg::Json => emit_json_value(args.report_path.as_deref(), &report),
+    }
+}
+
+fn run_cache_prune(args: CachePruneArgs) -> Result<()> {
+    let report = source_store_prune_report(args.max_bytes)?;
+    let format = if args.json {
+        CacheFormatArg::Json
+    } else {
+        args.format
+    };
+    match format {
+        CacheFormatArg::Json => emit_json_value(args.report_path.as_deref(), &report),
+    }
 }
 
 fn run_daemon_start(args: DaemonSocketArgs) -> Result<()> {
@@ -9597,6 +11124,20 @@ fn native_dependency_manifest_path(source_root: &Path) -> PathBuf {
         .parent()
         .unwrap_or(source_root)
         .join("Scarb.toml")
+}
+
+fn parse_scarb_metadata_document(stdout: &str) -> Result<ScarbMetadataDocument> {
+    let trimmed = stdout.trim_start();
+    if let Ok(metadata) = serde_json::from_str::<ScarbMetadataDocument>(trimmed) {
+        return Ok(metadata);
+    }
+    if let Some(json_start) = trimmed.find('{') {
+        let candidate = &trimmed[json_start..];
+        if let Ok(metadata) = serde_json::from_str::<ScarbMetadataDocument>(candidate) {
+            return Ok(metadata);
+        }
+    }
+    bail!("failed to decode scarb metadata JSON payload from command output");
 }
 
 #[cfg(feature = "native-compile")]
@@ -15535,6 +17076,24 @@ fn scarb_metadata_command(args: &MetadataArgs, manifest_path: &Path) -> (Command
     command_vec.push("--format-version".to_string());
     command_vec.push(args.format_version.to_string());
 
+    (command, command_vec)
+}
+
+fn scarb_fetch_command(manifest_path: &Path, offline: bool) -> (Command, Vec<String>) {
+    let mut command = Command::new("scarb");
+    let mut command_vec = vec!["scarb".to_string()];
+
+    command.arg("--manifest-path").arg(manifest_path);
+    command_vec.push("--manifest-path".to_string());
+    command_vec.push(manifest_path.display().to_string());
+
+    if offline {
+        command.arg("--offline");
+        command_vec.push("--offline".to_string());
+    }
+
+    command.arg("fetch");
+    command_vec.push("fetch".to_string());
     (command, command_vec)
 }
 

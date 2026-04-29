@@ -20,6 +20,9 @@ required_files=(
   docs/agent/schemas/project-inspect-report.schema.json
   docs/agent/schemas/native-support-report.schema.json
   docs/agent/schemas/resolve-report.schema.json
+  docs/agent/schemas/fetch-report.schema.json
+  docs/agent/schemas/source-store-status-report.schema.json
+  docs/agent/schemas/source-store-prune-report.schema.json
   docs/agent/schemas/build-report.schema.json
   docs/agent/schemas/agent-eval-report.schema.json
   docs/agent/schemas/failure-bundle.schema.json

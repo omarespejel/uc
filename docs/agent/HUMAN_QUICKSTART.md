@@ -24,6 +24,13 @@ uc support native --manifest-path Scarb.toml --format json | jq
 uc resolve --locked --manifest-path Scarb.toml --format json | jq
 ```
 
+## Hydrate Locked Sources
+
+```sh
+uc fetch --locked --manifest-path Scarb.toml --format json | jq
+uc cache status --format json | jq
+```
+
 ## Build With Native First
 
 ```sh

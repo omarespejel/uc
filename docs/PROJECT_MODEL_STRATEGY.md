@@ -80,14 +80,19 @@ The gate can become default only after project-model metadata matches the compat
 
 ### Phase 3: Resolver And Source Cache
 
-Implemented first slice: `uc resolve --locked` emits a deterministic, read-only
-resolver report derived from the current manifest and lockfile view without
-exposing an explicit correlation key.
+Implemented slices:
+
+- `uc resolve --locked` emits a deterministic, read-only resolver report derived
+  from the current manifest and lockfile view.
+- `uc fetch --locked` explicitly hydrates the locked dependency graph into the
+  shared `uc` source store and reports what was materialized, reused, or still
+  missing.
 
 Next hardening for this phase:
 
 - add lockfile drift fixtures from the reviewed corpus
-- extend the report with store/cache state once first-party fetch lands
+- harden the shared source-store lifecycle and prune policy with larger corpus
+  fixtures
 - keep `--locked` explicit until a separate policy-governed networked resolve
   mode exists
 
