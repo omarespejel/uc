@@ -3812,6 +3812,55 @@ fn build_uc_build_command_sets_helper_scoped_daemon_socket_override() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn build_uc_build_command_skips_helper_socket_override_when_daemon_is_off() {
+    let dir = unique_test_dir("uc-helper-build-command-daemon-off");
+    let _cleanup = TestDirCleanup::new(&dir);
+    let helper_path = dir.join("uc-helper-bin");
+    fs::write(&helper_path, "#!/bin/sh\n").expect("write helper");
+    let (command, _command_vec) = build_uc_build_command(
+        &helper_path,
+        &BuildCommonArgs {
+            manifest_path: Some(PathBuf::from("/tmp/workspace/Scarb.toml")),
+            package: None,
+            workspace: false,
+            features: Vec::new(),
+            offline: true,
+            release: false,
+            profile: None,
+        },
+        Path::new("/tmp/workspace/Scarb.toml"),
+        EngineArg::Uc,
+        DaemonModeArg::Off,
+        None,
+        Some(helper_path.to_str().expect("helper path should be utf-8")),
+    )
+    .expect("helper build command should be constructible");
+    let envs = command
+        .get_envs()
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().to_string(),
+                value.map(|entry| entry.to_string_lossy().to_string()),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    assert_eq!(
+        envs.get("UC_NATIVE_TOOLCHAIN_HELPER_ACTIVE"),
+        Some(&Some("1".to_string()))
+    );
+    assert_eq!(
+        envs.get("UC_NATIVE_TOOLCHAIN_HELPER_PATH"),
+        Some(&Some(helper_path.display().to_string()))
+    );
+    assert!(
+        !envs.contains_key("UC_DAEMON_SOCKET_PATH"),
+        "daemon-off helper subprocesses should not compute a helper-scoped socket override"
+    );
+}
+
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_compile_session_heap_estimate_scales_with_tracked_source_bytes() {

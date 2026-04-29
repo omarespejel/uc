@@ -27,13 +27,13 @@ Targeted tests:
 
 Artifacts:
 
-- warm comparison source: `/Users/espejelomar/StarkNet/compiler-starknet/_pr_work/uc-daemon-external-helper-native-20260429/benchmarks/results/daemon-helper-warm-20260429.json`
-- explicit helper-daemon rerun: `/Users/espejelomar/StarkNet/compiler-starknet/_pr_work/uc-daemon-external-helper-native-20260429/benchmarks/results/daemon-helper-require-warm-20260429.json`
-- additional helper-backed case: `/Users/espejelomar/StarkNet/compiler-starknet/_pr_work/uc-daemon-external-helper-native-20260429/benchmarks/results/daemon-helper-glint-20260429.json`
+- warm comparison source: `benchmarks/results/daemon-helper-warm-20260429.json`
+- explicit helper-daemon rerun: `benchmarks/results/daemon-helper-require-warm-20260429.json`
+- additional helper-backed case: `benchmarks/results/daemon-helper-glint-20260429.json`
 
 Helper lane rebuilt from this branch before measurement:
 
-- `/Users/espejelomar/.uc/toolchain-helpers/uc-cairo214-helper/bin/uc`
+- `<HOME>/.uc/toolchain-helpers/uc-cairo214-helper/bin/uc`
 
 ## Result
 

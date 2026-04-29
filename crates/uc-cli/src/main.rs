@@ -10448,11 +10448,14 @@ fn ensure_daemon_native_toolchain_request_supported(manifest_path: &Path) -> Res
     match selection {
         Ok(selection) => {
             if let Some(helper_path) = selection.helper_path {
-                let current_exe_matches_helper = std::env::current_exe()
-                    .ok()
-                    .and_then(|path| path.canonicalize().ok())
-                    .zip(helper_path.canonicalize().ok())
-                    .is_some_and(|(current_exe, helper)| current_exe == helper);
+                let current_exe = std::env::current_exe()
+                    .context("failed to resolve current daemon binary path")?
+                    .canonicalize()
+                    .context("failed to canonicalize current daemon binary path")?;
+                let helper_path = helper_path
+                    .canonicalize()
+                    .context("failed to canonicalize selected external helper path")?;
+                let current_exe_matches_helper = current_exe == helper_path;
                 if current_exe_matches_helper {
                     return Ok(());
                 }
@@ -18376,8 +18379,10 @@ fn build_uc_build_command(
     if let Some(path) = helper_path_override {
         command.env("UC_NATIVE_TOOLCHAIN_HELPER_ACTIVE", "1");
         command.env("UC_NATIVE_TOOLCHAIN_HELPER_PATH", path);
-        let helper_socket_path = daemon_socket_path_for_external_helper(Path::new(path))?;
-        command.env("UC_DAEMON_SOCKET_PATH", &helper_socket_path);
+        if !matches!(daemon_mode, DaemonModeArg::Off) {
+            let helper_socket_path = daemon_socket_path_for_external_helper(Path::new(path))?;
+            command.env("UC_DAEMON_SOCKET_PATH", &helper_socket_path);
+        }
     }
 
     Ok((command, command_vec))
