@@ -57,31 +57,44 @@
   - `fallback_likely`
   - `build_blocked`
 
-8. `uc migrate`
+8. `uc resolve`
+- Reads `Scarb.toml` and `Scarb.lock` in a lockfile-first, read-only mode.
+- Supports: `--locked`, `--manifest-path`, `--format json`, `--json`, `--report-path`.
+- Emits a stable resolution report with:
+  - dependency summaries
+  - source origins
+  - lockfile state
+  - lockfile-sync status (`in_sync`, `lockfile_missing`, `lockfile_invalid`, `manifest_drift`, `manifest_invalid`)
+  - conservative offline-readiness
+  - requested toolchain summary
+  - `network_intent=forbidden` and `mutation_status=none`
+- `uc resolve` currently requires `--locked`; there is no implicit networked resolution mode yet.
+
+9. `uc migrate`
 - Analyzes `Scarb.toml` and emits a migration readiness report.
 - Optional `--emit-uc-toml <path>` generates a starter `Uc.toml` scaffold.
 
-9. `uc agent eval`
+10. `uc agent eval`
 - Probes a manifest and returns an agent decision: proceed to build/benchmark, run a safe action and retry, or stop as native-unsupported.
 - Always emits JSON and can also write it with `--report-path`.
 - Includes the nested native support report, safe actions, manifest-specific next commands, and fallback/toolchain state.
 
-10. `uc agent safe-action`
+11. `uc agent safe-action`
 - Dry-run-first remediation surface.
 - Supports `build-helper-lane`, `rebuild-helper-lane`, `refresh-cache`, `rerun-doctor`, and `regenerate-support-matrix`.
 - Does not execute unless `--execute` is supplied.
 - Emits a structured safe-action report with command, dry-run status, execution status, exit code, stdout, and stderr.
 
-11. `uc replay <bundle>`
+12. `uc replay <bundle>`
 - Reads a `uc build --record-failure` bundle and emits a replay report.
 - Dry-run by default; `--execute` replays the recorded command after stripping legacy `--record-failure` arguments so replay cannot overwrite the original evidence bundle.
 
-12. `uc mcp serve`
+13. `uc mcp serve`
 - Emits the read-only MCP command/resource catalog as JSON.
 - Covers `doctor`, `project_inspect`, `support_native`, `explain_diagnostic`, `select_toolchain`, `benchmark_report`, and `profile_native_frontend`.
 - This is intentionally read-only: mutable actions stay behind `uc agent safe-action --execute`.
 
-13. `uc daemon`
+14. `uc daemon`
 - `start`: launches local background daemon (`~/.uc/daemon/uc.sock` by default).
 - `status`: checks daemon reachability and reports pid/start timestamp.
 - `stop`: requests graceful shutdown.
@@ -100,9 +113,9 @@ The intended primary surface for agents is:
   - Reports agent-facing `decision_status` values `native_supported`, `native_unsupported`, `fallback_likely`, or `build_blocked`, with reason codes and remediation diagnostics.
 
 - `uc resolve`
-  - Status: planned (not yet implemented)
-  - Lockfile-first resolution and graph emission.
-  - Must expose selected sources and whether network access is required.
+  - Status: implemented for `--locked`
+  - Lockfile-first, read-only resolution and graph emission.
+  - Reports source origins, lockfile-sync status, and explicit `network_intent=forbidden`.
 
 - `uc fetch`
   - Status: planned (not yet implemented)

@@ -277,6 +277,7 @@ enum Commands {
     Benchmark(benchmark_cmd::BenchmarkArgs),
     Agent(AgentArgs),
     Project(ProjectArgs),
+    Resolve(ResolveArgs),
     Cache(CacheArgs),
     Mcp(McpArgs),
     Support(SupportArgs),
@@ -309,6 +310,29 @@ struct ProjectArgs {
 #[derive(Subcommand, Debug)]
 enum ProjectCommand {
     Inspect(ProjectInspectArgs),
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum ResolveFormatArg {
+    Json,
+}
+
+#[derive(Args, Debug, Clone)]
+struct ResolveArgs {
+    #[arg(long)]
+    manifest_path: Option<PathBuf>,
+
+    #[arg(long)]
+    locked: bool,
+
+    #[arg(long, value_enum, default_value_t = ResolveFormatArg::Json)]
+    format: ResolveFormatArg,
+
+    #[arg(long, conflicts_with = "format")]
+    json: bool,
+
+    #[arg(long)]
+    report_path: Option<PathBuf>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -795,6 +819,60 @@ struct ProjectLockfilePackageSummary {
     version: Option<String>,
     source: Option<String>,
     dependencies_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ResolveStatus {
+    Ready,
+    BuildBlocked,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ResolveNetworkIntent {
+    Allowed,
+    Forbidden,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ResolveLockfileSyncStatus {
+    InSync,
+    LockfileMissing,
+    LockfileInvalid,
+    ManifestDrift,
+    ManifestInvalid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ResolveLockfileSyncSummary {
+    status: ResolveLockfileSyncStatus,
+    missing_dependencies: Vec<String>,
+    reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ResolveReport {
+    #[serde(default = "uc_agent_json_schema_version")]
+    schema_version: u32,
+    generated_at_epoch_ms: u64,
+    manifest_path: String,
+    workspace_root: String,
+    readonly: bool,
+    mutation_status: String,
+    mode: String,
+    status: ResolveStatus,
+    network_intent: ResolveNetworkIntent,
+    package: ProjectPackageSummary,
+    dependencies: Vec<ProjectDependencySummary>,
+    source_origins: Vec<ProjectSourceOriginSummary>,
+    lockfile: ProjectLockfileSummary,
+    lockfile_sync: ResolveLockfileSyncSummary,
+    offline_readiness: ProjectOfflineReadinessSummary,
+    toolchain: ProjectToolchainSummary,
+    blocked_reason: Option<String>,
+    diagnostics: Vec<NativeDiagnostic>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2271,6 +2349,7 @@ fn main() -> Result<()> {
         Commands::Benchmark(args) => benchmark_cmd::run(args),
         Commands::Agent(args) => run_agent(args),
         Commands::Project(args) => run_project(args),
+        Commands::Resolve(args) => run_resolve(args),
         Commands::Cache(args) => run_cache(args),
         Commands::Mcp(args) => run_mcp(args),
         Commands::Support(args) => run_support(args),
@@ -2325,6 +2404,21 @@ fn run_project(args: ProjectArgs) -> Result<()> {
     }
 }
 
+fn run_resolve(args: ResolveArgs) -> Result<()> {
+    if !args.locked {
+        bail!("uc resolve currently requires --locked");
+    }
+    let report = resolve_report_from_args(&args)?;
+    let format = if args.json {
+        ResolveFormatArg::Json
+    } else {
+        args.format
+    };
+    match format {
+        ResolveFormatArg::Json => emit_json_value(args.report_path.as_deref(), &report),
+    }
+}
+
 fn run_project_inspect(args: ProjectInspectArgs) -> Result<()> {
     let manifest_path = resolve_manifest_path(&args.manifest_path)?;
     let report = project_inspect_report_from_manifest_path(&manifest_path)?;
@@ -2339,6 +2433,13 @@ fn run_project_inspect(args: ProjectInspectArgs) -> Result<()> {
 }
 
 fn project_inspect_report_from_manifest_path(manifest_path: &Path) -> Result<ProjectInspectReport> {
+    project_inspect_report_from_manifest_path_with_native_support(manifest_path, true)
+}
+
+fn project_inspect_report_from_manifest_path_with_native_support(
+    manifest_path: &Path,
+    include_native_support: bool,
+) -> Result<ProjectInspectReport> {
     let workspace_root = metadata_cache_workspace_root(manifest_path)?;
     let manifest_metadata = fs::metadata(manifest_path)
         .with_context(|| format!("failed to stat {}", manifest_path.display()))?;
@@ -2477,7 +2578,7 @@ fn project_inspect_report_from_manifest_path(manifest_path: &Path) -> Result<Pro
         &workspace_dependencies,
         &lockfile,
     );
-    let native_support = if manifest.is_some() && readonly_native_source {
+    let native_support = if include_native_support && manifest.is_some() && readonly_native_source {
         match native_support_report_from_manifest_path(manifest_path) {
             Ok(report) => {
                 tracing::info!(
@@ -2518,7 +2619,7 @@ fn project_inspect_report_from_manifest_path(manifest_path: &Path) -> Result<Pro
                 None
             }
         }
-    } else if manifest.is_some() {
+    } else if include_native_support && manifest.is_some() {
         tracing::info!(
             manifest_path = %manifest_path.display(),
             workspace_root = %workspace_root.display(),
@@ -2591,6 +2692,167 @@ fn project_inspect_report_from_manifest_path(manifest_path: &Path) -> Result<Pro
         native_support,
         diagnostics,
     })
+}
+
+fn resolve_report_from_args(args: &ResolveArgs) -> Result<ResolveReport> {
+    match resolve_manifest_path(&args.manifest_path) {
+        Ok(manifest_path) => resolve_report_from_manifest_path(&manifest_path),
+        Err(err) => Ok(resolve_manifest_path_resolution_blocked_report(
+            &args.manifest_path,
+            &err,
+        )),
+    }
+}
+
+fn resolve_report_from_manifest_path(manifest_path: &Path) -> Result<ResolveReport> {
+    let inspect =
+        project_inspect_report_from_manifest_path_with_native_support(manifest_path, false)?;
+    let lockfile_sync = resolve_lockfile_sync_summary(
+        inspect.manifest.valid,
+        &inspect.dependencies,
+        &inspect.source_origins,
+        &inspect.lockfile,
+    );
+    let blocked_reason = (inspect.offline_readiness.status
+        != ProjectOfflineReadinessStatus::Unverified
+        || lockfile_sync.status != ResolveLockfileSyncStatus::InSync
+        || !inspect.manifest.valid)
+        .then(|| {
+            if !inspect.manifest.valid {
+                "manifest_invalid".to_string()
+            } else {
+                match lockfile_sync.status {
+                    ResolveLockfileSyncStatus::InSync => inspect
+                        .offline_readiness
+                        .reasons
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "resolve_blocked".to_string()),
+                    ResolveLockfileSyncStatus::LockfileMissing => {
+                        "lockfile_missing_for_locked_resolve".to_string()
+                    }
+                    ResolveLockfileSyncStatus::LockfileInvalid => {
+                        "lockfile_invalid_for_locked_resolve".to_string()
+                    }
+                    ResolveLockfileSyncStatus::ManifestDrift => {
+                        "lockfile_manifest_drift".to_string()
+                    }
+                    ResolveLockfileSyncStatus::ManifestInvalid => "manifest_invalid".to_string(),
+                }
+            }
+        });
+    let status = if blocked_reason.is_some() {
+        ResolveStatus::BuildBlocked
+    } else {
+        ResolveStatus::Ready
+    };
+
+    Ok(ResolveReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        generated_at_epoch_ms: inspect.generated_at_epoch_ms,
+        manifest_path: inspect.manifest_path,
+        workspace_root: inspect.workspace_root,
+        readonly: true,
+        mutation_status: "none".to_string(),
+        mode: "locked".to_string(),
+        status,
+        network_intent: ResolveNetworkIntent::Forbidden,
+        package: inspect.package,
+        dependencies: inspect.dependencies,
+        source_origins: inspect.source_origins,
+        lockfile: inspect.lockfile,
+        lockfile_sync,
+        offline_readiness: inspect.offline_readiness,
+        toolchain: inspect.toolchain,
+        blocked_reason,
+        diagnostics: inspect.diagnostics,
+    })
+}
+
+fn resolve_manifest_path_resolution_blocked_report(
+    manifest_path: &Option<PathBuf>,
+    err: &anyhow::Error,
+) -> ResolveReport {
+    let manifest_text = manifest_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "Scarb.toml".to_string());
+    ResolveReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        generated_at_epoch_ms: epoch_ms_u64().unwrap_or(0),
+        manifest_path: manifest_text.clone(),
+        workspace_root: manifest_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| ".".to_string()),
+        readonly: true,
+        mutation_status: "none".to_string(),
+        mode: "locked".to_string(),
+        status: ResolveStatus::BuildBlocked,
+        network_intent: ResolveNetworkIntent::Forbidden,
+        package: ProjectPackageSummary::default(),
+        dependencies: Vec::new(),
+        source_origins: Vec::new(),
+        lockfile: ProjectLockfileSummary {
+            present: false,
+            path: manifest_path
+                .as_ref()
+                .and_then(|path| path.parent())
+                .map(|parent| parent.join("Scarb.lock").display().to_string()),
+            valid: false,
+            version: None,
+            size_bytes: None,
+            modified_unix_ms: None,
+            hash: None,
+            packages: Vec::new(),
+        },
+        lockfile_sync: ResolveLockfileSyncSummary {
+            status: ResolveLockfileSyncStatus::ManifestInvalid,
+            missing_dependencies: Vec::new(),
+            reasons: vec!["manifest_path_resolution_failed".to_string()],
+        },
+        offline_readiness: ProjectOfflineReadinessSummary {
+            status: ProjectOfflineReadinessStatus::Blocked,
+            readonly_native_source: false,
+            lockfile_present: false,
+            lockfile_valid: false,
+            remote_dependency_count: 0,
+            path_dependency_count: 0,
+            workspace_dependency_count: 0,
+            cache_state_known: false,
+            reasons: vec!["manifest_path_resolution_failed".to_string()],
+        },
+        toolchain: ProjectToolchainSummary {
+            edition: None,
+            requested_version: None,
+            requested_major_minor: None,
+            request_source: None,
+            native_status: ProjectNativeSupportStatus::BuildBlocked,
+            native_supported: false,
+            fallback_used: false,
+        },
+        blocked_reason: Some("manifest_path_resolution_failed".to_string()),
+        diagnostics: vec![project_agent_diagnostic(
+            "UCN1100",
+            "manifest_path",
+            NativeDiagnosticSeverity::Error,
+            "Manifest path could not be resolved",
+            format!("uc could not resolve manifest path {manifest_text}."),
+            format!("{err:#}"),
+            vec![
+                "Use an absolute path to Scarb.toml or rerun from the intended workspace root."
+                    .to_string(),
+                "Ensure the manifest path stays inside the current workspace checkout.".to_string(),
+            ],
+            vec!["uc resolve --locked --manifest-path <Scarb.toml> --json".to_string()],
+            "manual_manifest_fix_required",
+            true,
+            false,
+            None,
+            None,
+        )],
+    }
 }
 
 fn project_has_readonly_native_toolchain_source(
@@ -3616,6 +3878,72 @@ fn project_offline_readiness_summary(
         workspace_dependency_count,
         cache_state_known: false,
         reasons,
+    }
+}
+
+fn resolve_lockfile_sync_summary(
+    manifest_valid: bool,
+    dependencies: &[ProjectDependencySummary],
+    source_origins: &[ProjectSourceOriginSummary],
+    lockfile: &ProjectLockfileSummary,
+) -> ResolveLockfileSyncSummary {
+    if !manifest_valid {
+        return ResolveLockfileSyncSummary {
+            status: ResolveLockfileSyncStatus::ManifestInvalid,
+            missing_dependencies: Vec::new(),
+            reasons: vec!["manifest_invalid".to_string()],
+        };
+    }
+
+    let remote_dependencies = dependencies
+        .iter()
+        .filter(|dependency| matches!(dependency.kind.as_str(), "git" | "version" | "table"))
+        .map(|dependency| dependency.name.as_str())
+        .collect::<BTreeSet<_>>();
+
+    if !remote_dependencies.is_empty() && !lockfile.present {
+        return ResolveLockfileSyncSummary {
+            status: ResolveLockfileSyncStatus::LockfileMissing,
+            missing_dependencies: remote_dependencies
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            reasons: vec!["lockfile_missing_for_remote_dependencies".to_string()],
+        };
+    }
+
+    if !remote_dependencies.is_empty() && !lockfile.valid {
+        return ResolveLockfileSyncSummary {
+            status: ResolveLockfileSyncStatus::LockfileInvalid,
+            missing_dependencies: remote_dependencies
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            reasons: vec!["lockfile_invalid_for_remote_dependencies".to_string()],
+        };
+    }
+
+    let mut missing_dependencies = source_origins
+        .iter()
+        .filter(|origin| matches!(origin.kind.as_str(), "git" | "version" | "table"))
+        .filter(|origin| !origin.locked)
+        .map(|origin| origin.dependency.clone())
+        .collect::<Vec<_>>();
+    missing_dependencies.sort();
+    missing_dependencies.dedup();
+
+    if !missing_dependencies.is_empty() {
+        return ResolveLockfileSyncSummary {
+            status: ResolveLockfileSyncStatus::ManifestDrift,
+            missing_dependencies,
+            reasons: vec!["remote_dependency_missing_from_lockfile".to_string()],
+        };
+    }
+
+    ResolveLockfileSyncSummary {
+        status: ResolveLockfileSyncStatus::InSync,
+        missing_dependencies: Vec::new(),
+        reasons: vec!["lockfile_covers_remote_dependencies".to_string()],
     }
 }
 

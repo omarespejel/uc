@@ -581,6 +581,32 @@ fn project_inspect_cli_accepts_json_format_and_report_path() {
 }
 
 #[test]
+fn resolve_cli_accepts_locked_json_and_report_path() {
+    let cli = Cli::try_parse_from([
+        "uc",
+        "resolve",
+        "--locked",
+        "--manifest-path",
+        "/tmp/workspace/Scarb.toml",
+        "--format",
+        "json",
+        "--report-path",
+        "/tmp/resolve.json",
+    ])
+    .expect("resolve args should parse");
+    let Commands::Resolve(args) = cli.command else {
+        panic!("expected resolve command");
+    };
+    assert!(args.locked);
+    assert_eq!(
+        args.manifest_path,
+        Some(PathBuf::from("/tmp/workspace/Scarb.toml"))
+    );
+    assert_eq!(args.format, ResolveFormatArg::Json);
+    assert_eq!(args.report_path, Some(PathBuf::from("/tmp/resolve.json")));
+}
+
+#[test]
 fn required_agent_arrays_serialize_when_empty() {
     let diagnostic = NativeDiagnostic {
         schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
@@ -637,6 +663,10 @@ fn report_schemas_match_nullable_option_output() {
         "../../../docs/agent/schemas/build-plan-report.schema.json"
     ))
     .expect("build plan report schema should parse");
+    let resolve_schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../docs/agent/schemas/resolve-report.schema.json"
+    ))
+    .expect("resolve report schema should parse");
     assert_eq!(
         replay_schema["properties"]["manifest_path"]["type"],
         serde_json::json!(["string", "null"])
@@ -716,6 +746,10 @@ fn report_schemas_match_nullable_option_output() {
     );
     assert_eq!(
         build_plan_schema["properties"]["blocked_reason"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    assert_eq!(
+        resolve_schema["properties"]["blocked_reason"]["type"],
         serde_json::json!(["string", "null"])
     );
 }
@@ -877,6 +911,153 @@ dependencies = ["core"]
         lock_hash_before
     );
     assert_project_inspect_left_no_artifacts(&dir);
+}
+
+#[test]
+fn resolve_report_from_args_marks_missing_manifest_build_blocked() {
+    let dir = unique_test_dir("uc-resolve-report-missing-manifest");
+    let _cleanup = TestDirCleanup::new(&dir);
+    let missing_manifest = dir.join("missing").join("Scarb.toml");
+    let report = resolve_report_from_args(&ResolveArgs {
+        manifest_path: Some(missing_manifest.clone()),
+        locked: true,
+        format: ResolveFormatArg::Json,
+        json: false,
+        report_path: None,
+    })
+    .expect("missing manifest should still produce a structured resolve report");
+    assert_eq!(report.status, ResolveStatus::BuildBlocked);
+    assert_eq!(report.manifest_path, missing_manifest.display().to_string());
+    assert_eq!(report.mode, "locked");
+    assert_eq!(report.network_intent, ResolveNetworkIntent::Forbidden);
+    assert_eq!(
+        report.lockfile_sync.status,
+        ResolveLockfileSyncStatus::ManifestInvalid
+    );
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "UCN1100"),
+        "resolve should surface manifest resolution diagnostics: {report:#?}"
+    );
+    assert_eq!(
+        report.blocked_reason.as_deref(),
+        Some("manifest_path_resolution_failed")
+    );
+}
+
+#[test]
+fn resolve_report_from_manifest_path_marks_ready_when_lockfile_covers_remote_dependencies() {
+    let dir = unique_test_dir("uc-resolve-report-ready");
+    let _cleanup = TestDirCleanup::new(&dir);
+    let manifest_path = dir.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+cairo-version = "2.14.0"
+
+[dependencies]
+starknet = "2.14.0"
+git_dep = { git = "https://example.com/repo.git", rev = "abc123" }
+"#,
+    )
+    .expect("write manifest");
+    fs::write(
+        dir.join("Scarb.lock"),
+        r#"version = 1
+
+[[package]]
+name = "starknet"
+version = "2.14.0"
+source = "registry+https://example.com"
+dependencies = ["core"]
+
+[[package]]
+name = "git_dep"
+version = "0.1.0"
+source = "git+https://example.com/repo.git?rev=abc123"
+"#,
+    )
+    .expect("write lockfile");
+
+    let report = resolve_report_from_manifest_path(&manifest_path)
+        .expect("locked manifest should produce a resolve report");
+    assert_eq!(report.status, ResolveStatus::Ready);
+    assert_eq!(report.mode, "locked");
+    assert_eq!(report.network_intent, ResolveNetworkIntent::Forbidden);
+    assert!(report.readonly);
+    assert_eq!(report.mutation_status, "none");
+    assert_eq!(
+        report.lockfile_sync.status,
+        ResolveLockfileSyncStatus::InSync
+    );
+    assert!(report.lockfile_sync.missing_dependencies.is_empty());
+    assert_eq!(
+        report.offline_readiness.status,
+        ProjectOfflineReadinessStatus::Unverified
+    );
+    assert!(report.blocked_reason.is_none());
+    let json = serde_json::to_value(&report).expect("resolve report should serialize");
+    assert_eq!(json["blocked_reason"], serde_json::Value::Null);
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "UCP1005"),
+        "resolve should not add the project-inspect native-probe skip diagnostic: {report:#?}"
+    );
+}
+
+#[test]
+fn resolve_report_from_manifest_path_marks_lockfile_drift_build_blocked() {
+    let dir = unique_test_dir("uc-resolve-report-drift");
+    let _cleanup = TestDirCleanup::new(&dir);
+    let manifest_path = dir.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+cairo-version = "2.14.0"
+
+[dependencies]
+starknet = "2.14.0"
+git_dep = { git = "https://example.com/repo.git", rev = "abc123" }
+"#,
+    )
+    .expect("write manifest");
+    fs::write(
+        dir.join("Scarb.lock"),
+        r#"version = 1
+
+[[package]]
+name = "starknet"
+version = "2.14.0"
+source = "registry+https://example.com"
+"#,
+    )
+    .expect("write incomplete lockfile");
+
+    let report = resolve_report_from_manifest_path(&manifest_path)
+        .expect("drifted lockfile should still produce a resolve report");
+    assert_eq!(report.status, ResolveStatus::BuildBlocked);
+    assert_eq!(
+        report.lockfile_sync.status,
+        ResolveLockfileSyncStatus::ManifestDrift
+    );
+    assert_eq!(
+        report.lockfile_sync.missing_dependencies,
+        vec!["git_dep".to_string()]
+    );
+    assert_eq!(
+        report.blocked_reason.as_deref(),
+        Some("lockfile_manifest_drift")
+    );
 }
 
 #[test]
