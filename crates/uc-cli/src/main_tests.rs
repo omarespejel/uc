@@ -688,7 +688,8 @@ fn toolchain_ensure_report_json_contract_includes_blocked_fields() {
     assert!(json["toolchain"].is_null());
     assert!(json["artifact_path"].is_null());
     assert!(json["log_path"].is_null());
-    assert_eq!(json["retryable"], true);
+    assert_eq!(json["retryable"], false);
+    assert_eq!(json["diagnostics"][0]["retryable"], false);
     assert_eq!(json["fallback_used"], false);
 }
 
@@ -1199,12 +1200,21 @@ fn toolchain_ensure_report_from_args_marks_missing_manifest_build_blocked() {
         report.blocked_reason.as_deref(),
         Some("manifest_path_resolution_failed")
     );
+    assert!(!report.retryable);
     assert!(
         report
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "UCN1100"),
         "toolchain ensure should surface manifest resolution diagnostics: {report:#?}"
+    );
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "UCN1100")
+            .all(|diagnostic| !diagnostic.retryable),
+        "toolchain ensure manifest path failures should be non-retryable: {report:#?}"
     );
 }
 
@@ -1399,12 +1409,21 @@ cairo-version = "{requested_major_minor}.0"
         report.execution_driver,
         Some(ToolchainEnsureExecutionDriver::HelperBuilderScript)
     );
+    assert!(!report.retryable);
     assert!(
         report
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "UCN1202"),
         "missing builder script should surface UCN1202: {report:#?}"
+    );
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "UCN1202")
+            .all(|diagnostic| !diagnostic.retryable),
+        "missing builder script should be a manual stop state: {report:#?}"
     );
 }
 
@@ -1475,6 +1494,14 @@ cairo-version = "{requested_major_minor}.0"
         "spawn failure should surface UCN1203: {report:#?}"
     );
     assert!(!report.retryable);
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "UCN1203")
+            .all(|diagnostic| !diagnostic.retryable),
+        "builder execution failures should stay non-retryable: {report:#?}"
+    );
 }
 
 #[cfg(all(feature = "native-compile", unix))]
@@ -1658,6 +1685,43 @@ cairo-version = "{requested_major_minor}.0"
             .iter()
             .any(|diagnostic| diagnostic.code == "UCN1204"),
         "revalidation failure should surface UCN1204: {report:#?}"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn toolchain_ensure_report_from_manifest_path_marks_manifest_probe_failures_non_retryable() {
+    let dir = unique_test_dir("uc-toolchain-ensure-parse-blocked");
+    let _cleanup = TestDirCleanup::new(&dir);
+    let manifest_path = dir.join("Scarb.toml");
+    fs::write(
+        &manifest_path,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+cairo-version = "2.14.0
+"#,
+    )
+    .expect("write invalid manifest");
+
+    let report = toolchain_ensure_report_from_manifest_path(&manifest_path)
+        .expect("manifest parse failure should still produce a structured report");
+    assert_eq!(report.status, ToolchainEnsureStatus::BuildBlocked);
+    assert_eq!(
+        report.blocked_reason.as_deref(),
+        Some("manifest_probe_failed")
+    );
+    assert!(!report.retryable);
+    let diagnostic = report
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "UCN1102")
+        .expect("blocked report should include UCN1102");
+    assert!(!diagnostic.retryable);
+    assert_eq!(
+        diagnostic.safe_automated_action,
+        "manual_manifest_fix_required"
     );
 }
 
