@@ -416,6 +416,49 @@ test_real_repo_benchmark_accepts_explicit_stamp() {
   fi
 }
 
+test_real_repo_benchmark_rejects_unsanitized_stamp() {
+  local cases_root="$TEST_TMP_DIR/bad-stamp-cases"
+  local mock_bin_dir="$TEST_TMP_DIR/bad-stamp-mock-bin"
+  local mock_uc="$mock_bin_dir/uc"
+  local mock_scarb="$mock_bin_dir/scarb"
+  local results_dir="$TEST_TMP_DIR/bad-stamp-results"
+  local canonical_results_dir
+  local stderr_path="$TEST_TMP_DIR/bad-stamp.err"
+  mkdir -p "$mock_bin_dir" "$results_dir"
+  canonical_results_dir="$(cd "$results_dir" && pwd -P)"
+  write_mock_uc_bin "$mock_uc"
+  write_mock_scarb_bin "$mock_scarb"
+  write_manifest_case "$cases_root" "bad-stamp-supported"
+
+  if PATH="$mock_bin_dir:$PATH" \
+    MOCK_UC_ARGS_LOG="$TEST_TMP_DIR/bad-stamp-uc.args" \
+    MOCK_SCARB_ARGS_LOG="$TEST_TMP_DIR/bad-stamp-scarb.args" \
+    "$BENCH_SCRIPT" \
+      --uc-bin "$mock_uc" \
+      --results-dir "$results_dir" \
+      --runs 1 \
+      --cold-runs 1 \
+      --warm-settle-seconds 0 \
+      --stamp "bad/stamp" \
+      --case "$cases_root/bad-stamp-supported/Scarb.toml" bad-stamp-supported \
+      >"$TEST_TMP_DIR/bad-stamp.out" 2>"$stderr_path"; then
+    echo "expected benchmark script to reject an unsafe stamp" >&2
+    return 1
+  fi
+
+  if ! grep -q "Invalid stamp: bad/stamp" "$stderr_path"; then
+    echo "expected invalid stamp validation message" >&2
+    cat "$stderr_path" >&2
+    return 1
+  fi
+
+  if find "$canonical_results_dir" -maxdepth 2 \( -name 'real-repo-bench-bad*' -o -path '*/bad/stamp*' \) | grep -q .; then
+    echo "unsafe stamp should not create benchmark artifacts" >&2
+    find "$canonical_results_dir" -maxdepth 2 -print >&2
+    return 1
+  fi
+}
+
 test_real_repo_benchmark_canonicalizes_relative_paths() {
   local work_dir="$TEST_TMP_DIR/relative-paths-work"
   local cases_root="$work_dir/cases"
@@ -881,14 +924,6 @@ test_strict_supported_set_benchmark_reruns_only_native_supported_cases() {
   cat > "$source_bench_json" <<JSON
 {
   "schema_version": 1,
-  "summary": {
-    "support_matrix": {
-      "native_supported": 1,
-      "native_unsupported": 1,
-      "fallback_used": 1,
-      "build_failed": 1
-    }
-  },
   "cases": [
     {
       "tag": "strict-supported",
@@ -941,11 +976,13 @@ JSON
 
   local selected_count
   selected_count="$(jq -r '.selection.selected_case_count' "$strict_json")"
+  local source_supported_count
+  source_supported_count="$(jq -r '.selection.source_native_supported_count' "$strict_json")"
   local safe_claim
   safe_claim="$(jq -r '.claim_guard.safe_to_say_native_supported_speed_claim' "$strict_json")"
   local claim_text
   claim_text="$(jq -r '.claim_guard.native_supported_speed_claim_text' "$strict_json")"
-  if [[ "$selected_count" != "1" || "$safe_claim" != "true" ]]; then
+  if [[ "$selected_count" != "1" || "$source_supported_count" != "1" || "$safe_claim" != "true" ]]; then
     echo "expected exactly one selected native-supported case with a safe claim" >&2
     cat "$strict_json" >&2
     return 1
@@ -983,6 +1020,8 @@ run_test "real_repo_benchmark_accepts_cases_file" \
   test_real_repo_benchmark_accepts_cases_file
 run_test "real_repo_benchmark_accepts_explicit_stamp" \
   test_real_repo_benchmark_accepts_explicit_stamp
+run_test "real_repo_benchmark_rejects_unsanitized_stamp" \
+  test_real_repo_benchmark_rejects_unsanitized_stamp
 run_test "real_repo_benchmark_canonicalizes_relative_paths" \
   test_real_repo_benchmark_canonicalizes_relative_paths
 run_test "real_repo_benchmark_rejects_malformed_cases_file_rows" \
