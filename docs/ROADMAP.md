@@ -22,7 +22,7 @@
 - Resolver read path landed: `uc resolve --locked` emits the lockfile-first report surface.
 - Source-fetch fast path landed: `uc fetch --locked` materializes locked package roots into the shared source store with explicit driver/network reporting.
 - Shared source store now exposes status and prune behavior.
-- Toolchain/helper-lane ensure path with explicit policy controls.
+- Toolchain/helper-lane ensure path landed: `uc toolchain ensure` now reports builtin/helper selection, explicit helper-builder subprocesses, and default helper-path discovery.
 - Metadata can be served from the project model behind `UC_METADATA_SOURCE=project-model`; see `docs/PROJECT_MODEL_STRATEGY.md`.
 
 ## Milestone 4: Command Surface Expansion and CI/Proving (6 weeks)

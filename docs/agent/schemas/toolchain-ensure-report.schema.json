@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/omarespejel/uc/docs/agent/schemas/toolchain-ensure-report.schema.json",
+  "title": "uc ToolchainEnsureReport",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "generated_at_epoch_ms",
+    "manifest_path",
+    "readonly",
+    "mutation_status",
+    "status",
+    "execution_driver",
+    "toolchain",
+    "ensured_now",
+    "expected",
+    "found",
+    "what_happened",
+    "why",
+    "retryable",
+    "fallback_used",
+    "replay_command",
+    "artifact_path",
+    "log_path",
+    "blocked_reason",
+    "subprocess_commands",
+    "diagnostics"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "generated_at_epoch_ms": { "type": "integer" },
+    "manifest_path": { "type": "string" },
+    "readonly": { "type": "boolean" },
+    "mutation_status": { "type": "string" },
+    "status": { "enum": ["ready", "build_blocked"] },
+    "execution_driver": {
+      "type": ["string", "null"],
+      "enum": ["uc_builtin", "uc_external_helper", "helper_builder_script", null]
+    },
+    "toolchain": { "type": ["object", "null"] },
+    "ensured_now": { "type": "boolean" },
+    "expected": { "type": ["string", "null"] },
+    "found": { "type": ["string", "null"] },
+    "what_happened": { "type": "string" },
+    "why": { "type": "string" },
+    "retryable": { "type": "boolean" },
+    "fallback_used": { "type": "boolean" },
+    "replay_command": { "type": "string" },
+    "artifact_path": { "type": ["string", "null"] },
+    "log_path": { "type": ["string", "null"] },
+    "blocked_reason": { "type": ["string", "null"] },
+    "subprocess_commands": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": { "type": "string" }
+      }
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": { "$ref": "native-diagnostic.schema.json" }
+    }
+  }
+}

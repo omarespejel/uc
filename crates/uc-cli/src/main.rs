@@ -279,6 +279,7 @@ enum Commands {
     Benchmark(benchmark_cmd::BenchmarkArgs),
     Agent(AgentArgs),
     Project(ProjectArgs),
+    Toolchain(ToolchainArgs),
     Resolve(ResolveArgs),
     Fetch(FetchArgs),
     Cache(CacheArgs),
@@ -313,6 +314,37 @@ struct ProjectArgs {
 #[derive(Subcommand, Debug)]
 enum ProjectCommand {
     Inspect(ProjectInspectArgs),
+}
+
+#[derive(Args, Debug)]
+struct ToolchainArgs {
+    #[command(subcommand)]
+    command: ToolchainCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum ToolchainCommand {
+    Ensure(ToolchainEnsureArgs),
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum ToolchainEnsureFormatArg {
+    Json,
+}
+
+#[derive(Args, Debug, Clone)]
+struct ToolchainEnsureArgs {
+    #[arg(long)]
+    manifest_path: Option<PathBuf>,
+
+    #[arg(long, value_enum, default_value_t = ToolchainEnsureFormatArg::Json)]
+    format: ToolchainEnsureFormatArg,
+
+    #[arg(long, conflicts_with = "format")]
+    json: bool,
+
+    #[arg(long)]
+    report_path: Option<PathBuf>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -1730,6 +1762,49 @@ struct BuildPlanReport {
     blocked_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ToolchainEnsureStatus {
+    Ready,
+    BuildBlocked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ToolchainEnsureExecutionDriver {
+    UcBuiltin,
+    UcExternalHelper,
+    HelperBuilderScript,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolchainEnsureReport {
+    #[serde(default = "uc_agent_json_schema_version")]
+    schema_version: u32,
+    generated_at_epoch_ms: u64,
+    manifest_path: String,
+    readonly: bool,
+    mutation_status: String,
+    status: ToolchainEnsureStatus,
+    execution_driver: Option<ToolchainEnsureExecutionDriver>,
+    toolchain: Option<NativeToolchainReport>,
+    ensured_now: bool,
+    expected: Option<String>,
+    found: Option<String>,
+    what_happened: String,
+    why: String,
+    retryable: bool,
+    fallback_used: bool,
+    replay_command: String,
+    artifact_path: Option<String>,
+    log_path: Option<String>,
+    blocked_reason: Option<String>,
+    #[serde(default)]
+    subprocess_commands: Vec<Vec<String>>,
+    #[serde(default)]
+    diagnostics: Vec<NativeDiagnostic>,
+}
+
 #[derive(Debug, Serialize)]
 struct MetadataReport {
     generated_at_epoch_ms: u128,
@@ -2582,6 +2657,7 @@ fn main() -> Result<()> {
         Commands::Benchmark(args) => benchmark_cmd::run(args),
         Commands::Agent(args) => run_agent(args),
         Commands::Project(args) => run_project(args),
+        Commands::Toolchain(args) => run_toolchain(args),
         Commands::Resolve(args) => run_resolve(args),
         Commands::Fetch(args) => run_fetch(args),
         Commands::Cache(args) => run_cache(args),
@@ -2635,6 +2711,24 @@ fn run_agent(args: AgentArgs) -> Result<()> {
 fn run_project(args: ProjectArgs) -> Result<()> {
     match args.command {
         ProjectCommand::Inspect(args) => run_project_inspect(args),
+    }
+}
+
+fn run_toolchain(args: ToolchainArgs) -> Result<()> {
+    match args.command {
+        ToolchainCommand::Ensure(args) => run_toolchain_ensure(args),
+    }
+}
+
+fn run_toolchain_ensure(args: ToolchainEnsureArgs) -> Result<()> {
+    let report = toolchain_ensure_report_from_args(&args)?;
+    let format = if args.json {
+        ToolchainEnsureFormatArg::Json
+    } else {
+        args.format
+    };
+    match format {
+        ToolchainEnsureFormatArg::Json => emit_json_value(args.report_path.as_deref(), &report),
     }
 }
 
@@ -3222,7 +3316,8 @@ fn fetch_report_from_manifest_path(manifest_path: &Path, offline: bool) -> Resul
         .filter(|package| package.source.is_some())
         .count();
 
-    if inspect.offline_readiness.remote_dependency_count == 0 && remote_lockfile_package_count == 0 {
+    if inspect.offline_readiness.remote_dependency_count == 0 && remote_lockfile_package_count == 0
+    {
         let store_scan = fetch_source_store_scan(&source_store_root)?;
         let materialized = FetchMaterialization::default();
         let offline_readiness_after =
@@ -3814,6 +3909,457 @@ fn fetch_blocked_report_from_resolve(resolve: &ResolveReport, offline: bool) -> 
         blocked_reason: resolve.blocked_reason.clone(),
         subprocess_commands: Vec::new(),
         diagnostics: resolve.diagnostics.clone(),
+    }
+}
+
+fn toolchain_helper_build_script_path() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("UC_TOOLCHAIN_HELPER_BUILD_SCRIPT") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+        bail!(
+            "UC_TOOLCHAIN_HELPER_BUILD_SCRIPT does not point to a file: {}",
+            path.display()
+        );
+    }
+    repo_relative_command("scripts/build_native_toolchain_helper.sh")
+}
+
+fn build_toolchain_helper_command(
+    lane: &str,
+    output_path: Option<&Path>,
+) -> Result<(Command, Vec<String>)> {
+    let script = toolchain_helper_build_script_path()?;
+    let mut command = Command::new(&script);
+    let mut command_vec = vec![script.display().to_string()];
+    command.arg("--lane").arg(lane);
+    command_vec.push("--lane".to_string());
+    command_vec.push(lane.to_string());
+    if let Some(output_path) = output_path {
+        command.arg("--output").arg(output_path);
+        command_vec.push("--output".to_string());
+        command_vec.push(output_path.display().to_string());
+    }
+    Ok((command, command_vec))
+}
+
+fn toolchain_ensure_report_from_args(args: &ToolchainEnsureArgs) -> Result<ToolchainEnsureReport> {
+    match resolve_manifest_path(&args.manifest_path) {
+        Ok(manifest_path) => toolchain_ensure_report_from_manifest_path(&manifest_path),
+        Err(err) => Ok(toolchain_ensure_manifest_path_resolution_blocked_report(
+            &args.manifest_path,
+            &err,
+        )),
+    }
+}
+
+#[cfg(not(feature = "native-compile"))]
+fn toolchain_ensure_report_from_manifest_path(
+    manifest_path: &Path,
+) -> Result<ToolchainEnsureReport> {
+    Ok(ToolchainEnsureReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        generated_at_epoch_ms: epoch_ms_u64()?,
+        manifest_path: manifest_path.display().to_string(),
+        readonly: false,
+        mutation_status: "none".to_string(),
+        status: ToolchainEnsureStatus::BuildBlocked,
+        execution_driver: None,
+        toolchain: None,
+        ensured_now: false,
+        expected: Some("uc built with native-compile support".to_string()),
+        found: Some("native-compile feature disabled".to_string()),
+        what_happened: format!(
+            "uc could not ensure a native toolchain for {}.",
+            manifest_path.display()
+        ),
+        why: "This uc binary was built without native-compile support.".to_string(),
+        retryable: false,
+        fallback_used: false,
+        replay_command: format!(
+            "uc toolchain ensure --manifest-path {} --format json",
+            shell_escape_path(manifest_path)
+        ),
+        artifact_path: None,
+        log_path: None,
+        blocked_reason: Some("native_compile_feature_disabled".to_string()),
+        subprocess_commands: Vec::new(),
+        diagnostics: vec![project_agent_diagnostic(
+            "UCN1200",
+            "toolchain_ensure",
+            NativeDiagnosticSeverity::Error,
+            "Native toolchain ensure is unavailable in this build",
+            format!(
+                "uc cannot ensure a native toolchain for {} because native-compile support is disabled.",
+                manifest_path.display()
+            ),
+            "This uc binary was built without the native-compile feature.".to_string(),
+            vec!["Rebuild uc with the native-compile feature enabled.".to_string()],
+            vec![format!(
+                "uc toolchain ensure --manifest-path {} --format json",
+                shell_escape_path(manifest_path)
+            )],
+            "manual_rebuild_required",
+            false,
+            false,
+            None,
+            None,
+        )],
+    })
+}
+
+#[cfg(feature = "native-compile")]
+fn toolchain_ensure_report_from_manifest_path(
+    manifest_path: &Path,
+) -> Result<ToolchainEnsureReport> {
+    let replay_command = format!(
+        "uc toolchain ensure --manifest-path {} --format json",
+        shell_escape_path(manifest_path)
+    );
+    let (requirement, selection) = match select_native_toolchain_from_manifest_path(manifest_path) {
+        Ok(result) => result,
+        Err(err) => {
+            return Ok(toolchain_ensure_manifest_probe_blocked_report(
+                manifest_path,
+                &replay_command,
+                &err,
+            ))
+        }
+    };
+
+    match selection {
+        Ok(selection) => {
+            let (execution_driver, artifact_path, why) = match selection.toolchain.source {
+                NativeToolchainSource::Builtin => (
+                    Some(ToolchainEnsureExecutionDriver::UcBuiltin),
+                    None,
+                    "The requested Cairo lane is already satisfied by the builtin uc compiler."
+                        .to_string(),
+                ),
+                NativeToolchainSource::ExternalHelper => (
+                    Some(ToolchainEnsureExecutionDriver::UcExternalHelper),
+                    selection
+                        .toolchain
+                        .binary_path
+                        .clone()
+                        .or_else(|| selection.helper_path.map(|path| path.display().to_string())),
+                    "The requested Cairo lane is already satisfied by a usable external helper."
+                        .to_string(),
+                ),
+            };
+            let found = Some(format!(
+                "source={}, requested={}",
+                serde_json::to_string(&selection.toolchain.source)
+                    .unwrap_or_else(|_| "\"unknown\"".to_string()),
+                selection
+                    .toolchain
+                    .requested_version
+                    .clone()
+                    .unwrap_or_else(|| "<auto>".to_string())
+            ));
+            return Ok(ToolchainEnsureReport {
+                schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+                generated_at_epoch_ms: epoch_ms_u64()?,
+                manifest_path: manifest_path.display().to_string(),
+                readonly: false,
+                mutation_status: "none".to_string(),
+                status: ToolchainEnsureStatus::Ready,
+                execution_driver,
+                toolchain: Some(selection.toolchain),
+                ensured_now: false,
+                expected: Some("selected native Cairo lane available locally".to_string()),
+                found,
+                what_happened: format!(
+                    "uc verified the native toolchain requirement for {}.",
+                    manifest_path.display()
+                ),
+                why,
+                retryable: true,
+                fallback_used: false,
+                replay_command,
+                artifact_path,
+                log_path: None,
+                blocked_reason: None,
+                subprocess_commands: Vec::new(),
+                diagnostics: Vec::new(),
+            });
+        }
+        Err(issue) => {
+            let lane = requirement
+                .requested_major_minor
+                .clone()
+                .or_else(|| requirement.requested_version.clone())
+                .unwrap_or_default();
+            let output_path = configured_native_toolchain_helper_path_for_major_minor(&lane)
+                .filter(|_| {
+                    matches!(
+                        issue,
+                        NativeCompileSupportIssue::InvalidToolchainHelper { .. }
+                    )
+                });
+            let safe_action = issue.safe_automated_action();
+            if !matches!(safe_action, "build_helper_lane" | "rebuild_helper_lane") {
+                return Ok(toolchain_ensure_issue_blocked_report(
+                    manifest_path,
+                    &replay_command,
+                    &requirement,
+                    &issue,
+                    Vec::new(),
+                ));
+            }
+            let (command, command_vec) =
+                build_toolchain_helper_command(&lane, output_path.as_deref())?;
+            let subprocess_commands = vec![command_vec.clone()];
+            let run = run_command_capture(command, command_vec)?;
+            if run.exit_code != 0 {
+                return Ok(toolchain_ensure_script_failure_report(
+                    manifest_path,
+                    &replay_command,
+                    &requirement,
+                    &issue,
+                    run,
+                    subprocess_commands,
+                ));
+            }
+            let (_, ensured_selection) = select_native_toolchain_from_manifest_path(manifest_path)?;
+            match ensured_selection {
+                Ok(selection) => Ok(ToolchainEnsureReport {
+                    schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+                    generated_at_epoch_ms: epoch_ms_u64()?,
+                    manifest_path: manifest_path.display().to_string(),
+                    readonly: false,
+                    mutation_status: "ensured".to_string(),
+                    status: ToolchainEnsureStatus::Ready,
+                    execution_driver: Some(ToolchainEnsureExecutionDriver::HelperBuilderScript),
+                    artifact_path: selection
+                        .toolchain
+                        .binary_path
+                        .clone()
+                        .or_else(|| selection.helper_path.map(|path| path.display().to_string())),
+                    toolchain: Some(selection.toolchain),
+                    ensured_now: true,
+                    expected: Some("requested helper lane built and revalidated".to_string()),
+                    found: Some(format!("lane={lane}")),
+                    what_happened: format!(
+                        "uc built and revalidated the native toolchain helper lane for {}.",
+                        manifest_path.display()
+                    ),
+                    why: "The requested Cairo lane needed an external helper, and the checked-in helper builder completed successfully.".to_string(),
+                    retryable: true,
+                    fallback_used: false,
+                    replay_command,
+                    log_path: None,
+                    blocked_reason: None,
+                    subprocess_commands,
+                    diagnostics: Vec::new(),
+                }),
+                Err(after_issue) => Ok(toolchain_ensure_issue_blocked_report(
+                    manifest_path,
+                    &replay_command,
+                    &requirement,
+                    &after_issue,
+                    subprocess_commands,
+                )),
+            }
+        }
+    }
+}
+
+#[cfg(feature = "native-compile")]
+fn toolchain_ensure_issue_blocked_report(
+    manifest_path: &Path,
+    replay_command: &str,
+    requirement: &NativeToolchainRequirement,
+    issue: &NativeCompileSupportIssue,
+    subprocess_commands: Vec<Vec<String>>,
+) -> ToolchainEnsureReport {
+    ToolchainEnsureReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        generated_at_epoch_ms: epoch_ms_u64().unwrap_or(0),
+        manifest_path: manifest_path.display().to_string(),
+        readonly: false,
+        mutation_status: "none".to_string(),
+        status: ToolchainEnsureStatus::BuildBlocked,
+        execution_driver: None,
+        toolchain: Some(native_toolchain_report_for_issue(requirement, issue)),
+        ensured_now: false,
+        expected: Some("selected native Cairo lane available locally".to_string()),
+        found: Some(issue.kind().to_string()),
+        what_happened: format!(
+            "uc could not ensure the native toolchain for {}.",
+            manifest_path.display()
+        ),
+        why: issue.reason(),
+        retryable: issue.diagnostic().retryable,
+        fallback_used: false,
+        replay_command: replay_command.to_string(),
+        artifact_path: None,
+        log_path: None,
+        blocked_reason: Some(issue.kind().to_string()),
+        subprocess_commands,
+        diagnostics: vec![issue.diagnostic()],
+    }
+}
+
+#[cfg(feature = "native-compile")]
+fn toolchain_ensure_script_failure_report(
+    manifest_path: &Path,
+    replay_command: &str,
+    requirement: &NativeToolchainRequirement,
+    issue: &NativeCompileSupportIssue,
+    run: CommandRun,
+    subprocess_commands: Vec<Vec<String>>,
+) -> ToolchainEnsureReport {
+    ToolchainEnsureReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        generated_at_epoch_ms: epoch_ms_u64().unwrap_or(0),
+        manifest_path: manifest_path.display().to_string(),
+        readonly: false,
+        mutation_status: "attempted".to_string(),
+        status: ToolchainEnsureStatus::BuildBlocked,
+        execution_driver: Some(ToolchainEnsureExecutionDriver::HelperBuilderScript),
+        toolchain: Some(native_toolchain_report_for_issue(requirement, issue)),
+        ensured_now: false,
+        expected: Some(
+            "helper builder exits successfully and yields a usable uc helper".to_string(),
+        ),
+        found: Some(format!("helper builder exit_code={}", run.exit_code)),
+        what_happened: format!(
+            "uc attempted to build the helper lane for {}, but the helper builder failed.",
+            manifest_path.display()
+        ),
+        why: bounded_error_summary(&run.stderr, "helper builder exited non-zero"),
+        retryable: true,
+        fallback_used: false,
+        replay_command: replay_command.to_string(),
+        artifact_path: None,
+        log_path: None,
+        blocked_reason: Some("helper_build_failed".to_string()),
+        subprocess_commands,
+        diagnostics: vec![project_agent_diagnostic(
+            "UCN1201",
+            "toolchain_ensure",
+            NativeDiagnosticSeverity::Error,
+            "Native helper build failed",
+            format!(
+                "uc could not build the required helper lane for {}.",
+                manifest_path.display()
+            ),
+            bounded_error_summary(&run.stderr, "helper builder exited non-zero"),
+            vec![
+                "Inspect the helper builder stderr and fix the lane build failure.".to_string(),
+                "Rerun `uc toolchain ensure` after the helper builder succeeds.".to_string(),
+            ],
+            vec![replay_command.to_string()],
+            "rebuild_helper_lane",
+            true,
+            false,
+            requirement.requested_version.clone(),
+            None,
+        )],
+    }
+}
+
+fn toolchain_ensure_manifest_path_resolution_blocked_report(
+    manifest_path: &Option<PathBuf>,
+    err: &anyhow::Error,
+) -> ToolchainEnsureReport {
+    let manifest_text = best_effort_manifest_path_display(manifest_path);
+    ToolchainEnsureReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        generated_at_epoch_ms: epoch_ms_u64().unwrap_or(0),
+        manifest_path: manifest_text.clone(),
+        readonly: false,
+        mutation_status: "none".to_string(),
+        status: ToolchainEnsureStatus::BuildBlocked,
+        execution_driver: None,
+        toolchain: None,
+        ensured_now: false,
+        expected: Some("an existing Scarb.toml path inside the active checkout".to_string()),
+        found: Some(manifest_text.clone()),
+        what_happened: format!("uc could not resolve the manifest path for {manifest_text}."),
+        why: format!("{err:#}"),
+        retryable: true,
+        fallback_used: false,
+        replay_command: "uc toolchain ensure --manifest-path <Scarb.toml> --format json"
+            .to_string(),
+        artifact_path: None,
+        log_path: None,
+        blocked_reason: Some("manifest_path_resolution_failed".to_string()),
+        subprocess_commands: Vec::new(),
+        diagnostics: vec![project_agent_diagnostic(
+            "UCN1100",
+            "manifest_path",
+            NativeDiagnosticSeverity::Error,
+            "Manifest path could not be resolved",
+            format!("uc could not resolve manifest path {manifest_text}."),
+            format!("{err:#}"),
+            vec![
+                "Use an absolute path to Scarb.toml or rerun from the intended workspace root."
+                    .to_string(),
+            ],
+            vec!["uc toolchain ensure --manifest-path <Scarb.toml> --format json".to_string()],
+            "manual_manifest_fix_required",
+            true,
+            false,
+            None,
+            None,
+        )],
+    }
+}
+
+#[cfg(feature = "native-compile")]
+fn toolchain_ensure_manifest_probe_blocked_report(
+    manifest_path: &Path,
+    replay_command: &str,
+    err: &anyhow::Error,
+) -> ToolchainEnsureReport {
+    ToolchainEnsureReport {
+        schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+        generated_at_epoch_ms: epoch_ms_u64().unwrap_or(0),
+        manifest_path: manifest_path.display().to_string(),
+        readonly: false,
+        mutation_status: "none".to_string(),
+        status: ToolchainEnsureStatus::BuildBlocked,
+        execution_driver: None,
+        toolchain: None,
+        ensured_now: false,
+        expected: Some("a readable and parseable Scarb.toml".to_string()),
+        found: Some(manifest_path.display().to_string()),
+        what_happened: format!(
+            "uc could not inspect the native toolchain requirement for {}.",
+            manifest_path.display()
+        ),
+        why: format!("{err:#}"),
+        retryable: true,
+        fallback_used: false,
+        replay_command: replay_command.to_string(),
+        artifact_path: None,
+        log_path: None,
+        blocked_reason: Some("manifest_probe_failed".to_string()),
+        subprocess_commands: Vec::new(),
+        diagnostics: vec![project_agent_diagnostic(
+            "UCN1102",
+            "manifest_parse",
+            NativeDiagnosticSeverity::Error,
+            "Manifest could not be parsed for toolchain ensure",
+            format!(
+                "uc could not inspect the native toolchain requirement for {}.",
+                manifest_path.display()
+            ),
+            format!("{err:#}"),
+            vec![
+                "Fix the Scarb.toml syntax or schema issue before rerunning toolchain ensure."
+                    .to_string(),
+            ],
+            vec![replay_command.to_string()],
+            "manual_manifest_fix_required",
+            true,
+            false,
+            None,
+            None,
+        )],
     }
 }
 
@@ -6141,6 +6687,21 @@ fn run_mcp_serve(args: McpServeArgs) -> Result<()> {
                 schema: "docs/agent/schemas/fetch-report.schema.json".to_string(),
             },
             McpToolDescriptor {
+                name: "uc.toolchain_ensure".to_string(),
+                description: "Ensure the selected Cairo/helper lane exists locally before build.".to_string(),
+                command: vec![
+                    "uc".to_string(),
+                    "toolchain".to_string(),
+                    "ensure".to_string(),
+                    "--manifest-path".to_string(),
+                    "<Scarb.toml>".to_string(),
+                    "--format".to_string(),
+                    "json".to_string(),
+                ],
+                mutates_state: true,
+                schema: "docs/agent/schemas/toolchain-ensure-report.schema.json".to_string(),
+            },
+            McpToolDescriptor {
                 name: "uc.benchmark_report".to_string(),
                 description: "Read benchmark reports with native-supported, unsupported, fallback-used, and build-failed classification.".to_string(),
                 command: vec!["benchmarks/results/<report>.json".to_string()],
@@ -6738,6 +7299,35 @@ fn native_toolchain_helper_path_override() -> Option<String> {
 fn native_toolchain_env_var_name_for_major_minor(major_minor: &str) -> String {
     let normalized = major_minor.replace('.', "_");
     format!("UC_NATIVE_TOOLCHAIN_{}_BIN", normalized)
+}
+
+#[cfg(feature = "native-compile")]
+fn default_native_toolchain_helper_path_for_major_minor(major_minor: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))?;
+    let lane_digits = major_minor.replace('.', "");
+    Some(
+        home.join(".uc")
+            .join("toolchain-helpers")
+            .join(format!("uc-cairo{lane_digits}-helper"))
+            .join("bin")
+            .join("uc"),
+    )
+}
+
+#[cfg(feature = "native-compile")]
+fn configured_native_toolchain_helper_path_for_major_minor(major_minor: &str) -> Option<PathBuf> {
+    let helper_env = native_toolchain_env_var_name_for_major_minor(major_minor);
+    std::env::var_os(helper_env).map(PathBuf::from)
+}
+
+#[cfg(feature = "native-compile")]
+fn discovered_native_toolchain_helper_path_for_major_minor(major_minor: &str) -> Option<PathBuf> {
+    configured_native_toolchain_helper_path_for_major_minor(major_minor).or_else(|| {
+        let candidate = default_native_toolchain_helper_path_for_major_minor(major_minor)?;
+        candidate.exists().then_some(candidate)
+    })
 }
 
 #[cfg(feature = "native-compile")]
@@ -7575,7 +8165,9 @@ fn select_native_toolchain_from_requirement_with_compiler(
                 .clone()
                 .unwrap_or_else(|| requirement.requested_version.clone().unwrap_or_default());
             let helper_env = native_toolchain_env_var_name_for_major_minor(&requested_major_minor);
-            let Some(helper_path_os) = std::env::var_os(&helper_env) else {
+            let Some(helper_path) =
+                discovered_native_toolchain_helper_path_for_major_minor(&requested_major_minor)
+            else {
                 if !native_toolchain_helper_lane_is_productized(&requested_major_minor) {
                     return Ok(Err(
                         NativeCompileSupportIssue::UnsupportedToolchainHelperLane {
@@ -7591,7 +8183,6 @@ fn select_native_toolchain_from_requirement_with_compiler(
                     helper_env,
                 }));
             };
-            let helper_path = PathBuf::from(helper_path_os);
             if !native_toolchain_helper_path_is_usable(&helper_path) {
                 if !native_toolchain_helper_lane_is_productized(&requested_major_minor) {
                     return Ok(Err(

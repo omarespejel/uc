@@ -21,6 +21,7 @@ required_files=(
   docs/agent/schemas/native-support-report.schema.json
   docs/agent/schemas/resolve-report.schema.json
   docs/agent/schemas/fetch-report.schema.json
+  docs/agent/schemas/toolchain-ensure-report.schema.json
   docs/agent/schemas/source-store-status-report.schema.json
   docs/agent/schemas/source-store-prune-report.schema.json
   docs/agent/schemas/build-report.schema.json

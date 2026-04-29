@@ -4,7 +4,7 @@ This document is the stable contract for machine-readable `uc` diagnostics. Huma
 
 ## Contract
 
-Every agent-facing diagnostic emitted by `uc project inspect --format json`, `uc support native --format json`, `uc resolve --locked --format json`, `uc fetch --locked --format json`, `uc build --plan-only --json`, `uc build --json`, or a build report must include:
+Every agent-facing diagnostic emitted by `uc project inspect --format json`, `uc support native --format json`, `uc resolve --locked --format json`, `uc fetch --locked --format json`, `uc toolchain ensure --format json`, `uc build --plan-only --json`, `uc build --json`, or a build report must include:
 
 - `schema_version`: integer schema version. Current version: `1`.
 - `code`: stable diagnostic code such as `UCN1004`.
@@ -126,6 +126,22 @@ External helper native support probe failed.
 - Category: `toolchain_helper_probe`
 - Safe action: `rebuild_helper_lane`
 - Agent behavior: rebuild the helper lane or inspect the helper directly before trusting the lane.
+
+### UCN1200
+
+Native toolchain ensure is unavailable in this build.
+
+- Category: `toolchain_ensure`
+- Safe action: `manual_rebuild_required`
+- Agent behavior: rebuild `uc` with `native-compile` enabled before expecting toolchain acquisition to work.
+
+### UCN1201
+
+Native helper build failed during `uc toolchain ensure`.
+
+- Category: `toolchain_ensure`
+- Safe action: `rebuild_helper_lane`
+- Agent behavior: inspect helper-builder stderr, fix the helper lane build failure, and rerun `uc toolchain ensure`.
 
 ### UCP1000
 
