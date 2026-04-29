@@ -156,8 +156,8 @@ Native helper builder could not be prepared during `uc toolchain ensure`.
 Native helper builder could not be executed during `uc toolchain ensure`.
 
 - Category: `toolchain_ensure`
-- Safe action: `rebuild_helper_lane`
-- Agent behavior: fix the helper builder execution environment or permissions, then rerun `uc toolchain ensure`.
+- Safe action: `manual_rebuild_required`
+- Agent behavior: fix the helper builder execution environment manually, then rerun `uc toolchain ensure`. Do not treat this as an autonomous rebuild path.
 
 ### UCN1204
 
@@ -165,7 +165,7 @@ Native helper lane could not be revalidated after `uc toolchain ensure`.
 
 - Category: `toolchain_ensure`
 - Safe action: `rebuild_helper_lane`
-- Agent behavior: inspect the manifest and generated helper artifacts, restore any invalid manifest state, and rerun `uc toolchain ensure`.
+- Agent behavior: revalidate by regenerating helper artifacts, clearing helper-lane caches, and rerunning `uc toolchain ensure`. If manifest changes are required, stop and request user approval before editing or proposing them.
 
 ### UCP1000
 
@@ -284,7 +284,7 @@ Agents may perform only safe actions by default:
 - `inspect_native_support_then_retry`
 - `use_native_enabled_binary`
 
-Agents must not edit Cairo source, dependency ranges, lockfiles, release metadata, or legacy toolchain adapter code unless the user or calling tool explicitly grants source-edit permission. Diagnostics with `safe_automated_action=manual_legacy_adapter_required` are stop-and-report states, not autonomous fix states.
+Agents must not edit Cairo source, dependency ranges, lockfiles, release metadata, or legacy toolchain adapter code unless the user or calling tool explicitly grants source-edit permission. Diagnostics with `safe_automated_action=manual_legacy_adapter_required`, `manual_rebuild_required`, or any other `manual_*` value are stop-and-report states, not autonomous fix states.
 
 ## Compatibility Notes
 
