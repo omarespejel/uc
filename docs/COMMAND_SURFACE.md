@@ -227,6 +227,6 @@ Agents should treat the `uc` source store as the authoritative local fetch surfa
 
 ## Next Expansion
 - Add more native toolchain helper lanes beyond Cairo `2.14`.
-- Expand `resolve` beyond `--locked` and keep hardening the implemented `fetch`, `toolchain ensure`, and `build --plan-only` surfaces behind stable JSON/report contracts.
+- Expand `resolve` beyond `--locked` and keep hardening the implemented `fetch`, `toolchain ensure`, and `build --plan-only` command/report contracts.
 - Add native `uc` compile engine implementation behind the existing command interface.
 - Keep `compare-build` as mandatory gate while deeper frontend-compile optimizations mature.
