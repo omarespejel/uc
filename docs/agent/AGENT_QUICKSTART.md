@@ -65,7 +65,10 @@ Read:
 - `.diagnostics[].code`
 
 If `.status == "build_blocked"`, stop before fetch or build and fix the lockfile
-or manifest state first. Do not infer locked-resolve safety from terminal prose.
+or manifest state first. Read `.blocked_reason` directly because the schema
+requires it as a nullable field and `uc` uses it as the authoritative blocked
+cause. Do not infer locked-resolve safety from diagnostics, lockfile prose, or
+terminal output.
 
 ## Build Plan
 
