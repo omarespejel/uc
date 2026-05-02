@@ -1,161 +1,39 @@
-# Agent-First Compiler Direction
+# Agent-First Compiler
 
-`uc` should be designed for agents first and humans second. The practical meaning is simple: every important compiler state must be structured, replayable, policy-aware, and safe to automate.
+`uc` is designed for agents first and terminal users second.
 
-## Why This Is Different
+That changes the architecture. Agents need structured state, explicit plans, replayable failures, and stable schemas. They should not infer behavior from logs or terminal prose.
 
-A human-first compiler can print a good paragraph and assume a developer will infer the next step. An agent-first compiler cannot rely on inference. It must expose the state that lets an agent decide whether to fix, retry, fall back, benchmark, or stop.
+## Core Flow
 
-The launch wedge is not just speed. The launch wedge is:
-
-> A Cairo compiler agents can operate reliably: structured diagnostics, native multi-toolchain support, reproducible failure bundles, and benchmark claims anyone can verify.
-
-The longer-term boundary is wider than build acceleration. `uc` should expose a typed project model that agents can inspect before build, metadata, benchmark, or safe-action work.
-
-## Product Principles
-
-1. Do not make agents parse prose.
-2. Every failure gets a stable code.
-3. Every diagnostic says what happened, why, how to fix it, whether fallback happened, and what command to run next.
-4. Every fallback is visible in JSON and benchmark reports.
-5. Every benchmark claim must carry lane, manifest source, host, sample count, and support classification.
-6. Safe automated actions are explicit and reversible by default.
-7. Source edits require explicit permission.
-8. Repo policy comes from checked-in files like `AGENTS.md`, `.codex/START_HERE.md`, and `docs/agent/*`.
-9. Project-model state should be explicit before command defaults change.
-
-## Launch-Minimum Agent Surfaces
-
-Already in this PR or required before launch:
-
-- `uc support native --format json` emits stable support reports.
-- `uc build --json` and `--report-path` carry build diagnostics.
-- `uc build --plan-only --json` emits the chosen execution path before side effects begin.
-- `uc fetch --locked --format json` hydrates locked package roots into the shared `uc` source store with explicit driver and offline-readiness reporting.
-- `uc cache status --format json` and `uc cache prune --format json` expose the source-store inventory and budget lifecycle directly to agents.
-- `uc toolchain ensure --format json` explicitly ensures the selected builtin/helper lane before build time.
-- `uc build --record-failure <path>` writes a redacted, replay-safe failure bundle on build errors.
-- `uc replay <bundle>` reads that bundle and is dry-run by default.
-- `uc agent eval --manifest-path <Scarb.toml>` returns a decision agents can act on before compiling.
-- `uc agent safe-action <action>` exposes dry-run-first remediation commands.
-- `uc mcp serve` emits the read-only command/resource catalog for MCP adapters.
-- `uc project inspect --manifest-path <Scarb.toml> --format json` emits read-only package, workspace, target, dependency, lockfile, and toolchain state.
-- Native support details are included only when exact lane data is available; if read-only inspect skips native probing, use `UCP1005` as the signal to run `uc support native` for full probing.
-- Native support reports include toolchain selection metadata plus agent-facing `decision_status` values `native_supported`, `native_unsupported`, `fallback_likely`, and `build_blocked`.
-- Diagnostics include schema version, docs URL, next commands, safe automated action, retryability, fallback status, expected toolchain, and found toolchain.
-- Real-repo benchmarks include native support classification and fallback status.
-- `scripts/doctor.sh --uc-bin <path> --manifest-path <Scarb.toml>` probes support before measurement.
-
-### Manual / Debug Surfaces
-
-- Agents should prefer `uc agent safe-action build-helper-lane --lane 2.14` for older-Cairo helper setup.
-- `./scripts/build_native_toolchain_helper.sh --lane 2.14` remains available for manual debugging when the agent command surface is not enough.
-
-## Remaining PRs
-
-1. `agent-flight-recorder-hardening`
-   - Extend the failure bundle with timing spans and source graph hashes.
-   - Add bundle schema validation in the replay path.
-
-2. `uc-mcp-stdio`
-   - Wrap the catalog in a real stdio MCP JSON-RPC server.
-   - Preserve `mutates_state` signaling so adapters can gate mutable actions explicitly.
-
-3. `agent-eval-fixtures`
-   - Check in fixture manifests for missing helper lanes, unsupported manifests, fallback activation, stale cache, and benchmark unsupported cases.
-   - Add real `monero` and `braavos` fixture runners, not just required-fixture markers.
-
-4. `sarif-and-lsp`
-   - Map diagnostics to SARIF for GitHub/code-scanning ingestion.
-   - Reuse the same stable codes for LSP diagnostics and code actions.
-
-5. `safe-source-edits`
-   - Keep source edits behind an explicit `--allow-source-edits` gate.
-   - Require failure-bundle replay evidence before allowing source-modifying actions.
-
-6. `metadata-from-project-model`
-   - Serve `uc metadata` from the project model behind an explicit gate.
-   - Keep Scarb metadata as the comparison oracle until parity passes on the support corpus.
-
-## MCP Shape
-
-MCP tools should eventually expose:
-
-- `uc.doctor`
-- `uc.fetch`
-- `uc.cache_status`
-- `uc.cache_prune`
-- `uc.support_native`
-- `uc.explain_diagnostic`
-- `uc.select_toolchain`
-- `uc.benchmark_report`
-- `uc.profile_native_frontend`
-
-MCP resources should expose:
-
-- `uc://diagnostics/catalog`
-- `uc://support/native-matrix/latest`
-- `uc://benchmarks/latest`
-- `uc://toolchains/native`
-- `uc://source-store/status`
-- `uc://repo/policy`
-
-## Human Workflow
-
-Humans can keep using terminal text:
-
-```sh
-uc support native --manifest-path Scarb.toml
-uc build --engine uc --daemon-mode off
+```bash
+uc project inspect --manifest-path /abs/path/to/project.toml --format json
+uc support native --manifest-path /abs/path/to/project.toml --format json
+uc resolve --locked --manifest-path /abs/path/to/project.toml --format json
+uc fetch --locked --manifest-path /abs/path/to/project.toml --format json
+uc toolchain ensure --manifest-path /abs/path/to/project.toml --format json
+uc build --engine uc --daemon-mode off --manifest-path /abs/path/to/project.toml --plan-only --json
+uc build --engine uc --daemon-mode off --manifest-path /abs/path/to/project.toml --json
 ```
 
-When debugging or sharing evidence, humans should switch to JSON:
+## Design Consequences
 
-```sh
-uc support native --manifest-path Scarb.toml --format json | jq
-uc build --engine uc --daemon-mode off --json | jq
-```
+- Project state must be inspectable before build.
+- Native support must be classified before expensive execution.
+- Dependency and source readiness must be explicit.
+- Toolchain/helper state must be explicit.
+- Build planning must report side effects before execution.
+- Fallback must be reported as fallback, not native success.
+- Diagnostics must include stable codes, retryability, expected/found state, and next commands.
 
-## Agent Workflow
+## Speed Direction
 
-Agents should start with support probing, not build-and-guess:
+The performance strategy is to avoid unnecessary work:
 
-```sh
-uc project inspect --manifest-path Scarb.toml --format json
-uc support native --manifest-path Scarb.toml --format json
-uc toolchain ensure --manifest-path Scarb.toml --format json
-uc build --engine uc --daemon-mode off --manifest-path Scarb.toml --plan-only --json
-uc agent eval --manifest-path Scarb.toml
-./scripts/doctor.sh --uc-bin ./target/release/uc --manifest-path /abs/path/to/Scarb.toml
-```
+- keep reusable state alive where safe,
+- avoid recomputing frontend work on unchanged inputs,
+- use content-addressed cache keys,
+- split planning from execution,
+- benchmark only supported workloads under same-window conditions.
 
-Agents should treat `uc project inspect`, `uc support native`, `uc toolchain ensure`, `uc build --plan-only`, and `uc agent eval` as the stable pre-build surfaces.
-
-If the diagnostic says `safe_automated_action=build_helper_lane`, the agent may run:
-
-```sh
-uc agent safe-action build-helper-lane --lane 2.14
-uc agent safe-action build-helper-lane --lane 2.14 --execute
-```
-
-Then it should export the printed helper env var and rerun support probing before benchmarking.
-
-When a build fails, agents should preserve a replayable artifact:
-
-```sh
-failure_bundle="$(mktemp -t uc-failure.XXXXXX.json)"
-uc build --engine uc --daemon-mode off --manifest-path Scarb.toml --record-failure "$failure_bundle"
-uc replay "$failure_bundle"
-```
-
-Use `uc replay "$failure_bundle" --execute` only when the agent is allowed to rerun the recorded build command. Replay reports still emit structured JSON if the command cannot spawn or exceeds capture limits.
-
-When native fallback activates, agents should inspect `UCN2002` before editing source. If `UCN2002` says the fallback build also failed, treat the embedded compiler error blocks as the immediate blocker and keep the manifest in `build_failed` support state until those errors are fixed or a lane-specific compatibility patch lands.
-
-## Sources
-
-- AGENTS.md: <https://agents.md/>
-- MCP schema and structured tool results: <https://modelcontextprotocol.io/specification/2025-11-25/schema>
-- Language Server Protocol overview: <https://microsoft.github.io/language-server-protocol/>
-- SARIF 2.1.0 specification: <https://docs.oasis-open.org/sarif/sarif/v2.1.0/os/sarif-v2.1.0-os.html>
-- GitHub SARIF upload behavior: <https://docs.github.com/en/code-security/how-tos/scan-code-for-vulnerabilities/integrate-with-existing-tools/uploading-a-sarif-file-to-github>
+Speed claims require the exact benchmark lane, host, sample counts, daemon mode, and source artifact.

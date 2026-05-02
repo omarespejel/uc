@@ -1,26 +1,21 @@
-# Scenario Matrix
+# Benchmark Scenarios
 
-## Build Scenarios
-1. `build.cold`
-- Remove workspace build artifacts and run `scarb build`.
+## `build.cold`
 
-2. `build.warm_noop`
-- Build once, then rerun without changes.
+Remove workspace build artifacts and run a fresh build.
 
-3. `build.warm_edit`
-- Build once, modify one source file, rebuild.
+## `build.warm_noop`
 
-4. `build.warm_edit_semantic`
-- Build once, apply a semantic source edit, rebuild.
+Run a build twice without changing source files. The second run measures unchanged-input behavior.
 
-## Metadata Scenarios
-5. `metadata.online_cold`
-- Run metadata with empty global cache.
+## `build.warm_edit`
 
-6. `metadata.offline_warm`
-- Warm cache once, then run metadata with `--offline`.
+Apply a reversible source edit, then run build.
 
-## Outputs
-Each run generates:
-- JSON with raw samples + summary stats.
-- Markdown summary table.
+## `build.warm_edit_semantic`
+
+Apply a reversible semantic source edit, then run build.
+
+## `support.native`
+
+Run support classification without compiling. This measures pre-build routing cost and correctness.

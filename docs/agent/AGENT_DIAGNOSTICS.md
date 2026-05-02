@@ -1,305 +1,72 @@
-# Agent Diagnostics Contract
+# Agent Diagnostics
 
-This document is the stable contract for machine-readable `uc` diagnostics. Human terminal output may change; agent-facing JSON must remain boring, versioned, and parseable.
+Diagnostics are part of the agent contract. They must be stable enough for automation and explicit enough for remediation.
 
-## Contract
+Every diagnostic should include:
 
-Every agent-facing diagnostic emitted by `uc project inspect --format json`, `uc support native --format json`, `uc resolve --locked --format json`, `uc fetch --locked --format json`, `uc toolchain ensure --format json`, `uc build --plan-only --json`, `uc build --json`, or a build report must include:
+- `schema_version`
+- `code`
+- `category`
+- `severity`
+- `what_happened`
+- `why`
+- `how_to_fix`
+- `next_commands`
+- `safe_automated_action`
+- `retryable`
+- `fallback_used`
+- expected/found state when available
+- artifact/log/replay paths when available
 
-- `schema_version`: integer schema version. Current version: `1`.
-- `code`: stable diagnostic code such as `UCN1004`.
-- `category`: stable machine category.
-- `severity`: `info`, `warn`, or `error`.
-- `title`: short human label.
-- `docs_url`: absolute GitHub remediation URL with a stable diagnostic-code anchor.
-- `what_happened`: concrete failure statement.
-- `why`: root cause or best-known causal explanation.
-- `how_to_fix`: ordered remediation text for humans and agents.
-- `next_commands`: commands an agent can run next without parsing prose.
-- `safe_automated_action`: symbolic action policy for autonomous agents.
-- `retryable`: whether retrying the same operation can plausibly succeed after remediation.
-- `fallback_used`: whether `uc` downgraded from native to Scarb.
-- `toolchain_expected`: expected Cairo/toolchain lane when relevant; nullable and serialized as `null` when not applicable.
-- `toolchain_found`: found compiler/helper/path when relevant; nullable and serialized as `null` when not applicable.
+## Routing Codes
 
-For `uc support native --format json`, agents should key their pre-build routing on `decision_status`:
+| Code | Meaning | Agent Behavior |
+| --- | --- | --- |
+| `UCN1001` | Native support is available. | Continue to planning or build. |
+| `UCN1006` | Required helper lane is not productized. | Mark as `native_unsupported` unless a reviewed helper binary is provided. |
+| `UCN1100` | Manifest path resolution failed. | Fix the manifest path and retry. |
+| `UCN1200` | Manifest could not be read or parsed. | Fix file access or syntax before running build. |
+| `UCN2001` | Native preflight selected compatibility fallback. | Report fallback explicitly; do not count as native success. |
+| `UCN2002` | Native build downgraded to compatibility fallback. | Preserve fallback state and inspect native diagnostics. |
+| `UCN3001` | Native build failed without fallback success. | Use the replay bundle and fix the bounded compiler errors. |
+| `UCN5001` | Fetch failed while hydrating locked sources. | Check offline readiness, lockfile state, source origin, or network policy. |
 
-- `native_supported`: native path is ready now.
-- `native_unsupported`: keep the workload outside native claims until compatibility work lands.
-- `fallback_likely`: native is not ready now, but Scarb compatibility fallback is likely to work.
-- `build_blocked`: the support probe itself could not complete; fix the blocking input or helper issue before routing further.
+## Decision Status
 
-## Codes
+Agent-facing support reports use:
 
-### UCN0001
+- `native_supported`
+- `native_unsupported`
+- `fallback_likely`
+- `build_blocked`
 
-Native compile support is unavailable because the binary was built without the native feature.
+Low-level probe status may still use:
 
-- Category: `feature_unavailable`
-- Safe action: `use_native_enabled_binary`
-- Agent behavior: switch to a native-enabled `uc` binary before retrying native support checks.
+- `supported`
+- `unsupported`
+- `unavailable`
 
-### UCN1000
+Agents should prefer `decision_status` when choosing the next action.
 
-Legacy edition toolchain could not be resolved.
+## Fallback Contract
 
-- Category: `toolchain_resolution`
-- Safe action: `manual_manifest_or_lockfile_fix_required`
-- Agent behavior: run `scarb metadata` and inspect `Scarb.lock`; do not edit manifests without explicit source-edit permission.
+Fallback is compatibility behavior.
 
-### UCN1001
+Required behavior:
 
-Native toolchain mismatch.
+- set `fallback_used=true` when fallback happened,
+- include why native did not continue,
+- include whether fallback succeeded or failed,
+- never count fallback as native support,
+- keep replay/log paths when available.
 
-- Category: `toolchain_mismatch`
-- Safe action: `select_matching_toolchain_lane`
-- Agent behavior: select or build a helper lane matching the manifest/lockfile major.minor Cairo version.
+## Retryability
 
-### UCN1002
+`retryable=true` means the same command can plausibly succeed after the reported remediation. It does not mean the agent should blindly retry without changing inputs.
 
-Unsupported manifest Cairo-version constraint.
+Examples:
 
-- Category: `manifest_version`
-- Safe action: `manual_manifest_or_lockfile_fix_required`
-- Agent behavior: report the unsupported range and request/require an exact lane source. Do not rewrite dependency ranges automatically.
-
-### UCN1003
-
-Unparseable native compiler version.
-
-- Category: `compiler_version`
-- Safe action: `select_matching_toolchain_lane`
-- Agent behavior: inspect `uc support native --format json` and `scarb --version`; use a released helper lane if the active binary reports a development or unparseable version.
-
-### UCN1004
-
-Required native toolchain helper is missing.
-
-- Category: `toolchain_lane_unavailable`
-- Safe action: `build_helper_lane`
-- Agent behavior: run the productized helper builder for the requested major.minor lane, export the printed `UC_NATIVE_TOOLCHAIN_<major>_<minor>_BIN`, and rerun support probing.
-
-### UCN1005
-
-Configured native toolchain helper is invalid.
-
-- Category: `toolchain_lane_unavailable`
-- Safe action: `rebuild_helper_lane`
-- Agent behavior: rebuild the helper or point the environment variable at an executable helper binary.
-
-### UCN1006
-
-Native toolchain helper lane is not productized.
-
-- Category: `toolchain_lane_unsupported`
-- Safe action: `manual_legacy_adapter_required`
-- Agent behavior: do not run the helper builder for this lane. Keep the workload in the support matrix as `native_unsupported` unless a reviewed compatible helper binary is explicitly supplied or a dedicated compatibility adapter lands.
-
-### UCN1100
-
-Manifest path could not be resolved.
-
-- Category: `manifest_path`
-- Safe action: `manual_manifest_fix_required`
-- Agent behavior: stop before build; fix the requested path or rerun from the intended project root.
-
-### UCN1101
-
-Project manifest could not be read.
-
-- Category: `manifest_read`
-- Safe action: `manual_manifest_fix_required`
-- Agent behavior: stop before build; ensure `Scarb.toml` exists, is readable, and is valid UTF-8.
-
-### UCN1102
-
-Project manifest TOML could not be parsed.
-
-- Category: `manifest_parse`
-- Safe action: `manual_manifest_fix_required`
-- Agent behavior: stop before build; fix the TOML syntax or manifest structure, then rerun support probing.
-
-### UCN1103
-
-External helper native support probe failed.
-
-- Category: `toolchain_helper_probe`
-- Safe action: `rebuild_helper_lane`
-- Agent behavior: rebuild the helper lane or inspect the helper directly before trusting the lane.
-
-### UCN1200
-
-Native toolchain ensure is unavailable in this build.
-
-- Category: `toolchain_ensure`
-- Safe action: `manual_rebuild_required`
-- Agent behavior: rebuild `uc` with `native-compile` enabled before expecting toolchain acquisition to work.
-
-### UCN1201
-
-Native helper build failed during `uc toolchain ensure`.
-
-- Category: `toolchain_ensure`
-- Safe action: `rebuild_helper_lane`
-- Agent behavior: inspect helper-builder stderr, fix the helper lane build failure, and rerun `uc toolchain ensure`.
-
-### UCN1202
-
-Native helper builder could not be prepared during `uc toolchain ensure`.
-
-- Category: `toolchain_ensure`
-- Safe action: `manual_rebuild_required`
-- Agent behavior: verify the checked-in helper builder script path or set `UC_TOOLCHAIN_HELPER_BUILD_SCRIPT`, then rerun `uc toolchain ensure`.
-
-### UCN1203
-
-Native helper builder could not be executed during `uc toolchain ensure`.
-
-- Category: `toolchain_ensure`
-- Safe action: `manual_rebuild_required`
-- Agent behavior: fix the helper builder execution environment manually, then rerun `uc toolchain ensure`. Do not treat this as an autonomous rebuild path.
-
-### UCN1204
-
-Native helper lane could not be revalidated after `uc toolchain ensure`.
-
-- Category: `toolchain_ensure`
-- Safe action: `rebuild_helper_lane`
-- Agent behavior: revalidate by regenerating helper artifacts, clearing helper-lane caches, and rerunning `uc toolchain ensure`. If manifest changes are required, stop and request user approval before editing or proposing them.
-
-### UCP1000
-
-Project manifest could not be read.
-
-- Category: `manifest_read`
-- Safe action: `manual_manifest_fix_required`
-- Agent behavior: report the read failure; do not edit manifests without explicit source-edit permission.
-
-### UCP1001
-
-Project manifest TOML could not be parsed.
-
-- Category: `manifest_parse`
-- Safe action: `manual_manifest_fix_required`
-- Agent behavior: report the parser error and stop before build, metadata, or benchmark work.
-
-### UCP1002
-
-Native support probe failed during project inspection.
-
-- Category: `native_support_probe`
-- Safe action: `inspect_native_support_then_retry`
-- Agent behavior: run `uc support native --manifest-path <Scarb.toml> --format json` directly and use that result as the narrower failure surface.
-
-### UCP1003
-
-Lockfile path is not a regular file.
-
-- Category: `lockfile_shape`
-- Safe action: `manual_lockfile_fix_required`
-- Agent behavior: report the invalid lockfile path and do not derive toolchain state from it.
-
-### UCP1004
-
-Lockfile could not be parsed.
-
-- Category: `lockfile_parse`
-- Safe action: `manual_lockfile_fix_required`
-- Agent behavior: keep manifest-derived state, but do not rely on lockfile-derived toolchain selection until the lockfile is regenerated or fixed.
-
-### UCP1005
-
-Native support probe skipped for read-only project inspection.
-
-- Category: `native_support_probe`
-- Safe action: `inspect_native_support_then_retry`
-- Agent behavior: keep the inspect report as project-state evidence; run `uc support native --manifest-path <Scarb.toml> --format json` only when full native support probing is needed.
-
-### UCN2001
-
-Native preflight downgraded to Scarb.
-
-- Category: `native_fallback_preflight_ineligible`
-- Safe action: `inspect_native_support_then_retry`
-- Agent behavior: run `uc support native --format json`, fix the support issue first, then rerun with `UC_NATIVE_DISALLOW_SCARB_FALLBACK=1` only when native is required.
-
-### UCN2002
-
-Native local build downgraded to Scarb.
-
-- Category: `native_fallback_local_native_error`
-- Safe action: `inspect_native_support_then_retry`
-- Agent behavior: keep the fallback result, inspect native support and build report diagnostics, then retry native with fallback disallowed only after fixing the native failure.
-- Required payload behavior: if the native compiler only reports a generic root cause such as `Compilation failed.`, preserve a bounded summary in `why` (truncated to `MAX_AGENT_DIAGNOSTIC_REASON_CHARS`) so agents can distinguish native Cairo frontend failures, external-dependency compatibility failures, and fallback activation.
-- Required fallback-failure behavior: if the Scarb fallback build also exits nonzero, keep `fallback_used=true` and include the first bounded compiler error blocks in `why`; agents should fix those Cairo diagnostics before claiming native support for that manifest.
-- Replay evidence: `next_commands` must include a `--record-failure` command so agents can preserve a redacted replay bundle for native-only retry failures when complete output is needed.
-
-### UCN2003
-
-Daemon backend downgraded to Scarb.
-
-- Category: `native_fallback_daemon_backend_downgrade`
-- Safe action: `inspect_native_support_then_retry`
-- Agent behavior: inspect daemon fallback hints and support JSON before rerunning the daemon path.
-
-### UCF1001
-
-Scarb fetch failed while `uc fetch` was hydrating the locked dependency graph.
-
-- Category: `fetch_driver`
-- Safe action: `manual_fetch_fix_required`
-- Agent behavior: fix registry/git/auth/network access first; do not treat the source store as hydrated.
-
-### UCF1002
-
-Offline metadata replay failed after fetch.
-
-- Category: `metadata_after_fetch`
-- Safe action: `manual_fetch_fix_required`
-- Agent behavior: the locked graph is not yet reproducible from local state alone; inspect `Scarb.lock` and retry online fetch before proceeding offline.
-
-### UCF1003
-
-Fetched metadata JSON could not be decoded.
-
-- Category: `metadata_decode`
-- Safe action: `manual_fetch_fix_required`
-- Agent behavior: inspect raw `scarb metadata` output and treat the dependency graph as unreadable until the metadata surface is stable again.
-
-### UCF1004
-
-Some locked package sources are still missing after fetch.
-
-- Category: `source_store_hydration`
-- Safe action: `manual_fetch_fix_required`
-- Agent behavior: inspect the `missing_entries` list, verify local cache state, and do not claim the project is offline-ready yet.
-
-## Agent Policy
-
-Agents may perform only safe actions by default:
-
-- `build_helper_lane`
-- `rebuild_helper_lane`
-- `select_matching_toolchain_lane`
-- `inspect_native_support_then_retry`
-- `use_native_enabled_binary`
-
-Agents must not edit Cairo source, dependency ranges, lockfiles, release metadata, or legacy toolchain adapter code unless the user or calling tool explicitly grants source-edit permission. Diagnostics with `safe_automated_action=manual_legacy_adapter_required`, `manual_rebuild_required`, or any other `manual_*` value are stop-and-report states, not autonomous fix states.
-
-## Compatibility Notes
-
-Schema version `1` is intentionally explicit rather than sparse:
-
-- `diagnostics` serializes as an array, including `[]` when no diagnostics were emitted.
-- `toolchain_found` serializes as `null` when no matching helper/compiler was found.
-- `docs_url` is an absolute GitHub URL so agents can dereference it without knowing the repository checkout path.
-
-Consumers should gate on `schema_version` and stable `code`/`category` values instead of relying on omitted optional fields.
-
-## Sources
-
-- AGENTS.md describes repository instructions as a predictable agent context surface: <https://agents.md/>
-- MCP tool results support structured content and output schemas: <https://modelcontextprotocol.io/specification/2025-11-25/schema>
-- LSP standardizes diagnostics and code actions across tools: <https://microsoft.github.io/language-server-protocol/>
-- SARIF 2.1.0 is the standard interchange format for static-analysis results: <https://docs.oasis-open.org/sarif/sarif/v2.1.0/os/sarif-v2.1.0-os.html>
-- GitHub code scanning consumes SARIF and requires stable categories for multiple uploads: <https://docs.github.com/en/code-security/how-tos/scan-code-for-vulnerabilities/integrate-with-existing-tools/uploading-a-sarif-file-to-github>
+- missing manifest path: retryable after path correction,
+- invalid manifest syntax: retryable after file edit,
+- missing reviewed helper lane: not retryable until a helper is supplied,
+- compiler error in project code: retryable after source correction.

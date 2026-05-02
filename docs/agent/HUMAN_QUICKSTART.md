@@ -1,79 +1,55 @@
 # Human Quickstart
 
-Use this path when you are debugging `uc` directly.
+Bootstrap the repo:
 
-## Inspect Project State
-
-```sh
-uc project inspect --manifest-path Scarb.toml --format json | jq
+```bash
+make bootstrap
+make doctor
 ```
 
-Raw inspect reports can include absolute local paths and manifest/lockfile
-hashes. Redact them before posting outside the host.
+Inspect a project:
 
-## Probe Native Support
-
-```sh
-uc support native --manifest-path Scarb.toml
-uc support native --manifest-path Scarb.toml --format json | jq
+```bash
+uc project inspect --manifest-path /abs/path/to/project.toml --format json | jq
 ```
 
-## Inspect Locked Resolve State
+Check native support:
 
-```sh
-uc resolve --locked --manifest-path Scarb.toml --format json | jq
+```bash
+uc support native --manifest-path /abs/path/to/project.toml
+uc support native --manifest-path /abs/path/to/project.toml --format json | jq
 ```
 
-## Hydrate Locked Sources
+Prepare dependencies and toolchain:
 
-```sh
-uc fetch --locked --manifest-path Scarb.toml --format json | jq
-uc cache status --format json | jq
+```bash
+uc resolve --locked --manifest-path /abs/path/to/project.toml --format json | jq
+uc fetch --locked --manifest-path /abs/path/to/project.toml --format json | jq
+uc toolchain ensure --manifest-path /abs/path/to/project.toml --format json | jq
 ```
 
-## Optional Cache Maintenance
+Plan and build:
 
-```sh
-uc cache prune --format json | jq
+```bash
+uc build --engine uc --daemon-mode off --manifest-path /abs/path/to/project.toml --plan-only --json | jq
+uc build --engine uc --daemon-mode off --manifest-path /abs/path/to/project.toml --json
 ```
 
-## Ensure Native Toolchain
+Capture a replayable failure:
 
-```sh
-uc toolchain ensure --manifest-path Scarb.toml --format json | jq
+```bash
+uc build --engine uc --daemon-mode off \
+  --manifest-path /abs/path/to/project.toml \
+  --record-failure /tmp/uc-failure.json
+
+uc replay /tmp/uc-failure.json
 ```
 
-## Build With Native First
+Validate before pushing:
 
-```sh
-uc build --engine uc --daemon-mode off --manifest-path Scarb.toml
+```bash
+cargo fmt --all
+make agent-validate
+git diff --check
+make local-ci
 ```
-
-## Inspect The Build Plan First
-
-```sh
-uc build --engine uc --daemon-mode off --manifest-path Scarb.toml --plan-only --json | jq
-```
-
-## Write A Build Report
-
-```sh
-uc build --engine uc --daemon-mode off --manifest-path Scarb.toml --report-path /tmp/uc-build-report.json
-jq . /tmp/uc-build-report.json
-```
-
-## Older Cairo Lane
-
-For Cairo `2.14` projects:
-
-```sh
-./scripts/build_native_toolchain_helper.sh --lane 2.14
-export UC_NATIVE_TOOLCHAIN_2_14_BIN=/absolute/path/printed/by/the/script
-uc support native --manifest-path Scarb.toml --format json | jq
-```
-
-## Benchmark Discipline
-
-Use same-window comparisons only. Do not compare today's `uc` run to yesterday's Scarb run.
-
-Publish benchmark numbers only when the artifact directory includes host metadata, binary identity, lanes, flags, sample counts, support classifications, and logs.
