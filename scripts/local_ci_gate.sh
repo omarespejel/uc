@@ -59,7 +59,7 @@ main() {
     while IFS= read -r path; do
       [[ -n "$path" ]] || continue
       case "$path" in
-        AGENTS.md|.codex/START_HERE.md|docs/agent/*|docs/AGENT_FIRST_LAUNCH_MINIMUM_2026-04-24.md|docs/PROJECT_MODEL_STRATEGY.md|.coderabbit.yaml|.pr_agent.toml|best_practices.md|pr_compliance_checklist.yaml|.github/workflows/*|Makefile|scripts/doctor.sh|scripts/refresh_repo_map.sh|scripts/validate_agent_surface.sh|scripts/install_git_hooks.sh|scripts/local_ci_gate.sh|scripts/tests/local_ci_gate_test.sh|.githooks/pre-push)
+        README.md|AGENTS.md|.codex/START_HERE.md|docs/agent/*|docs/NATIVE_TOOLCHAIN_HELPERS.md|.coderabbit.yaml|.pr_agent.toml|best_practices.md|pr_compliance_checklist.yaml|.github/workflows/*|Makefile|scripts/doctor.sh|scripts/refresh_repo_map.sh|scripts/validate_agent_surface.sh|scripts/install_git_hooks.sh|scripts/local_ci_gate.sh|scripts/tests/local_ci_gate_test.sh|.githooks/pre-push)
           docs_surface_changed=1
           ;;
       esac

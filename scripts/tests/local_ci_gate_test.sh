@@ -30,9 +30,9 @@ run_case \
   $'make doctor\nmake agent-validate\n'
 
 run_case \
-  "agent-launch-doc" \
-  $'docs/AGENT_FIRST_LAUNCH_MINIMUM_2026-04-24.md\n' \
-  $'make doctor\nmake agent-validate\n'
+  "helper-doc" \
+  $'docs/NATIVE_TOOLCHAIN_HELPERS.md\n' \
+  $'make doctor\nmake validate-scripts\nmake agent-validate\n'
 
 run_case \
   "bench-only" \
