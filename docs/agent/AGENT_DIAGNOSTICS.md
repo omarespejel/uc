@@ -28,8 +28,6 @@ Every diagnostic should include:
 | `UCN1200` | Manifest could not be read or parsed. | Fix file access or syntax before running build. |
 | `UCN2001` | Native preflight selected compatibility fallback. | Report fallback explicitly; do not count as native success. |
 | `UCN2002` | Native build downgraded to compatibility fallback. | Preserve fallback state and inspect native diagnostics. |
-| `UCN3001` | Native build failed without fallback success. | Use the replay bundle and fix the bounded compiler errors. |
-| `UCN5001` | Fetch failed while hydrating locked sources. | Check offline readiness, lockfile state, source origin, or network policy. |
 
 ## Decision Status
 

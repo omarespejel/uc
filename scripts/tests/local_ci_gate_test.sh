@@ -35,6 +35,11 @@ run_case \
   $'make doctor\nmake validate-scripts\nmake agent-validate\n'
 
 run_case \
+  "agent-doc" \
+  $'docs/agent/README.md\n' \
+  $'make doctor\nmake agent-validate\n'
+
+run_case \
   "bench-only" \
   $'benchmarks/scripts/run_local_benchmarks.sh\n' \
   $'make doctor\nmake validate-bench-scripts\n'
