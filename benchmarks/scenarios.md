@@ -19,3 +19,11 @@ Apply a reversible semantic source edit, then run build.
 ## `support.native`
 
 Run support classification without compiling. This measures pre-build routing cost and correctness.
+
+## `metadata.online_cold`
+
+Run dependency metadata collection from a cold metadata cache in the research matrix. This scenario measures online project/dependency state discovery for the dependencies workload.
+
+## `metadata.offline_warm`
+
+Run dependency metadata collection after warming the metadata cache in the research matrix. This scenario measures offline/read-cache behavior for the dependencies workload.
