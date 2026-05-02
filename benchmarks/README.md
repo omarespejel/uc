@@ -10,6 +10,10 @@ This directory contains benchmark harnesses, gates, corpora helpers, fixtures, a
 - Keep generated result files under `benchmarks/results/` unless the artifact is intentionally external.
 - Treat sample corpora as diagnostic evidence, not public claims.
 
+## Execution Policy
+
+Benchmark execution is local/manual by default. The old remote benchmark workflow was removed with the dated baseline artifacts because benchmark results must be produced from an explicit local lane with known host conditions. Use the commands below and commit only the artifacts that are intentionally part of a reviewed evidence set.
+
 ## Common Commands
 
 ```bash
