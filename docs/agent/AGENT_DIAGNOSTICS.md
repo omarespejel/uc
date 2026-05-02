@@ -8,6 +8,8 @@ Every diagnostic should include:
 - `code`
 - `category`
 - `severity`
+- `title`
+- `docs_url`
 - `what_happened`
 - `why`
 - `how_to_fix`

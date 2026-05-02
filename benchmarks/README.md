@@ -2,10 +2,13 @@
 
 This directory contains benchmark harnesses, gates, corpora helpers, fixtures, and result output locations for `uc`.
 
-## Rules
+## Reproducibility Rules
 
 - Use same-window runs for comparisons.
 - State lane, host, sample counts, daemon mode, selected cases, and fallback state.
+- Record exact pins for the `uc` binary, helper/toolchain lane, and case manifest revisions. Use commit hashes or immutable tags.
+- Run claimable builds through the offline harness path. `run_real_repo_benchmarks.sh` and the strict supported-set wrapper invoke offline builds internally; do not switch to online mode for claim artifacts.
+- Record the path and commit for any benchmark gate file used to approve a claimable run.
 - Do not quote unsupported or fallback-backed cases as native speed evidence.
 - Keep generated result files under `benchmarks/results/` unless the artifact is intentionally external.
 - Treat sample corpora as diagnostic evidence, not public claims.
@@ -20,15 +23,29 @@ Benchmark execution is local/manual by default. The old remote benchmark workflo
 make benchmark-strict-smoke
 make benchmark-strict-research
 
+UC_BIN=/abs/path/to/uc-<git-sha> \
+UC_NATIVE_TOOLCHAIN_2_14_BIN=/abs/path/to/helper-2.14-<git-sha> \
 benchmarks/scripts/run_real_repo_benchmarks.sh \
-  --case /abs/path/to/repo-a/project.toml repo-a \
-  --case /abs/path/to/repo-b/project.toml repo-b
-
-benchmarks/scripts/run_strict_supported_set_benchmarks.sh \
-  --benchmark-json /abs/path/to/real-repo-bench.json \
+  --uc-bin /abs/path/to/uc-<git-sha> \
+  --cases-file /abs/path/to/cases-pinned-at-<git-sha>.tsv \
   --results-dir benchmarks/results \
   --runs 12 \
-  --cold-runs 12
+  --cold-runs 12 \
+  --stamp same-window-<git-sha>
+
+UC_BIN=/abs/path/to/uc-<git-sha> \
+UC_NATIVE_TOOLCHAIN_2_14_BIN=/abs/path/to/helper-2.14-<git-sha> \
+benchmarks/scripts/run_strict_supported_set_benchmarks.sh \
+  --benchmark-json /abs/path/to/real-repo-bench-<git-sha>.json \
+  --uc-bin /abs/path/to/uc-<git-sha> \
+  --results-dir benchmarks/results \
+  --runs 12 \
+  --cold-runs 12 \
+  --stamp strict-supported-<git-sha>
+
+benchmarks/scripts/gate_benchmark_summary.sh \
+  --summary /abs/path/to/stability-summary-<git-sha>.json \
+  --config /abs/path/to/benchmark-gate-config-at-<git-sha>.json
 
 benchmarks/scripts/summarize_corpus_opportunities.py \
   --benchmark-json /abs/path/to/benchmark.json \
