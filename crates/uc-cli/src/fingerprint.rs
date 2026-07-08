@@ -148,12 +148,26 @@ pub(super) fn fingerprint_key_path(workspace_root: &Path, key: &str) -> PathBuf 
 
 pub(super) const MAX_EXTERNAL_PATH_DEPENDENCY_ROOTS: usize = 64;
 
-pub(super) fn manifest_path_dependency_dirs(manifest_path: &Path) -> Vec<PathBuf> {
-    let Ok(contents) = fs::read_to_string(manifest_path) else {
-        return Vec::new();
-    };
-    let Ok(manifest) = toml::from_str::<TomlValue>(&contents) else {
-        return Vec::new();
+pub(super) fn manifest_path_dependency_dirs(manifest_path: &Path) -> Result<Vec<PathBuf>> {
+    let contents = fs::read_to_string(manifest_path).with_context(|| {
+        format!(
+            "failed to read manifest {} while collecting path dependency roots",
+            manifest_path.display()
+        )
+    })?;
+    let manifest = match toml::from_str::<TomlValue>(&contents) {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            // A manifest that is not valid TOML cannot declare path
+            // dependencies scarb would honor (it is outside the build graph,
+            // e.g. an intentionally-broken test fixture), and its raw bytes
+            // are already part of the fingerprint, so edits still invalidate.
+            eprintln!(
+                "uc: warning: skipping path-dependency scan of unparseable manifest {}: {err}",
+                manifest_path.display()
+            );
+            return Ok(Vec::new());
+        }
     };
     let manifest_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
     let mut dirs = Vec::new();
@@ -180,7 +194,7 @@ pub(super) fn manifest_path_dependency_dirs(manifest_path: &Path) -> Vec<PathBuf
             .get("workspace")
             .and_then(|workspace| workspace.get("dependencies")),
     );
-    dirs
+    Ok(dirs)
 }
 
 pub(super) fn collect_external_path_dependency_roots(
@@ -198,7 +212,7 @@ pub(super) fn collect_external_path_dependency_roots(
         if !visited_manifests.insert(canonical_manifest.clone()) {
             continue;
         }
-        for dep_dir in manifest_path_dependency_dirs(&canonical_manifest) {
+        for dep_dir in manifest_path_dependency_dirs(&canonical_manifest)? {
             let Ok(canonical_dir) = dep_dir.canonicalize() else {
                 continue;
             };
@@ -603,7 +617,13 @@ pub(super) fn collect_fingerprint_files_from_root(
         .into_iter()
         .filter_entry(|entry| !is_ignored_entry(walk_root, entry.path()));
 
-    for entry in walker.filter_map(|entry| entry.ok()) {
+    for entry in walker {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to walk {} while collecting fingerprint files",
+                walk_root.display()
+            )
+        })?;
         if fingerprint_started.elapsed() > fingerprint_timeout {
             bail!(
                 "fingerprinting timed out after {} ms",

@@ -15804,6 +15804,41 @@ fn collect_external_path_dependency_roots_skips_in_root_and_missing_paths() {
 }
 
 #[test]
+fn fingerprint_tolerates_unparseable_stray_manifest_but_fails_on_unreadable() {
+    let (container, workspace, _dep_root) =
+        prepare_external_path_dep_workspace("uc-fingerprint-path-dep-badtoml");
+    fs::create_dir_all(workspace.join("fixtures")).expect("failed to create fixtures dir");
+    fs::write(
+        workspace.join("fixtures/Scarb.toml"),
+        "this is [ not valid toml",
+    )
+    .expect("failed to write broken fixture manifest");
+
+    let manifest_path = workspace.join("Scarb.toml");
+    let common = smoke_common_args(&manifest_path);
+    let profile = effective_profile(&common);
+    compute_build_fingerprint_with_scarb_version(
+        &workspace,
+        &manifest_path,
+        &common,
+        &profile,
+        None,
+        "scarb 2.14.0 (test)",
+    )
+    .expect("a stray unparseable manifest must not fail fingerprinting");
+
+    let unreadable = manifest_path_dependency_dirs(Path::new(
+        container.join("does-not-exist/Scarb.toml").as_path(),
+    ));
+    assert!(
+        unreadable.is_err(),
+        "unreadable manifests must propagate an error instead of being treated as dependency-free"
+    );
+
+    fs::remove_dir_all(&container).ok();
+}
+
+#[test]
 fn hot_fingerprint_invalidates_when_external_dep_dir_gains_file() {
     let (container, workspace, dep_root) =
         prepare_external_path_dep_workspace("uc-hot-fingerprint-external-add");
