@@ -193,6 +193,32 @@ state of the art. Gaps to close:
 | 10 | snforge build-backend integration; prove-path plan | L | ecosystem-level win, SNF-strategic |
 | 11 | Upstream estimate_size memoization + parallel units to cairo | M | everyone wins, uc keeps daemon moat |
 
+## 5b. Addendum — measured after the fix session (same day)
+
+Helper lane 2.14 built on this host (staged via `build_native_toolchain_helper.sh`;
+note: the script needs python ≥3.11 on PATH and pre-extracted registry sources for
+the two patched crates — both were missing on a fresh machine, worth a doctor check).
+
+Smoke **contract** fixture (4 contracts), `uc_native_external_helper` lane:
+
+| Scenario | uc | scarb 2.14 |
+|---|---:|---:|
+| cold | 516 ms (frontend 434) | ~900 ms |
+| warm noop | 22.8 ms | 20 ms |
+| dead-code semantic edit | **28.8 ms** (impacted-set: 0 contracts recompiled) | ~520 ms |
+
+Corelib/frontend-blob bound (2.16 builtin lane, lib project): virgin cold 237 ms →
+returning cold (session image kept) 182 ms. The session image recovers only
+`session_prepare` (25.6 → 3.2 ms); `native_frontend_compile_ms` stays ~180–211 ms.
+**The persisted session does not capture compiled frontend state — ~97% of a
+returning-cold build is re-derivable Salsa work.** That is the measured headroom for
+Phase-6-style blobs (corelib first, then immutable deps).
+
+Fix session outcome: PR #73 (stale path-dep cache fix + fresh-clone test fix,
+401/401 green, Qodo findings addressed), issues #74 (lib artifact parity),
+#75 (JSON error contract + daemon ensure), #76 (fingerprint hardening follow-ups),
+status comment on #18 (stranded PR #19).
+
 ## 6. Sources (research)
 - Scarb releases / incremental: github.com/software-mansion/scarb/releases; docs.swmansion.com/scarb/docs/reference/manifest.html
 - Cairo compiler: github.com/starkware-libs/cairo/releases; software-mansion-labs/cairo-compiler-workshop
