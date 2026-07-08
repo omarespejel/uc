@@ -15049,9 +15049,8 @@ edition = "2024_07"
 
 #[test]
 fn compile_native_casm_contract_rejects_tiny_bytecode_limit() {
-    let fixture_contract = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
-        "../../benchmarks/fixtures/scarb_smoke/target/dev/uc_smoke_token.contract_class.json",
-    );
+    let fixture_contract = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/uc_smoke_token.contract_class.json");
     let fixture_bytes = fs::read(&fixture_contract).unwrap_or_else(|err| {
         panic!(
             "failed to read starknet contract fixture {}: {err}",
@@ -15577,6 +15576,320 @@ fn fingerprint_ignores_cairo_comment_only_edits() {
     assert_ne!(original, with_semantic_change);
 
     fs::remove_dir_all(&workspace).ok();
+}
+
+fn prepare_external_path_dep_workspace(prefix: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let container = unique_test_dir(prefix);
+    let workspace = container.join("app");
+    let dep_root = container.join("dep_pkg");
+    fs::create_dir_all(workspace.join("src")).expect("failed to create app src dir");
+    fs::create_dir_all(dep_root.join("src")).expect("failed to create dep src dir");
+    fs::write(
+        workspace.join("Scarb.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n\n[dependencies]\ndep_pkg = { path = \"../dep_pkg\" }\n",
+    )
+    .expect("failed to write app manifest");
+    fs::write(
+        workspace.join("src/lib.cairo"),
+        "pub fn use_dep() -> felt252 { dep_pkg::answer() }\n",
+    )
+    .expect("failed to write app source");
+    fs::write(
+        dep_root.join("Scarb.toml"),
+        "[package]\nname = \"dep_pkg\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n",
+    )
+    .expect("failed to write dep manifest");
+    fs::write(
+        dep_root.join("src/lib.cairo"),
+        "pub fn answer() -> felt252 { 42 }\n",
+    )
+    .expect("failed to write dep source");
+    (container, workspace, dep_root)
+}
+
+#[test]
+fn fingerprint_changes_when_external_path_dep_source_changes() {
+    let (container, workspace, dep_root) =
+        prepare_external_path_dep_workspace("uc-fingerprint-path-dep-edit");
+    let manifest_path = workspace.join("Scarb.toml");
+    let common = smoke_common_args(&manifest_path);
+    let profile = effective_profile(&common);
+
+    let baseline = compute_build_fingerprint_with_scarb_version(
+        &workspace,
+        &manifest_path,
+        &common,
+        &profile,
+        None,
+        "scarb 2.14.0 (test)",
+    )
+    .expect("failed to compute baseline fingerprint");
+
+    fs::write(
+        dep_root.join("src/lib.cairo"),
+        "pub fn answer() -> felt252 { 43 }\n",
+    )
+    .expect("failed to edit dep source");
+
+    let after_dep_edit = compute_build_fingerprint_with_scarb_version(
+        &workspace,
+        &manifest_path,
+        &common,
+        &profile,
+        None,
+        "scarb 2.14.0 (test)",
+    )
+    .expect("failed to compute post-edit fingerprint");
+    assert_ne!(
+        baseline, after_dep_edit,
+        "editing an external path dependency source must change the build fingerprint"
+    );
+
+    fs::write(
+        dep_root.join("src/lib.cairo"),
+        "pub fn answer() -> felt252 { 43 }\n// comment-only dep change\n",
+    )
+    .expect("failed to append dep comment");
+    let after_dep_comment = compute_build_fingerprint_with_scarb_version(
+        &workspace,
+        &manifest_path,
+        &common,
+        &profile,
+        None,
+        "scarb 2.14.0 (test)",
+    )
+    .expect("failed to compute comment fingerprint");
+    assert_eq!(
+        after_dep_edit, after_dep_comment,
+        "comment-only external dep edits should keep the semantic fingerprint stable"
+    );
+
+    fs::remove_dir_all(&container).ok();
+}
+
+#[test]
+fn fingerprint_changes_when_external_path_dep_adds_source_file() {
+    let (container, workspace, dep_root) =
+        prepare_external_path_dep_workspace("uc-fingerprint-path-dep-add");
+    let manifest_path = workspace.join("Scarb.toml");
+    let common = smoke_common_args(&manifest_path);
+    let profile = effective_profile(&common);
+
+    let baseline = compute_build_fingerprint_with_scarb_version(
+        &workspace,
+        &manifest_path,
+        &common,
+        &profile,
+        None,
+        "scarb 2.14.0 (test)",
+    )
+    .expect("failed to compute baseline fingerprint");
+
+    fs::write(
+        dep_root.join("src/extra.cairo"),
+        "pub fn extra() -> felt252 { 7 }\n",
+    )
+    .expect("failed to add dep source file");
+
+    let after_new_file = compute_build_fingerprint_with_scarb_version(
+        &workspace,
+        &manifest_path,
+        &common,
+        &profile,
+        None,
+        "scarb 2.14.0 (test)",
+    )
+    .expect("failed to compute post-add fingerprint");
+    assert_ne!(
+        baseline, after_new_file,
+        "adding a source file to an external path dependency must change the build fingerprint"
+    );
+
+    fs::remove_dir_all(&container).ok();
+}
+
+#[test]
+fn fingerprint_tracks_transitive_external_path_deps() {
+    let (container, workspace, dep_root) =
+        prepare_external_path_dep_workspace("uc-fingerprint-path-dep-transitive");
+    let inner_root = container.join("dep_inner");
+    fs::create_dir_all(inner_root.join("src")).expect("failed to create inner src dir");
+    fs::write(
+        inner_root.join("Scarb.toml"),
+        "[package]\nname = \"dep_inner\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n",
+    )
+    .expect("failed to write inner manifest");
+    fs::write(
+        inner_root.join("src/lib.cairo"),
+        "pub fn inner() -> felt252 { 1 }\n",
+    )
+    .expect("failed to write inner source");
+    fs::write(
+        dep_root.join("Scarb.toml"),
+        "[package]\nname = \"dep_pkg\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n\n[dependencies]\ndep_inner = { path = \"../dep_inner\" }\n",
+    )
+    .expect("failed to rewrite dep manifest with transitive path dep");
+
+    let manifest_path = workspace.join("Scarb.toml");
+    let common = smoke_common_args(&manifest_path);
+    let profile = effective_profile(&common);
+
+    let baseline = compute_build_fingerprint_with_scarb_version(
+        &workspace,
+        &manifest_path,
+        &common,
+        &profile,
+        None,
+        "scarb 2.14.0 (test)",
+    )
+    .expect("failed to compute baseline fingerprint");
+
+    fs::write(
+        inner_root.join("src/lib.cairo"),
+        "pub fn inner() -> felt252 { 2 }\n",
+    )
+    .expect("failed to edit inner source");
+
+    let after_inner_edit = compute_build_fingerprint_with_scarb_version(
+        &workspace,
+        &manifest_path,
+        &common,
+        &profile,
+        None,
+        "scarb 2.14.0 (test)",
+    )
+    .expect("failed to compute post-edit fingerprint");
+    assert_ne!(
+        baseline, after_inner_edit,
+        "editing a transitive external path dependency must change the build fingerprint"
+    );
+
+    fs::remove_dir_all(&container).ok();
+}
+
+#[test]
+fn collect_external_path_dependency_roots_skips_in_root_and_missing_paths() {
+    let (container, workspace, dep_root) =
+        prepare_external_path_dep_workspace("uc-fingerprint-path-dep-roots");
+    fs::create_dir_all(workspace.join("member/src")).expect("failed to create member dir");
+    fs::write(
+        workspace.join("member/Scarb.toml"),
+        "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n",
+    )
+    .expect("failed to write member manifest");
+    fs::write(
+        workspace.join("Scarb.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n\n[dependencies]\ndep_pkg = { path = \"../dep_pkg\" }\nmember = { path = \"member\" }\nmissing = { path = \"../does-not-exist\" }\n",
+    )
+    .expect("failed to rewrite app manifest");
+
+    let canonical_workspace = workspace
+        .canonicalize()
+        .expect("failed to canonicalize workspace");
+    let roots = collect_external_path_dependency_roots(
+        &canonical_workspace,
+        &[workspace.join("Scarb.toml")],
+    )
+    .expect("collecting external roots should succeed");
+    let canonical_dep = dep_root
+        .canonicalize()
+        .expect("failed to canonicalize dep root");
+    assert_eq!(
+        roots,
+        vec![canonical_dep],
+        "only existing roots outside the workspace should be collected"
+    );
+
+    fs::remove_dir_all(&container).ok();
+}
+
+#[test]
+fn fingerprint_tolerates_unparseable_stray_manifest_but_fails_on_unreadable() {
+    let (container, workspace, _dep_root) =
+        prepare_external_path_dep_workspace("uc-fingerprint-path-dep-badtoml");
+    fs::create_dir_all(workspace.join("fixtures")).expect("failed to create fixtures dir");
+    fs::write(
+        workspace.join("fixtures/Scarb.toml"),
+        "this is [ not valid toml",
+    )
+    .expect("failed to write broken fixture manifest");
+
+    let manifest_path = workspace.join("Scarb.toml");
+    let common = smoke_common_args(&manifest_path);
+    let profile = effective_profile(&common);
+    compute_build_fingerprint_with_scarb_version(
+        &workspace,
+        &manifest_path,
+        &common,
+        &profile,
+        None,
+        "scarb 2.14.0 (test)",
+    )
+    .expect("a stray unparseable manifest must not fail fingerprinting");
+
+    let unreadable = manifest_path_dependency_dirs(Path::new(
+        container.join("does-not-exist/Scarb.toml").as_path(),
+    ));
+    assert!(
+        unreadable.is_err(),
+        "unreadable manifests must propagate an error instead of being treated as dependency-free"
+    );
+
+    fs::remove_dir_all(&container).ok();
+}
+
+#[test]
+fn hot_fingerprint_invalidates_when_external_dep_dir_gains_file() {
+    let (container, workspace, dep_root) =
+        prepare_external_path_dep_workspace("uc-hot-fingerprint-external-add");
+    let manifest_path = workspace.join("Scarb.toml");
+    let common = smoke_common_args(&manifest_path);
+    let profile = effective_profile(&common);
+    let cache_root = workspace.join(".uc/cache");
+
+    let baseline = compute_build_fingerprint_with_scarb_version(
+        &workspace,
+        &manifest_path,
+        &common,
+        &profile,
+        Some(&cache_root),
+        "scarb 2.14.0 (test)",
+    )
+    .expect("failed to compute baseline fingerprint");
+
+    let index = load_fingerprint_index(&cache_root.join("fingerprint/index-v1.json"))
+        .expect("failed to load fingerprint index");
+    let dep_src_key = normalize_fingerprint_path(
+        &dep_root
+            .join("src")
+            .canonicalize()
+            .expect("failed to canonicalize dep src"),
+    );
+    assert!(
+        index.directories.contains_key(&dep_src_key),
+        "external dep src directory should be tracked in the fingerprint index"
+    );
+    assert_eq!(index.last_fingerprint.as_deref(), Some(baseline.as_str()));
+
+    thread::sleep(Duration::from_millis(20));
+    fs::write(
+        dep_root.join("src/new.cairo"),
+        "pub fn extra() -> felt252 { 9 }\n",
+    )
+    .expect("failed to add dep source file");
+
+    let context_digest = index
+        .context_digest
+        .clone()
+        .expect("index should record a context digest");
+    let reused = try_reuse_hot_fingerprint(&workspace, &index, &context_digest, u64::MAX, 0)
+        .expect("hot-path check should succeed");
+    assert!(
+        reused.is_none(),
+        "a new file in an external dep directory must invalidate the hot fingerprint"
+    );
+
+    fs::remove_dir_all(&container).ok();
 }
 
 #[test]
