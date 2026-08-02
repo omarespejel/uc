@@ -24,20 +24,31 @@ Treat it as:
 ## Read First
 
 1. `.codex/START_HERE.md`
-2. `README.md`
-3. `docs/agent/README.md`
-4. `docs/agent/AGENT_FIRST_COMPILER.md`
-5. `docs/agent/AGENT_QUICKSTART.md`
-6. `docs/agent/AGENT_DIAGNOSTICS.md`
-7. `docs/NATIVE_TOOLCHAIN_HELPERS.md`
+2. `docs/agent/PR_LIFECYCLE.md` — how to take a change to `main`; read before your first commit
+3. `README.md`
+4. `docs/agent/README.md`
+5. `docs/agent/AGENT_FIRST_COMPILER.md`
+6. `docs/agent/AGENT_QUICKSTART.md`
+7. `docs/agent/AGENT_DIAGNOSTICS.md`
+8. `docs/NATIVE_TOOLCHAIN_HELPERS.md`
 
 ## PR-First Rule
 
-- Do non-trivial work in a fresh branch or clean worktree.
+Full procedure: `docs/agent/PR_LIFECYCLE.md`. The short version:
+
+- Do non-trivial work in a fresh branch or clean worktree. Never commit to `main`.
+- Gate locally before opening the PR, and read the gate's own exit code — not the exit
+  code of a `grep`/`tail` at the end of a pipeline. Redirect to a file and check `$?`.
 - Open a normal ready-for-review PR early; avoid draft PRs unless explicitly requested.
 - After pushing a coherent slice, start the review loop immediately.
-- Address useful CodeRabbit and Qodo feedback, including docs nits when they affect accuracy.
-- Merge only after all actionable feedback is addressed and the PR has been quiet for at least 6 minutes.
+- Read bot feedback as JSON with `make pr-feedback-open`, not from the web UI.
+- Triage **every** bot finding: verify it against the code before acting. If real, fix it
+  minimally and add a regression test. If invalid, decline it explicitly with verified
+  reasoning in a reply — never silently ignore one. Bots are adversarial reviewers to be
+  checked, not authorities to obey.
+- Re-run the gate on the fixed head; the previous green run does not carry over.
+- Merge only after all actionable feedback is addressed, `counts.unresolved_bot_threads` and
+  `counts.failing_checks` are both 0, and the PR has been quiet for at least 6 minutes.
 
 ## Current Priorities
 
@@ -65,6 +76,7 @@ Treat it as:
 - Bootstrap hooks: `make bootstrap` or `make install-hooks`
 - Fast repo check: `make doctor && make agent-validate`
 - Local push gate: `make local-ci`
+- Review-bot feedback as JSON: `make pr-feedback` (or `make pr-feedback-open`, `make pr-feedback PR=<n>`)
 - Format: `cargo fmt --all`
 - Fast Rust validation: `make validate-fast`
 - Native-focused validation: `make validate-native`

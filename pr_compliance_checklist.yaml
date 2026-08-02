@@ -5,11 +5,29 @@ pr_compliances:
     success_criteria: The PR includes focused regression tests for the affected invalidation or restore path and the code falls back conservatively on uncertainty.
     failure_criteria: Native cache or restore logic changed without regression coverage, or the code can reuse stale state when validation is ambiguous.
 
+  - title: Fingerprint bounds fail loudly
+    compliance_label: true
+    objective: Limits on fingerprint traversal must never silently shrink the set of inputs that determine cache identity.
+    success_criteria: Any depth, file-count, size, or timeout bound that is exceeded surfaces a diagnostic and disables cache reuse for that build, and fingerprint coverage includes sources reachable through path dependencies outside the workspace root.
+    failure_criteria: A bound silently excludes files from the fingerprint, or fingerprint traversal ignores inputs that can change compiled output.
+
+  - title: Agent contract stability
+    compliance_label: true
+    objective: Machine-readable output is a versioned contract that coding agents and CI depend on.
+    success_criteria: JSON report changes are additive, or bump the relevant `schema_version` and name affected consumers; every failure path in `--json` mode still emits exactly one JSON document; exit codes keep their documented meanings.
+    failure_criteria: A report field is removed, renamed, or retyped with no version bump; a failure path emits no JSON in `--json` mode; or distinct failure classes collapse onto one exit code.
+
+  - title: Verification artifacts are correctness surfaces
+    compliance_label: true
+    objective: Build receipts, class hashes, and emitted artifacts must be reproducible and honest about how they were produced.
+    success_criteria: Receipt and class-hash changes carry tests; artifact bytes stay identical across cold, warm, daemon, and fallback execution for the same inputs; any setting that changes emitted bytes is part of the fingerprint and the receipt; user manifests and sources are never mutated to make verification succeed.
+    failure_criteria: Artifact or receipt output varies with execution mode for identical inputs, a hash is computed from unpinned inputs, or the tool rewrites user sources or manifests before verifying them.
+
   - title: Benchmark rigor is preserved
     compliance_label: true
     objective: Performance-sensitive PRs must keep benchmark methodology reproducible.
-    success_criteria: Benchmark-related changes preserve explicit daemon mode, pinning behavior, sample counts, and gate configuration, and any methodology change is documented.
-    failure_criteria: The PR loosens benchmark conditions, hides lane settings, or changes perf gates without explanation.
+    success_criteria: Benchmark-related changes preserve explicit daemon mode, pinning behavior, sample counts, and gate configuration, and any methodology change is documented. Performance claims name the harness, lane, sample count, and comparison build.
+    failure_criteria: The PR loosens benchmark conditions, hides lane settings, changes perf gates without explanation, or states a performance number backed by a fallback run or an unstated lane.
 
   - title: Bot and agent entrypoints stay in sync
     compliance_label: true
@@ -17,14 +35,14 @@ pr_compliances:
     success_criteria: PRs that change repo bootstrap, commands, docs, or review tooling update the relevant files under `AGENTS.md`, `.codex/`, and `docs/agent/`.
     failure_criteria: Repo entrypoints drift or become stale after a command, path, or workflow change.
 
-  - title: Local validation stays authoritative
+  - title: Validation split is respected
     compliance_label: true
-    objective: Routine validation should run locally instead of spending GitHub Actions minutes by default.
-    success_criteria: Workflow-trigger or validation-surface PRs keep repo-managed hooks, local validation scripts, and agent docs aligned, and do not reintroduce automatic GitHub CI without an explicit documented decision.
-    failure_criteria: Automatic GitHub CI is reintroduced casually, or local hook/gate/documentation paths drift so agents can push without the intended local checks.
+    objective: Correctness gates run in CI; performance measurement stays local and pinned. This split was adopted deliberately (see docs/agent/CI_POLICY.md) after the repo's main branch went unvalidated for three months under local-only gates.
+    success_criteria: Workflow changes keep CI scoped to deterministic correctness lanes (format, lint, unit/native tests, artifact parity) and keep repo-managed hooks and local validation scripts aligned with the documented commands. Benchmark lanes remain local.
+    failure_criteria: Benchmark or timing-sensitive lanes are moved into GitHub Actions where they produce unreliable numbers, CI is expanded without updating `docs/agent/CI_POLICY.md`, or local hook and gate paths drift so agents can push without the intended checks.
 
   - title: Daemon and fallback behavior remain explicit
     compliance_label: true
     objective: Build execution should not fail or fall back silently in ways that hide risk.
-    success_criteria: Daemon, native compile, and fallback changes preserve actionable logging and respect explicit disallow-fallback modes.
+    success_criteria: Daemon, native compile, and fallback changes preserve actionable logging, record every degradation in a diagnostic or report field, and respect explicit disallow-fallback modes.
     failure_criteria: The PR introduces silent fallback, weakens error reporting, or obscures why a native path was not used.

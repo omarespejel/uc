@@ -1,3 +1,9 @@
+# Qodo Merge configuration. Policy: docs/agent/PR_BOT_POLICY.md
+#
+# Keep this file small. Durable coding standards belong in best_practices.md and
+# hard engineering gates belong in pr_compliance_checklist.yaml; Qodo reads both.
+# Only keys that Qodo actually consumes are set here — do not add speculative keys.
+
 [github_app]
 pr_commands = [
   "/agentic_describe",
@@ -8,9 +14,24 @@ pr_commands = [
 [review_agent]
 comments_location_policy = "both"
 inline_comments_severity_threshold = 3
-issues_user_guidelines = "Read AGENTS.md, .codex/START_HERE.md, docs/agent/PR_BOT_POLICY.md, and docs/agent/REPO_MAP.md first. Prioritize correctness bugs, invalidation mistakes, daemon safety, artifact drift, benchmark bias, and missing tests. Ignore formatting-only nits when existing tooling already covers them."
-compliance_user_guidelines = "Apply pr_compliance_checklist.yaml with emphasis on native compile correctness, conservative cache reuse, explicit fallback behavior, and strict benchmark methodology."
+issues_user_guidelines = """
+Read AGENTS.md, .codex/START_HERE.md, docs/agent/PR_BOT_POLICY.md, and docs/agent/REPO_MAP.md first.
+Prioritize, in order: (1) cache/fingerprint invalidation mistakes that could serve a stale artifact,
+(2) silent degradation — any fallback, daemon-unavailable, or offline downgrade that is not recorded
+in a diagnostic or report field, (3) agent-contract breaks — a JSON report or schema field removed,
+renamed, or retyped without a schema_version bump, or a failure path that exits without emitting JSON
+in --json mode, (4) daemon safety and concurrency, (5) build-receipt and class-hash correctness for
+verification work, (6) benchmark methodology bias, (7) missing regression tests on risky paths.
+Treat a cache false-hit as strictly worse than a false-miss. Ignore formatting-only nits that cargo fmt,
+clippy, or CodeRabbit already cover.
+"""
+compliance_user_guidelines = """
+Apply pr_compliance_checklist.yaml with emphasis on native compile correctness, conservative cache reuse,
+explicit fallback behavior, agent-contract stability, and strict benchmark methodology.
+A PR that changes reuse or restore logic without a regression test fails compliance unless the description
+justifies why correctness cannot regress.
+"""
 
 [pr_compliance]
 enable_global_pr_compliance = false
-extra_instructions = "Use the local pr_compliance_checklist.yaml as the repo-specific gate for native compile, benchmark, and agent-surface changes."
+extra_instructions = "Use the local pr_compliance_checklist.yaml as the repo-specific gate for native compile, benchmark, verification, and agent-surface changes."

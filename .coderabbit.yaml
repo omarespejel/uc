@@ -1,4 +1,10 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# Policy: docs/agent/PR_BOT_POLICY.md
+# Note on `tools`: every CodeRabbit tool defaults to enabled. Entries below are
+# therefore either deliberate opt-OUTs, or opt-INs kept explicit because they are
+# load-bearing for this repo (a build tool that spawns subprocesses, writes caches,
+# and ships CI). Do not add `enabled: true` lines that only restate the default.
 language: "en-US"
 tone_instructions: |
   Be direct and technical. Prioritize production bugs, cache invalidation mistakes,
@@ -13,8 +19,39 @@ reviews:
   poem: false
   collapse_walkthrough: true
   changed_files_summary: true
+  estimate_code_review_effort: true
+  assess_linked_issues: true
+  related_issues: true
+  related_prs: true
+  # Emit the "Prompt for AI Agents" block on inline comments. Coding agents in this
+  # repo consume these directly; see docs/agent/PR_BOT_POLICY.md "Agent review loop".
+  enable_prompt_for_ai_agents: true
+  suggested_labels: true
+  auto_apply_labels: true
+  labeling_instructions:
+    - label: "native-engine"
+      instructions: |
+        Apply when the diff touches the native compile session, Salsa integration,
+        corelib resolution, journal/watcher, or third_party/cairo-lang-* patches.
+    - label: "cache-correctness"
+      instructions: |
+        Apply when the diff touches fingerprinting, cache restore/persist, session
+        keys, or invalidation logic.
+    - label: "agent-surface"
+      instructions: |
+        Apply when the diff changes JSON reports, docs/agent/schemas/**, diagnostic
+        codes, exit codes, or the MCP surface.
+    - label: "benchmark"
+      instructions: |
+        Apply when the diff touches benchmarks/** harnesses, gates, or baselines.
+    - label: "verification"
+      instructions: |
+        Apply when the diff touches build receipts, class-hash computation, or the
+        uc verify provider surface.
   path_filters:
     - "!benchmarks/results/**"
+    - "!benchmarks/baselines/**"
+    - "!Cargo.lock"
   path_instructions:
     - path: "crates/**/src/**/*.rs"
       instructions: |
@@ -22,10 +59,18 @@ reviews:
         Focus on correctness, invalidation safety, deterministic outputs,
         daemon behavior, fallback behavior, and missing regression coverage.
         Treat cache false-hits as higher severity than false-misses.
+        Non-test code must not introduce bare unwrap()/expect()/panic!; flag any that appear.
+        Mutex locks must recover from poisoning rather than propagate panics.
     - path: "crates/**/tests/**"
       instructions: |
         Ensure tests cover edge cases, invalidation behavior, and failure paths.
         Flag cases where risky production changes do not add targeted regression tests.
+    - path: "third_party/**"
+      instructions: |
+        Vendored cairo-lang crates carrying uc patches (chiefly keyed Salsa file-override
+        slots). Review patches for correctness of invalidation semantics and for drift
+        from the upstream version pinned in Cargo.toml. Flag any patch that widens or
+        narrows invalidation scope without a test.
     - path: "benchmarks/**"
       instructions: |
         Verify measurement methodology remains explicit and reproducible.
@@ -34,9 +79,16 @@ reviews:
     - path: ".github/workflows/**"
       instructions: |
         Check that workflows preserve deterministic validation and useful failure output.
+        Flag unpinned third-party actions, excessive permissions, and untrusted input
+        interpolated into run steps.
     - path: "docs/**"
       instructions: |
         Flag stale commands, stale paths, or docs that drift from code and workflow behavior.
+    - path: "docs/agent/schemas/**"
+      instructions: |
+        These are the agent contract. Changes must be additive, or bump schema_version.
+        Flag any field removal, type change, or rename that is not accompanied by a
+        schema_version bump and a note in the PR description.
     - path: "scripts/**"
       instructions: |
         Check for shell safety (`set -euo pipefail`), portability within supported environments,
@@ -45,20 +97,67 @@ reviews:
     enabled: true
     auto_incremental_review: true
     drafts: false
+  # Mechanical merge gating. `error` + request_changes_workflow blocks the PR until
+  # resolved, which is what lets coding agents self-serve without a human gatekeeper.
+  pre_merge_checks:
+    title:
+      mode: "error"
+      requirements: |
+        Imperative mood, no trailing period, ideally under 72 characters.
+        Should name the affected surface, e.g. "Fix stale cache hits for path dependencies".
+        Conventional-commit prefixes are allowed but not required.
+    description:
+      mode: "error"
+    issue_assessment:
+      mode: "warning"
+    # Docstring coverage is deliberately off: this repo's largest files predate the
+    # convention and a coverage gate would fail every unrelated PR. Docstring quality
+    # is handled by path_instructions and code_generation below.
+    docstrings:
+      mode: "off"
+    custom_checks:
+      - name: "Invalidation regression coverage"
+        mode: "error"
+        instructions: |
+          Applies only when the diff modifies cache, fingerprint, session-key, or native
+          compile-session reuse logic under crates/uc-cli/src/{cache.rs,fingerprint.rs,main.rs}
+          or crates/uc-core/src/{cache.rs,session.rs}.
+          PASS if the PR also adds or modifies at least one test that exercises the changed
+          invalidation or restore path, or if the PR description explains why the change
+          cannot regress correctness (pure refactor, telemetry-only, docs-only).
+          FAIL if reuse/restore logic changed with no test change and no justification.
+      - name: "No silent degradation"
+        mode: "error"
+        instructions: |
+          Applies when the diff changes build execution, daemon dispatch, fallback selection,
+          or error handling.
+          PASS if every new path that degrades behavior (scarb fallback, daemon unavailable,
+          cache disabled, offline downgrade) emits a diagnostic or report field recording that
+          it happened.
+          FAIL if a degradation path returns success without recording the degradation.
+      - name: "Agent contract stability"
+        mode: "error"
+        instructions: |
+          Applies when the diff changes any serialized report struct, diagnostic code, exit
+          code, or file under docs/agent/schemas/.
+          PASS if changes are purely additive, or the affected schema_version is bumped and the
+          PR description names the consumers affected.
+          FAIL if a field is removed, renamed, or retyped with no schema_version bump.
+      - name: "Benchmark claim integrity"
+        mode: "warning"
+        instructions: |
+          Applies when the PR description or docs state a performance number.
+          PASS if the claim names the harness, lane, sample count, and the comparison build,
+          and the numbers come from a same-window run.
+          FAIL if a performance claim is stated without its measurement conditions, or if it
+          is backed by a run where uc fell back to scarb.
+  finishing_touches:
+    docstrings:
+      enabled: true
+    unit_tests:
+      enabled: true
   tools:
-    shellcheck:
-      enabled: true
-    markdownlint:
-      enabled: true
-    github-checks:
-      enabled: true
-      timeout_ms: 90000
-    yamllint:
-      enabled: true
-    gitleaks:
-      enabled: true
-    actionlint:
-      enabled: true
+    # Deliberate opt-outs: not applicable to this stack, or too noisy for the signal.
     ruff:
       enabled: false
     biome:
@@ -67,12 +166,43 @@ reviews:
       enabled: false
     checkov:
       enabled: false
+    languagetool:
+      enabled: false
     semgrep:
       enabled: false
-    ast-grep:
-      enabled: false
+    # Explicit opt-ins (already default-on) kept visible because they guard this repo's
+    # specific risk surface: shell harnesses, CI workflows, secrets, and dependency CVEs.
+    clippy:
+      enabled: true
+    shellcheck:
+      enabled: true
+    actionlint:
+      enabled: true
+    zizmor:
+      enabled: true
+    yamllint:
+      enabled: true
+    markdownlint:
+      enabled: true
+    gitleaks:
+      enabled: true
+    osvScanner:
+      enabled: true
+    github-checks:
+      enabled: true
+      timeout_ms: 90000
 chat:
   auto_reply: true
+code_generation:
+  docstrings:
+    language: "en-US"
+    path_instructions:
+      - path: "crates/**/src/**/*.rs"
+        instructions: |
+          Use `///` doc comments. Lead with a one-line summary of what the function
+          guarantees, not how it is implemented. For cache, fingerprint, and session
+          code, state the invalidation contract explicitly (what makes this stale) and
+          note whether a false hit or false miss is possible.
 knowledge_base:
   opt_out: false
   learnings:
