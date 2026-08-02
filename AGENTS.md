@@ -36,8 +36,10 @@ Treat it as:
 - Do non-trivial work in a fresh branch or clean worktree.
 - Open a normal ready-for-review PR early; avoid draft PRs unless explicitly requested.
 - After pushing a coherent slice, start the review loop immediately.
+- Read bot feedback as JSON with `make pr-feedback-open`, not from the web UI.
 - Address useful CodeRabbit and Qodo feedback, including docs nits when they affect accuracy.
-- Merge only after all actionable feedback is addressed and the PR has been quiet for at least 6 minutes.
+- Merge only after all actionable feedback is addressed, `counts.unresolved_bot_threads` and
+  `counts.failing_checks` are both 0, and the PR has been quiet for at least 6 minutes.
 
 ## Current Priorities
 
@@ -65,6 +67,7 @@ Treat it as:
 - Bootstrap hooks: `make bootstrap` or `make install-hooks`
 - Fast repo check: `make doctor && make agent-validate`
 - Local push gate: `make local-ci`
+- Review-bot feedback as JSON: `make pr-feedback` (or `make pr-feedback-open`, `make pr-feedback PR=<n>`)
 - Format: `cargo fmt --all`
 - Fast Rust validation: `make validate-fast`
 - Native-focused validation: `make validate-native`

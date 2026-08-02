@@ -1,6 +1,6 @@
 SHELL := /bin/sh
 
-.PHONY: bootstrap install-hooks doctor agent-map agent-validate validate-local-ci validate-scripts validate-helper-lane validate-bench-scripts validate-fast validate-native local-ci benchmark-local benchmark-uc benchmark-smoke benchmark-delta benchmark-strict-smoke benchmark-strict-research perf-fast perf-fast-semantic compare-local
+.PHONY: bootstrap install-hooks doctor agent-map agent-validate validate-local-ci validate-scripts validate-helper-lane validate-bench-scripts validate-fast validate-native local-ci pr-feedback pr-feedback-open benchmark-local benchmark-uc benchmark-smoke benchmark-delta benchmark-strict-smoke benchmark-strict-research perf-fast perf-fast-semantic compare-local
 
 bootstrap:
 	@mkdir -p benchmarks/results benchmarks/baselines
@@ -58,6 +58,14 @@ validate-native:
 
 local-ci:
 	@./scripts/local_ci_gate.sh
+
+# Review-bot feedback as JSON for the current branch's PR (see docs/agent/PR_BOT_POLICY.md).
+pr-feedback:
+	@./scripts/pr_feedback.sh $(PR)
+
+# Only the threads still needing action.
+pr-feedback-open:
+	@./scripts/pr_feedback.sh $(PR) --unresolved-only
 
 benchmark-local:
 	@./benchmarks/scripts/run_local_benchmarks.sh --matrix research --tool scarb
