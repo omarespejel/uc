@@ -130,7 +130,9 @@ const MAX_CAPTURE_STDOUT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CAPTURE_STDERR_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_MAX_CACHE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const DEFAULT_CACHE_BUDGET_MIN_INTERVAL_MS: u64 = 5 * 60 * 1000;
-const FINGERPRINT_INDEX_SCHEMA_VERSION: u32 = 3;
+// v4 adds per-directory child-name digests (FingerprintDirectoryState). Older
+// indexes deserialize into an empty index, which forces one full recompute.
+const FINGERPRINT_INDEX_SCHEMA_VERSION: u32 = 4;
 const ARTIFACT_INDEX_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_DIAGNOSTICS_SIMILARITY_THRESHOLD: f64 = 99.5;
 // Match Scarb's default package edition when manifests omit `[package].edition`.
@@ -767,6 +769,26 @@ struct NativeToolchainReport {
     binary_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compiler_version: Option<String>,
+    /// Whether this toolchain can actually run on this host right now.
+    ///
+    /// `supported` answers "is this project's shape supported by the native
+    /// lane"; it does not answer "is the toolchain present". An external-helper
+    /// lane can be shape-supported while its helper binary has never been built,
+    /// in which case the build silently downgrades to scarb. Agents following
+    /// inspect -> support -> build (without `toolchain ensure`) saw a
+    /// contradiction. See issue #76.
+    #[serde(default = "native_toolchain_host_ready_default")]
+    host_ready: bool,
+    /// For external-helper lanes: whether the helper binary exists and is
+    /// executable. `None` for the builtin lane, which needs no helper.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    helper_built: Option<bool>,
+}
+
+/// Older reports predate `host_ready`; assume ready so replaying an archived
+/// report does not invent a readiness failure.
+fn native_toolchain_host_ready_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2314,7 +2336,7 @@ struct FingerprintIndex {
     #[serde(default)]
     entries: BTreeMap<String, FingerprintIndexEntry>,
     #[serde(default)]
-    directories: BTreeMap<String, u64>,
+    directories: BTreeMap<String, FingerprintDirectoryState>,
     #[serde(default)]
     context_digest: Option<String>,
     #[serde(default)]
@@ -2326,6 +2348,20 @@ struct FingerprintIndexEntry {
     size_bytes: u64,
     modified_unix_ms: u64,
     blake3_hex: String,
+}
+
+/// Hot-path state for one tracked directory.
+///
+/// The modification time alone is not sufficient: an archive extracted with
+/// preserved directory times (`tar -p`, `rsync --times`) can add a new `.cairo`
+/// file without moving the parent's mtime, and a newly added file is by
+/// definition absent from `entries`, so nothing else would notice it.
+/// `children_digest` covers the set of fingerprint-relevant child names so that
+/// an addition or removal is a cache miss rather than a false hit. See issue #76.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FingerprintDirectoryState {
+    modified_unix_ms: u64,
+    children_digest: String,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -8409,22 +8445,56 @@ fn format_productized_helper_lanes(lanes: &[String]) -> String {
     }
 }
 
+/// Whether a helper binary at `path` exists and is executable by this process.
+///
+/// Existence alone is not enough: a path pointing at a directory, or at a file
+/// without the execute bit, cannot back a build.
+#[cfg(feature = "native-compile")]
+fn native_toolchain_helper_binary_is_built(path: Option<&str>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    let candidate = Path::new(path);
+    let Ok(metadata) = fs::metadata(candidate) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return metadata.permissions().mode() & 0o111 != 0;
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 #[cfg(feature = "native-compile")]
 fn native_builtin_toolchain_report(
     requirement: &NativeToolchainRequirement,
 ) -> NativeToolchainReport {
+    let helper_active = native_toolchain_helper_active();
+    let binary_path = native_toolchain_helper_path_override();
+    let helper_built =
+        helper_active.then(|| native_toolchain_helper_binary_is_built(binary_path.as_deref()));
     NativeToolchainReport {
         edition: requirement.edition.clone(),
         requested_version: requirement.requested_version.clone(),
         requested_major_minor: requirement.requested_major_minor.clone(),
         request_source: requirement.request_source.clone(),
-        source: if native_toolchain_helper_active() {
+        source: if helper_active {
             NativeToolchainSource::ExternalHelper
         } else {
             NativeToolchainSource::Builtin
         },
-        binary_path: native_toolchain_helper_path_override(),
+        binary_path,
         compiler_version: Some(native_cairo_lang_compiler_version().to_string()),
+        // The builtin lane is compiled into this binary, so it is always ready.
+        host_ready: helper_built.unwrap_or(true),
+        helper_built,
     }
 }
 
@@ -8443,6 +8513,8 @@ fn native_toolchain_report_for_issue(
                 source: NativeToolchainSource::ExternalHelper,
                 binary_path: std::env::var(helper_env).ok(),
                 compiler_version: Some(native_cairo_lang_compiler_version().to_string()),
+                host_ready: false,
+                helper_built: Some(false),
             }
         }
         NativeCompileSupportIssue::UnsupportedToolchainHelperLane { helper_env, .. } => {
@@ -8454,6 +8526,8 @@ fn native_toolchain_report_for_issue(
                 source: NativeToolchainSource::ExternalHelper,
                 binary_path: std::env::var(helper_env).ok(),
                 compiler_version: Some(native_cairo_lang_compiler_version().to_string()),
+                host_ready: false,
+                helper_built: Some(false),
             }
         }
         NativeCompileSupportIssue::InvalidToolchainHelper { path, .. } => NativeToolchainReport {
@@ -8464,6 +8538,8 @@ fn native_toolchain_report_for_issue(
             source: NativeToolchainSource::ExternalHelper,
             binary_path: Some(path.clone()),
             compiler_version: Some(native_cairo_lang_compiler_version().to_string()),
+            host_ready: false,
+            helper_built: Some(false),
         },
         _ => native_builtin_toolchain_report(requirement),
     }
@@ -8572,6 +8648,9 @@ fn select_native_toolchain_from_requirement_with_compiler(
                     source: NativeToolchainSource::ExternalHelper,
                     binary_path: Some(helper_path.display().to_string()),
                     compiler_version: None,
+                    // Reached only after native_toolchain_helper_path_is_usable above.
+                    host_ready: true,
+                    helper_built: Some(true),
                 },
                 helper_path: Some(helper_path),
             }));

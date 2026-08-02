@@ -531,7 +531,7 @@ pub(super) fn try_reuse_hot_fingerprint(
         return Ok(None);
     }
 
-    for (relative_dir, expected_modified_unix_ms) in &index.directories {
+    for (relative_dir, expected_state) in &index.directories {
         let dir_path = if relative_dir == "." {
             workspace_root.to_path_buf()
         } else {
@@ -545,7 +545,22 @@ pub(super) fn try_reuse_hot_fingerprint(
             return Ok(None);
         }
         let modified_unix_ms = metadata_modified_unix_ms(&metadata)?;
-        if modified_unix_ms != *expected_modified_unix_ms {
+        if modified_unix_ms != expected_state.modified_unix_ms {
+            return Ok(None);
+        }
+        // An unchanged mtime does not imply unchanged contents; compare the child
+        // name set so archive extractions with preserved times cannot slip a new
+        // source file past the hot path.
+        let walk_root = if relative_dir == "." || !Path::new(relative_dir).is_absolute() {
+            workspace_root
+        } else {
+            dir_path.as_path()
+        };
+        let children_digest = match fingerprint_directory_children_digest(walk_root, &dir_path) {
+            Ok(digest) => digest,
+            Err(_) => return Ok(None),
+        };
+        if children_digest != expected_state.children_digest {
             return Ok(None);
         }
     }
@@ -611,9 +626,13 @@ pub(super) fn collect_fingerprint_files_from_root(
     fingerprint_timeout: Duration,
     max_files: usize,
 ) -> Result<()> {
+    // Walk one level past the cap so that content living below it is observable.
+    // Truncating silently would drop real inputs from the fingerprint and produce a
+    // false cache hit; the file-count and byte budgets already bail loudly, so this
+    // bound does too. See issue #76.
     let walker = WalkDir::new(walk_root)
         .follow_links(false)
-        .max_depth(MAX_FINGERPRINT_DEPTH)
+        .max_depth(MAX_FINGERPRINT_DEPTH.saturating_add(1))
         .into_iter()
         .filter_entry(|entry| !is_ignored_entry(walk_root, entry.path()));
 
@@ -624,6 +643,23 @@ pub(super) fn collect_fingerprint_files_from_root(
                 walk_root.display()
             )
         })?;
+        if entry.depth() > MAX_FINGERPRINT_DEPTH {
+            // A directory here may hide fingerprintable files deeper still, and a
+            // fingerprintable file here would itself be excluded. Either way the
+            // fingerprint would no longer cover the build inputs.
+            let hides_inputs =
+                entry.file_type().is_dir() || should_include_fingerprint_file(entry.path());
+            if hides_inputs {
+                bail!(
+                    "fingerprint traversal depth limit exceeded at {} (>{} levels below {}); \
+refusing to compute a fingerprint that would omit build inputs",
+                    entry.path().display(),
+                    MAX_FINGERPRINT_DEPTH,
+                    walk_root.display()
+                );
+            }
+            continue;
+        }
         if fingerprint_started.elapsed() > fingerprint_timeout {
             bail!(
                 "fingerprinting timed out after {} ms",
@@ -646,10 +682,54 @@ pub(super) fn collect_fingerprint_files_from_root(
     Ok(())
 }
 
+/// Digest of the fingerprint-relevant child names of one directory.
+///
+/// Covers subdirectories that are not ignored plus files that would be
+/// fingerprinted. Names only: contents are covered by the per-file hashes, so
+/// this exists purely to notice additions and removals that leave the parent
+/// directory's mtime untouched.
+pub(super) fn fingerprint_directory_children_digest(
+    walk_root: &Path,
+    dir_path: &Path,
+) -> Result<String> {
+    let mut names: Vec<String> = Vec::new();
+    let read_dir = fs::read_dir(dir_path)
+        .with_context(|| format!("failed to read directory {}", dir_path.display()))?;
+    for entry in read_dir {
+        let entry =
+            entry.with_context(|| format!("failed to read entry under {}", dir_path.display()))?;
+        let path = entry.path();
+        if is_ignored_entry(walk_root, &path) {
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            // A racing removal is a change; treat it as one rather than guessing.
+            Err(_) => return Ok(String::from("unreadable")),
+        };
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if file_type.is_dir() {
+            names.push(format!("d:{name}"));
+        } else if file_type.is_file() && should_include_fingerprint_file(&path) {
+            names.push(format!("f:{name}"));
+        }
+    }
+    names.sort();
+    let mut hasher = Hasher::new();
+    hasher.update(b"uc-fingerprint-dir-children-v1");
+    for name in &names {
+        hasher.update(name.as_bytes());
+        hasher.update(b"\n");
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
 pub(super) fn snapshot_tracked_fingerprint_directories(
     workspace_root: &Path,
     tracked_directories: &BTreeSet<String>,
-) -> Result<BTreeMap<String, u64>> {
+) -> Result<BTreeMap<String, FingerprintDirectoryState>> {
     let mut snapshot = BTreeMap::new();
     for relative_dir in tracked_directories {
         let dir_path = if relative_dir == "." {
@@ -662,7 +742,18 @@ pub(super) fn snapshot_tracked_fingerprint_directories(
         if !metadata.is_dir() {
             continue;
         }
-        snapshot.insert(relative_dir.clone(), metadata_modified_unix_ms(&metadata)?);
+        let walk_root = if relative_dir == "." || !Path::new(relative_dir).is_absolute() {
+            workspace_root
+        } else {
+            dir_path.as_path()
+        };
+        snapshot.insert(
+            relative_dir.clone(),
+            FingerprintDirectoryState {
+                modified_unix_ms: metadata_modified_unix_ms(&metadata)?,
+                children_digest: fingerprint_directory_children_digest(walk_root, &dir_path)?,
+            },
+        );
     }
     Ok(snapshot)
 }
@@ -870,8 +961,11 @@ pub(super) fn should_include_fingerprint_file(path: &Path) -> bool {
         return true;
     }
 
+    // Case-insensitive to match hash_fingerprint_source_file, which already hashes any
+    // case variant semantically. Requiring exact "cairo" here meant a `Foo.CAIRO` file
+    // compiled by scarb was never fingerprinted at all. See issue #76.
     path.extension()
         .and_then(|s| s.to_str())
-        .map(|ext| ext == "cairo")
+        .map(|ext| ext.eq_ignore_ascii_case("cairo"))
         .unwrap_or(false)
 }

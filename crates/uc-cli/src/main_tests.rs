@@ -2953,6 +2953,8 @@ fn agent_eval_decision_runs_safe_action_for_helper_lane_failure() {
             source: NativeToolchainSource::ExternalHelper,
             binary_path: None,
             compiler_version: None,
+            host_ready: false,
+            helper_built: Some(false),
         }),
         diagnostics: vec![NativeDiagnostic {
             schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
@@ -3080,6 +3082,8 @@ fn agent_eval_decision_selects_first_runnable_safe_action() {
             source: NativeToolchainSource::ExternalHelper,
             binary_path: None,
             compiler_version: None,
+            host_ready: false,
+            helper_built: Some(false),
         }),
         diagnostics: Vec::new(),
     };
@@ -6039,6 +6043,8 @@ cairo-version = "{requested_version}"
                 source: NativeToolchainSource::Builtin,
                 binary_path: None,
                 compiler_version: Some(requested_version.clone()),
+                host_ready: true,
+                helper_built: None,
             }),
             diagnostics: Vec::new(),
         },
@@ -15413,8 +15419,6 @@ fn hot_fingerprint_reuses_digest_when_tracked_metadata_is_unchanged() {
     fs::write(&source, b"fn main() -> felt252 { 1 }").expect("failed to write source file");
 
     let source_metadata = fs::metadata(&source).expect("failed to stat source");
-    let src_dir_metadata = fs::metadata(&src_dir).expect("failed to stat src dir");
-    let root_metadata = fs::metadata(&dir).expect("failed to stat workspace");
 
     let mut entries = BTreeMap::new();
     entries.insert(
@@ -15426,15 +15430,11 @@ fn hot_fingerprint_reuses_digest_when_tracked_metadata_is_unchanged() {
             blake3_hex: "abc123".to_string(),
         },
     );
-    let mut directories = BTreeMap::new();
-    directories.insert(
-        ".".to_string(),
-        metadata_modified_unix_ms(&root_metadata).expect("failed to read workspace mtime"),
-    );
-    directories.insert(
-        "src".to_string(),
-        metadata_modified_unix_ms(&src_dir_metadata).expect("failed to read src dir mtime"),
-    );
+    let directories = snapshot_tracked_fingerprint_directories(
+        &dir,
+        &BTreeSet::from([".".to_string(), "src".to_string()]),
+    )
+    .expect("failed to snapshot tracked directories");
 
     let index = FingerprintIndex {
         schema_version: FINGERPRINT_INDEX_SCHEMA_VERSION,
@@ -15458,8 +15458,6 @@ fn hot_fingerprint_invalidates_when_tracked_directory_mtime_changes() {
     fs::write(&source, b"fn main() -> felt252 { 1 }").expect("failed to write source file");
 
     let source_metadata = fs::metadata(&source).expect("failed to stat source");
-    let src_dir_metadata = fs::metadata(&src_dir).expect("failed to stat src dir");
-    let root_metadata = fs::metadata(&dir).expect("failed to stat workspace");
 
     let mut entries = BTreeMap::new();
     entries.insert(
@@ -15471,15 +15469,11 @@ fn hot_fingerprint_invalidates_when_tracked_directory_mtime_changes() {
             blake3_hex: "abc123".to_string(),
         },
     );
-    let mut directories = BTreeMap::new();
-    directories.insert(
-        ".".to_string(),
-        metadata_modified_unix_ms(&root_metadata).expect("failed to read workspace mtime"),
-    );
-    directories.insert(
-        "src".to_string(),
-        metadata_modified_unix_ms(&src_dir_metadata).expect("failed to read src dir mtime"),
-    );
+    let directories = snapshot_tracked_fingerprint_directories(
+        &dir,
+        &BTreeSet::from([".".to_string(), "src".to_string()]),
+    )
+    .expect("failed to snapshot tracked directories");
 
     let index = FingerprintIndex {
         schema_version: FINGERPRINT_INDEX_SCHEMA_VERSION,
@@ -15496,6 +15490,190 @@ fn hot_fingerprint_invalidates_when_tracked_directory_mtime_changes() {
     let reused = try_reuse_hot_fingerprint(&dir, &index, "ctx", u64::MAX, 0)
         .expect("hot-path check should succeed");
     assert!(reused.is_none());
+    fs::remove_dir_all(&dir).ok();
+}
+
+// Restoring a directory mtime needs an fd on the directory, which `File::open`
+// only provides on Unix. The daemon hot path is Unix-only anyway.
+#[cfg(unix)]
+#[test]
+fn hot_fingerprint_invalidates_when_file_added_with_preserved_directory_mtime() {
+    // Regression for #76.3: `tar -p` / `rsync --times` restore directory mtimes, so a
+    // newly added source file is invisible to both the directory mtime check and the
+    // per-file entry check (a new file has no entry). Only the child-name digest
+    // catches it.
+    let dir = unique_test_dir("uc-hot-fingerprint-preserved-mtime");
+    let src_dir = dir.join("src");
+    fs::create_dir_all(&src_dir).expect("failed to create src dir");
+    let source = src_dir.join("lib.cairo");
+    fs::write(&source, b"fn main() -> felt252 { 1 }").expect("failed to write source file");
+
+    let source_metadata = fs::metadata(&source).expect("failed to stat source");
+    let src_dir_metadata = fs::metadata(&src_dir).expect("failed to stat src dir");
+    let preserved_src_mtime = src_dir_metadata
+        .modified()
+        .expect("failed to read src dir mtime");
+
+    let mut entries = BTreeMap::new();
+    entries.insert(
+        "src/lib.cairo".to_string(),
+        FingerprintIndexEntry {
+            size_bytes: source_metadata.len(),
+            modified_unix_ms: metadata_modified_unix_ms(&source_metadata)
+                .expect("failed to read source mtime"),
+            blake3_hex: "abc123".to_string(),
+        },
+    );
+    let directories = snapshot_tracked_fingerprint_directories(
+        &dir,
+        &BTreeSet::from([".".to_string(), "src".to_string()]),
+    )
+    .expect("failed to snapshot tracked directories");
+
+    let index = FingerprintIndex {
+        schema_version: FINGERPRINT_INDEX_SCHEMA_VERSION,
+        entries,
+        directories,
+        context_digest: Some("ctx".to_string()),
+        last_fingerprint: Some("fp-hot-hit".to_string()),
+    };
+
+    // Sanity check: without any change the hot path reuses.
+    assert_eq!(
+        try_reuse_hot_fingerprint(&dir, &index, "ctx", u64::MAX, 0)
+            .expect("hot-path check should succeed"),
+        Some("fp-hot-hit".to_string())
+    );
+
+    fs::write(src_dir.join("added.cairo"), b"fn extra() -> felt252 { 2 }")
+        .expect("failed to add new source");
+    // Restore the directory mtime the way an archive extraction would.
+    let src_dir_handle = fs::File::open(&src_dir).expect("failed to open src dir");
+    src_dir_handle
+        .set_times(fs::FileTimes::new().set_modified(preserved_src_mtime))
+        .expect("failed to restore src dir mtime");
+
+    let reused = try_reuse_hot_fingerprint(&dir, &index, "ctx", u64::MAX, 0)
+        .expect("hot-path check should succeed");
+    assert!(
+        reused.is_none(),
+        "a source file added under a preserved directory mtime must invalidate the hot path"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn toolchain_helper_binary_is_built_requires_executable_file() {
+    // Regression for #76.4: `support native` reported a helper binary_path without
+    // checking the host actually has it, so agents saw "supported" and then watched
+    // the build downgrade to scarb.
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = unique_test_dir("uc-helper-built-probe");
+    fs::create_dir_all(&dir).expect("failed to create probe dir");
+
+    assert!(
+        !native_toolchain_helper_binary_is_built(None),
+        "absent path is not built"
+    );
+    let missing = dir.join("nope");
+    assert!(
+        !native_toolchain_helper_binary_is_built(Some(&missing.display().to_string())),
+        "missing file is not built"
+    );
+    assert!(
+        !native_toolchain_helper_binary_is_built(Some(&dir.display().to_string())),
+        "a directory is not a helper binary"
+    );
+
+    let not_executable = dir.join("helper-noexec");
+    fs::write(&not_executable, b"#!/bin/sh\n").expect("failed to write helper");
+    fs::set_permissions(&not_executable, fs::Permissions::from_mode(0o644))
+        .expect("failed to set permissions");
+    assert!(
+        !native_toolchain_helper_binary_is_built(Some(&not_executable.display().to_string())),
+        "a non-executable file is not a usable helper"
+    );
+
+    let executable = dir.join("helper-ok");
+    fs::write(&executable, b"#!/bin/sh\n").expect("failed to write helper");
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+        .expect("failed to set permissions");
+    assert!(
+        native_toolchain_helper_binary_is_built(Some(&executable.display().to_string())),
+        "an executable file is a usable helper"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fingerprint_includes_uppercase_cairo_extension() {
+    // Regression for #76.2: selection used an exact "cairo" match while the hasher
+    // accepted any case, so `Foo.CAIRO` was compiled by scarb but never fingerprinted.
+    assert!(should_include_fingerprint_file(Path::new("src/Foo.CAIRO")));
+    assert!(should_include_fingerprint_file(Path::new("src/foo.Cairo")));
+    assert!(should_include_fingerprint_file(Path::new("src/foo.cairo")));
+    assert!(!should_include_fingerprint_file(Path::new("src/foo.rs")));
+}
+
+#[test]
+fn fingerprint_collection_fails_loudly_past_depth_cap() {
+    // Regression for #76.1: exceeding MAX_FINGERPRINT_DEPTH silently dropped files
+    // from the fingerprint, which is a false-cache-hit bug. It must bail like the
+    // file-count and byte budgets do.
+    let dir = unique_test_dir("uc-fingerprint-depth-cap");
+    let mut deep = dir.clone();
+    for level in 0..(MAX_FINGERPRINT_DEPTH + 2) {
+        deep = deep.join(format!("l{level}"));
+    }
+    fs::create_dir_all(&deep).expect("failed to create deep tree");
+    fs::write(deep.join("lib.cairo"), b"fn deep() -> felt252 { 1 }")
+        .expect("failed to write deep source");
+
+    let mut files: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+    let started = Instant::now();
+    let result = collect_fingerprint_files_from_root(
+        &dir,
+        None,
+        &mut files,
+        &started,
+        Duration::from_secs(30),
+        10_000,
+    );
+    let err = result.expect_err("collection past the depth cap must fail");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("depth limit exceeded"),
+        "unexpected error: {message}"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fingerprint_collection_allows_tree_at_depth_cap() {
+    let dir = unique_test_dir("uc-fingerprint-depth-ok");
+    let mut deep = dir.clone();
+    // One directory level below the cap leaves room for the file itself.
+    for level in 0..(MAX_FINGERPRINT_DEPTH - 1) {
+        deep = deep.join(format!("l{level}"));
+    }
+    fs::create_dir_all(&deep).expect("failed to create tree");
+    fs::write(deep.join("lib.cairo"), b"fn ok() -> felt252 { 1 }").expect("failed to write source");
+
+    let mut files: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+    let started = Instant::now();
+    collect_fingerprint_files_from_root(
+        &dir,
+        None,
+        &mut files,
+        &started,
+        Duration::from_secs(30),
+        10_000,
+    )
+    .expect("collection within the depth cap must succeed");
+    assert_eq!(files.len(), 1, "expected the single deep source file");
     fs::remove_dir_all(&dir).ok();
 }
 
