@@ -7,6 +7,10 @@
 - Make the repository easy for both review bots and coding agents to bootstrap correctly.
 - Keep GitHub spend bounded by using PR bots for review, while running routine tests and benchmarks locally.
 
+> Full end-to-end procedure, including bot-finding triage rules and the standing gotchas:
+> **`docs/agent/PR_LIFECYCLE.md`**. This file covers bot *configuration*; that one covers
+> how to *work* with them.
+
 ## Agent review loop
 
 Agents must not scrape the PR web UI. Read bot feedback as JSON:

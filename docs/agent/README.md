@@ -8,7 +8,9 @@ This directory is the checked-in handoff layer for coding agents, humans, and PR
 - `AGENT_DIAGNOSTICS.md`: stable diagnostic-code contract for JSON consumers.
 - `AGENT_QUICKSTART.md`: command sequence agents should prefer before build, fix, or benchmark work.
 - `HUMAN_QUICKSTART.md`: compact human command sequence for the same surfaces.
-- `PR_BOT_POLICY.md`: how CodeRabbit and Qodo should be interpreted.
+- `PR_LIFECYCLE.md`: how to take a change to `main` — branching, gating, bot-finding triage, merge criteria. Read before your first commit.
+- `PR_BOT_POLICY.md`: how CodeRabbit and Qodo are configured and how their output should be interpreted.
+- `CI_POLICY.md`: what runs in GitHub Actions versus locally, and why.
 - `REPO_MAP.md`: generated map of current repo entrypoints and hot files.
 - `schemas/`: JSON schemas for diagnostic, project inspect, support, resolve, fetch, toolchain, source-store, build-plan, and build outputs.
 

@@ -22,7 +22,8 @@ The product is not only "make build faster". It should let agents:
 3. `make agent-validate`
 4. Read `README.md`
 5. Read `docs/agent/README.md`
-6. Read the subsystem doc you are changing.
+6. Read `docs/agent/PR_LIFECYCLE.md` before your first commit.
+7. Read the subsystem doc you are changing.
 
 ## Immediate Priorities
 
@@ -31,10 +32,22 @@ The product is not only "make build faster". It should let agents:
 3. Preserve correctness and fallback classification.
 4. Keep acceleration work focused on native-supported modern Cairo lanes.
 
+## Shipping A Change
+
+Read `docs/agent/PR_LIFECYCLE.md`. Non-negotiables:
+
+- Branch; never commit to `main`.
+- Gate locally first, and read the gate's own exit code — a `grep` or `tail` at the end of
+  a pipeline reports its own status, not the gate's. Redirect to a file and check `$?`.
+- Verify every bot finding against the code before acting on it. Fix real ones with a
+  regression test; decline invalid ones explicitly with reasoning. Never ignore one.
+- Re-gate on the fixed head before merging.
+
 ## Common Commands
 
 - Install repo hooks: `make install-hooks`
 - Local push gate: `make local-ci`
+- Review-bot feedback as JSON: `make pr-feedback-open`
 - Format: `cargo fmt --all`
 - Fast validation: `make validate-fast`
 - Native validation: `make validate-native`
@@ -58,6 +71,9 @@ The product is not only "make build faster". It should let agents:
 
 - Product overview: `README.md`
 - Agent docs: `docs/agent/README.md`
+- PR lifecycle and bot triage: `docs/agent/PR_LIFECYCLE.md`
+- PR bot policy: `docs/agent/PR_BOT_POLICY.md`
+- CI policy: `docs/agent/CI_POLICY.md`
 - Agent diagnostics: `docs/agent/AGENT_DIAGNOSTICS.md`
 - Agent quickstart: `docs/agent/AGENT_QUICKSTART.md`
 - Human quickstart: `docs/agent/HUMAN_QUICKSTART.md`
