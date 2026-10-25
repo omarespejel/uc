@@ -509,14 +509,14 @@ Omar Espejel
 <h2>uc — Real Measured Performance</h2>
 <p>In-process Cairo compiler, test runner, devnet, and formal prover, written in Rust.</p>
 
-<img data-src="./assets/uc.svg" title="uc benchmark" style="width:65.0%" class="r-stretch quarto-figure-center"><p class="caption">betshare, 2026-10-25, same window (<code>benchmarks/results/head-to-head-20261025-162907.json</code>): cold build scarb 11.90 s vs uc 5.23 s; warm 0.27 s vs 0.03 s; 41 tests warm snforge 2.43 s vs uc 0.85 s; 13/13 artifacts byte-identical. Heavy nested-call suites are still about 3x slower on uc.</p></section>
+<img data-src="./assets/uc.svg" title="uc benchmark" style="width:65.0%" class="r-stretch quarto-figure-center"><p class="caption">betshare, 2026-10-25, same window (<code>benchmarks/results/head-to-head-20261025-162907.json</code>): cold build scarb 11.90 s vs uc 5.23 s; warm 0.27 s vs 0.03 s; 41 tests warm snforge 2.43 s vs uc 0.85 s; 13/13 artifacts byte-identical. erc8004 (168 tests, seven with over a million VM steps): uc 11.6 s and 2.2 GB peak vs snforge 0.60 16.9 s and 3.3 GB, same machine.</p></section>
 <section id="uv-1" class="slide level2">
 <h2>uc — What Is Actually Verified (2026-10-25)</h2>
 <ul>
 <li><strong>Byte-identical artifacts</strong>: on erc8004 (6 contracts, OpenZeppelin v3) all 13 files from <code>uc build</code> equal <code>scarb 2.18 build</code> byte for byte, Sierra and CASM included</li>
 <li><strong>Same test verdicts as snforge 0.60</strong>: betshare 41/41, erc8004 168/168; a mutated contract fails the right test under uc</li>
 <li><strong>Fresh machine</strong>: empty HOME, empty cache, no scarb on PATH: uc fetched 12 OpenZeppelin packages from scarbs.xyz (SHA-256 checked), built 13 artifacts, ran 41 tests green</li>
-<li><strong>Real bytecode</strong>: 16 deployed mainnet classes (STRK, ETH, USDC, Ekubo, AVNU, zkLend, StarkGate, Vesu, Pragma...) audited from chain with no source: 2,843 Sierra functions in 32 s</li>
+<li><strong>Real bytecode</strong>: 16 deployed mainnet classes (STRK, ETH, USDC, Ekubo, AVNU, zkLend, StarkGate, Vesu, Pragma...) audited from chain with no source: 2,843 Sierra functions, 92 findings, 23 counterexamples, 32 s on an idle machine</li>
 <li><strong>Self-contained</strong>: Cairo 2.18.0 compiler and 164 corelib files embedded; <code>uc --version</code> says which</li>
 </ul>
 </section>
@@ -579,9 +579,9 @@ Omar Espejel
 <span id="cb8-2"><a href=""></a>uc optimize-inlining --min-threshold 0 --max-threshold 250 --step 25</span></code><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></pre></div>
 </section>
 <section id="drop-in-replacement-for-pip-tools" class="slide level2">
-<h2>Drop-In Parity: <code>sncast</code>, and What Is Still a Stub</h2>
+<h2>Drop-In Parity: <code>sncast</code> and a Local Chain</h2>
 <ul>
-<li><code>uc devnet</code> launches a real <code>starknet-devnet</code> when one is on PATH; on its own it is a JSON-RPC protocol stub with no execution, and it says so:</li>
+<li><code>uc devnet</code> runs a Starknet chain in process: embedded account, fee token and deployer compiled by uc itself; declare, deploy, invoke, call, receipts, events, blocks; nonces enforced, no fees or signature checks. The same <code>uc declare / deploy / invoke / call</code> commands drive it:</li>
 </ul>
 <div class="sourceCode" id="cb16"><pre class="sourceCode numberSource shell number-lines code-with-copy"><code class="sourceCode"><span id="cb16-1"><a href=""></a>uc devnet --port 5050 --seed 42 --accounts 10 --fork-network $MAINNET_RPC</span></code><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></pre></div>
 <ul>
@@ -653,9 +653,10 @@ Omar Espejel
 <h1>4. Conclusions</h1>
 <ul>
 <li><strong>One self-contained binary</strong> for Linux &amp; macOS with embedded Cairo <code>corelib</code></li>
-<li><strong>Drop-in for <code>scarb</code>, <code>snforge</code> and <code>sncast</code></strong>: byte-identical artifacts, same test verdicts, no scarb needed for registry packages; <code>uc devnet</code> is still a stub without an external devnet</li>
-<li><strong>Formal verification that runs on deployed bytecode</strong>: 2,843 functions across 16 mainnet classes in 32 s, with detectors that recognise guards and locks instead of flagging every state write</li>
-<li>Every number on these slides comes from a script in <code>benchmarks/scripts/</code>; the heavy-integration-test gap vs snforge (about 3x) is reported, not hidden</li>
+<li><strong>Drop-in for <code>scarb</code>, <code>snforge</code>, <code>sncast</code> and <code>starknet-devnet</code></strong>: byte-identical artifacts, same test verdicts, no scarb needed for registry packages, a local chain in process</li>
+<li><strong>Formal verification that runs on deployed bytecode</strong>: 2,843 functions across 16 mainnet classes, with detectors that recognise held locks instead of flagging every state write, and a live-storage mode that decides state-dependent paths on chain data</li>
+<li><strong>Checkable</strong>: every proof obligation can be exported as SMT-LIB and re-checked with z3 (<code>uc prove --emit-smt</code>); every number on these slides comes from a script in <code>benchmarks/scripts/</code></li>
+<li><strong>For explorers</strong>: Starkscan RPC and labels, an audit feed of newly declared classes, <code>uc watch</code> diffs findings across upgrades, <code>uc declare --upgrade-of</code> refuses unsafe upgrades</li>
 </ul>
 </section>
 <section id="competitor-issues" class="slide level2">

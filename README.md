@@ -42,9 +42,13 @@ what uc downloaded.
 
 **Real bytecode.** `benchmarks/scripts/run_mainnet_audit.py` fetches 20 well-known mainnet
 classes over JSON-RPC and audits them with no source: 16 are Sierra classes (4 are Cairo 0 or
-misaddressed), 2,843 functions analysed in 32 s, 19 reachable-panic witnesses, 102 detector
-findings. Results are written to `benchmarks/results/`. They are a measurement of the prover,
-not a security review of those protocols.
+misaddressed), 2,843 functions analysed, 23 reachable-panic witnesses, 92 detector findings
+(`mainnet-audit-20261025-224629.json`, 118 s on a machine at load average 60; the same run took 32 s
+earlier in the day at lower load). Each function gets a 15 s budget, 1024 statements per path and
+1024 paths; the explorer is depth-first with a bounded pending set, so the largest class in the
+corpus (Ekubo core, 208 functions) peaks below 50 MB. Results are written to
+`benchmarks/results/`. They are a measurement of the prover, not a security review of those
+protocols.
 
 **Head to head.** `benchmarks/scripts/run_head_to_head.py` copies real projects to a scratch
 directory and times cold and warm builds and test runs for both toolchains (median of 3), then
@@ -254,8 +258,9 @@ the upgrade `UPGRADE_UNSAFE`; `uc declare` then refuses to build the transaction
 ## Working on uc
 
 ```bash
-cargo build --release           # ~5 min cold, incremental afterwards
-cargo test --release            # 490 tests
+cargo build --release           # ~5 min cold, incremental afterwards (nightly from rust-toolchain)
+cargo +stable build --release   # what the release workflow builds; verified 2026-10-25 (8 min)
+cargo test --release            # 505 tests; run them alone, a concurrent uc process sharing ~/.uc/cache makes three flaky
 python3 benchmarks/scripts/run_head_to_head.py --uc target/release/uc --project <dir> ...
 python3 benchmarks/scripts/run_mainnet_audit.py --uc target/release/uc
 ```

@@ -32,6 +32,11 @@ pub(crate) struct ProveArgs {
     #[arg(long, default_value_t = 1024)]
     pub max_paths: usize,
 
+    /// Wall-clock budget per function, in milliseconds; a function that exceeds it is reported
+    /// with `exploration_truncated` (BOUNDED_SAFE at best), never PROVEN_SAFE.
+    #[arg(long, default_value_t = 15_000)]
+    pub function_timeout_ms: u64,
+
     /// Run modernized Trail of Bits Caracal Sierra IR taint, CFG dominance, and dataflow detectors.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub caracal: bool,
@@ -1738,6 +1743,24 @@ impl SymExpr {
         }
     }
 
+    /// True when the tree has more than `cap` nodes (stops counting early).
+    fn exceeds(&self, cap: usize) -> bool {
+        fn count(e: &SymExpr, left: &mut usize) -> bool {
+            if *left == 0 {
+                return true;
+            }
+            *left -= 1;
+            match e {
+                SymExpr::Param(..) | SymExpr::Const(_) | SymExpr::SymbolicOpaque(_) => false,
+                SymExpr::Add(a, b) | SymExpr::Sub(a, b) | SymExpr::Mul(a, b) | SymExpr::Div(a, b) | SymExpr::Rem(a, b) => {
+                    count(a, left) || count(b, left)
+                }
+            }
+        }
+        let mut left = cap;
+        count(self, &mut left)
+    }
+
     fn mentions_param(&self) -> bool {
         match self {
             Self::Param(_, _) => true,
@@ -2312,8 +2335,9 @@ fn solve_path_constraints(
     }
 
     // Check pairwise contradictions: `A == B` and `A != B`, or `A < B` and `A >= B`
-    for i in 0..constraints.len() {
-        for j in (i + 1)..constraints.len() {
+    let pairwise_n = if constraints.len() > PAIRWISE_SCAN_LIMIT { 0 } else { constraints.len() };
+    for i in 0..pairwise_n {
+        for j in (i + 1)..pairwise_n {
             let ci = &constraints[i];
             let cj = &constraints[j];
             if ci.lhs == cj.lhs && ci.rhs == cj.rhs {
@@ -2534,7 +2558,9 @@ fn solve_path_constraints(
         .map(|c| c.lhs.highest_param().max(c.rhs.highest_param()))
         .collect();
     let mut env = vec![0i128; n];
-    let mut budget = WITNESS_SEARCH_BUDGET;
+    // Each partial assignment re-evaluates the constraints bound so far, so the budget shrinks
+    // with the path length: a path of a thousand constraints gets a few thousand assignments.
+    let mut budget = WITNESS_SEARCH_BUDGET.min(WITNESS_EVALUATION_BUDGET / constraints.len().max(1));
     if search_witness_recursive(
         0,
         &mut env,
@@ -2551,8 +2577,34 @@ fn solve_path_constraints(
     SolverOutcome::Unknown
 }
 
+/// Symbolic expressions are trees without sharing, so `x = x + x` repeated doubles the tree
+/// every step. Past this many nodes a result is kept opaque instead; the solver then treats it
+/// as unknown rather than spending seconds walking one expression.
+const MAX_SYM_EXPR_NODES: usize = 96;
+
+fn cap_sym_expr(expr: SymExpr, var_id: u64) -> SymExpr {
+    if expr.exceeds(MAX_SYM_EXPR_NODES) {
+        SymExpr::SymbolicOpaque(format!("v{var_id}"))
+    } else {
+        expr
+    }
+}
+
+/// Whether panic-path obligations are kept on the reports (only `--emit-smt` needs them; for a
+/// large class they are gigabytes of cloned constraints).
+pub(crate) static KEEP_OBLIGATIONS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Wall-clock budget per analysed function (set from `--function-timeout-ms`).
+pub(crate) static FUNCTION_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(15_000);
+
+/// Past this many constraints on one path the pairwise contradiction scan (quadratic) is
+/// skipped; interval tightening and the witness search still run.
+const PAIRWISE_SCAN_LIMIT: usize = 400;
+
 /// Partial assignments the witness search may try per panic path before answering Unknown.
 const WITNESS_SEARCH_BUDGET: usize = 20_000;
+/// Upper bound on `assignments * constraints` per panic path (about a second of solving).
+const WITNESS_EVALUATION_BUDGET: usize = 4_000_000;
 
 impl SymExpr {
     /// Highest parameter index the expression mentions, or `usize::MAX` when it mentions none
@@ -2761,8 +2813,13 @@ fn run_symbolic_verification_for_function(
         || (!fname.contains('[') && has_entry_point_wrapper(index, &short_name));
 
     let (_, start, end) = index.func_ranges[func_idx];
+    let debug_timing = std::env::var("UC_PROVE_DEBUG_TIMING").is_ok();
+    let phase_started = std::time::Instant::now();
     let (_can_reach_ok, panic_vars) =
         compute_ok_reachable_statements(index, summaries, start, end);
+    if debug_timing && phase_started.elapsed().as_millis() > 200 {
+        eprintln!("prove phase: {fname} reachability {} ms ({} statements)", phase_started.elapsed().as_millis(), end - start);
+    }
 
     // Extract symbolic value parameters (excluding builtins like GasBuiltin, RangeCheck, System)
     let mut param_bounds: Vec<(String, i128, i128)> = Vec::new();
@@ -2824,9 +2881,14 @@ fn run_symbolic_verification_for_function(
     let mut obligations: Vec<PathObligation> = Vec::new();
 
     let max_paths = max_paths.max(1);
+    let function_started = std::time::Instant::now();
+    let function_budget = std::time::Duration::from_millis(FUNCTION_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed));
 
-    while let Some(mut state) = queue.pop_front() {
-        if explored_paths >= max_paths {
+    // Depth-first: the pending set stays at most `depth x fan-out` states. Breadth-first kept
+    // every pending fork of a looping function alive (gigabytes for one Ekubo function).
+    let pending_cap = max_paths.saturating_mul(4).max(64);
+    while let Some(mut state) = queue.pop_back() {
+        if explored_paths >= max_paths || function_started.elapsed() > function_budget {
             exploration_truncated = true;
             break;
         }
@@ -2857,8 +2919,18 @@ fn run_symbolic_verification_for_function(
                             .cloned()
                             .collect();
 
+                        let solve_started = std::time::Instant::now();
                         let verdict = solve_path_constraints(&param_bounds, &meaningful_constraints);
-                        obligations.push(PathObligation {
+                        if debug_timing && solve_started.elapsed().as_millis() > 200 {
+                            eprintln!(
+                                "prove phase: {fname} solver {} ms ({} constraints, {} params)",
+                                solve_started.elapsed().as_millis(),
+                                meaningful_constraints.len(),
+                                param_bounds.len()
+                            );
+                        }
+                        if KEEP_OBLIGATIONS.load(std::sync::atomic::Ordering::Relaxed) {
+                            obligations.push(PathObligation {
                             expected: match &verdict {
                                 SolverOutcome::Unsat => "unsat",
                                 SolverOutcome::Sat(_) => "sat",
@@ -2873,7 +2945,8 @@ fn run_symbolic_verification_for_function(
                                 .last()
                                 .map(|c| c.reason.clone())
                                 .unwrap_or_else(|| "panic path".to_string()),
-                        });
+                            });
+                        }
                         match verdict {
                             SolverOutcome::Unsat => {
                                 unreachable_panic_paths += 1;
@@ -2993,7 +3066,7 @@ fn run_symbolic_verification_for_function(
                                 } else {
                                     SymExpr::Add(Box::new(a), Box::new(b))
                                 };
-                                state.vars.insert(r.id, expr);
+                                state.vars.insert(r.id, cap_sym_expr(expr, r.id));
                                 if let Some(max) = state.var_max.get(&lhs_id).copied() {
                                     state.var_max.insert(r.id, max);
                                 }
@@ -3015,7 +3088,7 @@ fn run_symbolic_verification_for_function(
                             if let Some(r) = branch.results.last() {
                                 state
                                     .vars
-                                    .insert(r.id, SymExpr::Sub(Box::new(a), Box::new(b)));
+                                    .insert(r.id, cap_sym_expr(SymExpr::Sub(Box::new(a), Box::new(b)), r.id));
                             }
                         } else if gid.ends_with("_safe_divmod") && inv.args.len() >= 2 {
                             let lhs_id = inv.args[inv.args.len() - 2].id;
@@ -3033,11 +3106,11 @@ fn run_symbolic_verification_for_function(
                             if branch.results.len() >= 3 {
                                 state.vars.insert(
                                     branch.results[1].id,
-                                    SymExpr::Div(Box::new(a.clone()), Box::new(b.clone())),
+                                    cap_sym_expr(SymExpr::Div(Box::new(a.clone()), Box::new(b.clone())), branch.results[1].id),
                                 );
                                 state
                                     .vars
-                                    .insert(branch.results[2].id, SymExpr::Rem(Box::new(a), Box::new(b)));
+                                    .insert(branch.results[2].id, cap_sym_expr(SymExpr::Rem(Box::new(a), Box::new(b)), branch.results[2].id));
                                 state.performed_computation = true;
                             }
                         }
@@ -3239,8 +3312,10 @@ fn run_symbolic_verification_for_function(
                                 let ty_prefix = gid.split('_').next().unwrap_or("u128");
                                 let max_val = max_bound_for_sierra_type(ty_prefix);
                                 if let (Some(lhs), Some(rhs)) = (a, b) {
-                                    let sum_expr =
-                                        SymExpr::Add(Box::new(lhs.clone()), Box::new(rhs.clone()));
+                                    let sum_expr = cap_sym_expr(
+                                        SymExpr::Add(Box::new(lhs.clone()), Box::new(rhs.clone())),
+                                        branch.results.last().map(|r| r.id).unwrap_or(0),
+                                    );
                                     if let Some(res_var) = branch.results.last() {
                                         child.vars.insert(res_var.id, sum_expr.clone());
                                         child.var_max.insert(res_var.id, max_val);
@@ -3264,8 +3339,10 @@ fn run_symbolic_verification_for_function(
                                 let a = state.vars.get(&lhs_id).cloned();
                                 let b = state.vars.get(&rhs_id).cloned();
                                 if let (Some(lhs), Some(rhs)) = (a, b) {
-                                    let diff_expr =
-                                        SymExpr::Sub(Box::new(lhs.clone()), Box::new(rhs.clone()));
+                                    let diff_expr = cap_sym_expr(
+                                        SymExpr::Sub(Box::new(lhs.clone()), Box::new(rhs.clone())),
+                                        branch.results.last().map(|r| r.id).unwrap_or(0),
+                                    );
                                     if let Some(res_var) = branch.results.last() {
                                         child.vars.insert(res_var.id, diff_expr);
                                     }
@@ -3284,6 +3361,10 @@ fn run_symbolic_verification_for_function(
                                 }
                             }
 
+                            if queue.len() >= pending_cap {
+                                exploration_truncated = true;
+                                continue;
+                            }
                             queue.push_back(child);
                         }
                         break;
@@ -4619,12 +4700,23 @@ fn prove_single_package(
 }
 
 pub(crate) fn run_prove(args: ProveArgs) -> Result<()> {
+    FUNCTION_TIMEOUT_MS.store(args.function_timeout_ms.max(1), std::sync::atomic::Ordering::Relaxed);
+    KEEP_OBLIGATIONS.store(args.emit_smt.is_some(), std::sync::atomic::Ordering::Relaxed);
     let start = Instant::now();
     let mut pkg_reports = Vec::new();
 
     if let Some(sierra_file) = &args.sierra_file {
-        let text = fs::read_to_string(sierra_file)
+        let mut text = fs::read_to_string(sierra_file)
             .with_context(|| format!("failed to read {}", sierra_file.display()))?;
+        // Classes saved from JSON-RPC carry the ABI as a string; the class type wants the array.
+        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(abi_text) = v.get("abi").and_then(|a| a.as_str()) {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(abi_text) {
+                    v["abi"] = parsed;
+                    text = v.to_string();
+                }
+            }
+        }
         #[cfg(feature = "native-compile")]
         {
             let program = if let Ok(versioned) =

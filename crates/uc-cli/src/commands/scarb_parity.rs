@@ -3262,6 +3262,10 @@ pub(crate) struct AuditArgs {
     #[arg(long, default_value_t = 1024)]
     pub max_paths: usize,
 
+    /// Wall-clock budget per analysed function, in milliseconds.
+    #[arg(long, default_value_t = 15_000)]
+    pub function_timeout_ms: u64,
+
     /// Audit every Sierra class declared on chain from this block (inclusive) to
     /// `--declared-until` (default: latest), as a feed for explorers: one entry per class with
     /// its grade, counts and findings.
@@ -3444,6 +3448,7 @@ pub(crate) fn synthesize_contract_function_names(
 
 pub(crate) fn run_audit(args: AuditArgs) -> Result<()> {
     let started = Instant::now();
+    FUNCTION_TIMEOUT_MS.store(args.function_timeout_ms.max(1), std::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "native-test-runner")]
     {
         if args.declared_since.is_some() {
