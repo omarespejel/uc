@@ -10,6 +10,7 @@ mod prove;
 mod registry;
 mod scarb_parity;
 mod starknet_onchain;
+mod starkscan;
 mod test_runner;
 mod watch;
 
@@ -25,6 +26,7 @@ pub(crate) use prove::*;
 pub(crate) use registry::*;
 pub(crate) use scarb_parity::*;
 pub(crate) use starknet_onchain::*;
+pub(crate) use starkscan::*;
 pub(crate) use test_runner::*;
 pub(crate) use watch::*;
 

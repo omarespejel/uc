@@ -8,10 +8,35 @@ use std::time::Duration;
 pub(crate) const STARKNET_UDC_ADDRESS: &str =
     "0x041a78e741e5af2fec34b695679bc6891742439f7afb8484ecd7766661ad02bf";
 
-const DEFAULT_STARKSCAN_MAINNET_VERIFY_URL: &str = "https://api.starkscan.co/api/v1/verify";
-const DEFAULT_STARKSCAN_SEPOLIA_VERIFY_URL: &str = "https://api-sepolia.starkscan.co/api/v1/verify";
+/// Public fallback endpoints, used when no `STARKSCAN_API_KEY` is configured.
 const DEFAULT_MAINNET_RPC_URL: &str = "https://api.cartridge.gg/x/starknet/mainnet";
 const DEFAULT_SEPOLIA_RPC_URL: &str = "https://api.cartridge.gg/x/starknet/sepolia";
+
+/// Default RPC for a network preset: Starkscan's header-authenticated gateway when an API key
+/// is configured, else the public Cartridge endpoint.
+pub(crate) fn default_rpc_url_for_network(network: &str) -> Option<String> {
+    let chain = starkscan_chain_id(Some(network));
+    match (network, chain, starkscan_api_key()) {
+        (_, Some(chain), Some(_)) => Some(starkscan_rpc_url(chain)),
+        ("mainnet" | "alpha-mainnet", _, None) => Some(DEFAULT_MAINNET_RPC_URL.to_string()),
+        ("sepolia" | "alpha-sepolia", _, None) => Some(DEFAULT_SEPOLIA_RPC_URL.to_string()),
+        ("devnet" | "katana", _, _) => Some("http://127.0.0.1:5050/rpc".to_string()),
+        _ => None,
+    }
+}
+
+/// Which provider a resolved RPC URL belongs to, for reports.
+pub(crate) fn rpc_provider_label(url: &str) -> &'static str {
+    if is_starkscan_url(url) {
+        "starkscan"
+    } else if url.contains("cartridge.gg") {
+        "cartridge-public"
+    } else if url.contains("127.0.0.1") || url.contains("localhost") {
+        "local"
+    } else {
+        "custom"
+    }
+}
 
 #[derive(Args, Debug, Clone)]
 pub(crate) struct ClassHashArgs {
@@ -382,7 +407,8 @@ pub(crate) struct VerifyOnchainArgs {
     #[arg(long, value_enum, default_value_t = VerifierProviderArg::Starkscan)]
     pub verifier: VerifierProviderArg,
 
-    /// Custom verifier API endpoint (defaults to Starkscan Mainnet/Sepolia verification API).
+    /// Custom verifier endpoint (POST of the bundle). Without it `--submit` writes Starkscan's
+    /// verification record: `PUT https://starkscan.co/api/v1/{chain}/contract/{address}/verification`.
     #[arg(long)]
     pub verifier_url: Option<String>,
 
@@ -560,12 +586,7 @@ pub(crate) fn resolve_sncast_profile_config(
         resolved.network = Some(n.to_string());
     }
     if resolved.url.is_none() {
-        resolved.url = match resolved.network.as_deref() {
-            Some("mainnet") | Some("alpha-mainnet") => Some(DEFAULT_MAINNET_RPC_URL.to_string()),
-            Some("sepolia") | Some("alpha-sepolia") => Some(DEFAULT_SEPOLIA_RPC_URL.to_string()),
-            Some("devnet") | Some("katana") => Some("http://127.0.0.1:5050/rpc".to_string()),
-            _ => None,
-        };
+        resolved.url = resolved.network.as_deref().and_then(default_rpc_url_for_network);
     }
     if let Some(acc) = account_override {
         resolved.account = Some(acc.to_string());
@@ -634,6 +655,81 @@ pub(crate) fn resolve_sncast_profile_config(
 /// Sends a JSON-RPC or HTTP POST payload to `url`.
 /// Uses native `TcpStream` HTTP/1.1 for `http://` URLs (zero external process overhead, <1ms latency)
 /// and falls back to `curl` for `https://` URLs.
+/// A parsed HTTP response: status code and JSON body (`null` when the body was empty).
+pub(crate) struct HttpJsonResponse {
+    pub status: u16,
+    pub body: serde_json::Value,
+}
+
+/// GET / PUT / POST a JSON document. Plain `http://` goes over a raw socket; `https://` through
+/// `curl`. Unlike [http_post_json] this reports the status code instead of failing on it.
+pub(crate) fn http_request_json(
+    method: &str,
+    url: &str,
+    payload: Option<&serde_json::Value>,
+    extra_headers: &[(&str, &str)],
+) -> Result<HttpJsonResponse> {
+    let body_bytes = match payload {
+        Some(p) => serde_json::to_vec(p).context("failed to serialize JSON payload")?,
+        None => Vec::new(),
+    };
+    let parse = |text: &str| -> serde_json::Value {
+        let trimmed = extract_http_json_body(text.trim());
+        serde_json::from_str(trimmed).unwrap_or(serde_json::Value::Null)
+    };
+    if let Some(rest) = url.strip_prefix("http://") {
+        let (host_port, path) = match rest.split_once('/') {
+            Some((hp, p)) => (hp, format!("/{p}")),
+            None => (rest, "/".to_string()),
+        };
+        let addr_str = if host_port.contains(':') { host_port.to_string() } else { format!("{host_port}:80") };
+        let mut stream = TcpStream::connect(&addr_str).with_context(|| format!("failed to connect to {addr_str}"))?;
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
+        let mut req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body_bytes.len()
+        );
+        for (k, v) in extra_headers {
+            req.push_str(&format!("{k}: {v}\r\n"));
+        }
+        req.push_str("\r\n");
+        stream.write_all(req.as_bytes())?;
+        stream.write_all(&body_bytes)?;
+        stream.flush()?;
+        let mut resp_bytes = Vec::new();
+        stream.read_to_end(&mut resp_bytes)?;
+        let resp_str = String::from_utf8_lossy(&resp_bytes);
+        let status = resp_str
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse::<u16>().ok())
+            .unwrap_or(0);
+        let (_, body_part) = resp_str
+            .split_once("\r\n\r\n")
+            .or_else(|| resp_str.split_once("\n\n"))
+            .unwrap_or(("", &resp_str));
+        return Ok(HttpJsonResponse { status, body: parse(body_part) });
+    }
+    let mut cmd = Command::new("curl");
+    cmd.arg("-sS").arg("-X").arg(method).arg("-H").arg("Content-Type: application/json").arg("-H").arg("Accept: application/json");
+    for (k, v) in extra_headers {
+        cmd.arg("-H").arg(format!("{k}: {v}"));
+    }
+    if payload.is_some() {
+        cmd.arg("--data-binary").arg(String::from_utf8_lossy(&body_bytes).as_ref());
+    }
+    // Status code on the last line, body before it.
+    cmd.arg("-w").arg("\n%{http_code}").arg(url);
+    let output = cmd.output().with_context(|| format!("failed to execute curl for {url}"))?;
+    if !output.status.success() {
+        bail!("HTTPS request to {url} failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let (body_text, code) = text.rsplit_once('\n').unwrap_or((&text, "0"));
+    Ok(HttpJsonResponse { status: code.trim().parse().unwrap_or(0), body: parse(body_text) })
+}
+
 pub(crate) fn http_post_json(
     url: &str,
     payload: &serde_json::Value,
@@ -728,7 +824,9 @@ pub(crate) fn starknet_rpc_request(
         "method": method,
         "params": params,
     });
-    let resp = http_post_json(url, &req, &[])?;
+    let owned_headers = starkscan_headers(url);
+    let headers: Vec<(&str, &str)> = owned_headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let resp = http_post_json(url, &req, &headers)?;
     if let Some(err) = resp.get("error") {
         bail!("Starknet JSON-RPC `{method}` error: {err}");
     }
@@ -1772,6 +1870,28 @@ fn sign_starknet_payload_if_key_present(
         vec![format_felt_hex(&sig.r), format_felt_hex(&sig.s)],
         Some(format_felt_hex(&pubkey)),
     ))
+}
+
+/// Current time as an RFC 3339 UTC timestamp with second precision.
+pub(crate) fn iso8601_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // Civil-from-days (Howard Hinnant), no external crate needed.
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, (rem % 3600) / 60, rem % 60)
 }
 
 #[cfg(feature = "native-test-runner")]
@@ -2960,28 +3080,54 @@ pub(crate) fn run_verify_onchain(args: VerifyOnchainArgs) -> Result<()> {
         .with_context(|| format!("failed to write Starkscan bundle to {}", bundle_path.display()))?;
     }
 
+    // Starkscan's verification record for this contract: read when a key is available, written
+    // with --submit. The PUT needs a key carrying the verification scope; the record's
+    // `verificationStatus` is pending / verified / failed.
+    let api_key = args.api_key.clone().or_else(starkscan_api_key);
+    let starkscan_record = match (&args.contract_address, api_key.as_deref()) {
+        (Some(address), Some(_)) if matches!(args.verifier, VerifierProviderArg::Starkscan) => {
+            starkscan_contract_verification(chain_id, address).unwrap_or_else(|e| {
+                eprintln!("warning: could not read Starkscan verification record: {e}");
+                None
+            })
+        }
+        _ => None,
+    };
+    let starkscan_upsert_request = serde_json::json!({
+        "classHash": onchain_class_hash,
+        "sourceRef": args.export_bundle.as_ref().map(|p| p.display().to_string())
+            .unwrap_or_else(|| format!("uc-bundle:{source_tree_merkle_root}")),
+        "language": "cairo",
+        "compilerVersion": native_cairo_lang_compiler_version(),
+        "verificationStatus": if verified_all { "verified" } else { "failed" },
+        "verificationError": if verified_all { serde_json::Value::Null } else { serde_json::json!("local class hash does not match the deployed class") },
+        "verifiedAtIso": if verified_all { serde_json::json!(iso8601_now()) } else { serde_json::Value::Null },
+        "metadata": {
+            "bundle_schema": "uc-starkscan-verification-bundle-v1",
+            "source_tree_merkle_root": source_tree_merkle_root,
+            "source_file_count": sources_map.len(),
+            "uc_version": uc_version_banner(),
+        },
+    });
     let mut verifier_submission_response: Option<serde_json::Value> = None;
     if args.submit || args.verifier_url.is_some() {
-        let target_verifier_url = args
-            .verifier_url
-            .clone()
-            .unwrap_or_else(|| {
-                if chain_id == "SN_SEPOLIA" {
-                    DEFAULT_STARKSCAN_SEPOLIA_VERIFY_URL.to_string()
-                } else {
-                    DEFAULT_STARKSCAN_MAINNET_VERIFY_URL.to_string()
+        match (&args.verifier_url, &args.contract_address) {
+            (Some(custom_url), _) => {
+                let mut headers = Vec::new();
+                if let Some(k) = api_key.as_deref() {
+                    headers.push((STARKSCAN_API_KEY_HEADER, k));
                 }
-            });
-        let api_key = args
-            .api_key
-            .clone()
-            .or_else(|| std::env::var("STARKSCAN_API_KEY").ok());
-        let mut headers = Vec::new();
-        if let Some(k) = api_key.as_deref() {
-            headers.push(("x-api-key", k));
+                verifier_submission_response = Some(http_post_json(custom_url, &starkscan_bundle, &headers)?);
+            }
+            (None, Some(address)) => {
+                if api_key.is_none() {
+                    bail!("--submit needs a Starkscan API key (--api-key or {STARKSCAN_API_KEY_ENV})");
+                }
+                let resp = starkscan_put_contract_verification(chain_id, address, &starkscan_upsert_request)?;
+                verifier_submission_response = Some(resp);
+            }
+            (None, None) => bail!("--submit needs --contract-address (the record is keyed by address)"),
         }
-        let resp = http_post_json(&target_verifier_url, &starkscan_bundle, &headers)?;
-        verifier_submission_response = Some(resp);
     }
 
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -2998,6 +3144,8 @@ pub(crate) fn run_verify_onchain(args: VerifyOnchainArgs) -> Result<()> {
         "source_file_count": sources_map.len(),
         "bundle_exported_to": args.export_bundle.as_ref().map(|p| p.display().to_string()),
         "starkscan_rust_exp_payload": starkscan_rust_exp_payload,
+        "starkscan_verification_record": starkscan_record,
+        "starkscan_upsert_request": starkscan_upsert_request,
         "verifier_submission": verifier_submission_response,
         "contracts": contract_verifications,
         "elapsed_ms": elapsed_ms,

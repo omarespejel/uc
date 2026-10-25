@@ -1741,6 +1741,10 @@ pub(crate) struct TraceTxArgs {
     /// Transaction hash (`0x...`) or path to a saved trace JSON file.
     pub target: String,
 
+    /// Skip Starkscan address labels even when `STARKSCAN_API_KEY` is set.
+    #[arg(long)]
+    pub no_labels: bool,
+
     #[arg(short = 'u', long)]
     pub url: Option<String>,
 
@@ -1852,11 +1856,38 @@ pub(crate) fn run_trace_tx(args: TraceTxArgs) -> Result<()> {
         .get("entry_point_selector")
         .and_then(|v| v.as_str())
         .unwrap_or("0x0");
-    let decoded_sel = selector_dict
-        .get(raw_sel)
-        .cloned()
-        .unwrap_or_else(|| raw_sel.to_string());
     let revert_reason = root_inv.get("revert_reason").and_then(|v| v.as_str());
+
+    // Name every call from the ABI of the class it ran (one class fetch per distinct class) and
+    // label every address through Starkscan when an API key is configured.
+    let rpc_for_names = resolve_read_rpc_url(args.url.as_deref(), args.network.as_deref()).ok();
+    let mut class_names = rpc_for_names.as_deref().map(ClassSelectorNames::new);
+    let starkscan_chain = rpc_for_names
+        .as_deref()
+        .and_then(starkscan_chain_from_url)
+        .or_else(|| starkscan_chain_id(args.network.as_deref()));
+    let mut labels = match (starkscan_api_key(), starkscan_chain) {
+        (Some(_), Some(chain)) if !args.no_labels => Some(StarkscanLabels::new(chain)),
+        _ => None,
+    };
+    let mut calls: Vec<serde_json::Value> = Vec::new();
+    flatten_trace_calls(root_inv, 0, &selector_dict, &mut class_names, &mut labels, &mut calls);
+    let decoded_sel = calls
+        .first()
+        .and_then(|c| c.get("function").and_then(|f| f.as_str()))
+        .map(str::to_string)
+        .unwrap_or_else(|| selector_dict.get(raw_sel).cloned().unwrap_or_else(|| raw_sel.to_string()));
+    let mut participants: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    for c in &calls {
+        if let Some(addr) = c.get("contract_address").and_then(|v| v.as_str()) {
+            participants.entry(addr.to_string()).or_insert_with(|| {
+                serde_json::json!({
+                    "label": c.get("label").cloned().unwrap_or(serde_json::Value::Null),
+                    "class_hash": c.get("class_hash").cloned().unwrap_or(serde_json::Value::Null),
+                })
+            });
+        }
+    }
 
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     let report = serde_json::json!({
@@ -1867,6 +1898,11 @@ pub(crate) fn run_trace_tx(args: TraceTxArgs) -> Result<()> {
         "decoded_function": decoded_sel,
         "reverted": revert_reason.is_some(),
         "revert_reason": revert_reason,
+        "calls": calls,
+        "participants": participants,
+        "labels_source": labels.as_ref().map(|_| "starkscan"),
+        "label_requests": labels.as_ref().map(|l| l.requests),
+        "class_fetches": class_names.as_ref().map(|c| c.class_fetches),
         "trace": trace_json,
         "elapsed_ms": elapsed_ms,
     });
@@ -1874,15 +1910,69 @@ pub(crate) fn run_trace_tx(args: TraceTxArgs) -> Result<()> {
     if args.json || args.report_path.is_some() {
         emit_json_value(args.report_path.as_deref(), &report)?;
     } else {
-        println!("Transaction Trace Autopsy: {}", args.target);
-        println!("  ├─ [CALL] {contract_addr}::{decoded_sel} ({raw_sel})");
+        println!("Transaction Trace: {}", args.target);
+        for c in &calls {
+            let depth = c.get("depth").and_then(|d| d.as_u64()).unwrap_or(0) as usize;
+            let addr = c.get("contract_address").and_then(|v| v.as_str()).unwrap_or("0x0");
+            let label = c.get("label").and_then(|v| v.as_str()).map(|l| format!(" [{l}]")).unwrap_or_default();
+            let func = c.get("function").and_then(|v| v.as_str()).unwrap_or("?");
+            let kind = c.get("call_type").and_then(|v| v.as_str()).unwrap_or("CALL");
+            let failed = c.get("reverted").and_then(|v| v.as_bool()).unwrap_or(false);
+            println!(
+                "  {}{kind} {addr}{label}::{func}{}",
+                "  ".repeat(depth),
+                if failed { "  <- reverted" } else { "" }
+            );
+        }
         if let Some(rev) = revert_reason {
-            println!("  └─ [REVERT] {rev}");
+            println!("  REVERT {rev}");
         } else {
-            println!("  └─ [SUCCESS]");
+            println!("  SUCCESS ({} calls)", calls.len());
+        }
+        if labels.is_none() {
+            println!("  (set {STARKSCAN_API_KEY_ENV} to label addresses through Starkscan)");
         }
     }
     Ok(())
+}
+
+/// Depth-first list of every call in a trace with its function name (ABI by class, else the
+/// well-known selector table, else the raw selector) and Starkscan label.
+fn flatten_trace_calls(
+    inv: &serde_json::Value,
+    depth: usize,
+    selector_dict: &HashMap<String, String>,
+    class_names: &mut Option<ClassSelectorNames>,
+    labels: &mut Option<StarkscanLabels>,
+    out: &mut Vec<serde_json::Value>,
+) {
+    let addr = inv.get("contract_address").and_then(|v| v.as_str()).unwrap_or("0x0").to_string();
+    let selector = inv.get("entry_point_selector").and_then(|v| v.as_str()).unwrap_or("0x0").to_string();
+    let class_hash = inv.get("class_hash").and_then(|v| v.as_str()).map(str::to_string);
+    let function = class_names
+        .as_mut()
+        .and_then(|c| c.name(class_hash.as_deref(), &selector))
+        .or_else(|| selector_dict.get(&selector).cloned())
+        .unwrap_or_else(|| selector.clone());
+    let label = labels.as_mut().and_then(|l| l.lookup(&addr).display());
+    out.push(serde_json::json!({
+        "depth": depth,
+        "contract_address": addr,
+        "class_hash": class_hash,
+        "selector": selector,
+        "function": function,
+        "label": label,
+        "call_type": inv.get("call_type").and_then(|v| v.as_str()).unwrap_or("CALL"),
+        "caller_address": inv.get("caller_address").and_then(|v| v.as_str()),
+        "calldata_len": inv.get("calldata").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
+        "reverted": inv.get("revert_reason").is_some(),
+        "events": inv.get("events").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
+    }));
+    if let Some(children) = inv.get("calls").and_then(|v| v.as_array()) {
+        for child in children {
+            flatten_trace_calls(child, depth + 1, selector_dict, class_names, labels, out);
+        }
+    }
 }
 
 
@@ -1988,6 +2078,7 @@ pub(crate) fn run_balance(args: BalanceArgs) -> Result<()> {
         "account": account_addr,
         "block_id": args.block_id,
         "rpc_url": rpc,
+        "rpc_provider": rpc_provider_label(&rpc),
         "balance_low": low,
         "balance_high": high,
         "balance_raw": raw,
@@ -3213,6 +3304,20 @@ pub(crate) struct AuditArgs {
     #[arg(long, default_value_t = 1024)]
     pub max_paths: usize,
 
+    /// Audit every Sierra class declared on chain from this block (inclusive) to
+    /// `--declared-until` (default: latest), as a feed for explorers: one entry per class with
+    /// its grade, counts and findings.
+    #[arg(long, value_name = "BLOCK")]
+    pub declared_since: Option<u64>,
+
+    /// Last block (inclusive) of the `--declared-since` range.
+    #[arg(long, value_name = "BLOCK")]
+    pub declared_until: Option<u64>,
+
+    /// Stop the `--declared-since` feed after this many classes.
+    #[arg(long, default_value_t = 50)]
+    pub max_classes: usize,
+
     /// Read the contract's live storage (`starknet_getStorageAt`) for storage cells at known
     /// addresses, so paths that depend on state (lengths, flags, owners) are decided against the
     /// chain instead of treated as unknown; counterexamples are replayed on that state too.
@@ -3383,6 +3488,9 @@ pub(crate) fn run_audit(args: AuditArgs) -> Result<()> {
     let started = Instant::now();
     #[cfg(feature = "native-test-runner")]
     {
+        if args.declared_since.is_some() {
+            return run_declared_class_feed(&args);
+        }
         let mut target_label = args
             .target
             .clone()
@@ -3418,13 +3526,7 @@ pub(crate) fn run_audit(args: AuditArgs) -> Result<()> {
                     loaded_program = Some(program);
                 }
             } else if t.starts_with("0x") {
-                let rpc = args.rpc_url.clone().unwrap_or_else(|| {
-                    match args.network.as_deref().unwrap_or("mainnet") {
-                        "sepolia" | "testnet" => "https://api.cartridge.gg/x/starknet/sepolia".to_string(),
-                        "devnet" | "local" => "http://127.0.0.1:5050/rpc".to_string(),
-                        _ => "https://api.cartridge.gg/x/starknet/mainnet".to_string(),
-                    }
-                });
+                let rpc = resolve_read_rpc_url(args.rpc_url.as_deref(), Some(args.network.as_deref().unwrap_or("mainnet")))?;
                 let fetched = fetch_onchain_sierra_program(&rpc, t)?;
                 if args.live_storage && fetched.is_contract_address {
                     live_oracle = Some(StorageOracle::rpc(&rpc, t, 256));
@@ -3584,9 +3686,17 @@ pub(crate) fn run_audit(args: AuditArgs) -> Result<()> {
             fs::write(out_file, &markdown_report)?;
         }
 
+        // Starkscan's source verification record for an on-chain target, when a key is set.
+        let starkscan_verification = match (&args.target, starkscan_api_key(), starkscan_chain_id(Some(args.network.as_deref().unwrap_or("mainnet")))) {
+            (Some(t), Some(_), Some(chain)) if t.starts_with("0x") => {
+                starkscan_contract_verification(chain, t).unwrap_or(None)
+            }
+            _ => None,
+        };
         let report_json = serde_json::json!({
             "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
             "target": target_label,
+            "starkscan_verification": starkscan_verification,
             "crate_name": inferred_crate,
             "security_grade": security_grade,
             "sierra_statements": program.statements.len(),

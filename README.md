@@ -105,7 +105,8 @@ uc decompile target/dev/my_vault_Vault.contract_class.json
 uc fetch                         # download registry dependencies natively
 uc call --contract-address 0x... --function name --network mainnet
 uc balance --token strk --account 0x... --network mainnet
-uc trace 0x<tx hash> --network mainnet
+uc trace 0x<tx hash> --network mainnet   # every call named from its class ABI; labels with STARKSCAN_API_KEY
+uc audit --declared-since 1693000 --network mainnet --json   # audit feed of newly declared classes
 uc get nonce 0x... --network mainnet
 ```
 
@@ -177,6 +178,26 @@ loop bounds (interprocedural, numeric parameters only, capped bounds excluded), 
 storage writes in constructors and setters, swallowed syscall errors, redundant `divmod`,
 bitwise parity. `#[test]` bodies are never symbolic targets; `prove_*`, `invariant_*` and
 `check_*` functions are.
+
+## Starkscan
+
+Set `STARKSCAN_API_KEY` and every `--network mainnet|sepolia` command talks to Starkscan's
+JSON-RPC gateway (`https://starkscan.co/api/v1/SN_MAIN/rpc`, header `X-Starkscan-Api-Key`)
+instead of the public Cartridge endpoint; reports name the provider in `rpc_provider`. A
+`--url https://starkscan.co/rpc/v0_10/SN_MAIN/<key>` URL-token endpoint works as well.
+
+- `uc trace <tx>` names every call in the trace from the ABI of the class it ran (one class
+  fetch per distinct class, no key needed) and, with a key, labels every address through
+  Starkscan's contract metadata and token endpoints (`alias`, account, token symbol).
+- `uc audit <address>` includes Starkscan's source verification record
+  (`verificationStatus`, `sourceRef`, `compilerVersion`) when a key is set.
+- `uc verify-onchain --verifier starkscan` reads the same record and, with `--submit`, writes
+  it through `PUT /v1/{chain}/contract/{address}/verification` (the key needs the verification
+  scope; the request body is in the report as `starkscan_upsert_request`).
+- `uc audit --declared-since <block> [--declared-until <block>] [--max-classes N]` walks the
+  state updates of a block range, audits every Sierra class declared there and emits one entry
+  per class (grade, counts, findings; Cairo 0 declarations listed as skipped), as a feed an
+  explorer can ingest.
 
 ## Upgrade gate
 

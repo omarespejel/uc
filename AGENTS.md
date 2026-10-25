@@ -44,12 +44,16 @@ uc build --json                      # Sierra + CASM artifacts, byte-identical t
 | Selector | `uc selector <name_or_hex> --json` |
 | Read-only call | `uc call --contract-address 0x.. --function <name> --network mainnet --json` |
 | Nonce, class hash at, balance | `uc get nonce 0x.. --network mainnet`, `uc get class-hash-at 0x.. --network mainnet`, `uc balance --token strk --account 0x.. --network mainnet` |
-| Transaction trace | `uc trace <tx_hash> --network mainnet --json` |
+| Transaction trace, calls named from class ABIs | `uc trace <tx_hash> --network mainnet --json` (`calls[]`, `participants`) |
+| Audit feed of declared classes | `uc audit --declared-since <block> --declared-until <block> --max-classes 50 --network mainnet --json` |
 | Declare / deploy / invoke (dry run) | `uc declare -c <Contract> --dry-run --json` |
 
 RPC resolution for on-chain commands: `--url`, else `STARKNET_RPC`, else the `snfoundry.toml`
-profile in the current directory, else `--network mainnet|sepolia|devnet` (public Cartridge
-endpoints). Every report includes the `rpc_url` used.
+profile in the current directory, else `--network mainnet|sepolia|devnet`: Starkscan's gateway
+(`https://starkscan.co/api/v1/{SN_MAIN|SN_SEPOLIA}/rpc`, header `X-Starkscan-Api-Key`) when
+`STARKSCAN_API_KEY` is set, else the public Cartridge endpoints. Reports include `rpc_url` and
+`rpc_provider`. With the key, `uc trace` labels addresses, `uc audit` reports the Starkscan
+verification record, and `uc verify-onchain --submit` writes it.
 
 ## Output and exit codes
 
