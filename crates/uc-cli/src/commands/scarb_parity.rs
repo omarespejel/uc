@@ -3213,6 +3213,12 @@ pub(crate) struct AuditArgs {
     #[arg(long, default_value_t = 1024)]
     pub max_paths: usize,
 
+    /// Read the contract's live storage (`starknet_getStorageAt`) for storage cells at known
+    /// addresses, so paths that depend on state (lengths, flags, owners) are decided against the
+    /// chain instead of treated as unknown; counterexamples are replayed on that state too.
+    #[arg(long)]
+    pub live_storage: bool,
+
     /// Write a full Markdown security audit report to `<OUTPUT>`
     #[arg(short = 'o', long)]
     pub output: Option<PathBuf>,
@@ -3237,19 +3243,26 @@ pub(crate) struct OnchainSierraProgram {
     /// Crate prefix of the synthesized names (`audit_target`), or the real one when the class
     /// shipped debug names.
     pub crate_name: String,
-    pub class: ContractClass,
+    /// True when `target` resolved as a deployed contract address (not a bare class hash).
+    pub is_contract_address: bool,
+    /// The class hash as the chain reports it (`starknet_getClassHashAt`, or the target when it
+    /// was a class hash). Recomputing it from the fetched JSON is not reliable: the RPC ships
+    /// the ABI as a string and any re-serialization changes the hash.
+    pub class_hash: String,
 }
 
 /// Fetches the class deployed at `target` (a contract address, else a class hash) and extracts
 /// its Sierra program. Classes without debug names get names synthesized from the entry points
 /// and ABI, so wrappers read `<crate>::Contract::__wrapper__<name>`. Cairo 0 classes are rejected.
 pub(crate) fn fetch_onchain_sierra_program(rpc: &str, target: &str) -> Result<OnchainSierraProgram> {
+    let mut is_contract_address = true;
     let class_val = starknet_rpc_request(
         rpc,
         "starknet_getClassAt",
         serde_json::json!({ "block_id": "latest", "contract_address": target }),
     )
     .or_else(|_| {
+        is_contract_address = false;
         starknet_rpc_request(
             rpc,
             "starknet_getClass",
@@ -3282,7 +3295,19 @@ pub(crate) fn fetch_onchain_sierra_program(rpc: &str, target: &str) -> Result<On
         .and_then(|dn| dn.split("::").next())
         .unwrap_or("audit_target")
         .to_string();
-    Ok(OnchainSierraProgram { program, crate_name, class })
+    let class_hash = if is_contract_address {
+        starknet_rpc_request(
+            rpc,
+            "starknet_getClassHashAt",
+            serde_json::json!({ "block_id": "latest", "contract_address": target }),
+        )
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+    } else {
+        target.to_string()
+    };
+    Ok(OnchainSierraProgram { program, crate_name, is_contract_address, class_hash })
 }
 
 pub(crate) fn synthesize_contract_function_names(
@@ -3362,6 +3387,7 @@ pub(crate) fn run_audit(args: AuditArgs) -> Result<()> {
             .target
             .clone()
             .unwrap_or_else(|| "workspace".to_string());
+        let mut live_oracle: Option<StorageOracle> = None;
         let mut loaded_program: Option<cairo_lang_sierra::program::Program> = None;
 
         if let Some(t) = &args.target {
@@ -3399,7 +3425,11 @@ pub(crate) fn run_audit(args: AuditArgs) -> Result<()> {
                         _ => "https://api.cartridge.gg/x/starknet/mainnet".to_string(),
                     }
                 });
-                loaded_program = Some(fetch_onchain_sierra_program(&rpc, t)?.program);
+                let fetched = fetch_onchain_sierra_program(&rpc, t)?;
+                if args.live_storage && fetched.is_contract_address {
+                    live_oracle = Some(StorageOracle::rpc(&rpc, t, 256));
+                }
+                loaded_program = Some(fetched.program);
             }
         }
 
@@ -3452,7 +3482,21 @@ pub(crate) fn run_audit(args: AuditArgs) -> Result<()> {
             args.max_depth,
             args.max_paths,
             true,
+            live_oracle.as_ref(),
         );
+        let mut symbolic_proofs = symbolic_proofs;
+        let storage_seeds: Vec<(String, String)> =
+            live_oracle.as_ref().map(|o| o.resolved()).unwrap_or_default();
+        if symbolic_proofs.iter().any(|p| p.status == "COUNTEREXAMPLE_FOUND") {
+            replay_counterexamples_on_slice(&program, &mut symbolic_proofs, &storage_seeds);
+        }
+        let live_storage_json = live_oracle.as_ref().map(|o| {
+            serde_json::json!({
+                "contract": o.label(),
+                "reads": storage_seeds.len(),
+                "values": storage_seeds.iter().cloned().collect::<BTreeMap<String, String>>(),
+            })
+        });
 
         // 3. Compute Stwo Circle STARK AIR Builtin Multiplicities
         let mut range_check_ops = 0usize;
@@ -3562,6 +3606,7 @@ pub(crate) fn run_audit(args: AuditArgs) -> Result<()> {
                 "ec_op": ec_ops,
                 "syscalls": syscalls,
             },
+            "live_storage": live_storage_json,
             "symbolic_proofs": symbolic_proofs,
             "caracal_findings": caracal_findings,
             "decompiled_cairo": decompiled_cairo,

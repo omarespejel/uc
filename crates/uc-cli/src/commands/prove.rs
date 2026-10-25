@@ -249,6 +249,9 @@ struct LibfuncMeta {
     debug_name: String,
     user_func_callee: Option<u64>,
     const_value: Option<i128>,
+    /// The full constant for `*_const` libfuncs whose value exceeds `i128` (storage base
+    /// addresses), as lowercase hex without `0x`.
+    big_const_hex: Option<String>,
     enum_variant_idx: Option<usize>,
     is_panic_result_enum: bool,
 }
@@ -259,6 +262,8 @@ struct TypeMeta {
     generic_id: String,
     debug_name: String,
     const_value: Option<i128>,
+    /// Full constant of a `Const<T, v>` type whose value exceeds `i128`, lowercase hex.
+    big_const_hex: Option<String>,
     is_panic_result: bool,
 }
 
@@ -282,12 +287,18 @@ impl<'a> SierraProgramIndex<'a> {
                 .map(|s| s.as_str().to_string())
                 .unwrap_or_else(|| generic_id.clone());
             let mut const_value = None;
+            let mut big_const_hex = None;
             let mut is_panic_result = debug_name.contains("PanicResult");
             for arg in &td.long_id.generic_args {
                 match arg {
                     GenericArg::Value(v) => {
                         if let Ok(val) = i128::try_from(v.clone()) {
                             const_value = Some(val);
+                        } else {
+                            let hex = format!("{:x}", v);
+                            if !hex.starts_with('-') {
+                                big_const_hex = Some(hex);
+                            }
                         }
                     }
                     GenericArg::UserType(ut) => {
@@ -306,6 +317,7 @@ impl<'a> SierraProgramIndex<'a> {
                     generic_id,
                     debug_name,
                     const_value,
+                    big_const_hex,
                     is_panic_result,
                 },
             );
@@ -407,6 +419,7 @@ impl<'a> SierraProgramIndex<'a> {
                 .unwrap_or_else(|| generic_id.clone());
             let mut user_func_callee = None;
             let mut const_value = None;
+            let mut big_const_hex = None;
             let mut enum_variant_idx = None;
             let mut is_panic_result_enum = debug_name.contains("PanicResult");
 
@@ -422,12 +435,20 @@ impl<'a> SierraProgramIndex<'a> {
                             } else {
                                 const_value = Some(val);
                             }
+                        } else {
+                            let hex = format!("{:x}", v);
+                            if !hex.starts_with('-') {
+                                big_const_hex = Some(hex);
+                            }
                         }
                     }
                     GenericArg::Type(tid) => {
                         if let Some(tm) = types.get(&tid.id) {
                             if tm.const_value.is_some() && const_value.is_none() {
                                 const_value = tm.const_value;
+                            }
+                            if tm.big_const_hex.is_some() && big_const_hex.is_none() {
+                                big_const_hex = tm.big_const_hex.clone();
                             }
                             if tm.is_panic_result {
                                 is_panic_result_enum = true;
@@ -444,6 +465,7 @@ impl<'a> SierraProgramIndex<'a> {
                     debug_name,
                     user_func_callee,
                     const_value,
+                    big_const_hex,
                     enum_variant_idx,
                     is_panic_result_enum,
                 },
@@ -1095,14 +1117,7 @@ fn run_caracal_sierra_analysis(
         let has_wrapper = !is_external_wrapper
             && !is_l1_handler_wrapper
             && !is_constructor_wrapper
-            && (0..index.program.funcs.len()).any(|other_idx| {
-                let other_name = index.func_name(other_idx);
-                other_name.ends_with(&format!("::__external::{short_name}"))
-                    || other_name.ends_with(&format!("::__constructor::{short_name}"))
-                    || other_name.ends_with(&format!("::__l1_handler::{short_name}"))
-                    || other_name.ends_with(&format!("__wrapper__{short_name}"))
-                    || other_name.ends_with(&format!("__{short_name}"))
-            });
+            && has_entry_point_wrapper(index, &short_name);
 
         let (_, start, end) = index.func_ranges[func_idx];
         if start >= end {
@@ -1746,6 +1761,89 @@ impl SymConstraint {
     }
 }
 
+/// Supplies concrete values for storage reads at known addresses during symbolic execution
+/// and seeds the counterexample replay with the same values. Backed by `starknet_getStorageAt`
+/// for a deployed contract, or by a fixed map in tests. Reads are cached and capped.
+pub(crate) struct StorageOracle {
+    label: String,
+    reader: Box<dyn Fn(&str) -> Option<String> + Send + Sync>,
+    cache: std::sync::Mutex<BTreeMap<String, Option<String>>>,
+    max_reads: usize,
+}
+
+impl StorageOracle {
+    /// Reads live storage of `contract` over JSON-RPC (`block_id` latest).
+    pub(crate) fn rpc(rpc: &str, contract: &str, max_reads: usize) -> Self {
+        let rpc = rpc.to_string();
+        let contract_owned = contract.to_string();
+        Self {
+            label: contract.to_string(),
+            reader: Box::new(move |key| {
+                starknet_rpc_request(
+                    &rpc,
+                    "starknet_getStorageAt",
+                    serde_json::json!({ "block_id": "latest", "contract_address": contract_owned, "key": key }),
+                )
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+            }),
+            cache: std::sync::Mutex::new(BTreeMap::new()),
+            max_reads,
+        }
+    }
+
+    /// A fixed `{storage key hex: value hex}` map (tests, offline replays).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn from_map(values: BTreeMap<String, String>) -> Self {
+        Self {
+            label: "map".to_string(),
+            reader: Box::new(move |key| values.get(key).cloned()),
+            cache: std::sync::Mutex::new(BTreeMap::new()),
+            max_reads: usize::MAX,
+        }
+    }
+
+    /// The value stored at `key` (`0x...`), as a felt hex string, if the backend has one.
+    pub(crate) fn read_hex(&self, key: &str) -> Option<String> {
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(v) = cache.get(key) {
+            return v.clone();
+        }
+        if cache.len() >= self.max_reads {
+            return None;
+        }
+        let value = (self.reader)(key);
+        cache.insert(key.to_string(), value.clone());
+        value
+    }
+
+    /// The value at `key` as a small integer the symbolic engine can reason about; `None` when
+    /// unknown or too large for the solver (it then stays opaque).
+    pub(crate) fn read_small(&self, key: &str) -> Option<i128> {
+        let hex = self.read_hex(key)?;
+        let digits = hex.trim_start_matches("0x");
+        if digits.len() > 30 {
+            return None;
+        }
+        i128::from_str_radix(digits, 16).ok().filter(|v| *v <= i128::MAX / 4)
+    }
+
+    /// Every `(key, value)` the oracle has resolved so far.
+    pub(crate) fn resolved(&self) -> Vec<(String, String)> {
+        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.iter().filter_map(|(k, v)| v.as_ref().map(|v| (k.clone(), v.clone()))).collect()
+    }
+
+    pub(crate) fn label(&self) -> &str {
+        &self.label
+    }
+}
+
+/// Lowercase `0x` hex of a felt, with no leading zeros, as JSON-RPC expects storage keys.
+fn felt_key_hex(f: &starknet_types_core::felt::Felt) -> String {
+    format!("{f:#x}")
+}
+
 /// One panic path of a function: its path constraints and what the in-process solver said.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PathObligation {
@@ -1923,7 +2021,11 @@ pub(crate) fn witness_calldata(witness: &[i128], param_types: &[String]) -> Vec<
 /// Replays every counterexample in `proofs` on a runner built from the slice of `program`
 /// reachable from the functions involved, so even a whole test crate's program (far too large
 /// to assemble as one CASM program) gets its witnesses executed.
-fn replay_counterexamples_on_slice(program: &Program, proofs: &mut [SymbolicFunctionProofReport]) {
+pub(crate) fn replay_counterexamples_on_slice(
+    program: &Program,
+    proofs: &mut [SymbolicFunctionProofReport],
+    storage_seeds: &[(String, String)],
+) {
     use cairo_lang_runner::{slice_program_for_roots, SierraCasmRunner};
     let mut roots = Vec::new();
     for proof in proofs.iter() {
@@ -1960,7 +2062,7 @@ fn replay_counterexamples_on_slice(program: &Program, proofs: &mut [SymbolicFunc
             eprintln!("replay runner built in {:.1} ms", t1.elapsed().as_secs_f64() * 1000.0);
         }
         let t2 = std::time::Instant::now();
-        verify_counterexamples_concretely(&runner, &sliced, proofs);
+        verify_counterexamples_concretely(&runner, &sliced, proofs, storage_seeds);
         if debug {
             eprintln!("replay ran in {:.1} ms", t2.elapsed().as_secs_f64() * 1000.0);
         }
@@ -2010,6 +2112,20 @@ fn find_entry_point_wrapper<'p>(program: &'p Program, function: &str) -> Option<
     ];
     program.funcs.iter().find(|f| {
         f.id.debug_name.as_ref().is_some_and(|dn| candidates.iter().any(|c| c == dn.as_str()))
+    })
+}
+
+/// Whether some generated entry point wrapper (`__wrapper__<name>`, `__wrapper__<Impl>__<name>`,
+/// `__external::<name>`, `__constructor::<name>`, `__l1_handler::<name>`) exists for `short_name`,
+/// meaning the function is reached from calldata.
+fn has_entry_point_wrapper(index: &SierraProgramIndex<'_>, short_name: &str) -> bool {
+    let suffix = format!("__{short_name}");
+    (0..index.program.funcs.len()).any(|other_idx| {
+        let other = index.func_name(other_idx);
+        other.ends_with(&format!("::__external::{short_name}"))
+            || other.ends_with(&format!("::__constructor::{short_name}"))
+            || other.ends_with(&format!("::__l1_handler::{short_name}"))
+            || (other.contains("::__wrapper__") && other.ends_with(&suffix))
     })
 }
 
@@ -2324,8 +2440,15 @@ fn solve_path_constraints(
         per_param_candidates.push(pts.into_iter().collect());
     }
 
-    // Search for a concrete witness satisfying all constraints
+    // Search for a concrete witness satisfying all constraints. Constraints are checked as soon
+    // as every parameter they mention is bound, and the search gives up (Unknown) after a fixed
+    // number of partial assignments rather than enumerating 24^n combinations.
+    let highest_param: Vec<usize> = constraints
+        .iter()
+        .map(|c| c.lhs.highest_param().max(c.rhs.highest_param()))
+        .collect();
     let mut env = vec![0i128; n];
+    let mut budget = WITNESS_SEARCH_BUDGET;
     if search_witness_recursive(
         0,
         &mut env,
@@ -2333,6 +2456,8 @@ fn solve_path_constraints(
         &lo,
         &hi,
         constraints,
+        &highest_param,
+        &mut budget,
     ) {
         return SolverOutcome::Sat(env);
     }
@@ -2340,6 +2465,30 @@ fn solve_path_constraints(
     SolverOutcome::Unknown
 }
 
+/// Partial assignments the witness search may try per panic path before answering Unknown.
+const WITNESS_SEARCH_BUDGET: usize = 20_000;
+
+impl SymExpr {
+    /// Highest parameter index the expression mentions, or `usize::MAX` when it mentions none
+    /// (such constraints are checked only once every parameter is bound).
+    fn highest_param(&self) -> usize {
+        match self {
+            Self::Param(idx, _) => *idx,
+            Self::Const(_) | Self::SymbolicOpaque(_) => usize::MAX,
+            Self::Add(a, b) | Self::Sub(a, b) | Self::Mul(a, b) | Self::Div(a, b) | Self::Rem(a, b) => {
+                let (x, y) = (a.highest_param(), b.highest_param());
+                match (x == usize::MAX, y == usize::MAX) {
+                    (true, true) => usize::MAX,
+                    (true, false) => y,
+                    (false, true) => x,
+                    (false, false) => x.max(y),
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn search_witness_recursive(
     param_idx: usize,
     env: &mut [i128],
@@ -2347,6 +2496,8 @@ fn search_witness_recursive(
     lo: &[i128],
     hi: &[i128],
     constraints: &[SymConstraint],
+    highest_param: &[usize],
+    budget: &mut usize,
 ) -> bool {
     let n = env.len();
     if param_idx == n {
@@ -2396,8 +2547,19 @@ fn search_witness_recursive(
     }
 
     for val in dynamic_pts.into_iter().take(24) {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
         env[param_idx] = val;
-        if search_witness_recursive(param_idx + 1, env, candidates, lo, hi, constraints) {
+        // Prune: a constraint whose parameters are all bound now must already hold.
+        let violated = constraints.iter().zip(highest_param).any(|(c, hp)| {
+            *hp == param_idx && c.eval(env) == Some(false)
+        });
+        if violated {
+            continue;
+        }
+        if search_witness_recursive(param_idx + 1, env, candidates, lo, hi, constraints, highest_param, budget) {
             return true;
         }
     }
@@ -2409,8 +2571,71 @@ struct SymPathState {
     stmt_idx: usize,
     depth: usize,
     vars: HashMap<u64, SymExpr>,
+    /// Concrete storage addresses flowing through `storage_base_address_const`,
+    /// `storage_address_from_base[_and_offset]` and copies, for the storage oracle.
+    storage_addrs: HashMap<u64, starknet_types_core::felt::Felt>,
+    /// Upper bound of the integer type a variable carries (`u8` 255, `u64` 2^64-1, ...), for
+    /// the bounded-int lowering of checked arithmetic (`bounded_int_trim_max` and friends).
+    var_max: HashMap<u64, i128>,
     constraints: Vec<SymConstraint>,
     performed_computation: bool,
+}
+
+/// Follows concrete storage addresses through the libfuncs that build and copy them.
+fn track_storage_address(
+    state: &mut SymPathState,
+    gid: &str,
+    lf: &LibfuncMeta,
+    inv: &cairo_lang_sierra::program::Invocation,
+    branch: &cairo_lang_sierra::program::BranchInfo,
+) {
+    use starknet_types_core::felt::Felt;
+    let Some(res) = branch.results.first() else { return };
+    if gid == "storage_base_address_const" || gid == "const_as_immediate" {
+        let value = lf
+            .big_const_hex
+            .as_deref()
+            .and_then(|h| Felt::from_hex(&format!("0x{h}")).ok())
+            .or_else(|| lf.const_value.filter(|v| *v >= 0).map(|v| Felt::from(v as u128)));
+        if let Some(addr) = value {
+            state.storage_addrs.insert(res.id, addr);
+        }
+    } else if gid == "storage_address_from_base"
+        || gid == "rename"
+        || gid == "dup"
+        || gid == "store_temp"
+        || gid == "store_local"
+    {
+        if let Some(arg) = inv.args.last() {
+            if let Some(addr) = state.storage_addrs.get(&arg.id).copied() {
+                for r in &branch.results {
+                    state.storage_addrs.insert(r.id, addr);
+                }
+            }
+        }
+    } else if gid == "struct_construct" || gid == "struct_deconstruct" || gid == "snapshot_take" {
+        // `StoragePointer { address, .. }` wraps the base address as its first member; the
+        // address survives construction, deconstruction and snapshots of that struct.
+        if let Some(first) = inv.args.first() {
+            if let Some(addr) = state.storage_addrs.get(&first.id).copied() {
+                state.storage_addrs.insert(res.id, addr);
+                if gid == "snapshot_take" {
+                    for r in &branch.results {
+                        state.storage_addrs.insert(r.id, addr);
+                    }
+                }
+            }
+        }
+    } else if gid == "storage_address_from_base_and_offset" && inv.args.len() >= 2 {
+        let base = state.storage_addrs.get(&inv.args[0].id).copied();
+        let offset = match state.vars.get(&inv.args[1].id) {
+            Some(SymExpr::Const(v)) if *v >= 0 => Some(*v as u128),
+            _ => None,
+        };
+        if let (Some(base), Some(off)) = (base, offset) {
+            state.storage_addrs.insert(res.id, base + Felt::from(off));
+        }
+    }
 }
 
 fn run_symbolic_verification_for_function(
@@ -2419,6 +2644,7 @@ fn run_symbolic_verification_for_function(
     func_idx: usize,
     max_depth: usize,
     max_paths: usize,
+    oracle: Option<&StorageOracle>,
 ) -> SymbolicFunctionProofReport {
     let fname = index.func_name(func_idx);
     let (_, short_name) = extract_contract_and_short_name(&fname);
@@ -2439,6 +2665,15 @@ fn run_symbolic_verification_for_function(
         "function"
     };
 
+    // Whose values are the parameters? Entry points, constructors, handlers, property functions
+    // and uncalled functions take caller-chosen values; a method with an entry point wrapper is
+    // reached with calldata. Internal helpers and loop bodies receive values their callers
+    // already constrained, so a panic that needs a parameter at a type bound is a precondition on
+    // the caller, not a counterexample.
+    let params_externally_controlled = kind != "function"
+        || !summaries[func_idx].has_callers
+        || (!fname.contains('[') && has_entry_point_wrapper(index, &short_name));
+
     let (_, start, end) = index.func_ranges[func_idx];
     let (_can_reach_ok, panic_vars) =
         compute_ok_reachable_statements(index, summaries, start, end);
@@ -2446,6 +2681,7 @@ fn run_symbolic_verification_for_function(
     // Extract symbolic value parameters (excluding builtins like GasBuiltin, RangeCheck, System)
     let mut param_bounds: Vec<(String, i128, i128)> = Vec::new();
     let mut initial_vars: HashMap<u64, SymExpr> = HashMap::new();
+    let mut initial_var_max: HashMap<u64, i128> = HashMap::new();
     let mut param_descriptions: Vec<String> = Vec::new();
     let mut param_types: Vec<String> = Vec::new();
 
@@ -2473,6 +2709,9 @@ fn run_symbolic_verification_for_function(
         param_types.push(ty_name.clone());
         param_descriptions.push(format!("{pname}: {ty_name}"));
         initial_vars.insert(p.id.id, SymExpr::Param(p_idx, pname));
+        if is_numeric_sierra_type(&ty_name) {
+            initial_var_max.insert(p.id.id, max_b);
+        }
     }
 
     let mut queue: VecDeque<SymPathState> = VecDeque::new();
@@ -2480,6 +2719,8 @@ fn run_symbolic_verification_for_function(
         stmt_idx: start,
         depth: 0,
         vars: initial_vars,
+        storage_addrs: HashMap::new(),
+        var_max: initial_var_max,
         constraints: Vec::new(),
         performed_computation: false,
     });
@@ -2561,7 +2802,8 @@ fn run_symbolic_verification_for_function(
                                     || (!state.performed_computation
                                         && !has_overflow
                                         && !is_test_or_property
-                                        && !summaries[func_idx].is_recursive_loop);
+                                        && !summaries[func_idx].is_recursive_loop)
+                                    || (has_overflow && !params_externally_controlled);
 
                                 if is_precondition_guard {
                                     let pre = if meaningful_constraints.is_empty() {
@@ -2612,6 +2854,9 @@ fn run_symbolic_verification_for_function(
                     // Single-branch deterministic assignment
                     if inv.branches.len() == 1 {
                         let branch = &inv.branches[0];
+                        if oracle.is_some() {
+                            track_storage_address(&mut state, gid, lf, inv, branch);
+                        }
                         if gid == "const_as_immediate" || gid.ends_with("_const") {
                             if let (Some(val), Some(res)) = (lf.const_value, branch.results.first())
                             {
@@ -2620,6 +2865,7 @@ fn run_symbolic_verification_for_function(
                         } else if gid == "rename"
                             || gid == "dup"
                             || gid == "store_temp"
+                            || gid == "store_local"
                             || gid == "snapshot_take"
                             || gid == "unbox"
                             || gid == "into_box"
@@ -2631,8 +2877,16 @@ fn run_symbolic_verification_for_function(
                                         state.vars.insert(r.id, expr.clone());
                                     }
                                 }
+                                if let Some(max) = state.var_max.get(&arg0.id).copied() {
+                                    for r in &branch.results {
+                                        state.var_max.insert(r.id, max);
+                                    }
+                                }
                             }
-                        } else if (gid.starts_with("felt252_add") || gid.ends_with("_wide_mul"))
+                        } else if (gid.starts_with("felt252_add")
+                            || gid.ends_with("_wide_mul")
+                            || gid == "bounded_int_add"
+                            || gid == "bounded_int_mul")
                             && inv.args.len() >= 2
                         {
                             let lhs_id = inv.args[inv.args.len() - 2].id;
@@ -2648,15 +2902,18 @@ fn run_symbolic_verification_for_function(
                                 .cloned()
                                 .unwrap_or_else(|| SymExpr::SymbolicOpaque(format!("v{rhs_id}")));
                             if let Some(r) = branch.results.last() {
-                                let expr = if gid.ends_with("_wide_mul") {
+                                let expr = if gid.ends_with("_wide_mul") || gid == "bounded_int_mul" {
                                     SymExpr::Mul(Box::new(a), Box::new(b))
                                 } else {
                                     SymExpr::Add(Box::new(a), Box::new(b))
                                 };
                                 state.vars.insert(r.id, expr);
+                                if let Some(max) = state.var_max.get(&lhs_id).copied() {
+                                    state.var_max.insert(r.id, max);
+                                }
                                 state.performed_computation = true;
                             }
-                        } else if gid.starts_with("felt252_sub") && inv.args.len() >= 2 {
+                        } else if (gid.starts_with("felt252_sub") || gid == "bounded_int_sub") && inv.args.len() >= 2 {
                             let lhs_id = inv.args[inv.args.len() - 2].id;
                             let rhs_id = inv.args[inv.args.len() - 1].id;
                             let a = state
@@ -2719,6 +2976,17 @@ fn run_symbolic_verification_for_function(
                             || is_callee_panic_match
                         {
                             let b0 = &inv.branches[0];
+                            if gid == "storage_read_syscall" {
+                                if let (Some(oracle), Some(addr_var), Some(res)) =
+                                    (oracle, inv.args.last(), b0.results.last())
+                                {
+                                    if let Some(addr) = state.storage_addrs.get(&addr_var.id) {
+                                        if let Some(v) = oracle.read_small(&felt_key_hex(addr)) {
+                                            state.vars.insert(res.id, SymExpr::Const(v));
+                                        }
+                                    }
+                                }
+                            }
                             state.stmt_idx = match b0.target {
                                 BranchTarget::Fallthrough => state.stmt_idx + 1,
                                 BranchTarget::Statement(s) => s.0,
@@ -2808,6 +3076,75 @@ fn run_symbolic_verification_for_function(
                                         is_overflow_branch: false,
                                     });
                                 }
+                            } else if gid.ends_with("_try_from_felt252") && !inv.args.is_empty() {
+                                // Branch 0: the felt fits the integer type; branch 1: it does not.
+                                let arg_id = inv.args[inv.args.len() - 1].id;
+                                let ty_prefix = gid.split('_').next().unwrap_or("u128");
+                                let max_val = max_bound_for_sierra_type(ty_prefix);
+                                if let Some(arg_expr) = state.vars.get(&arg_id).cloned() {
+                                    if b_idx == 0 {
+                                        if let Some(res_var) = branch.results.last() {
+                                            child.vars.insert(res_var.id, arg_expr.clone());
+                                            child.var_max.insert(res_var.id, max_val);
+                                        }
+                                    }
+                                    let op = if b_idx == 0 { CmpOp::Le } else { CmpOp::Gt };
+                                    child.constraints.push(SymConstraint {
+                                        lhs: arg_expr.clone(),
+                                        op,
+                                        rhs: SymExpr::Const(max_val),
+                                        reason: format!("{gid}({}) branch {b_idx}", arg_expr.format_human()),
+                                        is_overflow_branch: false,
+                                    });
+                                } else if b_idx == 0 {
+                                    if let Some(res_var) = branch.results.last() {
+                                        child.var_max.insert(res_var.id, max_val);
+                                    }
+                                }
+                            } else if (gid == "bounded_int_trim_max" || gid == "bounded_int_trim_min")
+                                && !inv.args.is_empty()
+                            {
+                                // Checked `+ 1` / `- 1` lowering: branch 0 is the value already at
+                                // the bound (the overflow / underflow panic path), branch 1 the
+                                // trimmed value.
+                                let arg_id = inv.args[inv.args.len() - 1].id;
+                                let bound = if gid == "bounded_int_trim_max" {
+                                    state.var_max.get(&arg_id).copied()
+                                } else {
+                                    Some(0)
+                                };
+                                if let (Some(arg_expr), Some(bound)) = (state.vars.get(&arg_id).cloned(), bound) {
+                                    if b_idx == 1 {
+                                        if let Some(res_var) = branch.results.last() {
+                                            child.vars.insert(res_var.id, arg_expr.clone());
+                                            if let Some(max) = state.var_max.get(&arg_id).copied() {
+                                                child.var_max.insert(res_var.id, max);
+                                            }
+                                        }
+                                    }
+                                    child.performed_computation = true;
+                                    let (op, what) = match (gid, b_idx) {
+                                        ("bounded_int_trim_max", 0) => (CmpOp::Eq, "overflow"),
+                                        ("bounded_int_trim_max", _) => (CmpOp::Lt, "no overflow"),
+                                        (_, 0) => (CmpOp::Eq, "underflow"),
+                                        (_, _) => (CmpOp::Gt, "no underflow"),
+                                    };
+                                    child.constraints.push(SymConstraint {
+                                        lhs: arg_expr.clone(),
+                                        op,
+                                        rhs: SymExpr::Const(bound),
+                                        reason: format!(
+                                            "arithmetic {what} in `{gid}`: {} {} {bound}",
+                                            arg_expr.format_human(),
+                                            match op { CmpOp::Eq => "==", CmpOp::Lt => "<", _ => ">" }
+                                        ),
+                                        is_overflow_branch: b_idx == 0,
+                                    });
+                                } else if b_idx == 1 {
+                                    if let (Some(res_var), Some(max)) = (branch.results.last(), state.var_max.get(&arg_id).copied()) {
+                                        child.var_max.insert(res_var.id, max);
+                                    }
+                                }
                             } else if gid.ends_with("_overflowing_add") && inv.args.len() >= 2 {
                                 let lhs_id = inv.args[inv.args.len() - 2].id;
                                 let rhs_id = inv.args[inv.args.len() - 1].id;
@@ -2820,6 +3157,7 @@ fn run_symbolic_verification_for_function(
                                         SymExpr::Add(Box::new(lhs.clone()), Box::new(rhs.clone()));
                                     if let Some(res_var) = branch.results.last() {
                                         child.vars.insert(res_var.id, sum_expr.clone());
+                                        child.var_max.insert(res_var.id, max_val);
                                     }
                                     child.performed_computation = true;
                                     let op = if b_idx == 0 { CmpOp::Le } else { CmpOp::Gt };
@@ -2925,6 +3263,7 @@ pub(crate) fn analyze_sierra_program(
     max_depth: usize,
     max_paths: usize,
     enable_caracal: bool,
+    oracle: Option<&StorageOracle>,
 ) -> (Vec<SymbolicFunctionProofReport>, Vec<CaracalSierraFinding>) {
     let index = SierraProgramIndex::build(program);
     let summaries = compute_function_summaries(&index);
@@ -2955,7 +3294,20 @@ pub(crate) fn analyze_sierra_program(
         if is_plain_test {
             continue;
         }
-        let proof = run_symbolic_verification_for_function(&index, &summaries, func_idx, max_depth, max_paths);
+        let started = std::time::Instant::now();
+        if std::env::var("UC_PROVE_DEBUG_TIMING").is_ok() {
+            eprintln!("prove start: {fname}");
+        }
+        let proof = run_symbolic_verification_for_function(&index, &summaries, func_idx, max_depth, max_paths, oracle);
+        if std::env::var("UC_PROVE_DEBUG_TIMING").is_ok() {
+            let ms = started.elapsed().as_secs_f64() * 1000.0;
+            if ms > 100.0 {
+                eprintln!(
+                    "prove timing: {fname} {ms:.0} ms, paths {}, panic {}, status {}",
+                    proof.explored_paths, proof.panic_paths, proof.status
+                );
+            }
+        }
         symbolic_proofs.push(proof);
     }
 
@@ -2967,10 +3319,21 @@ fn verify_counterexamples_concretely(
     runner: &cairo_lang_runner::SierraCasmRunner,
     program: &Program,
     proofs: &mut [SymbolicFunctionProofReport],
+    storage_seeds: &[(String, String)],
 ) {
     use cairo_lang_runner::casm_run::format_for_panic;
     use cairo_lang_runner::{Arg, RunResultValue, StarknetState};
     use starknet_types_core::felt::Felt as Felt252;
+
+    let seeded_state = || {
+        let mut state = StarknetState::default();
+        for (key, value) in storage_seeds {
+            if let (Ok(k), Ok(v)) = (Felt252::from_hex(key), Felt252::from_hex(value)) {
+                state.seed_storage_for_current_contract(k, v);
+            }
+        }
+        state
+    };
 
     for proof in proofs.iter_mut() {
         if proof.status != "COUNTEREXAMPLE_FOUND" {
@@ -3018,7 +3381,7 @@ fn verify_counterexamples_concretely(
                 wrapper,
                 vec![Arg::Array(felts)],
                 Some(1_000_000_000),
-                StarknetState::default(),
+                seeded_state(),
             ) {
                 Ok(run_res) => match run_res.value {
                     RunResultValue::Panic(felts) => {
@@ -3054,7 +3417,7 @@ fn verify_counterexamples_concretely(
             func,
             user_args,
             Some(10_000_000),
-            StarknetState::default(),
+            seeded_state(),
         ) {
             if let RunResultValue::Panic(felts) = run_res.value {
                 proof.concrete_verified = Some(true);
@@ -3491,14 +3854,13 @@ pub(crate) fn check_upgrade_safety_against_onchain(
     candidate_crate_name: &str,
 ) -> Result<UpgradeSafetyReport> {
     let onchain = fetch_onchain_sierra_program(rpc, target)?;
-    let class_hash = compute_starknet_sierra_class_hash(&onchain.class);
     Ok(compare_upgrade_signatures(
         &onchain.program,
         &onchain.crate_name,
         candidate_program,
         candidate_crate_name,
         target.to_string(),
-        class_hash,
+        Some(onchain.class_hash),
     ))
 }
 
@@ -3615,7 +3977,7 @@ fn check_functional_equivalence_against_baseline(
 
     let base_prog = &base_comp.sierra_program.program;
     let cand_prog = &candidate_compilation.sierra_program.program;
-    let (base_proofs, _) = analyze_sierra_program(base_prog, &base_crate, None, 1024, 1024, false);
+    let (base_proofs, _) = analyze_sierra_program(base_prog, &base_crate, None, 1024, 1024, false, None);
     let base_index = SierraProgramIndex::build(base_prog);
     let cand_index = SierraProgramIndex::build(cand_prog);
 
@@ -4038,6 +4400,7 @@ fn prove_single_package(
         args.max_depth,
         args.max_paths,
         args.caracal,
+        None,
     );
     // A `#[should_panic]` test exists to panic: a satisfiable panic path there is the test
     // doing its job, not a counterexample.
@@ -4073,7 +4436,7 @@ fn prove_single_package(
             }));
 
     if has_counterexamples {
-        replay_counterexamples_on_slice(program, &mut symbolic_proofs);
+        replay_counterexamples_on_slice(program, &mut symbolic_proofs, &[]);
     }
     let mut stateful_invariants = Vec::new();
     if has_invariant_candidates && program.statements.len() <= 8_000 {
@@ -4227,9 +4590,10 @@ pub(crate) fn run_prove(args: ProveArgs) -> Result<()> {
                 args.max_depth,
                 args.max_paths,
                 args.caracal,
+                None,
             );
             if symbolic_proofs.iter().any(|p| p.status == "COUNTEREXAMPLE_FOUND") {
-                replay_counterexamples_on_slice(&program, &mut symbolic_proofs);
+                replay_counterexamples_on_slice(&program, &mut symbolic_proofs, &[]);
             }
             let undecided_count = symbolic_proofs.iter().filter(|p| p.status == "UNDECIDED").count();
             let bounded_safe_count = symbolic_proofs.iter().filter(|p| p.status == "BOUNDED_SAFE").count();
@@ -4791,6 +5155,78 @@ pub mod Vault {
         );
         let _ = fs::remove_dir_all(&root);
         assert_eq!(safe.status, "UPGRADE_SAFE", "{safe:?}");
+    }
+
+    #[test]
+    #[cfg(feature = "native-test-runner")]
+    fn storage_oracle_decides_storage_dependent_overflow_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "uc-storage-oracle-test-{}-{}",
+            std::process::id(),
+            epoch_ms_u64().unwrap_or(1)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Scarb.toml"),
+            "[package]\nname = \"counter_demo\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n\n[dependencies]\nstarknet = \"2.18.0\"\n\n[[target.starknet-contract]]\nsierra = true\ncasm = false\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/lib.cairo"),
+            r#"
+#[starknet::interface]
+pub trait ICounter<T> {
+    fn next_id(self: @T) -> u64;
+}
+#[starknet::contract]
+pub mod Counter {
+    use starknet::storage::StoragePointerReadAccess;
+    #[storage]
+    struct Storage { len: u64 }
+    #[abi(embed_v0)]
+    impl CounterImpl of super::ICounter<ContractState> {
+        #[inline(never)]
+        fn next_id(self: @ContractState) -> u64 { self.len.read() + 1 }
+    }
+}
+"#,
+        )
+        .unwrap();
+        let (comp, _, _) = compile_or_load_native_tests(
+            &root.join("Scarb.toml"), &root, "counter_demo", "counter_demo", &[], true,
+        )
+        .expect("compile");
+        let program = &comp.sierra_program.program;
+        let len_key = format!("{:#x}", cairo_lang_starknet_classes::keccak::starknet_keccak(b"len"));
+        let status_with = |oracle: Option<&StorageOracle>| {
+            let (proofs, _) = analyze_sierra_program(program, "counter_demo", Some("next_id"), 1024, 1024, false, oracle);
+            // Small methods are inlined into their entry point wrapper.
+            let p = proofs
+                .iter()
+                .find(|p| p.function.ends_with("::next_id") && !p.function.contains("__wrapper__"))
+                .or_else(|| proofs.iter().find(|p| p.function.contains("__wrapper__") && p.function.ends_with("next_id")))
+                .unwrap_or_else(|| panic!("next_id proof missing in {:?}", proofs.iter().map(|p| &p.function).collect::<Vec<_>>()));
+            (p.status.clone(), p.counterexample_reason.clone())
+        };
+        // Storage unknown: the overflow depends on an opaque read, nothing is decided.
+        let (opaque, _) = status_with(None);
+        assert_ne!(opaque, "PROVEN_SAFE", "opaque storage must not prove safety");
+        // len = 5 on chain: 5 + 1 cannot overflow.
+        let small = StorageOracle::from_map(BTreeMap::from([(len_key.clone(), "0x5".to_string())]));
+        let small_status = status_with(Some(&small));
+        assert_eq!(small.resolved(), vec![(len_key.clone(), "0x5".to_string())], "the len slot must be read");
+        assert_eq!(small_status.0, "PROVEN_SAFE", "{small_status:?}");
+        // len = u64::MAX on chain: the very next call overflows.
+        let full = StorageOracle::from_map(BTreeMap::from([(len_key.clone(), "0xffffffffffffffff".to_string())]));
+        let (status, reason) = status_with(Some(&full));
+        assert_eq!(status, "COUNTEREXAMPLE_FOUND", "{reason:?}");
+        assert!(reason.unwrap_or_default().contains("overflow"));
+        // Values the solver cannot hold stay opaque instead of being misread.
+        let huge = StorageOracle::from_map(BTreeMap::from([(len_key.clone(), "0x800000000000011000000000000000000000000000000000000000000000000".to_string())]));
+        assert_eq!(huge.read_small(&len_key), None);
+        assert_eq!(status_with(Some(&huge)).0, opaque);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -99,6 +99,8 @@ uc prove --check-upgrade 0x04718f...938d --network mainnet   # against the deplo
 uc declare -c Vault --upgrade-of 0x04718f...938d --network mainnet  # refuses unsafe upgrades
 uc prove --check-equivalence v1/Scarb.toml
 uc audit 0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d --network mainnet
+uc audit 0x04718f...938d --network mainnet --live-storage   # decide state-dependent paths on chain data
+uc watch 0x04718f...938d --network mainnet --interval 60     # re-audit on class change, diff findings
 uc decompile target/dev/my_vault_Vault.contract_class.json
 uc fetch                         # download registry dependencies natively
 uc call --contract-address 0x... --function name --network mainnet
@@ -136,7 +138,27 @@ trace measurement.
   panics on an unrelated assertion (the symbolic path then depends on storage the replay does
   not have).
 - `BOUNDED_SAFE`: no explored panic path is satisfiable, but the depth or path budget was hit.
-- `UNDECIDED`: a panic path the in-process solver could neither satisfy nor refute.
+- `UNDECIDED`: a panic path the in-process solver could neither satisfy nor refute (its witness
+  search is capped at 20,000 partial assignments per path).
+
+A counterexample is only reported where the caller chooses the values: entry points,
+constructors, handlers, property functions and uncalled functions. In an internal helper or a
+loop body, a panic that needs a parameter at its type bound (`i + 1` with `i == u32::MAX`) is a
+precondition on the caller and lands in `GUARDED_SAFE` with the negated constraint. The engine
+models Cairo 2.18's bounded-int lowering of checked arithmetic (`u64_try_from_felt252`,
+`bounded_int_trim_max`, `bounded_int_add`) as well as the `*_overflowing_*` libfuncs.
+
+**Live storage.** `uc audit <address> --live-storage` (and `uc watch --live-storage`) reads the
+contract's storage over `starknet_getStorageAt` for every cell at a known address the symbolic
+engine meets (plain fields, vector lengths, flags; map entries stay opaque), binds the value, and
+replays counterexamples on that state. Paths that depend on a length or flag are then decided
+against the chain instead of counted as unknown; the JSON lists every cell read under
+`live_storage`.
+
+**Watching a deployment.** `uc watch <address>` polls the class hash at the address (every 60 s,
+or `--once` for cron), re-audits when it changes, and prints the findings and counterexamples
+that appeared or disappeared relative to the previous class. State lives in
+`.uc/watch/<address>.json`; `--json` emits one document per check.
 
 **Checkable proofs.** `uc prove --emit-smt target/smt` writes one SMT-LIB 2 file per function
 with every panic path's constraints as a `(check-sat)` obligation and the verdict uc expects

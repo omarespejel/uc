@@ -11,6 +11,7 @@ mod registry;
 mod scarb_parity;
 mod starknet_onchain;
 mod test_runner;
+mod watch;
 
 #[cfg(test)]
 pub(crate) use build::build_plan_report_from_args;
@@ -25,4 +26,5 @@ pub(crate) use registry::*;
 pub(crate) use scarb_parity::*;
 pub(crate) use starknet_onchain::*;
 pub(crate) use test_runner::*;
+pub(crate) use watch::*;
 

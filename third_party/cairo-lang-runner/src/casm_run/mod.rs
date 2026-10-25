@@ -277,6 +277,13 @@ pub struct StarknetState {
     next_keypair_secret: u64,
 }
 impl StarknetState {
+    /// Seeds a storage cell of the contract that is currently executing (the address a direct
+    /// entry point run sees as `get_contract_address`), so a replay observes live chain state.
+    pub fn seed_storage_for_current_contract(&mut self, key: Felt252, value: Felt252) {
+        let contract = self.exec_info.contract_address;
+        self.storage.entry(contract).or_default().insert(key, value);
+    }
+
     /// Initializes StarknetState with Starknet Foundry (`snforge`) default execution context
     /// (`block_number = 2000`, `sequencer_address = 0x1000`, `tx_info.version = 3`,
     /// `chain_id = 'SN_SEPOLIA'`, default V3 resource bounds, and optional predeployed `STRK`/`ETH`).

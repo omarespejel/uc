@@ -34,6 +34,8 @@ uc build --json                      # Sierra + CASM artifacts, byte-identical t
 | Functional equivalence vs baseline | `uc prove --check-equivalence <baseline_dir> --json` |
 | Audit a deployed class, no source | `uc audit <address or class hash> --network mainnet --json` |
 | Audit a local class file | `uc audit target/dev/<pkg>_<Contract>.contract_class.json --json` |
+| Audit against live storage | `uc audit 0x<address> --network mainnet --live-storage --json` (`live_storage.values` lists the cells read) |
+| Watch a deployment for class changes | `uc watch 0x<address> --network mainnet --once --json` (diff of findings vs the previous class; state in `.uc/watch/`) |
 | Decompile Sierra | `uc decompile <path.contract_class.json>` |
 | Lint and auto-fix | `uc lint --fix --json` |
 | Gas, CASM size, Stwo AIR | `uc profile --prover-air --json` |
@@ -62,6 +64,9 @@ endpoints). Every report includes the `rpc_url` used.
   reason, false when it returned or hit an unrelated assertion), `BOUNDED_SAFE` (depth or path
   budget hit, nothing found), `UNDECIDED` (a panic path the solver could not decide).
   `exploration_truncated` says whether `--max-depth` / `--max-paths` (both 1024) were hit.
+  Counterexamples are reported only where the caller chooses the values (entry surface,
+  property functions); bound-hitting overflows inside internal helpers and loop bodies are
+  preconditions (`GUARDED_SAFE`).
   Plain `#[test]` bodies are not symbolic targets; `prove_*`, `invariant_*`, `check_*` are.
 - `uc prove --emit-smt <dir>` writes SMT-LIB obligations per function plus `obligations.json`;
   `benchmarks/scripts/check_smt_obligations.py --dir <dir>` checks them with z3 or cvc5.
