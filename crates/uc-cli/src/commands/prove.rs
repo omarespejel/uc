@@ -63,9 +63,19 @@ pub(crate) struct ProveArgs {
     #[arg(long, value_name = "DIR")]
     pub emit_smt: Option<PathBuf>,
 
-    /// Verify formal upgrade compatibility (storage slots, ABI arity, and auth guards) against a baseline manifest.
-    #[arg(long)]
-    pub check_upgrade: Option<PathBuf>,
+    /// Verify upgrade compatibility (storage slots, entry points, calldata arity, auth guards)
+    /// against a baseline: a manifest or package directory, or a deployed contract address or
+    /// class hash (`0x...`, fetched from `--url` / `--network`).
+    #[arg(long, value_name = "MANIFEST|ADDRESS")]
+    pub check_upgrade: Option<String>,
+
+    /// RPC URL for `--check-upgrade 0x...` (else `STARKNET_RPC`, else `--network`).
+    #[arg(short = 'u', long)]
+    pub url: Option<String>,
+
+    /// Network for `--check-upgrade 0x...`: `mainnet`, `sepolia` or `devnet`.
+    #[arg(short = 'n', long)]
+    pub network: Option<String>,
 
     /// Prove formal functional equivalence (return values, panic conditions, and storage writes) against a baseline manifest.
     #[arg(long)]
@@ -154,7 +164,11 @@ pub(crate) struct StatefulInvariantResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct UpgradeSafetyReport {
+    /// The baseline manifest, or the deployed address / class hash the candidate replaces.
     pub baseline_manifest: String,
+    /// Class hash of the deployed baseline, when the baseline came from chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_class_hash: Option<String>,
     pub status: String,
     pub baseline_storage_slots: usize,
     pub candidate_storage_slots: usize,
@@ -3336,11 +3350,14 @@ fn run_medusa_stateful_campaign(
     results
 }
 
+/// Storage slots keyed by their hex base address, with the recovered field name when the
+/// program's names let us invert the keccak; entry points by short name with (contract, arity);
+/// and the entry points that enforce a caller or signature guard.
 fn extract_sierra_upgrade_signature(
     program: &Program,
     crate_name: &str,
 ) -> (
-    BTreeSet<String>,
+    BTreeMap<String, Option<String>>,
     BTreeMap<String, (String, usize)>,
     BTreeSet<String>,
 ) {
@@ -3378,17 +3395,14 @@ fn extract_sierra_upgrade_signature(
         }
     }
 
-    let mut storage_slots = BTreeSet::new();
+    let mut storage_slots: BTreeMap<String, Option<String>> = BTreeMap::new();
     for ld in &program.libfunc_declarations {
         if ld.long_id.generic_id.0.as_str() == "storage_base_address_const" {
             for arg in &ld.long_id.generic_args {
                 if let GenericArg::Value(v) = arg {
                     let hex_slot = format!("0x{:x}", v);
-                    if let Some(name) = keccak_reverse.get(&hex_slot) {
-                        storage_slots.insert(format!("{name} ({hex_slot})"));
-                    } else {
-                        storage_slots.insert(hex_slot);
-                    }
+                    let name = keccak_reverse.get(&hex_slot).cloned();
+                    storage_slots.entry(hex_slot).or_insert(name);
                 }
             }
         }
@@ -3456,12 +3470,63 @@ fn check_upgrade_safety_against_baseline(
         no_cache,
     )?;
 
+    Ok(compare_upgrade_signatures(
+        &base_comp.sierra_program.program,
+        &base_crate,
+        candidate_program,
+        candidate_crate_name,
+        base_manifest.display().to_string(),
+        None,
+    ))
+}
+
+/// Checks a candidate class against the class deployed at `target` (address or class hash):
+/// the baseline is fetched over RPC and named from its ABI, so the comparison works on classes
+/// without debug info.
+#[cfg(feature = "native-test-runner")]
+pub(crate) fn check_upgrade_safety_against_onchain(
+    target: &str,
+    rpc: &str,
+    candidate_program: &Program,
+    candidate_crate_name: &str,
+) -> Result<UpgradeSafetyReport> {
+    let onchain = fetch_onchain_sierra_program(rpc, target)?;
+    let class_hash = compute_starknet_sierra_class_hash(&onchain.class);
+    Ok(compare_upgrade_signatures(
+        &onchain.program,
+        &onchain.crate_name,
+        candidate_program,
+        candidate_crate_name,
+        target.to_string(),
+        class_hash,
+    ))
+}
+
+/// Compares two programs' upgrade signatures: storage slots that disappear, entry points that
+/// disappear or change calldata arity, and caller / signature guards that are lost.
+pub(crate) fn compare_upgrade_signatures(
+    base_program: &Program,
+    base_crate: &str,
+    candidate_program: &Program,
+    candidate_crate_name: &str,
+    baseline_label: String,
+    baseline_class_hash: Option<String>,
+) -> UpgradeSafetyReport {
     let (base_slots, base_eps, base_protected) =
-        extract_sierra_upgrade_signature(&base_comp.sierra_program.program, &base_crate);
+        extract_sierra_upgrade_signature(base_program, base_crate);
     let (cand_slots, cand_eps, cand_protected) =
         extract_sierra_upgrade_signature(candidate_program, candidate_crate_name);
 
-    let removed_storage_slots: Vec<String> = base_slots.difference(&cand_slots).cloned().collect();
+    // Slots compare by address; the label comes from whichever side could name it, so a
+    // baseline without debug names never makes a renamed-but-identical slot look removed.
+    let removed_storage_slots: Vec<String> = base_slots
+        .iter()
+        .filter(|(hex, _)| !cand_slots.contains_key(*hex))
+        .map(|(hex, name)| match name.as_ref().or_else(|| cand_slots.get(hex).and_then(|n| n.as_ref())) {
+            Some(n) => format!("{n} ({hex})"),
+            None => hex.clone(),
+        })
+        .collect();
     let mut removed_entrypoints = Vec::new();
     let mut arity_mismatches = Vec::new();
     for (ep_short, (base_contract, base_arity)) in &base_eps {
@@ -3491,8 +3556,9 @@ fn check_upgrade_safety_against_baseline(
         && arity_mismatches.is_empty()
         && auth_regressions.is_empty();
 
-    Ok(UpgradeSafetyReport {
-        baseline_manifest: base_manifest.display().to_string(),
+    UpgradeSafetyReport {
+        baseline_manifest: baseline_label,
+        baseline_class_hash,
         status: if is_safe {
             "UPGRADE_SAFE".to_string()
         } else {
@@ -3504,7 +3570,7 @@ fn check_upgrade_safety_against_baseline(
         removed_entrypoints,
         arity_mismatches,
         auth_regressions,
-    })
+    }
 }
 
 #[cfg(feature = "native-test-runner")]
@@ -4038,7 +4104,10 @@ fn prove_single_package(
         }
     }
 
-    let upgrade_safety = if let Some(baseline_path) = &args.check_upgrade {
+    let upgrade_safety = if let Some(baseline) = args.check_upgrade.as_deref().filter(|b| b.starts_with("0x")) {
+        let rpc = resolve_read_rpc_url(args.url.as_deref(), args.network.as_deref())?;
+        Some(check_upgrade_safety_against_onchain(baseline, &rpc, program, crate_name)?)
+    } else if let Some(baseline_path) = args.check_upgrade.as_deref().map(Path::new) {
         Some(check_upgrade_safety_against_baseline(
             baseline_path,
             program,
@@ -4571,6 +4640,160 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "native-test-runner")]
+    fn upgrade_check_against_class_without_debug_names_detects_removed_slot_and_entrypoint() {
+        let root = std::env::temp_dir().join(format!(
+            "uc-upgrade-onchain-test-{}-{}",
+            std::process::id(),
+            epoch_ms_u64().unwrap_or(1)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let write_project = |dir: &Path, name: &str, source: &str| {
+            fs::create_dir_all(dir.join("src")).unwrap();
+            fs::write(
+                dir.join("Scarb.toml"),
+                format!(
+                    "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n\n[dependencies]\nstarknet = \"2.18.0\"\n\n[[target.starknet-contract]]\nsierra = true\ncasm = false\n"
+                ),
+            )
+            .unwrap();
+            fs::write(dir.join("src/lib.cairo"), source).unwrap();
+        };
+        let v1 = r#"
+#[starknet::interface]
+pub trait IVault<T> {
+    fn set_fee(ref self: T, new_fee_bps: u16);
+    fn set_limit(ref self: T, limit: u64, cap: u64);
+    fn fee(self: @T) -> u16;
+}
+#[starknet::contract]
+pub mod Vault {
+    use starknet::storage::{StoragePointerReadAccess, StoragePointerWriteAccess};
+    use starknet::{ContractAddress, get_caller_address};
+    #[storage]
+    struct Storage { owner: ContractAddress, fee_bps: u16, limit: u64 }
+    #[abi(embed_v0)]
+    impl VaultImpl of super::IVault<ContractState> {
+        fn set_fee(ref self: ContractState, new_fee_bps: u16) {
+            assert!(get_caller_address() == self.owner.read(), "not_owner");
+            self.fee_bps.write(new_fee_bps);
+        }
+        fn set_limit(ref self: ContractState, limit: u64, cap: u64) {
+            assert!(limit <= cap, "limit_over_cap");
+            self.limit.write(limit);
+        }
+        fn fee(self: @ContractState) -> u16 { self.fee_bps.read() }
+    }
+}
+"#;
+        // v2 drops the `limit` slot and the `set_limit` entry point, changes nothing else.
+        let v2 = r#"
+#[starknet::interface]
+pub trait IVault<T> {
+    fn set_fee(ref self: T, new_fee_bps: u16);
+    fn fee(self: @T) -> u16;
+}
+#[starknet::contract]
+pub mod Vault {
+    use starknet::storage::{StoragePointerReadAccess, StoragePointerWriteAccess};
+    use starknet::{ContractAddress, get_caller_address};
+    #[storage]
+    struct Storage { owner: ContractAddress, fee_bps: u16 }
+    #[abi(embed_v0)]
+    impl VaultImpl of super::IVault<ContractState> {
+        fn set_fee(ref self: ContractState, new_fee_bps: u16) {
+            assert!(get_caller_address() == self.owner.read(), "not_owner");
+            self.fee_bps.write(new_fee_bps);
+        }
+        fn fee(self: @ContractState) -> u16 { self.fee_bps.read() }
+    }
+}
+"#;
+        let base_dir = root.join("v1");
+        let cand_dir = root.join("v2");
+        write_project(&base_dir, "vault_v1", v1);
+        write_project(&cand_dir, "vault_v2", v2);
+
+        // Build v1 to a contract class file and reload it the way `uc audit` loads a deployed
+        // class: no debug names, wrappers named from the ABI.
+        run_build(BuildArgs {
+            common: BuildCommonArgs {
+                manifest_path: Some(base_dir.join("Scarb.toml")),
+                package: None,
+                workspace: false,
+                features: Vec::new(),
+                offline: true,
+                release: false,
+                profile: Some("dev".to_string()),
+            },
+            engine: EngineArg::Uc,
+            daemon_mode: DaemonModeArg::Off,
+            report_path: Some(base_dir.join("build.json")),
+            record_failure: None,
+            json: false,
+            plan_only: false,
+        })
+        .expect("build v1");
+        let class_text = fs::read_to_string(base_dir.join("target/dev/vault_v1_Vault.contract_class.json"))
+            .expect("v1 contract class");
+        let class_json: serde_json::Value = serde_json::from_str(&class_text).unwrap();
+        let class: ContractClass = serde_json::from_str(&class_text).unwrap();
+        let mut base_program = class.extract_sierra_program(true).unwrap().program;
+        for f in &mut base_program.funcs {
+            f.id.debug_name = None;
+        }
+        synthesize_contract_function_names(&mut base_program, &class.entry_points_by_type, class_json.get("abi"));
+
+        let (cand, _, _) = compile_or_load_native_tests(
+            &cand_dir.join("Scarb.toml"),
+            &cand_dir,
+            "vault_v2",
+            "vault_v2",
+            &[],
+            true,
+        )
+        .expect("compile v2");
+        let report = compare_upgrade_signatures(
+            &base_program,
+            "audit_target",
+            &cand.sierra_program.program,
+            "vault_v2",
+            "0xbaseline".to_string(),
+            Some("0xclass".to_string()),
+        );
+
+        assert_eq!(report.status, "UPGRADE_UNSAFE", "{report:?}");
+        assert_eq!(report.baseline_class_hash.as_deref(), Some("0xclass"));
+        assert!(
+            report.removed_entrypoints.iter().any(|e| e.ends_with("::set_limit")),
+            "set_limit must be reported removed: {:?}",
+            report.removed_entrypoints
+        );
+        let limit_slot = format!(
+            "0x{:x}",
+            cairo_lang_starknet_classes::keccak::starknet_keccak(b"limit")
+        );
+        assert_eq!(
+            report.removed_storage_slots,
+            vec![limit_slot],
+            "exactly the limit slot must be reported removed (by address: the deployed class has no names)"
+        );
+        assert!(report.arity_mismatches.is_empty(), "{:?}", report.arity_mismatches);
+        assert!(report.auth_regressions.is_empty(), "{:?}", report.auth_regressions);
+
+        // The same class against its own source is safe.
+        let (same, _, _) = compile_or_load_native_tests(
+            &base_dir.join("Scarb.toml"), &base_dir, "vault_v1", "vault_v1", &[], true,
+        )
+        .expect("compile v1");
+        let safe = compare_upgrade_signatures(
+            &base_program, "audit_target", &same.sierra_program.program, "vault_v1", "0xbaseline".to_string(), None,
+        );
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(safe.status, "UPGRADE_SAFE", "{safe:?}");
+    }
+
+    #[test]
     fn witness_calldata_encodes_by_parameter_type() {
         use super::witness_calldata;
         let types: Vec<String> = [
@@ -5060,7 +5283,7 @@ pub mod Vault {
             max_paths: 1024,
             caracal: true,
             stateful_runs: 16,
-            check_upgrade: Some(baseline_dir.clone()),
+            check_upgrade: Some(baseline_dir.display().to_string()),
             ..ProveArgs::default()
         };
 

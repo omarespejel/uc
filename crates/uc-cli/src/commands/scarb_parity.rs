@@ -2324,6 +2324,8 @@ pub(crate) fn run_declare_from(args: DeclareFromArgs) -> Result<()> {
                 password: None,
                 accounts_file: None,
                 dry_run: true,
+                upgrade_of: None,
+                allow_unsafe_upgrade: false,
                 wait: false,
                 wait_timeout: 30,
                 manifest_path: None,
@@ -3229,6 +3231,60 @@ pub(crate) struct AuditArgs {
 /// their ABI name (matched by selector), the rest a stable `internal::fn_<idx>` label.
 /// Returns the crate prefix the analyzers should filter on.
 #[cfg(feature = "native-test-runner")]
+/// A deployed class fetched over JSON-RPC, as a Sierra program with analyzer-friendly names.
+pub(crate) struct OnchainSierraProgram {
+    pub program: cairo_lang_sierra::program::Program,
+    /// Crate prefix of the synthesized names (`audit_target`), or the real one when the class
+    /// shipped debug names.
+    pub crate_name: String,
+    pub class: ContractClass,
+}
+
+/// Fetches the class deployed at `target` (a contract address, else a class hash) and extracts
+/// its Sierra program. Classes without debug names get names synthesized from the entry points
+/// and ABI, so wrappers read `<crate>::Contract::__wrapper__<name>`. Cairo 0 classes are rejected.
+pub(crate) fn fetch_onchain_sierra_program(rpc: &str, target: &str) -> Result<OnchainSierraProgram> {
+    let class_val = starknet_rpc_request(
+        rpc,
+        "starknet_getClassAt",
+        serde_json::json!({ "block_id": "latest", "contract_address": target }),
+    )
+    .or_else(|_| {
+        starknet_rpc_request(
+            rpc,
+            "starknet_getClass",
+            serde_json::json!({ "block_id": "latest", "class_hash": target }),
+        )
+    });
+    let mut val = class_val.with_context(|| {
+        format!("failed to fetch class for `{target}` from {rpc} (tried starknet_getClassAt and starknet_getClass)")
+    })?;
+    // The JSON-RPC spec ships `abi` as an embedded JSON string; the class type expects the array.
+    if let Some(abi_text) = val.get("abi").and_then(|a| a.as_str()) {
+        let parsed = serde_json::from_str::<serde_json::Value>(abi_text)
+            .unwrap_or(serde_json::Value::Array(Vec::new()));
+        val["abi"] = parsed;
+    }
+    let abi = val.get("abi").cloned();
+    let class = serde_json::from_value::<ContractClass>(val).with_context(|| {
+        format!("`{target}` is not a Sierra contract class (Cairo 0 classes cannot be analysed)")
+    })?;
+    let mut program = class
+        .extract_sierra_program(true)
+        .map_err(|e| anyhow!("failed to extract Sierra program for `{target}`: {e}"))?
+        .program;
+    synthesize_contract_function_names(&mut program, &class.entry_points_by_type, abi.as_ref());
+    let crate_name = program
+        .funcs
+        .iter()
+        .filter_map(|f| f.id.debug_name.as_ref().map(|d| d.as_str()))
+        .find(|dn| !dn.starts_with("core::"))
+        .and_then(|dn| dn.split("::").next())
+        .unwrap_or("audit_target")
+        .to_string();
+    Ok(OnchainSierraProgram { program, crate_name, class })
+}
+
 pub(crate) fn synthesize_contract_function_names(
     program: &mut cairo_lang_sierra::program::Program,
     entry_points: &cairo_lang_starknet_classes::contract_class::ContractEntryPoints,
@@ -3336,52 +3392,14 @@ pub(crate) fn run_audit(args: AuditArgs) -> Result<()> {
                     loaded_program = Some(program);
                 }
             } else if t.starts_with("0x") {
-                {
-                    let rpc = args.rpc_url.clone().unwrap_or_else(|| {
-                        match args.network.as_deref().unwrap_or("mainnet") {
-                            "sepolia" | "testnet" => "https://api.cartridge.gg/x/starknet/sepolia".to_string(),
-                            "devnet" | "local" => "http://127.0.0.1:5050/rpc".to_string(),
-                            _ => "https://api.cartridge.gg/x/starknet/mainnet".to_string(),
-                        }
-                    });
-                    // Try starknet_getClassAt first (contract address), then starknet_getClass (class hash)
-                    let class_val = starknet_rpc_request(
-                        &rpc,
-                        "starknet_getClassAt",
-                        serde_json::json!({ "block_id": "latest", "contract_address": t }),
-                    )
-                    .or_else(|_| {
-                        starknet_rpc_request(
-                            &rpc,
-                            "starknet_getClass",
-                            serde_json::json!({ "block_id": "latest", "class_hash": t }),
-                        )
-                    });
-                    let mut val = class_val.with_context(|| {
-                        format!("failed to fetch class for `{t}` from {rpc} (tried starknet_getClassAt and starknet_getClass)")
-                    })?;
-                    // The JSON-RPC spec ships `abi` as an embedded JSON string; the class type
-                    // expects the parsed array (the audit only needs the Sierra program anyway).
-                    if let Some(abi_text) = val.get("abi").and_then(|a| a.as_str()) {
-                        let parsed = serde_json::from_str::<serde_json::Value>(abi_text)
-                            .unwrap_or(serde_json::Value::Array(Vec::new()));
-                        val["abi"] = parsed;
+                let rpc = args.rpc_url.clone().unwrap_or_else(|| {
+                    match args.network.as_deref().unwrap_or("mainnet") {
+                        "sepolia" | "testnet" => "https://api.cartridge.gg/x/starknet/sepolia".to_string(),
+                        "devnet" | "local" => "http://127.0.0.1:5050/rpc".to_string(),
+                        _ => "https://api.cartridge.gg/x/starknet/mainnet".to_string(),
                     }
-                    let abi_json = val.get("abi").cloned();
-                    let cc = serde_json::from_value::<ContractClass>(val).with_context(|| {
-                        format!("`{t}` is not a Sierra contract class (Cairo 0 classes cannot be audited)")
-                    })?;
-                    let mut program = cc
-                        .extract_sierra_program(true)
-                        .map_err(|e| anyhow!("failed to extract Sierra program for `{t}`: {e}"))?
-                        .program;
-                    synthesize_contract_function_names(
-                        &mut program,
-                        &cc.entry_points_by_type,
-                        abi_json.as_ref(),
-                    );
-                    loaded_program = Some(program);
-                }
+                });
+                loaded_program = Some(fetch_onchain_sierra_program(&rpc, t)?.program);
             }
         }
 

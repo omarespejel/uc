@@ -151,6 +151,16 @@ pub(crate) struct DeclareArgs {
     #[arg(long, visible_alias = "estimate-only")]
     pub dry_run: bool,
 
+    /// Address (or class hash) of the deployed contract this class will replace. Its class is
+    /// fetched and compared with the candidate; the declare is refused when a storage slot or
+    /// entry point disappears, calldata arity changes, or a caller / signature guard is lost.
+    #[arg(long, value_name = "ADDRESS")]
+    pub upgrade_of: Option<String>,
+
+    /// Declare even when `--upgrade-of` reports the upgrade unsafe (the report is still emitted).
+    #[arg(long, requires = "upgrade_of")]
+    pub allow_unsafe_upgrade: bool,
+
     /// Wait for transaction confirmation (`ACCEPTED_ON_L2` / `ACCEPTED_ON_L1`) after broadcast.
     #[arg(long)]
     pub wait: bool,
@@ -1764,6 +1774,32 @@ fn sign_starknet_payload_if_key_present(
     ))
 }
 
+#[cfg(feature = "native-test-runner")]
+fn print_upgrade_check(report: &UpgradeSafetyReport) {
+    println!(
+        "upgrade check:       {} against {}{}",
+        report.status,
+        report.baseline_manifest,
+        report
+            .baseline_class_hash
+            .as_deref()
+            .map(|h| format!(" (class {h})"))
+            .unwrap_or_default()
+    );
+    for slot in &report.removed_storage_slots {
+        println!("  removed storage slot: {slot}");
+    }
+    for ep in &report.removed_entrypoints {
+        println!("  removed entry point:  {ep}");
+    }
+    for a in &report.arity_mismatches {
+        println!("  arity change:         {a}");
+    }
+    for a in &report.auth_regressions {
+        println!("  auth regression:      {a}");
+    }
+}
+
 pub(crate) fn run_declare(args: DeclareArgs) -> Result<()> {
     #[cfg(feature = "native-test-runner")]
     {
@@ -1799,6 +1835,56 @@ pub(crate) fn run_declare(args: DeclareArgs) -> Result<()> {
             .account_address
             .clone()
             .unwrap_or_else(|| "0x1".to_string());
+
+        // Upgrade gate: compare the candidate with the class deployed at `--upgrade-of`.
+        let upgrade_check = if let Some(target) = args.upgrade_of.as_deref() {
+            let sierra_path = contract
+                .get("sierra_path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("missing sierra artifact path for `{}`", args.contract))?;
+            let class: ContractClass = serde_json::from_str(&fs::read_to_string(sierra_path)?)
+                .with_context(|| format!("failed to parse {sierra_path}"))?;
+            let candidate = class
+                .extract_sierra_program(true)
+                .map_err(|e| anyhow!("failed to extract Sierra program from {sierra_path}: {e}"))?
+                .program;
+            let crate_name = contract
+                .get("package_name")
+                .and_then(|v| v.as_str())
+                .map(normalize_package_name_for_cairo_crate)
+                .unwrap_or_else(|| "candidate".to_string());
+            let rpc = match prof.url.as_deref() {
+                Some(u) => u.to_string(),
+                None => resolve_read_rpc_url(args.url.as_deref(), args.network.as_deref())?,
+            };
+            let report = check_upgrade_safety_against_onchain(target, &rpc, &candidate, &crate_name)?;
+            if report.status != "UPGRADE_SAFE" && !args.allow_unsafe_upgrade {
+                let refusal = serde_json::json!({
+                    "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
+                    "command": "declare",
+                    "refused": true,
+                    "contract": args.contract,
+                    "class_hash": class_hash,
+                    "upgrade_check": report,
+                });
+                if args.json || args.report_path.is_some() {
+                    emit_json_value(args.report_path.as_deref(), &refusal)?;
+                } else {
+                    print_upgrade_check(&report);
+                }
+                bail!(
+                    "declare refused: `{}` is not a safe upgrade of {target} ({} removed storage slots, {} removed entry points, {} arity changes, {} auth regressions); pass --allow-unsafe-upgrade to override",
+                    args.contract,
+                    report.removed_storage_slots.len(),
+                    report.removed_entrypoints.len(),
+                    report.arity_mismatches.len(),
+                    report.auth_regressions.len()
+                );
+            }
+            Some(report)
+        } else {
+            None
+        };
 
         let effective_pk = resolve_effective_private_key(
             prof.private_key.as_deref(),
@@ -1876,6 +1962,7 @@ pub(crate) fn run_declare(args: DeclareArgs) -> Result<()> {
             "confirmation_status": confirmation_status,
             "fee_estimate": fee_estimate,
             "transaction_v3": declare_tx,
+            "upgrade_check": upgrade_check,
             "elapsed_ms": elapsed_ms,
         });
         if args.json || args.report_path.is_some() {
@@ -1884,6 +1971,9 @@ pub(crate) fn run_declare(args: DeclareArgs) -> Result<()> {
             println!("contract:            {}", args.contract);
             println!("class_hash:          {class_hash}");
             println!("compiled_class_hash: {compiled_class_hash}");
+            if let Some(check) = &upgrade_check {
+                print_upgrade_check(check);
+            }
             if let Some(th) = &tx_hash {
                 println!("transaction_hash:    {th}");
             }
@@ -3329,6 +3419,8 @@ accounts-file = "{}"
             password: Some("ultra-secret-pass".to_string()),
             accounts_file: None,
             dry_run: false,
+            upgrade_of: None,
+            allow_unsafe_upgrade: false,
             wait: true,
             wait_timeout: 5,
             manifest_path: Some(manifest_path.clone()),

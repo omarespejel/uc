@@ -29,7 +29,8 @@ uc build --json                      # Sierra + CASM artifacts, byte-identical t
 | Formal verification + taint | `uc prove --json` |
 | Write counterexamples as tests | `uc prove --emit-repro tests/repro.cairo` |
 | Checkable proof obligations (SMT-LIB) | `uc prove --emit-smt target/smt --json` |
-| Upgrade safety vs baseline | `uc prove --check-upgrade <baseline_dir> --json` |
+| Upgrade safety vs baseline | `uc prove --check-upgrade <baseline_dir> --json`, or `--check-upgrade 0x<address> --network mainnet` against the deployed class |
+| Declare only if it is a safe upgrade | `uc declare -c <Contract> --upgrade-of 0x<address> --network mainnet` (refuses on removed slots or entry points, arity changes, lost guards; `--allow-unsafe-upgrade` overrides) |
 | Functional equivalence vs baseline | `uc prove --check-equivalence <baseline_dir> --json` |
 | Audit a deployed class, no source | `uc audit <address or class hash> --network mainnet --json` |
 | Audit a local class file | `uc audit target/dev/<pkg>_<Contract>.contract_class.json --json` |

@@ -95,6 +95,8 @@ uc test --fuzzer-runs 256
 uc prove                         # symbolic execution + Sierra taint detectors
 uc prove --emit-smt target/smt   # SMT-LIB obligations per function, checkable with z3
 uc prove --check-upgrade v1/Scarb.toml
+uc prove --check-upgrade 0x04718f...938d --network mainnet   # against the deployed class
+uc declare -c Vault --upgrade-of 0x04718f...938d --network mainnet  # refuses unsafe upgrades
 uc prove --check-equivalence v1/Scarb.toml
 uc audit 0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d --network mainnet
 uc decompile target/dev/my_vault_Vault.contract_class.json
@@ -153,6 +155,16 @@ loop bounds (interprocedural, numeric parameters only, capped bounds excluded), 
 storage writes in constructors and setters, swallowed syscall errors, redundant `divmod`,
 bitwise parity. `#[test]` bodies are never symbolic targets; `prove_*`, `invariant_*` and
 `check_*` functions are.
+
+## Upgrade gate
+
+`uc prove --check-upgrade <baseline>` and `uc declare --upgrade-of <address>` compare the
+candidate class with a baseline: a local manifest, or the class deployed at an address or class
+hash, fetched over RPC and named from its ABI (no debug info needed). Storage slots compare by
+base address, entry points by selector name and calldata arity, and caller or signature guards
+by Sierra structure. A removed slot, a removed entry point, an arity change or a lost guard makes
+the upgrade `UPGRADE_UNSAFE`; `uc declare` then refuses to build the transaction unless
+`--allow-unsafe-upgrade` is passed, and puts the report in its JSON either way.
 
 ## What uc does not do yet
 

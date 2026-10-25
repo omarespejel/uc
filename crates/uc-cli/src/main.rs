@@ -7807,6 +7807,7 @@ fn inspect_contract_artifacts_in_workspace(
                 "module_path": entry.module_path,
                 "compiler_version": compiler_ver,
                 "sierra_artifact": entry.artifacts.sierra,
+                "sierra_path": sierra_path.display().to_string(),
                 "sierra_blake3": sierra_blake3,
                 "class_hash": class_hash,
                 "casm_artifact": entry.artifacts.casm,
