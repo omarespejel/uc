@@ -200,6 +200,12 @@ uc invoke --contract-address 0x... --function increase --calldata 2 --url http:/
 uc call --contract-address 0x... --function get --url http://127.0.0.1:5050/rpc
 ```
 
+`uc declare`, `uc deploy`, `uc invoke` and `uc account deploy` build V3 transactions, estimate
+fees on the node (and refuse to broadcast when the estimate fails), hash them per SNIP-8
+(`poseidon` over prefix, version, sender, fee fields, paymaster data, chain id, nonce, DA modes
+and the type-specific fields) and sign with the account key; reports carry
+`computed_transaction_hash`, which equals the hash the node returns.
+
 Served: `starknet_addDeclareTransaction`, `addDeployAccountTransaction`, `addInvokeTransaction`,
 `call`, `estimateFee`, `getNonce`, `getClassHashAt`, `getClass`, `getClassAt`, `getStorageAt`,
 `getTransactionByHash` / `Receipt` / `Status`, `getBlockWithTxHashes` / `WithTxs`, `getEvents`,
@@ -244,11 +250,13 @@ the upgrade `UPGRADE_UNSAFE`; `uc declare` then refuses to build the transaction
 
 ## What uc does not do yet
 
-- `uc devnet` does not charge fees, check signatures or run `__validate__`; `estimateFee`
-  returns a flat figure and `simulateTransactions` is not implemented. `uc declare`, `uc deploy`
-  and `uc invoke` sign a placeholder payload, not the SNIP-8 transaction hash, so against a
-  real node (or `--backend starknet-devnet`) their transactions are rejected for an invalid
-  signature; against `uc devnet` they go through.
+- `uc devnet` does not charge fees or run `__validate__`; `estimateFee` returns a flat figure and
+  `simulateTransactions` is not implemented. It does verify signatures against the embedded
+  account's public key and reports SNIP-8 transaction hashes.
+- The DECLARE and DEPLOY_ACCOUNT hashes were checked against uc's own verifier and the formula;
+  the INVOKE hash was checked against starknet-devnet 0.7.1 (the node reports the same hash and
+  executes the transaction). That devnet cannot compile Sierra 1.8.0 classes, so DECLARE of a
+  Cairo 2.18 class could not be sent to it.
 - Fuzz runs collect statement coverage for corpus guidance on their own thread only; `--coverage`
   and `--lcov` still switch the whole run to the unsliced program, which is slower.
 - `uc fetch` writes `Scarb.lock` only when the package has none; it does not update an existing

@@ -465,6 +465,49 @@ pub(crate) enum AccountSubcommand {
     List(AccountListArgs),
     /// Compute deterministic counterfactual Starknet account address (`calculate_contract_address_from_hash`).
     ComputeAddress(AccountComputeAddressArgs),
+    /// Deploy an account with a V3 DEPLOY_ACCOUNT transaction (fund the counterfactual address first).
+    Deploy(AccountDeployArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct AccountDeployArgs {
+    /// Account class hash (`0x...`); must already be declared on the network.
+    #[arg(long)]
+    pub class_hash: String,
+
+    /// Private key (`0x...`); the public key becomes the constructor argument unless
+    /// `--constructor-calldata` is given.
+    #[arg(long)]
+    pub private_key: String,
+
+    /// Constructor calldata (defaults to `[public_key]`).
+    #[arg(long, num_args = 0..)]
+    pub constructor_calldata: Vec<String>,
+
+    #[arg(long, default_value = "0x0")]
+    pub salt: String,
+
+    #[arg(short = 'u', long)]
+    pub url: Option<String>,
+
+    #[arg(short = 'n', long)]
+    pub network: Option<String>,
+
+    /// Build and sign without broadcasting.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    #[arg(long)]
+    pub wait: bool,
+
+    #[arg(long, default_value_t = 30)]
+    pub wait_timeout: u64,
+
+    #[arg(long)]
+    pub json: bool,
+
+    #[arg(long)]
+    pub report_path: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1749,16 +1792,23 @@ fn resolve_effective_private_key(
 }
 
 /// Calls `starknet_estimateFee` and auto-scales `resource_bounds` (`l1_gas`, `l2_gas`, `l1_data_gas`) by `1.5x`.
+/// Asks the node for a fee estimate (validation skipped: the transaction is not signed yet) and
+/// writes 1.5x the estimated amounts and prices into `resource_bounds`. The node's error is
+/// returned verbatim so a transaction that cannot execute is never broadcast blind.
 fn estimate_and_autoscale_v3_resource_bounds(
     rpc_url: &str,
     tx: &mut serde_json::Value,
-) -> Option<serde_json::Value> {
+) -> Result<serde_json::Value, String> {
+    let mut unsigned = tx.clone();
+    if let Some(map) = unsigned.as_object_mut() {
+        map.remove("class_hash");
+    }
     let est = starknet_rpc_request(
         rpc_url,
         "starknet_estimateFee",
-        serde_json::json!([[tx.clone()], ["SKIP_VALIDATE"], "latest"]),
+        serde_json::json!({ "request": [unsigned], "simulation_flags": ["SKIP_VALIDATE"], "block_id": "latest" }),
     )
-    .ok()?;
+    .map_err(|e| e.to_string())?;
     let first = est.as_array().and_then(|a| a.first()).unwrap_or(&est);
     let parse_u128_hex_or_dec = |v: Option<&serde_json::Value>| -> Option<u128> {
         let s = v?.as_str()?.trim();
@@ -1811,7 +1861,7 @@ fn estimate_and_autoscale_v3_resource_bounds(
         tx["resource_bounds"]["l1_data_gas"]["max_price_per_unit"] =
             serde_json::json!(scale_1_5x(l1_data_price));
     }
-    Some(est)
+    Ok(est)
 }
 
 /// Polls `starknet_getTransactionStatus` until `ACCEPTED_ON_L2` or `ACCEPTED_ON_L1` (or errors on `REJECTED` / `REVERTED`).
@@ -1853,24 +1903,6 @@ fn poll_for_transaction_confirmation(
 }
 
 #[cfg(feature = "native-test-runner")]
-fn sign_starknet_payload_if_key_present(
-    private_key_hex: Option<&str>,
-    tx_digest_elements: &[starknet_types_core::felt::Felt],
-) -> Result<(Vec<String>, Option<String>)> {
-    use starknet_crypto::{get_public_key, poseidon_hash_many, rfc6979_generate_k, sign};
-    let Some(pk_str) = private_key_hex else {
-        return Ok((Vec::new(), None));
-    };
-    let pk = parse_felt_str(pk_str)?;
-    let pubkey = get_public_key(&pk);
-    let msg_hash = poseidon_hash_many(tx_digest_elements);
-    let k = rfc6979_generate_k(&msg_hash, &pk, None);
-    let sig = sign(&pk, &msg_hash, &k).map_err(|e| anyhow!("ECDSA sign failed: {e}"))?;
-    Ok((
-        vec![format_felt_hex(&sig.r), format_felt_hex(&sig.s)],
-        Some(format_felt_hex(&pubkey)),
-    ))
-}
 
 /// The account's next nonce from the node (`starknet_getNonce`), or `0x0` when there is no RPC
 /// (dry runs) or the account is not deployed yet.
@@ -1880,7 +1912,8 @@ pub(crate) fn fetch_account_nonce(rpc_url: Option<&str>, address: &str) -> Strin
             starknet_rpc_request(
                 rpc,
                 "starknet_getNonce",
-                serde_json::json!({ "block_id": "pending", "contract_address": address }),
+                // "latest": RPC 0.10 renamed "pending" to "pre_confirmed", so "pending" fails there.
+                serde_json::json!({ "block_id": "latest", "contract_address": address }),
             )
             .ok()
         })
@@ -2037,14 +2070,9 @@ pub(crate) fn run_declare(args: DeclareArgs) -> Result<()> {
             args.keystore.as_deref(),
             args.password.as_deref(),
         )?;
-        let (signature, public_key) = sign_starknet_payload_if_key_present(
-            effective_pk.as_deref(),
-            &[
-                parse_felt_str(&sender_address)?,
-                parse_felt_str(&class_hash)?,
-                parse_felt_str(&compiled_class_hash)?,
-            ],
-        )?;
+        let signing_key = effective_pk.as_deref().map(parse_felt_str).transpose()?;
+        let public_key = signing_key.map(|pk| format_felt_hex(&starknet_crypto::get_public_key(&pk)));
+        let signature: Vec<String> = Vec::new();
 
         let contract_class_payload = contract
             .get("sierra_path")
@@ -2063,7 +2091,7 @@ pub(crate) fn run_declare(args: DeclareArgs) -> Result<()> {
             "contract_class": contract_class_payload,
             "resource_bounds": {
                 "l1_gas": { "max_amount": "0x186a0", "max_price_per_unit": "0x2540be400" },
-                "l2_gas": { "max_amount": "0x0", "max_price_per_unit": "0x0" },
+                "l2_gas": { "max_amount": "0x1000000", "max_price_per_unit": "0x2540be400" },
                 "l1_data_gas": { "max_amount": "0x2710", "max_price_per_unit": "0x2540be400" }
             },
             "tip": "0x0",
@@ -2077,15 +2105,31 @@ pub(crate) fn run_declare(args: DeclareArgs) -> Result<()> {
 
         let mut tx_hash: Option<String> = None;
         let mut fee_estimate: Option<serde_json::Value> = None;
+        let mut fee_estimate_error: Option<String> = None;
         let mut confirmation_status: Option<serde_json::Value> = None;
 
+        let chain_id = resolve_chain_id(prof.url.as_deref(), prof.network.as_deref());
         if let Some(rpc_url) = prof.url.as_deref() {
-            fee_estimate = estimate_and_autoscale_v3_resource_bounds(rpc_url, &mut declare_tx);
+            match estimate_and_autoscale_v3_resource_bounds(rpc_url, &mut declare_tx) {
+                Ok(est) => fee_estimate = Some(est),
+                Err(e) if args.dry_run => fee_estimate_error = Some(e),
+                Err(e) => bail!("fee estimation failed, transaction not sent: {e}"),
+            }
+        }
+        // Sign once the fee bounds are final: they are part of the SNIP-8 hash.
+        let computed_tx_hash = sign_v3_transaction(&mut declare_tx, chain_id, signing_key.as_ref())?;
+        // The broadcast form carries the class itself; `class_hash` is derived by the node and
+        // rejected as an unknown field (it stays in the hash and in the report).
+        let mut broadcast_tx = declare_tx.clone();
+        if let Some(map) = broadcast_tx.as_object_mut() {
+            map.remove("class_hash");
+        }
+        if let Some(rpc_url) = prof.url.as_deref() {
             if !args.dry_run {
                 let res = starknet_rpc_request(
                     rpc_url,
                     "starknet_addDeclareTransaction",
-                    serde_json::json!([declare_tx]),
+                    serde_json::json!([broadcast_tx]),
                 )?;
                 tx_hash = res
                     .get("transaction_hash")
@@ -2113,9 +2157,12 @@ pub(crate) fn run_declare(args: DeclareArgs) -> Result<()> {
             "compiled_class_hash": compiled_class_hash,
             "sender_address": sender_address,
             "public_key": public_key,
+            "chain_id": format_felt_hex(&chain_id),
+            "computed_transaction_hash": format_felt_hex(&computed_tx_hash),
             "transaction_hash": tx_hash,
             "confirmation_status": confirmation_status,
             "fee_estimate": fee_estimate,
+            "fee_estimate_error": fee_estimate_error,
             "transaction_v3": declare_tx,
             "upgrade_check": upgrade_check,
             "elapsed_ms": elapsed_ms,
@@ -2220,14 +2267,8 @@ pub(crate) fn run_deploy(args: DeployArgs) -> Result<()> {
             args.keystore.as_deref(),
             args.password.as_deref(),
         )?;
-        let (signature, _) = sign_starknet_payload_if_key_present(
-            effective_pk.as_deref(),
-            &[
-                parse_felt_str(&sender_address)?,
-                parse_felt_str(&class_hash)?,
-                parse_felt_str(&args.salt)?,
-            ],
-        )?;
+        let signing_key = effective_pk.as_deref().map(parse_felt_str).transpose()?;
+        let signature: Vec<String> = Vec::new();
 
         let nonce = fetch_account_nonce(prof.url.as_deref(), &sender_address);
         let mut invoke_tx = serde_json::json!({
@@ -2237,7 +2278,7 @@ pub(crate) fn run_deploy(args: DeployArgs) -> Result<()> {
             "calldata": account_execute_calldata,
             "resource_bounds": {
                 "l1_gas": { "max_amount": "0x186a0", "max_price_per_unit": "0x2540be400" },
-                "l2_gas": { "max_amount": "0x0", "max_price_per_unit": "0x0" },
+                "l2_gas": { "max_amount": "0x1000000", "max_price_per_unit": "0x2540be400" },
                 "l1_data_gas": { "max_amount": "0x2710", "max_price_per_unit": "0x2540be400" }
             },
             "tip": "0x0",
@@ -2251,9 +2292,18 @@ pub(crate) fn run_deploy(args: DeployArgs) -> Result<()> {
 
         let mut tx_hash: Option<String> = None;
         let mut fee_estimate: Option<serde_json::Value> = None;
+        let mut fee_estimate_error: Option<String> = None;
         let mut confirmation_status: Option<serde_json::Value> = None;
+        let chain_id = resolve_chain_id(prof.url.as_deref(), prof.network.as_deref());
         if let Some(rpc_url) = prof.url.as_deref() {
-            fee_estimate = estimate_and_autoscale_v3_resource_bounds(rpc_url, &mut invoke_tx);
+            match estimate_and_autoscale_v3_resource_bounds(rpc_url, &mut invoke_tx) {
+                Ok(est) => fee_estimate = Some(est),
+                Err(e) if args.dry_run => fee_estimate_error = Some(e),
+                Err(e) => bail!("fee estimation failed, transaction not sent: {e}"),
+            }
+        }
+        let computed_tx_hash = sign_v3_transaction(&mut invoke_tx, chain_id, signing_key.as_ref())?;
+        if let Some(rpc_url) = prof.url.as_deref() {
             if !args.dry_run {
                 let res = starknet_rpc_request(
                     rpc_url,
@@ -2281,6 +2331,8 @@ pub(crate) fn run_deploy(args: DeployArgs) -> Result<()> {
             "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
             "command": "deploy",
             "dry_run": args.dry_run,
+            "chain_id": format_felt_hex(&chain_id),
+            "computed_transaction_hash": format_felt_hex(&computed_tx_hash),
             "class_hash": class_hash,
             "salt": args.salt,
             "unique": args.unique,
@@ -2290,6 +2342,7 @@ pub(crate) fn run_deploy(args: DeployArgs) -> Result<()> {
             "transaction_hash": tx_hash,
             "confirmation_status": confirmation_status,
             "fee_estimate": fee_estimate,
+            "fee_estimate_error": fee_estimate_error,
             "transaction_v3": invoke_tx,
             "elapsed_ms": elapsed_ms,
         });
@@ -2357,14 +2410,8 @@ pub(crate) fn run_invoke(args: InvokeArgs) -> Result<()> {
             args.keystore.as_deref(),
             args.password.as_deref(),
         )?;
-        let (signature, _) = sign_starknet_payload_if_key_present(
-            effective_pk.as_deref(),
-            &[
-                parse_felt_str(&sender_address)?,
-                parse_felt_str(&args.contract_address)?,
-                parse_felt_str(&selector_hex)?,
-            ],
-        )?;
+        let signing_key = effective_pk.as_deref().map(parse_felt_str).transpose()?;
+        let signature: Vec<String> = Vec::new();
 
         let nonce = fetch_account_nonce(prof.url.as_deref(), &sender_address);
         let mut invoke_tx = serde_json::json!({
@@ -2374,7 +2421,7 @@ pub(crate) fn run_invoke(args: InvokeArgs) -> Result<()> {
             "calldata": account_execute_calldata,
             "resource_bounds": {
                 "l1_gas": { "max_amount": "0x186a0", "max_price_per_unit": "0x2540be400" },
-                "l2_gas": { "max_amount": "0x0", "max_price_per_unit": "0x0" },
+                "l2_gas": { "max_amount": "0x1000000", "max_price_per_unit": "0x2540be400" },
                 "l1_data_gas": { "max_amount": "0x2710", "max_price_per_unit": "0x2540be400" }
             },
             "tip": "0x0",
@@ -2388,9 +2435,18 @@ pub(crate) fn run_invoke(args: InvokeArgs) -> Result<()> {
 
         let mut tx_hash: Option<String> = None;
         let mut fee_estimate: Option<serde_json::Value> = None;
+        let mut fee_estimate_error: Option<String> = None;
         let mut confirmation_status: Option<serde_json::Value> = None;
+        let chain_id = resolve_chain_id(prof.url.as_deref(), prof.network.as_deref());
         if let Some(rpc_url) = prof.url.as_deref() {
-            fee_estimate = estimate_and_autoscale_v3_resource_bounds(rpc_url, &mut invoke_tx);
+            match estimate_and_autoscale_v3_resource_bounds(rpc_url, &mut invoke_tx) {
+                Ok(est) => fee_estimate = Some(est),
+                Err(e) if args.dry_run => fee_estimate_error = Some(e),
+                Err(e) => bail!("fee estimation failed, transaction not sent: {e}"),
+            }
+        }
+        let computed_tx_hash = sign_v3_transaction(&mut invoke_tx, chain_id, signing_key.as_ref())?;
+        if let Some(rpc_url) = prof.url.as_deref() {
             if !args.dry_run {
                 let res = starknet_rpc_request(
                     rpc_url,
@@ -2418,6 +2474,8 @@ pub(crate) fn run_invoke(args: InvokeArgs) -> Result<()> {
             "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
             "command": "invoke",
             "dry_run": args.dry_run,
+            "chain_id": format_felt_hex(&chain_id),
+            "computed_transaction_hash": format_felt_hex(&computed_tx_hash),
             "contract_address": args.contract_address,
             "function": args.function,
             "entry_point_selector": selector_hex,
@@ -2425,6 +2483,7 @@ pub(crate) fn run_invoke(args: InvokeArgs) -> Result<()> {
             "transaction_hash": tx_hash,
             "confirmation_status": confirmation_status,
             "fee_estimate": fee_estimate,
+            "fee_estimate_error": fee_estimate_error,
             "transaction_v3": invoke_tx,
             "elapsed_ms": elapsed_ms,
         });
@@ -2514,6 +2573,101 @@ pub(crate) fn run_tx_status(args: TxStatusArgs) -> Result<()> {
     Ok(())
 }
 
+/// `uc account deploy`: a V3 DEPLOY_ACCOUNT transaction signed with the SNIP-8 hash.
+#[cfg(feature = "native-test-runner")]
+fn run_account_deploy(args: AccountDeployArgs) -> Result<()> {
+    use starknet_types_core::felt::Felt;
+    let started = Instant::now();
+    let private_key = parse_felt_str(&args.private_key)?;
+    let public_key = starknet_crypto::get_public_key(&private_key);
+    let calldata: Vec<String> = if args.constructor_calldata.is_empty() {
+        vec![format_felt_hex(&public_key)]
+    } else {
+        encode_starknet_calldata(&args.constructor_calldata, None)?
+    };
+    let class_hash = parse_felt_str(&args.class_hash)?;
+    let salt = parse_felt_str(&args.salt)?;
+    let calldata_felts: Vec<Felt> = calldata.iter().map(|c| parse_felt_str(c)).collect::<Result<Vec<_>>>()?;
+    let address = cairo_lang_runner::casm_run::contract_address::calculate_contract_address(&salt, &class_hash, &calldata_felts, &Felt::ZERO);
+    let rpc_url = match args.url.as_deref() {
+        Some(u) => Some(u.to_string()),
+        None => args.network.as_deref().and_then(default_rpc_url_for_network),
+    };
+    let chain_id = resolve_chain_id(rpc_url.as_deref(), args.network.as_deref());
+    let mut tx = serde_json::json!({
+        "type": "DEPLOY_ACCOUNT",
+        "version": "0x3",
+        "class_hash": format_felt_hex(&class_hash),
+        "contract_address_salt": format_felt_hex(&salt),
+        "constructor_calldata": calldata,
+        "resource_bounds": {
+            "l1_gas": { "max_amount": "0x186a0", "max_price_per_unit": "0x2540be400" },
+            "l2_gas": { "max_amount": "0x1000000", "max_price_per_unit": "0x2540be400" },
+            "l1_data_gas": { "max_amount": "0x2710", "max_price_per_unit": "0x2540be400" }
+        },
+        "tip": "0x0",
+        "paymaster_data": [],
+        "nonce_data_availability_mode": "L1",
+        "fee_data_availability_mode": "L1",
+        "nonce": "0x0",
+        "signature": [],
+    });
+    let mut fee_estimate = None;
+    let mut fee_estimate_error: Option<String> = None;
+    if let Some(rpc) = rpc_url.as_deref() {
+        match estimate_and_autoscale_v3_resource_bounds(rpc, &mut tx) {
+            Ok(est) => fee_estimate = Some(est),
+            Err(e) if args.dry_run => fee_estimate_error = Some(e),
+            Err(e) => bail!("fee estimation failed, transaction not sent: {e}"),
+        }
+    }
+    let computed_tx_hash = sign_v3_transaction(&mut tx, chain_id, Some(&private_key))?;
+    let mut tx_hash = None;
+    let mut confirmation_status = None;
+    if let (Some(rpc), false) = (rpc_url.as_deref(), args.dry_run) {
+        let res = starknet_rpc_request(rpc, "starknet_addDeployAccountTransaction", serde_json::json!([tx]))?;
+        tx_hash = res.get("transaction_hash").and_then(|v| v.as_str()).map(str::to_string);
+        if args.wait {
+            if let Some(th) = tx_hash.as_deref() {
+                confirmation_status = Some(poll_for_transaction_confirmation(rpc, th, args.wait_timeout)?);
+            }
+        }
+    }
+    let report = serde_json::json!({
+        "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
+        "command": "account deploy",
+        "dry_run": args.dry_run,
+        "contract_address": format_felt_hex(&address),
+        "class_hash": format_felt_hex(&class_hash),
+        "public_key": format_felt_hex(&public_key),
+        "chain_id": format_felt_hex(&chain_id),
+        "computed_transaction_hash": format_felt_hex(&computed_tx_hash),
+        "transaction_hash": tx_hash,
+        "confirmation_status": confirmation_status,
+        "fee_estimate": fee_estimate,
+        "fee_estimate_error": fee_estimate_error,
+        "rpc_url": rpc_url,
+        "transaction_v3": tx,
+        "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+    });
+    if args.json || args.report_path.is_some() {
+        emit_json_value(args.report_path.as_deref(), &report)?;
+    } else {
+        println!("account address:     {}", format_felt_hex(&address));
+        println!("class_hash:          {}", format_felt_hex(&class_hash));
+        println!("public_key:          {}", format_felt_hex(&public_key));
+        if let Some(th) = report["transaction_hash"].as_str() {
+            println!("transaction_hash:    {th}");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "native-test-runner"))]
+fn run_account_deploy(_args: AccountDeployArgs) -> Result<()> {
+    bail!("native-test-runner feature required for uc account deploy")
+}
+
 pub(crate) fn run_account(args: AccountArgs) -> Result<()> {
     match args.command {
         AccountSubcommand::List(list_args) => {
@@ -2577,6 +2731,7 @@ pub(crate) fn run_account(args: AccountArgs) -> Result<()> {
             }
             Ok(())
         }
+        AccountSubcommand::Deploy(d) => run_account_deploy(d),
         AccountSubcommand::ComputeAddress(ca_args) => {
             #[cfg(feature = "native-test-runner")]
             {

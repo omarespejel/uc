@@ -812,13 +812,58 @@ impl DevnetChain {
         felt_from_digest("uc-devnet-tx:", &[kind.as_bytes(), &sender.to_bytes_be(), &nonce.to_le_bytes(), body.to_string().as_bytes(), &self.chain_id.to_bytes_be()])
     }
 
+    /// The SNIP-8 hash of a well-formed V3 transaction, else a digest of its fields.
+    fn v3_hash_or_digest(&self, kind: &str, sender: &Felt, nonce: u64, tx: &serde_json::Value, fallback: &serde_json::Value) -> Felt {
+        let mut normalized = tx.clone();
+        normalized["type"] = serde_json::json!(kind);
+        normalized["version"] = tx.get("version").cloned().unwrap_or(serde_json::json!("0x3"));
+        normalized["nonce"] = serde_json::json!(format!("{nonce:#x}"));
+        if kind != "DEPLOY_ACCOUNT" {
+            normalized["sender_address"] = serde_json::json!(hex(sender));
+        }
+        v3_transaction_hash(&normalized, self.chain_id).unwrap_or_else(|_| self.tx_hash_for(kind, sender, nonce, fallback))
+    }
+
+    /// Checks a transaction's signature against the account's public key when both exist.
+    /// Empty signatures are accepted (a devnet convenience); a wrong one is refused.
+    fn check_signature(&mut self, tx_hash: &Felt, signature: &[Felt], public_key: Option<Felt>) -> Result<(), RpcError> {
+        if signature.is_empty() {
+            return Ok(());
+        }
+        let Some(public_key) = public_key else { return Ok(()) };
+        if signature.len() != 2 || !verify_transaction_signature(&public_key, tx_hash, &signature[0], &signature[1]) {
+            return Err(RpcError::new(ERR_TX_EXECUTION_ERROR, "invalid signature").with_data(serde_json::json!({
+                "transaction_hash": hex(tx_hash),
+                "public_key": hex(&public_key),
+            })));
+        }
+        Ok(())
+    }
+
+    /// The public key the embedded account at `address` reports, if it is one.
+    fn account_public_key(&mut self, address: Felt) -> Option<Felt> {
+        let snapshot = self.state.clone();
+        let out = self.execute(address, selector("get_public_key"), Vec::new(), Felt::ZERO, &DevnetExecutionContext::default()).ok();
+        self.state = snapshot;
+        out.filter(|o| o.panic.is_none()).and_then(|o| o.retdata.first().copied())
+    }
+
     fn add_declare(&mut self, tx: &serde_json::Value) -> Result<serde_json::Value, RpcError> {
         let sender = felt(tx.get("sender_address").and_then(|v| v.as_str()).unwrap_or("0x1"))?;
         let nonce = self.check_nonce(&sender, tx.get("nonce"))?;
         let class_json = tx.get("contract_class").cloned().ok_or_else(|| RpcError::new(ERR_INVALID_PARAMS, "contract_class is required"))?;
         let block = self.next_block_number();
+        let signature = felts_of_json(tx.get("signature"));
         let class_hash = self.declare(class_json, block)?;
-        let tx_hash = self.tx_hash_for("DECLARE", &sender, nonce, &serde_json::json!({ "class_hash": hex(&class_hash) }));
+        let mut for_hash = tx.clone();
+        for_hash["class_hash"] = serde_json::json!(hex(&class_hash));
+        for_hash.as_object_mut().map(|m| m.remove("contract_class"));
+        let tx_hash = self.v3_hash_or_digest("DECLARE", &sender, nonce, &for_hash, &serde_json::json!({ "class_hash": hex(&class_hash) }));
+        let public_key = self.account_public_key(sender);
+        if let Err(e) = self.check_signature(&tx_hash, &signature, public_key) {
+            self.undeclare(&class_hash);
+            return Err(e);
+        }
         self.nonces.insert(sender, nonce + 1);
         let record = serde_json::json!({
             "type": "DECLARE",
@@ -849,7 +894,11 @@ impl DevnetChain {
             return Err(RpcError::new(ERR_TX_EXECUTION_ERROR, format!("contract {} is already deployed", hex(&address))));
         }
         let nonce = self.check_nonce(&address, tx.get("nonce"))?;
-        let tx_hash = self.tx_hash_for("DEPLOY_ACCOUNT", &address, nonce, &serde_json::json!({ "class_hash": hex(&class_hash), "salt": hex(&salt) }));
+        let tx_hash = self.v3_hash_or_digest("DEPLOY_ACCOUNT", &address, nonce, tx, &serde_json::json!({ "class_hash": hex(&class_hash), "salt": hex(&salt) }));
+        // The embedded account takes its public key as the first constructor argument.
+        let signature = felts_of_json(tx.get("signature"));
+        let public_key = (class_hash == parse_felt_str(&self.account_class_hash).unwrap_or_default()).then(|| calldata.first().copied()).flatten();
+        self.check_signature(&tx_hash, &signature, public_key)?;
         let ctx = DevnetExecutionContext { account_contract_address: address, transaction_hash: tx_hash, nonce: Felt::from(nonce), version: Felt::from(3_u64), ..Default::default() };
         self.state.register_deployed_contract(address, class_hash);
         let info = self.infos.get(&class_hash).cloned().unwrap();
@@ -892,7 +941,9 @@ impl DevnetChain {
             .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|x| x.as_str().and_then(|s| parse_felt_str(s).ok())).collect())
             .unwrap_or_default();
-        let tx_hash = self.tx_hash_for("INVOKE", &sender, nonce, &serde_json::json!({ "calldata": hex_vec(&calldata) }));
+        let tx_hash = self.v3_hash_or_digest("INVOKE", &sender, nonce, tx, &serde_json::json!({ "calldata": hex_vec(&calldata) }));
+        let public_key = self.account_public_key(sender);
+        self.check_signature(&tx_hash, &signature, public_key)?;
         let ctx = DevnetExecutionContext { account_contract_address: sender, transaction_hash: tx_hash, nonce: Felt::from(nonce), version: Felt::from(3_u64), signature, ..Default::default() };
         let outcome = self
             .execute(sender, selector("__execute__"), calldata.clone(), Felt::ZERO, &ctx)
@@ -1206,6 +1257,20 @@ impl DevnetChain {
     }
 }
 
+fn felts_of_json(v: Option<&serde_json::Value>) -> Vec<Felt> {
+    v.and_then(|a| a.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().and_then(|s| parse_felt_str(s).ok())).collect())
+        .unwrap_or_default()
+}
+
+impl DevnetChain {
+    fn undeclare(&mut self, class_hash: &Felt) {
+        self.classes.remove(class_hash);
+        self.infos.swap_remove(class_hash);
+        let _ = self.rebuild_runners();
+    }
+}
+
 /// `starknet_keccak(name)` as a felt.
 pub(crate) fn selector(name: &str) -> Felt {
     Felt::from(&cairo_lang_starknet_classes::keccak::starknet_keccak(name.as_bytes()))
@@ -1228,6 +1293,10 @@ mod tests {
         let system = ensure_devnet_system_classes().expect("system classes");
         let accounts = generate_devnet_predeployed_accounts(2, 7, "1000000000000000000000");
         DevnetChain::genesis(&system, accounts, Felt::from_bytes_be_slice(b"SN_SEPOLIA"), 1_700_000_000, false).expect("genesis")
+    }
+
+    fn inc_again(deployed: &str) -> Vec<String> {
+        vec!["0x1".to_string(), deployed.to_string(), hex(&selector("increase")), "0x1".to_string(), "0x1".to_string()]
     }
 
     fn u256_of(retdata: &serde_json::Value) -> String {
@@ -1336,6 +1405,22 @@ pub mod Counter {
         assert_eq!(block["transactions"].as_array().unwrap().len(), 1);
         let events = chain.handle_rpc("starknet_getEvents", &serde_json::json!({ "filter": { "address": strk, "chunk_size": 10 } })).unwrap();
         assert!(events["events"].as_array().unwrap().len() >= 1);
+
+        // Signatures: a transaction signed with the account's key over its SNIP-8 hash is accepted;
+        // one signed with another key is refused; the node's hash is the SNIP-8 hash.
+        let pk = parse_felt_str(&acc.private_key).unwrap();
+        let mut signed = serde_json::json!({ "type": "INVOKE", "version": "0x3", "sender_address": acc.address, "calldata": inc_again(&deployed), "nonce": "0x5",
+            "resource_bounds": { "l1_gas": { "max_amount": "0x1", "max_price_per_unit": "0x1" }, "l2_gas": { "max_amount": "0x1", "max_price_per_unit": "0x1" }, "l1_data_gas": { "max_amount": "0x1", "max_price_per_unit": "0x1" } },
+            "tip": "0x0", "paymaster_data": [], "account_deployment_data": [], "nonce_data_availability_mode": "L1", "fee_data_availability_mode": "L1" });
+        let expected_hash = sign_v3_transaction(&mut signed, chain.chain_id, Some(&pk)).unwrap();
+        let res = chain.handle_rpc("starknet_addInvokeTransaction", &serde_json::json!({ "invoke_transaction": signed.clone() })).unwrap();
+        assert_eq!(parse_felt_str(res["transaction_hash"].as_str().unwrap()).unwrap(), expected_hash, "the devnet reports the SNIP-8 hash");
+        let mut forged = signed.clone();
+        forged["nonce"] = serde_json::json!("0x6");
+        sign_v3_transaction(&mut forged, chain.chain_id, Some(&Felt::from(99_u64))).unwrap();
+        let err = chain.handle_rpc("starknet_addInvokeTransaction", &serde_json::json!({ "invoke_transaction": forged })).unwrap_err();
+        assert_eq!(err.message, "invalid signature");
+        assert_eq!(chain.handle_rpc("starknet_getNonce", &serde_json::json!({ "block_id": "latest", "contract_address": acc.address })).unwrap(), serde_json::json!("0x6"));
 
         // Mint and deploy_account.
         let minted = chain.handle_rpc("devnet_mint", &serde_json::json!({ "address": other.address, "amount": 7, "unit": "FRI" })).unwrap();

@@ -13,6 +13,7 @@ mod scarb_parity;
 mod starknet_onchain;
 mod starkscan;
 mod test_runner;
+mod tx_hash;
 mod watch;
 
 #[cfg(test)]
@@ -30,5 +31,6 @@ pub(crate) use scarb_parity::*;
 pub(crate) use starknet_onchain::*;
 pub(crate) use starkscan::*;
 pub(crate) use test_runner::*;
+pub(crate) use tx_hash::*;
 pub(crate) use watch::*;
 

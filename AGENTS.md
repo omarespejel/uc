@@ -48,6 +48,7 @@ uc build --json                      # Sierra + CASM artifacts, byte-identical t
 | Audit feed of declared classes | `uc audit --declared-since <block> --declared-until <block> --max-classes 50 --network mainnet --json` |
 | Local chain | `uc devnet --port 5050 --accounts 2 --seed 1` (`/predeployed_accounts` lists keys), then `uc declare` / `uc deploy` / `uc invoke` / `uc call` with `--url http://127.0.0.1:5050/rpc` |
 | Declare / deploy / invoke (dry run) | `uc declare -c <Contract> --dry-run --json` |
+| Deploy an account | `uc account deploy --class-hash 0x.. --private-key 0x.. --salt 0x1 --url <rpc> --json` |
 
 RPC resolution for on-chain commands: `--url`, else `STARKNET_RPC`, else the `snfoundry.toml`
 profile in the current directory, else `--network mainnet|sepolia|devnet`: Starkscan's gateway
@@ -82,9 +83,13 @@ verification record, and `uc verify-onchain --submit` writes it.
 ## Known limits (do not work around silently)
 
 - `uc devnet` executes declare / deploy / invoke / call in process (embedded account, fee token
-  and deployer; one block per transaction; nonces enforced). It charges no fees and checks no
-  signatures; `simulateTransactions` is not served. `--backend starknet-devnet` runs the external
-  binary instead.
+  and deployer; one block per transaction; nonces and signatures enforced, SNIP-8 hashes). It
+  charges no fees; `simulateTransactions` is not served. `--backend starknet-devnet` runs the
+  external binary instead.
+- Write commands sign the SNIP-8 V3 hash with `--private-key` / keystore; `--dry-run` reports
+  `computed_transaction_hash` and the signed payload without sending. `uc account deploy
+  --class-hash <hash> --private-key <key> --salt <salt>` deploys an account (fund the
+  `contract_address` from its `--dry-run` report first).
 - `--coverage` and `--lcov` run every test on the unsliced program (slower); plain runs and fuzz
   runs use per-test and per-class program slices.
 - `uc fetch` writes `Scarb.lock` only when the package has none.
