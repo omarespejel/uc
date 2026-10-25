@@ -5,7 +5,10 @@ use std::sync::Arc;
 use cairo_lang_casm::hints::Hint;
 use cairo_lang_runnable_utils::builder::{BuildError, EntryCodeConfig, RunnableBuilder};
 use cairo_lang_sierra::extensions::NamedType;
+use cairo_lang_sierra::extensions::array::ArrayType;
 use cairo_lang_sierra::extensions::enm::EnumType;
+use cairo_lang_sierra::extensions::felt252::Felt252Type;
+use cairo_lang_sierra::extensions::structure::StructType;
 use cairo_lang_sierra::extensions::gas::{CostTokenType, GasBuiltinType};
 use cairo_lang_sierra::ids::{ConcreteTypeId, GenericTypeId};
 use cairo_lang_sierra::program::{Function, GenericArg};
@@ -33,6 +36,8 @@ use crate::casm_run::{HintMap, RunFunctionResult, RunProgramLazyResult, Starknet
 use crate::profiling::ProfilerConfig;
 
 pub mod casm_run;
+pub use casm_run::DevnetExecutionContext;
+pub use cairo_lang_utils::ordered_hash_map::OrderedHashMap as ClassInfoMap;
 pub mod clap;
 pub mod profiling;
 pub mod short_string;
@@ -266,6 +271,21 @@ impl SierraCasmRunner {
         Ok(runner)
     }
 
+    /// A runner for one declared class that shares the per-class runner table with every other
+    /// class of a devnet, so nested `call_contract`, `library_call` and `deploy` reach classes
+    /// compiled from other programs. `starknet_contracts_info` must hold every class's entry
+    /// points (ids refer to each class's own program, which is what its runner holds).
+    pub fn new_with_shared_classes(
+        sierra_program: cairo_lang_sierra::program::Program,
+        metadata_config: Option<MetadataComputationConfig>,
+        starknet_contracts_info: OrderedHashMap<Felt252, ContractInfo>,
+        class_runners: Arc<std::sync::RwLock<HashMap<Felt252, Arc<SierraCasmRunner>>>>,
+    ) -> Result<Self, RunnerError> {
+        let mut runner = Self::new_inner(sierra_program, metadata_config, starknet_contracts_info, None)?;
+        runner.class_runners = class_runners;
+        Ok(runner)
+    }
+
     fn new_inner(
         sierra_program: cairo_lang_sierra::program::Program,
         metadata_config: Option<MetadataComputationConfig>,
@@ -458,6 +478,14 @@ impl SierraCasmRunner {
         let sub = Arc::new(sub);
         map.insert(*class_hash, Arc::clone(&sub));
         Some(sub)
+    }
+
+    /// Looks a Sierra function up by id in this runner's program.
+    pub fn function_by_id(&self, id: &cairo_lang_sierra::ids::FunctionId) -> Result<&Function, RunnerError> {
+        self.builder
+            .registry()
+            .get_function(id)
+            .map_err(|e| RunnerError::BuildError(BuildError::ProgramRegistryError(e)))
     }
 
     /// Drops the cached per-function runner for `func` (call when a test has finished all of
@@ -712,13 +740,43 @@ impl SierraCasmRunner {
             .unwrap()
             .generic_args;
 
-        if *ty == EnumType::ID
-            && matches!(&generic_args[0], GenericArg::UserType(ut)
-                if ut.debug_name.as_ref().unwrap().starts_with("core::panics::PanicResult::"))
-        {
-            return Some(extract_matches!(&generic_args[1], GenericArg::Type).clone());
+        if *ty == EnumType::ID {
+            let named_panic_result = matches!(&generic_args[0], GenericArg::UserType(ut)
+                if ut.debug_name.as_ref().is_some_and(|n| n.starts_with("core::panics::PanicResult::")));
+            // Classes loaded from `.contract_class.json` carry no debug names: recognise
+            // `PanicResult<T>` by its shape, `Enum<_, T, (<empty struct>, Array<felt252>)>`.
+            let shaped_panic_result = !named_panic_result
+                && matches!(&generic_args[0], GenericArg::UserType(ut) if ut.debug_name.is_none())
+                && generic_args.len() == 3
+                && matches!(&generic_args[2], GenericArg::Type(err) if self.is_panic_payload_type(err));
+            if named_panic_result || shaped_panic_result {
+                return Some(extract_matches!(&generic_args[1], GenericArg::Type).clone());
+            }
         }
         None
+    }
+
+    /// `(<empty struct>, Array<felt252>)`: the error payload of `PanicResult`.
+    fn is_panic_payload_type(&self, ty: &ConcreteTypeId) -> bool {
+        let long_id = self.builder.type_long_id(ty);
+        if long_id.generic_id != StructType::ID {
+            return false;
+        }
+        let members: Vec<&ConcreteTypeId> = long_id
+            .generic_args
+            .iter()
+            .filter_map(|a| match a {
+                GenericArg::Type(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        members.len() == 2 && {
+            let array = self.builder.type_long_id(members[1]);
+            array.generic_id == ArrayType::ID
+                && array.generic_args.first().is_some_and(|a| {
+                    matches!(a, GenericArg::Type(elem) if self.builder.type_long_id(elem).generic_id == Felt252Type::ID)
+                })
+        }
     }
 
     /// Runs the VM starting from a function with a custom hint processor. The function may have

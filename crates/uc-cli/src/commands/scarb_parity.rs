@@ -1965,7 +1965,7 @@ fn flatten_trace_calls(
         "call_type": inv.get("call_type").and_then(|v| v.as_str()).unwrap_or("CALL"),
         "caller_address": inv.get("caller_address").and_then(|v| v.as_str()),
         "calldata_len": inv.get("calldata").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
-        "reverted": inv.get("revert_reason").is_some(),
+        "reverted": inv.get("revert_reason").and_then(|v| v.as_str()).is_some(),
         "events": inv.get("events").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
     }));
     if let Some(children) = inv.get("calls").and_then(|v| v.as_array()) {
@@ -2745,8 +2745,8 @@ pub(crate) struct DevnetArgs {
     #[arg(long, num_args = 0..)]
     pub restrictive_mode: Vec<String>,
 
-    /// Execution backend (`auto`, `native`, or `starknet-devnet`) [default: auto]
-    #[arg(long, default_value = "auto")]
+    /// Execution backend: `native` (in-process chain, default) or `starknet-devnet` (external binary on PATH)
+    #[arg(long, default_value = "native")]
     pub backend: String,
 
     /// Print predeployed accounts and configuration without blocking on the HTTP listener
@@ -2809,7 +2809,7 @@ pub(crate) struct DevnetPredeployedAccount {
     pub initial_balance: String,
 }
 
-fn generate_devnet_predeployed_accounts(
+pub(crate) fn generate_devnet_predeployed_accounts(
     count: u32,
     seed: u64,
     initial_balance: &str,
@@ -2879,14 +2879,9 @@ pub(crate) fn run_devnet(args: DevnetArgs) -> Result<()> {
     let seed = args.seed.unwrap_or(42);
     let backend_mode = args.backend.trim().to_ascii_lowercase();
 
-    // If explicitly requested `starknet-devnet` external binary (or `auto` when running indefinitely without dump/json/max_requests)
-    if backend_mode == "starknet-devnet"
-        || (backend_mode == "auto"
-            && !args.dump_accounts
-            && !args.json
-            && args.report_path.is_none()
-            && args.max_requests.is_none())
-    {
+    // The in-process chain is the default; `--backend starknet-devnet` hands over to an external
+    // `starknet-devnet` binary on PATH.
+    if backend_mode == "starknet-devnet" {
         if let Some(ext_bin) = find_external_starknet_devnet_binary() {
             let mut cmd = std::process::Command::new(&ext_bin);
             cmd.arg("--accounts")
@@ -2916,9 +2911,7 @@ pub(crate) fn run_devnet(args: DevnetArgs) -> Result<()> {
                 .arg("--block-generation-on")
                 .arg(&args.block_generation_on)
                 .arg("--state-archive-capacity")
-                .arg(&args.state_archive_capacity)
-                .arg("--request-body-size-limit")
-                .arg(args.request_body_size_limit.to_string());
+                .arg(&args.state_archive_capacity);
             if let Some(custom) = &args.account_class_custom {
                 cmd.arg("--account-class-custom").arg(custom);
             }
@@ -3004,9 +2997,21 @@ pub(crate) fn run_devnet(args: DevnetArgs) -> Result<()> {
         .with_context(|| format!("failed to bind Starknet Devnet listener on {bind_addr}"))?;
     let local_addr = listener.local_addr()?;
 
+    let genesis_started = Instant::now();
+    let system_classes = ensure_devnet_system_classes()?;
+    let chain_id_felt = parse_felt_str(&chain_id_hex)?;
+    let start_time = args.start_time.unwrap_or_else(|| epoch_ms_u64().unwrap_or(1_700_000_000_000) / 1000);
+    let mut chain = DevnetChain::genesis(
+        &system_classes,
+        accounts.clone(),
+        chain_id_felt,
+        start_time,
+        args.block_generation_on.eq_ignore_ascii_case("demand"),
+    )?;
     if !args.json {
         println!(
-            "uc devnet: in-process protocol stub (JSON-RPC shape only, no transaction execution). Install starknet-devnet for a real local chain; uc will launch it automatically when found on PATH."
+            "uc devnet: in-process Starknet chain (declare, deploy, invoke, call, receipts, events, blocks); fees are not charged, signatures are not checked. Genesis in {:.0} ms.",
+            genesis_started.elapsed().as_secs_f64() * 1000.0
         );
         println!("Predeployed FeeToken");
         println!("ETH Address: {eth_fee_token}");
@@ -3020,15 +3025,11 @@ pub(crate) fn run_devnet(args: DevnetArgs) -> Result<()> {
             );
         }
         println!(
-            "\nStarknet Devnet listening on http://{} (JSON-RPC v0.7 + devnet_* endpoints)",
-            local_addr
+            "\nStarknet Devnet listening on http://{} (JSON-RPC {} + devnet_* endpoints)",
+            local_addr, "0.8"
         );
     }
 
-    let mut block_number: u64 = args.fork_block.unwrap_or(0);
-    let mut current_time: u64 = args
-        .start_time
-        .unwrap_or_else(|| epoch_ms_u64().unwrap_or(1_700_000_000_000) / 1000);
     let mut served_requests = 0usize;
 
     for stream_res in listener.incoming() {
@@ -3062,104 +3063,61 @@ pub(crate) fn run_devnet(args: DevnetArgs) -> Result<()> {
             let _ = std::io::Read::read_exact(&mut reader, &mut body_bytes);
         }
 
+        let rpc_envelope = |id: serde_json::Value, outcome: Result<serde_json::Value, RpcError>| -> String {
+            match outcome {
+                Ok(result) => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string(),
+                Err(e) => {
+                    let mut err = serde_json::json!({ "code": e.code, "message": e.message });
+                    if let Some(d) = e.data {
+                        err["data"] = d;
+                    }
+                    serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": err }).to_string()
+                }
+            }
+        };
         let (status_line, content_type, resp_body) = if method == "GET" && path == "/is_alive" {
             ("HTTP/1.1 200 OK", "text/plain", "Alive!".to_string())
         } else if method == "GET" && path == "/predeployed_accounts" {
-            (
-                "HTTP/1.1 200 OK",
-                "application/json",
-                serde_json::to_string(&accounts).unwrap_or_else(|_| "[]".to_string()),
-            )
+            ("HTTP/1.1 200 OK", "application/json", chain.handle_rpc("devnet_getPredeployedAccounts", &serde_json::json!({})).map(|v| v.to_string()).unwrap_or_else(|_| "[]".to_string()))
+        } else if method == "GET" && path == "/config" {
+            ("HTTP/1.1 200 OK", "application/json", chain.handle_rpc("devnet_getConfig", &serde_json::json!({})).map(|v| v.to_string()).unwrap_or_else(|_| "{}".to_string()))
         } else if method == "POST" && path == "/mint" {
-            block_number += 1;
-            let req_json: serde_json::Value =
-                serde_json::from_slice(&body_bytes).unwrap_or_default();
-            let amount = req_json
-                .get("amount")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1_000_000_000_000_000_000);
-            let unit = req_json
-                .get("unit")
-                .and_then(|v| v.as_str())
-                .unwrap_or("FRI");
-            (
-                "HTTP/1.1 200 OK",
-                "application/json",
-                serde_json::json!({
-                    "new_balance": amount.to_string(),
-                    "unit": unit,
-                    "tx_hash": format!("0x{:064x}", block_number)
-                })
-                .to_string(),
-            )
+            let req_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+            match chain.handle_rpc("devnet_mint", &req_json) {
+                Ok(v) => ("HTTP/1.1 200 OK", "application/json", v.to_string()),
+                Err(e) => ("HTTP/1.1 400 Bad Request", "application/json", serde_json::json!({ "error": e.message }).to_string()),
+            }
         } else if method == "POST" && path == "/create_block" {
-            block_number += 1;
-            (
-                "HTTP/1.1 200 OK",
-                "application/json",
-                serde_json::json!({
-                    "block_hash": format!("0x{:064x}", block_number),
-                    "block_number": block_number
-                })
-                .to_string(),
-            )
+            let v = chain.handle_rpc("devnet_createBlock", &serde_json::json!({})).unwrap_or_default();
+            ("HTTP/1.1 200 OK", "application/json", v.to_string())
+        } else if method == "POST" && (path == "/set_time" || path == "/increase_time") {
+            let req_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+            let m = if path == "/set_time" { "devnet_setTime" } else { "devnet_increaseTime" };
+            match chain.handle_rpc(m, &req_json) {
+                Ok(v) => ("HTTP/1.1 200 OK", "application/json", v.to_string()),
+                Err(e) => ("HTTP/1.1 400 Bad Request", "application/json", serde_json::json!({ "error": e.message }).to_string()),
+            }
         } else {
-            let rpc_req: serde_json::Value =
-                serde_json::from_slice(&body_bytes).unwrap_or_default();
-            let id = rpc_req.get("id").cloned().unwrap_or(serde_json::json!(1));
-            let rpc_method = rpc_req
-                .get("method")
-                .and_then(|m| m.as_str())
-                .unwrap_or("starknet_chainId");
-
-            let result_val = match rpc_method {
-                "starknet_specVersion" => serde_json::json!("0.7.1"),
-                "starknet_chainId" => serde_json::json!(chain_id_hex),
-                "starknet_blockNumber" => serde_json::json!(block_number),
-                "starknet_blockHashAndNumber" => serde_json::json!({
-                    "block_hash": format!("0x{:064x}", block_number.max(1)),
-                    "block_number": block_number
-                }),
-                "starknet_syncing" => serde_json::json!(false),
-                "starknet_getNonce" => serde_json::json!("0x0"),
-                "starknet_getStorageAt" => serde_json::json!("0x0"),
-                "starknet_getClassHashAt" => serde_json::json!("0x1"),
-                "starknet_call" => serde_json::json!(["0x0"]),
-                "devnet_getPredeployedAccounts" => serde_json::json!(accounts),
-                "devnet_createBlock" => {
-                    block_number += 1;
-                    serde_json::json!({
-                        "block_hash": format!("0x{:064x}", block_number),
-                        "block_number": block_number
+            let rpc_req: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+            // Batches are answered element by element.
+            let body = if let Some(batch) = rpc_req.as_array() {
+                let answers: Vec<serde_json::Value> = batch
+                    .iter()
+                    .map(|req| {
+                        let id = req.get("id").cloned().unwrap_or(serde_json::json!(1));
+                        let m = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                        let params = req.get("params").cloned().unwrap_or_default();
+                        serde_json::from_str(&rpc_envelope(id, chain.handle_rpc(m, &params))).unwrap_or_default()
                     })
-                }
-                "devnet_mint" => {
-                    block_number += 1;
-                    serde_json::json!({
-                        "new_balance": "1000000000000000000000",
-                        "unit": "FRI",
-                        "tx_hash": format!("0x{:064x}", block_number)
-                    })
-                }
-                "devnet_setTime" | "devnet_increaseTime" => {
-                    current_time += 60;
-                    block_number += 1;
-                    serde_json::json!({
-                        "timestamp": current_time,
-                        "block_hash": format!("0x{:064x}", block_number)
-                    })
-                }
-                _ => serde_json::json!({
-                    "status": "ACCEPTED_ON_L2",
-                    "transaction_hash": format!("0x{:064x}", block_number + 1)
-                }),
+                    .collect();
+                serde_json::Value::Array(answers).to_string()
+            } else {
+                let id = rpc_req.get("id").cloned().unwrap_or(serde_json::json!(1));
+                let rpc_method = rpc_req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                let params = rpc_req.get("params").cloned().unwrap_or_default();
+                rpc_envelope(id, chain.handle_rpc(rpc_method, &params))
             };
-            let rpc_resp = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": result_val
-            });
-            ("HTTP/1.1 200 OK", "application/json", rpc_resp.to_string())
+            ("HTTP/1.1 200 OK", "application/json", body)
         };
 
         let http_response = format!(

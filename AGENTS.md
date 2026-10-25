@@ -46,6 +46,7 @@ uc build --json                      # Sierra + CASM artifacts, byte-identical t
 | Nonce, class hash at, balance | `uc get nonce 0x.. --network mainnet`, `uc get class-hash-at 0x.. --network mainnet`, `uc balance --token strk --account 0x.. --network mainnet` |
 | Transaction trace, calls named from class ABIs | `uc trace <tx_hash> --network mainnet --json` (`calls[]`, `participants`) |
 | Audit feed of declared classes | `uc audit --declared-since <block> --declared-until <block> --max-classes 50 --network mainnet --json` |
+| Local chain | `uc devnet --port 5050 --accounts 2 --seed 1` (`/predeployed_accounts` lists keys), then `uc declare` / `uc deploy` / `uc invoke` / `uc call` with `--url http://127.0.0.1:5050/rpc` |
 | Declare / deploy / invoke (dry run) | `uc declare -c <Contract> --dry-run --json` |
 
 RPC resolution for on-chain commands: `--url`, else `STARKNET_RPC`, else the `snfoundry.toml`
@@ -80,8 +81,10 @@ verification record, and `uc verify-onchain --submit` writes it.
 
 ## Known limits (do not work around silently)
 
-- `uc devnet` without an external `starknet-devnet` on `PATH` is a protocol stub: JSON-RPC shape
-  only, no transaction execution. It says so on start.
+- `uc devnet` executes declare / deploy / invoke / call in process (embedded account, fee token
+  and deployer; one block per transaction; nonces enforced). It charges no fees and checks no
+  signatures; `simulateTransactions` is not served. `--backend starknet-devnet` runs the external
+  binary instead.
 - `--coverage` and `--lcov` run every test on the unsliced program (slower); plain runs and fuzz
   runs use per-test and per-class program slices.
 - `uc fetch` writes `Scarb.lock` only when the package has none.

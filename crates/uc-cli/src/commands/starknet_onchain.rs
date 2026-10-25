@@ -1872,6 +1872,32 @@ fn sign_starknet_payload_if_key_present(
     ))
 }
 
+/// The account's next nonce from the node (`starknet_getNonce`), or `0x0` when there is no RPC
+/// (dry runs) or the account is not deployed yet.
+pub(crate) fn fetch_account_nonce(rpc_url: Option<&str>, address: &str) -> String {
+    rpc_url
+        .and_then(|rpc| {
+            starknet_rpc_request(
+                rpc,
+                "starknet_getNonce",
+                serde_json::json!({ "block_id": "pending", "contract_address": address }),
+            )
+            .ok()
+        })
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "0x0".to_string())
+}
+
+/// A built `.contract_class.json` as the `DECLARE` transaction carries it: the ABI serialized
+/// as a string, everything else verbatim.
+pub(crate) fn declare_contract_class_payload(class_json: &serde_json::Value) -> serde_json::Value {
+    let mut payload = class_json.clone();
+    if let Some(abi) = payload.get("abi").filter(|a| !a.is_string()).cloned() {
+        payload["abi"] = serde_json::json!(serde_json::to_string(&abi).unwrap_or_default());
+    }
+    payload
+}
+
 /// Current time as an RFC 3339 UTC timestamp with second precision.
 pub(crate) fn iso8601_now() -> String {
     let secs = std::time::SystemTime::now()
@@ -2020,12 +2046,21 @@ pub(crate) fn run_declare(args: DeclareArgs) -> Result<()> {
             ],
         )?;
 
+        let contract_class_payload = contract
+            .get("sierra_path")
+            .and_then(|v| v.as_str())
+            .and_then(|p| fs::read_to_string(p).ok())
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .map(|c| declare_contract_class_payload(&c))
+            .unwrap_or(serde_json::Value::Null);
+        let nonce = fetch_account_nonce(prof.url.as_deref(), &sender_address);
         let mut declare_tx = serde_json::json!({
             "type": "DECLARE",
             "version": "0x3",
             "sender_address": sender_address,
             "compiled_class_hash": compiled_class_hash,
             "class_hash": class_hash,
+            "contract_class": contract_class_payload,
             "resource_bounds": {
                 "l1_gas": { "max_amount": "0x186a0", "max_price_per_unit": "0x2540be400" },
                 "l2_gas": { "max_amount": "0x0", "max_price_per_unit": "0x0" },
@@ -2036,7 +2071,7 @@ pub(crate) fn run_declare(args: DeclareArgs) -> Result<()> {
             "account_deployment_data": [],
             "nonce_data_availability_mode": "L1",
             "fee_data_availability_mode": "L1",
-            "nonce": "0x0",
+            "nonce": nonce,
             "signature": signature,
         });
 
@@ -2194,6 +2229,7 @@ pub(crate) fn run_deploy(args: DeployArgs) -> Result<()> {
             ],
         )?;
 
+        let nonce = fetch_account_nonce(prof.url.as_deref(), &sender_address);
         let mut invoke_tx = serde_json::json!({
             "type": "INVOKE",
             "version": "0x3",
@@ -2209,7 +2245,7 @@ pub(crate) fn run_deploy(args: DeployArgs) -> Result<()> {
             "account_deployment_data": [],
             "nonce_data_availability_mode": "L1",
             "fee_data_availability_mode": "L1",
-            "nonce": "0x0",
+            "nonce": nonce,
             "signature": signature,
         });
 
@@ -2330,6 +2366,7 @@ pub(crate) fn run_invoke(args: InvokeArgs) -> Result<()> {
             ],
         )?;
 
+        let nonce = fetch_account_nonce(prof.url.as_deref(), &sender_address);
         let mut invoke_tx = serde_json::json!({
             "type": "INVOKE",
             "version": "0x3",
@@ -2345,7 +2382,7 @@ pub(crate) fn run_invoke(args: InvokeArgs) -> Result<()> {
             "account_deployment_data": [],
             "nonce_data_availability_mode": "L1",
             "fee_data_availability_mode": "L1",
-            "nonce": "0x0",
+            "nonce": nonce,
             "signature": signature,
         });
 

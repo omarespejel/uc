@@ -60,7 +60,7 @@ use crate::{Arg, RunResultValue, SierraCasmRunner, StarknetExecutionResources, a
 mod test;
 
 mod circuit;
-mod contract_address;
+pub mod contract_address;
 mod dict_manager;
 
 /// Converts a hint to the Cairo VM class `HintParams` by canonically serializing it to a string.
@@ -276,7 +276,70 @@ pub struct StarknetState {
     /// Monotonic counter for `KeyPairTrait::generate()`.
     next_keypair_secret: u64,
 }
+/// The transaction and block context a devnet sets before executing an entry point.
+#[derive(Clone, Default)]
+pub struct DevnetExecutionContext {
+    pub contract_address: Felt252,
+    pub caller_address: Felt252,
+    pub account_contract_address: Felt252,
+    pub transaction_hash: Felt252,
+    pub nonce: Felt252,
+    pub version: Felt252,
+    pub chain_id: Felt252,
+    pub signature: Vec<Felt252>,
+    pub block_number: Felt252,
+    pub block_timestamp: Felt252,
+    pub sequencer_address: Felt252,
+}
+
 impl StarknetState {
+    /// Sets the execution info a devnet transaction runs under.
+    pub fn set_execution_context(&mut self, ctx: &DevnetExecutionContext) {
+        self.exec_info.contract_address = ctx.contract_address;
+        self.exec_info.caller_address = ctx.caller_address;
+        self.exec_info.tx_info.account_contract_address = ctx.account_contract_address;
+        self.exec_info.tx_info.transaction_hash = ctx.transaction_hash;
+        self.exec_info.tx_info.nonce = ctx.nonce;
+        self.exec_info.tx_info.version = ctx.version;
+        self.exec_info.tx_info.chain_id = ctx.chain_id;
+        self.exec_info.tx_info.signature = ctx.signature.clone();
+        self.exec_info.block_info.block_number = ctx.block_number;
+        self.exec_info.block_info.block_timestamp = ctx.block_timestamp;
+        self.exec_info.block_info.sequencer_address = ctx.sequencer_address;
+    }
+
+    /// Records `class_hash` as deployed at `address` (no constructor run).
+    pub fn register_deployed_contract(&mut self, address: Felt252, class_hash: Felt252) {
+        self.deployed_contracts.insert(address, class_hash);
+    }
+
+    pub fn class_hash_at(&self, address: &Felt252) -> Option<Felt252> {
+        self.deployed_contracts.get(address).copied()
+    }
+
+    pub fn deployed_contracts(&self) -> Vec<(Felt252, Felt252)> {
+        self.deployed_contracts.iter().map(|(a, c)| (*a, *c)).collect()
+    }
+
+    /// The storage cell `key` of `contract` (zero when never written).
+    pub fn storage_at(&self, contract: &Felt252, key: &Felt252) -> Felt252 {
+        self.storage.get(contract).and_then(|m| m.get(key)).copied().unwrap_or_default()
+    }
+
+    pub fn write_storage(&mut self, contract: Felt252, key: Felt252, value: Felt252) {
+        self.storage.entry(contract).or_default().insert(key, value);
+    }
+
+    /// Takes every event emitted so far as `(emitter, keys, data)`, oldest first.
+    pub fn take_events(&mut self) -> Vec<(Felt252, Vec<Felt252>, Vec<Felt252>)> {
+        std::mem::take(&mut self.all_events)
+    }
+
+    /// Takes every L2 to L1 message sent so far as `(from, to, payload)`.
+    pub fn take_l2_to_l1_messages(&mut self) -> Vec<(Felt252, Felt252, Vec<Felt252>)> {
+        std::mem::take(&mut self.all_l2_to_l1_messages)
+    }
+
     /// Seeds a storage cell of the contract that is currently executing (the address a direct
     /// entry point run sees as `get_contract_address`), so a replay observes live chain state.
     pub fn seed_storage_for_current_contract(&mut self, key: Felt252, value: Felt252) {
@@ -3033,7 +3096,7 @@ pub fn read_felts(
 }
 
 /// Reads the result of a function call that returns `Array<felt252>`.
-fn read_array_result_as_vec(memory: &[Option<Felt252>], value: &[Felt252]) -> Vec<Felt252> {
+pub fn read_array_result_as_vec(memory: &[Option<Felt252>], value: &[Felt252]) -> Vec<Felt252> {
     // TODO(spapini): Handle failures.
     let [res_start, res_end] = value else {
         panic!("Unexpected return value from contract call");

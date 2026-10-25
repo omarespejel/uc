@@ -7596,7 +7596,7 @@ struct BuildReceiptFile {
 }
 
 #[cfg(feature = "native-compile")]
-fn compute_starknet_sierra_class_hash(contract_class: &ContractClass) -> Option<String> {
+pub(crate) fn compute_starknet_sierra_class_hash(contract_class: &ContractClass) -> Option<String> {
     use cairo_lang_starknet_classes::keccak::starknet_keccak;
     use starknet_types_core::felt::Felt;
     use starknet_types_core::hash::{Poseidon, StarkHash};
@@ -17932,7 +17932,7 @@ fn native_setup_project(db: &mut RootDatabase, path: &Path) -> Result<Vec<CrateI
 }
 
 #[cfg(feature = "native-compile")]
-fn native_global_cache_root_dir() -> Option<PathBuf> {
+pub(crate) fn native_global_cache_root_dir() -> Option<PathBuf> {
     if let Some(custom) = std::env::var_os("UC_GLOBAL_CACHE_DIR") {
         let p = PathBuf::from(custom);
         if !p.as_os_str().is_empty() {

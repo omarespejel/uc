@@ -179,6 +179,35 @@ storage writes in constructors and setters, swallowed syscall errors, redundant 
 bitwise parity. `#[test]` bodies are never symbolic targets; `prove_*`, `invariant_*` and
 `check_*` functions are.
 
+## Local chain
+
+`uc devnet` runs a Starknet chain in the uc process, no `starknet-devnet` binary needed. On
+start it compiles three embedded Cairo 2.18 contracts with its own compiler (an account, an ERC20
+fee token, a universal deployer; cached per compiler version), declares them, deploys the tokens
+at the mainnet STRK and ETH addresses and the deployer at the mainnet UDC address, and funds the
+predeployed accounts. Transactions execute on the same Sierra runner `uc test` uses, one runner
+per declared class sharing one class table, so calls cross classes declared at any time.
+
+```bash
+uc devnet --port 5050 --accounts 2 --seed 1
+uc declare -c Counter --url http://127.0.0.1:5050/rpc --account-address 0x... --private-key 0x...
+uc deploy -c Counter --constructor-calldata 40 --salt 0x1 --url http://127.0.0.1:5050/rpc ...
+uc invoke --contract-address 0x... --function increase --calldata 2 --url http://127.0.0.1:5050/rpc ...
+uc call --contract-address 0x... --function get --url http://127.0.0.1:5050/rpc
+```
+
+Served: `starknet_addDeclareTransaction`, `addDeployAccountTransaction`, `addInvokeTransaction`,
+`call`, `estimateFee`, `getNonce`, `getClassHashAt`, `getClass`, `getClassAt`, `getStorageAt`,
+`getTransactionByHash` / `Receipt` / `Status`, `getBlockWithTxHashes` / `WithTxs`, `getEvents`,
+`getStateUpdate`, `traceTransaction`, `blockNumber`, `chainId`, `specVersion`, plus `devnet_mint`,
+`devnet_createBlock`, `devnet_setTime`, `devnet_increaseTime`, `devnet_getPredeployedAccounts`
+and the `/predeployed_accounts`, `/mint`, `/create_block`, `/is_alive` routes. One block per
+transaction (`--block-generation-on demand` to batch). Receipts carry events, revert reasons from
+nested calls, steps and builtin counts. Nonces are enforced; signatures and fees are not (a
+devnet signs nothing worth protecting). `uc declare` now carries the class in the transaction and
+every write command fetches the account nonce first; both were missing before, so they would
+have been rejected by any node.
+
 ## Starkscan
 
 Set `STARKSCAN_API_KEY` and every `--network mainnet|sepolia` command talks to Starkscan's
@@ -211,8 +240,11 @@ the upgrade `UPGRADE_UNSAFE`; `uc declare` then refuses to build the transaction
 
 ## What uc does not do yet
 
-- `uc devnet` without an external `starknet-devnet` binary is a JSON-RPC protocol stub with
-  predeployed account addresses and no transaction execution. It prints that on start.
+- `uc devnet` does not charge fees, check signatures or run `__validate__`; `estimateFee`
+  returns a flat figure and `simulateTransactions` is not implemented. `uc declare`, `uc deploy`
+  and `uc invoke` sign a placeholder payload, not the SNIP-8 transaction hash, so against a
+  real node (or `--backend starknet-devnet`) their transactions are rejected for an invalid
+  signature; against `uc devnet` they go through.
 - Fuzz runs collect statement coverage for corpus guidance on their own thread only; `--coverage`
   and `--lcov` still switch the whole run to the unsliced program, which is slower.
 - `uc fetch` writes `Scarb.lock` only when the package has none; it does not update an existing
