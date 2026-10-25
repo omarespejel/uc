@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "cairo-lang-semantic"
-version = "2.16.0"
+version = "2.18.0"
 build = false
 autolib = false
 autobins = false
@@ -36,36 +36,36 @@ name = "cairo_lang_semantic"
 path = "src/lib.rs"
 
 [dependencies.cairo-lang-debug]
-version = "=2.16.0"
+version = "=2.18.0"
 
 [dependencies.cairo-lang-defs]
-version = "=2.16.0"
+version = "=2.18.0"
 
 [dependencies.cairo-lang-diagnostics]
-version = "=2.16.0"
+version = "=2.18.0"
 
 [dependencies.cairo-lang-filesystem]
-version = "=2.16.0"
+version = "=2.18.0"
 
 [dependencies.cairo-lang-parser]
-version = "=2.16.0"
+version = "=2.18.0"
 
 [dependencies.cairo-lang-plugins]
-version = "=2.16.0"
+version = "=2.18.0"
 
 [dependencies.cairo-lang-proc-macros]
-version = "=2.16.0"
+version = "=2.18.0"
 
 [dependencies.cairo-lang-syntax]
-version = "=2.16.0"
+version = "=2.18.0"
 
 [dependencies.cairo-lang-test-utils]
-version = "=2.16.0"
+version = "=2.18.0"
 features = ["testing"]
 optional = true
 
 [dependencies.cairo-lang-utils]
-version = "=2.16.0"
+version = "=2.18.0"
 features = ["tracing"]
 
 [dependencies.id-arena]
@@ -102,7 +102,7 @@ features = [
 default-features = false
 
 [dependencies.sha3]
-version = "0.10.8"
+version = "0.11.0"
 
 [dependencies.starknet-types-core]
 version = "0.2.4"
@@ -113,7 +113,7 @@ features = [
 ]
 
 [dependencies.toml]
-version = "0.9.5"
+version = "1.0.6"
 optional = true
 
 [dependencies.tracing]
@@ -126,7 +126,7 @@ version = "0.4.27"
 version = "1.4.1"
 
 [dev-dependencies.toml]
-version = "0.9.5"
+version = "1.0.6"
 
 [dev-dependencies.tracing]
 version = "0.1.40"

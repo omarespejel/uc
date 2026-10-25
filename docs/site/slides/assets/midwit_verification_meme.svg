@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 460" width="960" height="460">
+  <rect width="960" height="460" rx="12" fill="#ffffff" stroke="#e2e8f0" stroke-width="2"/>
+  <text x="480" y="38" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="22" font-weight="800" fill="#0f172a">The Smart Contract Verification Curve</text>
+
+  <!-- Bell Curve Path -->
+  <path d="M 80 360 C 220 360, 310 340, 370 190 C 415 80, 445 65, 480 65 C 515 65, 545 80, 590 190 C 650 340, 740 360, 880 360" fill="none" stroke="#5c3cbe" stroke-width="5"/>
+  <path d="M 80 360 C 220 360, 310 340, 370 190 C 415 80, 445 65, 480 65 C 515 65, 545 80, 590 190 C 650 340, 740 360, 880 360 L 880 365 L 80 365 Z" fill="#5c3cbe" fill-opacity="0.08"/>
+
+  <!-- Axis -->
+  <line x1="60" y1="365" x2="900" y2="365" stroke="#64748b" stroke-width="2"/>
+  <text x="150" y="395" text-anchor="middle" font-family="ui-monospace, monospace" font-size="16" font-weight="700" fill="#475569">55 IQ (0.1%)</text>
+  <text x="480" y="395" text-anchor="middle" font-family="ui-monospace, monospace" font-size="16" font-weight="700" fill="#475569">100 IQ (68%)</text>
+  <text x="810" y="395" text-anchor="middle" font-family="ui-monospace, monospace" font-size="16" font-weight="700" fill="#475569">145 IQ (0.1%)</text>
+
+  <!-- Dashed percentile lines -->
+  <line x1="340" y1="240" x2="340" y2="365" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="5,5"/>
+  <line x1="480" y1="65" x2="480" y2="365" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="5,5"/>
+  <line x1="620" y1="240" x2="620" y2="365" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="5,5"/>
+
+  <!-- Left Card (Simpleton) -->
+  <rect x="30" y="210" width="250" height="115" rx="8" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
+  <text x="155" y="238" text-anchor="middle" font-family="system-ui, sans-serif" font-size="15" font-weight="700" fill="#334155">"One command is enough"</text>
+  <text x="155" y="268" text-anchor="middle" font-family="ui-monospace, monospace" font-size="15" fill="#003b4f">uc build</text>
+  <text x="155" y="298" text-anchor="middle" font-family="system-ui, sans-serif" font-size="13" fill="#64748b">It compiled, ship it.</text>
+
+  <!-- Center Card (Midwit) -->
+  <rect x="305" y="82" width="350" height="142" rx="8" fill="#fff1f2" stroke="#fda4af" stroke-width="2"/>
+  <text x="480" y="106" text-anchor="middle" font-family="system-ui, sans-serif" font-size="14" font-weight="700" fill="#9f1239">"NOOO! You need 4 separate CLI tools &amp; 3 unit tests!"</text>
+  <text x="480" y="130" text-anchor="middle" font-family="ui-monospace, monospace" font-size="12.5" fill="#881337">asdf install scarb 2.18.0 &amp;&amp; snforge 0.60.0</text>
+  <text x="480" y="150" text-anchor="middle" font-family="ui-monospace, monospace" font-size="12.5" fill="#881337">assert(vault.deposit(100) == 100) // tested 1 input!</text>
+  <text x="480" y="170" text-anchor="middle" font-family="ui-monospace, monospace" font-size="12.5" fill="#881337">sncast --profile sepolia declare ...</text>
+  <text x="480" y="192" text-anchor="middle" font-family="ui-monospace, monospace" font-size="12.5" fill="#881337">starknet-devnet --port 5050</text>
+  <text x="480" y="212" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12" font-style="italic" fill="#be123c">(Still overflows at amount = 18446744073709551615)</text>
+
+  <!-- Right Card (Master / Jedi) -->
+  <rect x="675" y="185" width="260" height="140" rx="8" fill="#f0fdf4" stroke="#86efac" stroke-width="2"/>
+  <text x="805" y="212" text-anchor="middle" font-family="system-ui, sans-serif" font-size="15" font-weight="700" fill="#166534">"One command is enough"</text>
+  <text x="805" y="242" text-anchor="middle" font-family="ui-monospace, monospace" font-size="15" font-weight="700" fill="#14532d">uc prove</text>
+  <text x="805" y="268" text-anchor="middle" font-family="system-ui, sans-serif" font-size="13" fill="#15803d">Proves all 2^64 inputs,</text>
+  <text x="805" y="288" text-anchor="middle" font-family="system-ui, sans-serif" font-size="13" fill="#15803d">equivalence &amp; taint safety</text>
+  <text x="805" y="308" text-anchor="middle" font-family="ui-monospace, monospace" font-size="13" font-weight="700" fill="#166534">in 18.7ms.</text>
+</svg>

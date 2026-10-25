@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 264" width="880" height="264">
+  <rect width="880" height="264" fill="#ffffff"/>
+  <line x1="182" y1="14" x2="182" y2="210" stroke="#e2e2e2" stroke-width="2"/>
+  <line x1="472" y1="14" x2="472" y2="210" stroke="#e2e2e2" stroke-width="2"/>
+  <line x1="762" y1="14" x2="762" y2="210" stroke="#e2e2e2" stroke-width="2"/>
+
+  <text x="166" y="45" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="24" font-weight="700" fill="#222222">uc build</text>
+  <text x="166" y="96" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="24" font-weight="700" fill="#222222">uc test</text>
+  <text x="166" y="147" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="24" fill="#222222">scarb</text>
+  <text x="166" y="198" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="24" fill="#222222">snforge</text>
+
+  <rect x="182" y="21" width="7" height="32" fill="#5c3cbe"/>
+  <rect x="182" y="72" width="14" height="32" fill="#5c3cbe"/>
+  <rect x="182" y="123" width="273" height="32" fill="#5c3cbe"/>
+  <rect x="182" y="174" width="396" height="32" fill="#5c3cbe"/>
+
+  <text x="201" y="45" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="24" font-weight="600" fill="#222222">0.03s</text>
+  <text x="208" y="96" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="24" font-weight="600" fill="#222222">0.02s</text>
+  <text x="467" y="147" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="24" fill="#222222">0.94s</text>
+  <text x="590" y="198" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="24" fill="#222222">1.37s</text>
+
+  <text x="182" y="246" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="24" fill="#222222">0s</text>
+  <text x="472" y="246" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="24" fill="#222222">1.0s</text>
+  <text x="762" y="246" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="24" fill="#222222">2.0s</text>
+</svg>

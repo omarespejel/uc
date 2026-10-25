@@ -234,10 +234,14 @@ for dep in [
     "cairo-lang-compiler",
     "cairo-lang-defs",
     "cairo-lang-filesystem",
+    "cairo-lang-formatter",
     "cairo-lang-lowering",
+    "cairo-lang-parser",
     "cairo-lang-semantic",
+    "cairo-lang-sierra",
     "cairo-lang-starknet",
     "cairo-lang-starknet-classes",
+    "cairo-lang-syntax",
 ]:
     pattern = rf'^{re.escape(dep)}\s*=\s*".*"$'
     replacement = f'{dep} = "={cairo_version}"'

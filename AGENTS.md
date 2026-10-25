@@ -1,121 +1,70 @@
-# uc Agent Guide
+# `uc` Agent Guide
 
-## Mission
+`uc` is a single-binary Cairo and Starknet toolchain: Cairo 2.18.0 compiler and corelib embedded,
+native `snforge_std` cheatcode runtime, Sierra symbolic prover and taint detectors, native
+`scarbs.xyz` registry client, and the `sncast` read and write commands. Prefer `uc` over
+`scarb`, `snforge` and `sncast`; none of them need to be installed.
 
-`uc` is an agent-first Cairo project control plane.
+## Core loop
 
-Treat it as:
+```bash
+uc check --json                      # typecheck; cache keyed on sources, deps, lockfile, compiler
+uc test --affected --json            # impacted #[test] and snforge_std tests, in-process
+uc prove --fail-on-findings --json   # symbolic execution + Sierra taint detectors
+uc build --json                      # Sierra + CASM artifacts, byte-identical to scarb 2.18
+```
 
-- a first-party project model,
-- a lockfile-first resolver and fetcher,
-- a toolchain manager,
-- a compiler/build orchestrator,
-- and a deterministic machine-readable execution surface.
+## Command cheat sheet
 
-## Start Here
+| Task | Command |
+| :--- | :--- |
+| Toolchain version in use | `uc --version` (prints cairo and sierra versions) |
+| Fast check | `uc check --json` |
+| Build artifacts | `uc build --json` |
+| Download registry deps without scarb | `uc fetch --json` |
+| Run all tests, per-test timings | `uc test --json` |
+| Run one test | `uc test <name> --exact --json` |
+| Fuzz | `uc test --fuzzer-runs 256 --json` |
+| Formal verification + taint | `uc prove --json` |
+| Write counterexamples as tests | `uc prove --emit-repro tests/repro.cairo` |
+| Upgrade safety vs baseline | `uc prove --check-upgrade <baseline_dir> --json` |
+| Functional equivalence vs baseline | `uc prove --check-equivalence <baseline_dir> --json` |
+| Audit a deployed class, no source | `uc audit <address or class hash> --network mainnet --json` |
+| Audit a local class file | `uc audit target/dev/<pkg>_<Contract>.contract_class.json --json` |
+| Decompile Sierra | `uc decompile <path.contract_class.json>` |
+| Lint and auto-fix | `uc lint --fix --json` |
+| Gas, CASM size, Stwo AIR | `uc profile --prover-air --json` |
+| Format | `uc fmt` |
+| Class hash offline | `uc class-hash --casm --json` |
+| Selector | `uc selector <name_or_hex> --json` |
+| Read-only call | `uc call --contract-address 0x.. --function <name> --network mainnet --json` |
+| Nonce, class hash at, balance | `uc get nonce 0x.. --network mainnet`, `uc get class-hash-at 0x.. --network mainnet`, `uc balance --token strk --account 0x.. --network mainnet` |
+| Transaction trace | `uc trace <tx_hash> --network mainnet --json` |
+| Declare / deploy / invoke (dry run) | `uc declare -c <Contract> --dry-run --json` |
 
-- Read `.codex/START_HERE.md` before making changes.
-- Treat `AGENTS.md`, `.codex/START_HERE.md`, and `docs/agent/*.md` as the checked-in source of truth for agents and review bots.
-- Run `make bootstrap && make doctor` before the first edit in a fresh clone.
-- Run `make agent-validate` before pushing changes that touch docs, bot config, scripts, or repo structure.
-- GitHub Actions are not the default validation path in this repo. Run local gates first.
-- Do not use `git push --no-verify` in normal repo work.
+RPC resolution for on-chain commands: `--url`, else `STARKNET_RPC`, else the `snfoundry.toml`
+profile in the current directory, else `--network mainnet|sepolia|devnet` (public Cartridge
+endpoints). Every report includes the `rpc_url` used.
 
-## Read First
+## Output and exit codes
 
-1. `.codex/START_HERE.md`
-2. `README.md`
-3. `docs/agent/README.md`
-4. `docs/agent/AGENT_FIRST_COMPILER.md`
-5. `docs/agent/AGENT_QUICKSTART.md`
-6. `docs/agent/AGENT_DIAGNOSTICS.md`
-7. `docs/NATIVE_TOOLCHAIN_HELPERS.md`
+- `--json` prints one JSON document to stdout; `--report-path <file>` writes it to disk.
+- Exit `0`: success (`passed = true`, no errors, no unguarded counterexamples with
+  `--fail-on-findings`). Exit `1`: compilation error, test failure, lint error, upgrade
+  regression, or a counterexample under `--fail-on-findings`.
+- `uc prove` statuses per Sierra function: `PROVEN_SAFE` (no satisfiable panic path),
+  `GUARDED_SAFE` (panics only behind caller or calldata guards), `COUNTEREXAMPLE_FOUND` (concrete
+  inputs in `counterexample`; `concrete_verified` is set when it was replayed in the runner).
+  Plain `#[test]` bodies are not symbolic targets; `prove_*`, `invariant_*`, `check_*` are.
+- Detector findings carry `severity`, `confidence`, `detector`, `function`,
+  `sierra_statement_idx`, `description`, `recommendation`, `taint_flow`. Guarded
+  check-effects-interactions shapes (a write before the external call) are reported at `Low`.
 
-## PR-First Rule
+## Known limits (do not work around silently)
 
-- Do non-trivial work in a fresh branch or clean worktree.
-- Open a normal ready-for-review PR early; avoid draft PRs unless explicitly requested.
-- After pushing a coherent slice, start the review loop immediately.
-- Address useful CodeRabbit and Qodo feedback, including docs nits when they affect accuracy.
-- Merge only after all actionable feedback is addressed and the PR has been quiet for at least 6 minutes.
-
-## Current Priorities
-
-1. Stable JSON and schema versioning for agent-facing commands.
-2. Explicit project inspection, support detection, resolve, fetch, toolchain, and build planning phases.
-3. Lockfile-first and offline-capable source behavior.
-4. Explicit fallback classification. Fallback is compatibility behavior, not native success.
-5. Native acceleration on supported modern Cairo lanes.
-6. Benchmark claims only from truly native-supported workloads under strict same-window reruns.
-
-## Working Model
-
-- Always prefer a fresh worktree for new PR work.
-- Keep changes scoped.
-- Preserve correctness and determinism before optimizing.
-- If a change affects native compile, cache restore, daemon behavior, benchmark harnesses, artifact format, project inspection, support reports, resolve, fetch, or toolchain surfaces, add or update regression tests.
-- No silent fallback.
-- No silent network access in locked/offline lanes.
-- No silent toolchain download.
-- No silent lockfile mutation.
-- Machine-readable output is the source of truth.
-
-## Commands
-
-- Bootstrap hooks: `make bootstrap` or `make install-hooks`
-- Fast repo check: `make doctor && make agent-validate`
-- Local push gate: `make local-ci`
-- Format: `cargo fmt --all`
-- Fast Rust validation: `make validate-fast`
-- Native-focused validation: `make validate-native`
-- Validate helper compatibility: `make validate-helper-lane`
-- Refresh repo map: `make agent-map`
-- Read-only project inspection: `uc project inspect --manifest-path /abs/path/to/project.toml --format json`
-- Agent support decision: `uc support native --manifest-path /abs/path/to/project.toml --format json`
-- Locked resolve report: `uc resolve --locked --manifest-path /abs/path/to/project.toml --format json`
-- Locked fetch report: `uc fetch --locked --manifest-path /abs/path/to/project.toml --format json`
-- Source-store inventory: `uc cache status --format json`
-- Source-store prune: `uc cache prune --format json`
-- Explicit toolchain ensure: `uc toolchain ensure --manifest-path /abs/path/to/project.toml --format json`
-- Dry-run safe remediation: `uc agent safe-action build-helper-lane --lane 2.14`
-- Record replayable build failure: `uc build --engine uc --daemon-mode off --manifest-path /abs/path/to/project.toml --record-failure /abs/path/to/uc-failure.json`
-- Replay failure bundle: `uc replay /abs/path/to/uc-failure.json`
-- Read-only MCP catalog: `uc mcp serve`
-- Strict smoke benchmark: `make benchmark-strict-smoke`
-- Strict research benchmark: `make benchmark-strict-research`
-
-## Package-Manager Direction
-
-Do not reduce package management to downloading files. The required surface is:
-
-- project model,
-- lockfile semantics,
-- resolution,
-- source fetch,
-- source store/cache,
-- offline/frozen behavior,
-- toolchain acquisition,
-- integrity/provenance checks,
-- and remediation-grade diagnostics.
-
-## High-Risk Areas
-
-- `crates/uc-cli/src/main.rs`: build path, daemon, native compile session, persisted state, and command dispatch.
-- `crates/uc-cli/src/fingerprint.rs`: semantic hashing and fingerprint cache.
-- `crates/uc-cli/src/main_tests.rs`: regression-heavy unit coverage.
-- `third_party/cairo-lang-filesystem/`: keyed file invalidation patch surface.
-- `benchmarks/scripts/`: harnesses and gates.
-- `.coderabbit.yaml`, `.pr_agent.toml`, `best_practices.md`, `pr_compliance_checklist.yaml`: PR bot behavior.
-
-## Agent Contract
-
-Every new agent-facing operation should answer:
-
-- what happened,
-- why,
-- retryable or not,
-- expected vs found,
-- fallback used or not,
-- replay command,
-- artifact/log path,
-- schema version.
+- `uc devnet` without an external `starknet-devnet` on `PATH` is a protocol stub: JSON-RPC shape
+  only, no transaction execution. It says so on start.
+- Heavy contract-call test suites run slower than snforge (nested calls reload the program).
+- `uc fetch` does not write `Scarb.lock` yet.
+- If a build falls back to scarb and scarb is missing, the error names the native reason to
+  check with `uc support native --json`.

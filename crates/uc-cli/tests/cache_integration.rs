@@ -88,6 +88,12 @@ fn local_native_corelib_src() -> Option<PathBuf> {
             return candidate.canonicalize().ok().or(Some(candidate));
         }
     }
+    let vendored = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../third_party/corelib/src");
+    if let Ok(path) = vendored.canonicalize() {
+        if path.is_dir() {
+            return Some(path);
+        }
+    }
     let candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../cairo/corelib/src");
     candidate.canonicalize().ok().filter(|path| path.is_dir())
 }

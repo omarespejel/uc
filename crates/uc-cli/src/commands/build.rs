@@ -1597,6 +1597,214 @@ fn maybe_autostart_daemon_for_build(
     }
 }
 
+fn try_run_native_multi_member_workspace_build(
+    common: &BuildCommonArgs,
+    engine: EngineArg,
+    daemon_mode: DaemonModeArg,
+    report_path: Option<&Path>,
+    emit_json: bool,
+    manifest_path: &Path,
+    workspace_root: &Path,
+    profile: &str,
+) -> Result<bool> {
+    if engine != EngineArg::Uc
+        || common.package.is_some()
+        || native_build_mode() == NativeBuildMode::Off
+    {
+        return Ok(false);
+    }
+    let Ok(manifest_text) = read_text_file_with_limit(manifest_path, MAX_MANIFEST_BYTES, "manifest")
+    else {
+        return Ok(false);
+    };
+    let Ok(manifest) = parse_manifest_toml(&manifest_text, manifest_path, "manifest") else {
+        return Ok(false);
+    };
+    let has_workspace = manifest
+        .get("workspace")
+        .and_then(TomlValue::as_table)
+        .and_then(|ws| ws.get("members"))
+        .and_then(TomlValue::as_array)
+        .is_some_and(|m| !m.is_empty());
+    if !has_workspace {
+        return Ok(false);
+    }
+    let has_root_package = manifest.get("package").and_then(TomlValue::as_table).is_some();
+    if !common.workspace && has_root_package {
+        return Ok(false);
+    }
+    let Ok(member_manifests) = resolve_all_workspace_member_manifests(manifest_path, workspace_root)
+    else {
+        return Ok(false);
+    };
+    if member_manifests.is_empty() || (member_manifests.len() == 1 && has_root_package) {
+        return Ok(false);
+    }
+
+    let mut member_targets = Vec::with_capacity(member_manifests.len());
+    for member_manifest in &member_manifests {
+        let Ok(text) = read_text_file_with_limit(member_manifest, MAX_MANIFEST_BYTES, "manifest")
+        else {
+            return Ok(false);
+        };
+        let Ok(val) = parse_manifest_toml(&text, member_manifest, "manifest") else {
+            return Ok(false);
+        };
+        let Some(pkg_name) = val
+            .get("package")
+            .and_then(TomlValue::as_table)
+            .and_then(|p| p.get("name"))
+            .and_then(TomlValue::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+        else {
+            return Ok(false);
+        };
+        if with_native_compat_toolchain_fallback(|| native_compile_support_reason(member_manifest))
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return Ok(false);
+        }
+        let member_common = BuildCommonArgs {
+            manifest_path: Some(member_manifest.clone()),
+            package: Some(pkg_name.clone()),
+            workspace: false,
+            features: common.features.clone(),
+            offline: common.offline,
+            release: common.release,
+            profile: common.profile.clone(),
+        };
+        if !member_manifest
+            .parent()
+            .unwrap_or(workspace_root)
+            .join("src/lib.cairo")
+            .is_file()
+        {
+            return Ok(false);
+        }
+        member_targets.push((pkg_name, member_manifest.clone(), member_common));
+    }
+
+    let write_report = report_path.is_some() || emit_json;
+    let mut total_elapsed_ms = 0.0_f64;
+    let mut all_cache_hits = true;
+    let mut any_daemon_used = false;
+    let mut combined_telemetry = BuildPhaseTelemetry::default();
+    let mut combined_diagnostics = Vec::new();
+    let mut last_report: Option<BuildReport> = None;
+
+    for (_pkg_name, _member_manifest, member_common) in member_targets {
+        let temp_report = helper_build_report_temp_path(workspace_root)?;
+        let member_res = run_build(BuildArgs {
+            common: member_common,
+            engine,
+            daemon_mode,
+            report_path: Some(temp_report.clone()),
+            record_failure: None,
+            json: false,
+            plan_only: false,
+        });
+        if let Err(err) = member_res {
+            let _ = fs::remove_file(&temp_report);
+            return Err(err);
+        }
+        if temp_report.exists() {
+            if let Ok(rep) = load_build_report(&temp_report) {
+                total_elapsed_ms += rep.elapsed_ms;
+                all_cache_hits &= rep.cache_hit;
+                any_daemon_used |= rep.daemon_used;
+                if let Some(tel) = &rep.phase_telemetry {
+                    combined_telemetry.fingerprint_ms += tel.fingerprint_ms;
+                    combined_telemetry.cache_lookup_ms += tel.cache_lookup_ms;
+                    combined_telemetry.cache_restore_ms += tel.cache_restore_ms;
+                    combined_telemetry.compile_ms += tel.compile_ms;
+                    combined_telemetry.cache_persist_ms += tel.cache_persist_ms;
+                    combined_telemetry.native_context_ms += tel.native_context_ms;
+                    combined_telemetry.native_target_dir_ms += tel.native_target_dir_ms;
+                    combined_telemetry.native_session_prepare_ms += tel.native_session_prepare_ms;
+                    combined_telemetry.native_frontend_compile_ms += tel.native_frontend_compile_ms;
+                    combined_telemetry.native_casm_ms += tel.native_casm_ms;
+                    combined_telemetry.native_artifact_write_ms += tel.native_artifact_write_ms;
+                }
+                combined_diagnostics.extend(rep.diagnostics.clone());
+                last_report = Some(rep);
+            }
+            let _ = fs::remove_file(&temp_report);
+        }
+    }
+
+    if write_report {
+        let artifacts = collect_profile_artifacts(workspace_root, profile)?;
+        let native_compiler_version = native_compiler_version_line();
+        let session_key = build_session_input_with_compiler_version(
+            common,
+            manifest_path,
+            profile,
+            &native_compiler_version,
+        )
+        .map(|s| s.deterministic_key_hex())
+        .unwrap_or_else(|_| {
+            last_report
+                .as_ref()
+                .map(|r| r.session_key.clone())
+                .unwrap_or_else(|| "n/a".to_string())
+        });
+        let fingerprint = compute_build_fingerprint(
+            workspace_root,
+            manifest_path,
+            common,
+            profile,
+            None,
+        )
+        .unwrap_or_else(|_| {
+            last_report
+                .as_ref()
+                .map(|r| r.fingerprint.clone())
+                .unwrap_or_default()
+        });
+        let report = BuildReport {
+            schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
+            generated_at_epoch_ms: epoch_ms()?,
+            engine: engine.as_str().to_string(),
+            daemon_used: any_daemon_used,
+            manifest_path: manifest_path.display().to_string(),
+            workspace_root: workspace_root.display().to_string(),
+            profile: profile.to_string(),
+            session_key,
+            command: vec![
+                "uc".to_string(),
+                "build".to_string(),
+                "--workspace".to_string(),
+            ],
+            exit_code: 0,
+            elapsed_ms: total_elapsed_ms,
+            cache_hit: all_cache_hits,
+            fingerprint,
+            artifact_count: artifacts.len(),
+            phase_telemetry: Some(combined_telemetry),
+            compile_backend: last_report
+                .as_ref()
+                .and_then(|r| r.compile_backend.clone())
+                .or_else(|| Some("uc_native".to_string())),
+            native_toolchain: last_report.and_then(|r| r.native_toolchain),
+            diagnostics: combined_diagnostics,
+        };
+        if let Some(path) = report_path {
+            write_json_report(path, &report)?;
+        }
+        if emit_json {
+            println!(
+                "{}",
+                serde_json::to_string(&report).context("failed to serialize build report")?
+            );
+        }
+    }
+    Ok(true)
+}
+
 pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
     if args.plan_only {
         return run_build_plan(args);
@@ -1608,8 +1816,22 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
     let engine = args.engine;
     let daemon_mode = args.daemon_mode;
     let manifest_path = resolve_manifest_path(&common.manifest_path)?;
+    ensure_manifest_is_cairo_package(&manifest_path)?;
     let workspace_root = metadata_cache_workspace_root(&manifest_path)?;
     let profile = effective_profile(&common);
+
+    if try_run_native_multi_member_workspace_build(
+        &common,
+        engine,
+        daemon_mode,
+        report_path.as_deref(),
+        emit_json,
+        &manifest_path,
+        &workspace_root,
+        &profile,
+    )? {
+        return Ok(());
+    }
 
     let mut session_key = String::new();
     let mut daemon_used = false;
@@ -1642,6 +1864,13 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         EngineArg::Uc => 'uc: {
             let (toolchain_requirement, toolchain_selection) =
                 select_native_toolchain_from_manifest_path(&manifest_path)?;
+            #[cfg(feature = "native-compile")]
+            let use_compat_toolchain_fallback = toolchain_selection
+                .as_ref()
+                .err()
+                .is_some_and(native_issue_allows_in_process_compat);
+            #[cfg(not(feature = "native-compile"))]
+            let use_compat_toolchain_fallback = false;
             native_toolchain = Some(match &toolchain_selection {
                 Ok(selection) => selection.toolchain.clone(),
                 Err(issue) => native_toolchain_report_for_issue(&toolchain_requirement, issue),
@@ -1670,7 +1899,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             Some(&helper_display),
                         )?;
                         let run = run_command(command, command_vec, write_report)?;
-                        if !emit_json {
+                        if !emit_json && !is_native_compat_toolchain_fallback_active() {
                             replay_output(&run.stdout, &run.stderr)?;
                         }
                         let mut cache_hit = false;
@@ -1722,12 +1951,41 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                         &native_compiler_version,
                     )?
                     .deterministic_key_hex();
-                    match native_auto_preflight_hint_state(&workspace_root, &native_session_key)? {
+                    let mut hint_state =
+                        native_auto_preflight_hint_state(&workspace_root, &native_session_key)?;
+                    if use_compat_toolchain_fallback
+                        && matches!(
+                            hint_state,
+                            NativeAutoPreflightHintState::UnsupportedHint(_)
+                                | NativeAutoPreflightHintState::FallbackHint(_)
+                        )
+                    {
+                        hint_state = NativeAutoPreflightHintState::Unknown;
+                    }
+                    match hint_state {
                         NativeAutoPreflightHintState::Supported => None,
                         NativeAutoPreflightHintState::UnsupportedHint(reason) => Some(reason),
-                        NativeAutoPreflightHintState::FallbackHint(reason) => Some(reason),
+                        NativeAutoPreflightHintState::FallbackHint(reason) => {
+                            // A cached "fell back to scarb" hint can go stale (for example the
+                            // registry dependency it tripped on has since been downloaded).
+                            // Re-run the cheap native preflight before trusting it.
+                            match with_native_compat_toolchain_fallback(|| {
+                                native_compile_preflight(&common, &manifest_path, &workspace_root)
+                            }) {
+                                Ok(()) => {
+                                    let _ = clear_daemon_local_probe_hint(
+                                        &workspace_root,
+                                        &native_session_key,
+                                    );
+                                    None
+                                }
+                                Err(_) => Some(reason),
+                            }
+                        }
                         NativeAutoPreflightHintState::Unknown => {
-                            if let Some(reason) = native_compile_support_reason(&manifest_path)? {
+                            if let Some(reason) = with_native_compat_toolchain_fallback(|| {
+                                native_compile_support_reason(&manifest_path)
+                            })? {
                                 let _ = persist_daemon_local_native_unsupported_hint(
                                     &workspace_root,
                                     &native_session_key,
@@ -1747,11 +2005,13 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                     &workspace_root,
                                     &native_session_key,
                                 );
-                                match native_compile_preflight(
-                                    &common,
-                                    &manifest_path,
-                                    &workspace_root,
-                                ) {
+                                match with_native_compat_toolchain_fallback(|| {
+                                    native_compile_preflight(
+                                        &common,
+                                        &manifest_path,
+                                        &workspace_root,
+                                    )
+                                }) {
                                     Ok(()) => None,
                                     Err(err) => {
                                         if native_error_allows_scarb_fallback(&err) {
@@ -1811,23 +2071,26 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                         // Local Scarb-backed UC builds execute Scarb directly in-process and must enforce the toolchain gate.
                         validate_scarb_toolchain()?;
                     }
-                    let (run, cache_hit, fingerprint, telemetry) = run_build_with_uc_cache(
-                        &common,
-                        BuildCacheRunContext {
-                            manifest_path: &manifest_path,
-                            workspace_root: &workspace_root,
-                            profile: &profile,
-                            session_key,
-                            compiler_version,
-                            compile_backend: backend,
-                            options: BuildRunOptions {
-                                capture_output: write_report,
-                                inherit_output_when_uncaptured: !write_report,
-                                async_cache_persist: false,
-                                use_daemon_shared_cache: false,
-                            },
-                        },
-                    )?;
+                    let (run, cache_hit, fingerprint, telemetry) =
+                        with_native_compat_toolchain_fallback(|| {
+                            run_build_with_uc_cache(
+                                &common,
+                                BuildCacheRunContext {
+                                    manifest_path: &manifest_path,
+                                    workspace_root: &workspace_root,
+                                    profile: &profile,
+                                    session_key,
+                                    compiler_version,
+                                    compile_backend: backend,
+                                    options: BuildRunOptions {
+                                        capture_output: write_report,
+                                        inherit_output_when_uncaptured: !write_report,
+                                        async_cache_persist: false,
+                                        use_daemon_shared_cache: false,
+                                    },
+                                },
+                            )
+                        })?;
                     Ok((run, cache_hit, fingerprint, telemetry))
                 };
 
@@ -1889,9 +2152,14 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             .deterministic_key_hex();
                             Ok((compiler_version, session_key))
                         };
-                        if let Some(hinted_session_key) =
-                            load_daemon_local_probe_hint(&workspace_root, &native_session_key)?
+                        let cached_probe_hint = if use_compat_toolchain_fallback
+                            || is_native_compat_toolchain_fallback_active()
                         {
+                            None
+                        } else {
+                            load_daemon_local_probe_hint(&workspace_root, &native_session_key)?
+                        };
+                        if let Some(hinted_session_key) = cached_probe_hint {
                             if disallow_native_fallback {
                                 bail!(
                                     "native fallback is disallowed (UC_NATIVE_DISALLOW_SCARB_FALLBACK=1): cached fallback hint present for session key {native_session_key}"
@@ -2005,11 +2273,13 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                     &run,
                                 );
                                 push_diagnostic(diagnostic);
-                                let _ = persist_daemon_local_probe_hint(
-                                    &workspace_root,
-                                    &native_session_key,
-                                    &local_session_key,
-                                );
+                                if run.exit_code == 0 {
+                                    let _ = persist_daemon_local_probe_hint(
+                                        &workspace_root,
+                                        &native_session_key,
+                                        &local_session_key,
+                                    );
+                                }
                                 let _ = clear_daemon_local_native_supported_hint(
                                     &workspace_root,
                                     &native_session_key,
@@ -2274,7 +2544,13 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                 Ok(None)
             };
 
-            match daemon_mode {
+            let effective_daemon_mode =
+                if use_compat_toolchain_fallback && matches!(daemon_mode, DaemonModeArg::Auto) {
+                    DaemonModeArg::Off
+                } else {
+                    daemon_mode
+                };
+            match effective_daemon_mode {
                 DaemonModeArg::Off => {
                     let (run, cache_hit, fingerprint, local_session_key, telemetry, backend) =
                         run_local_for_native_mode(native_mode)?;
@@ -2463,7 +2739,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             }
         }
     };
-    if !emit_json {
+    if !emit_json && !is_native_compat_toolchain_fallback_active() {
         replay_output(&run.stdout, &run.stderr)?;
     }
     if should_log_phase_telemetry() {

@@ -1,0 +1,308 @@
+{
+  "stamp": "20261025-162907",
+  "host": "arm64 Darwin",
+  "versions": {
+    "uc": "uc 0.1.0 (cairo 2.18.0, sierra 1.8.0)",
+    "scarb": "scarb 2.18.0 (e6144df0f 2026-04-21)",
+    "snforge": "snforge 0.60.0"
+  },
+  "runs": 3,
+  "results": [
+    {
+      "project": "erc8004",
+      "manifest": "/private/tmp/claude-501/-Users-espejelomar-StarkNet-block-explorer/e8bbc75f-27a7-424b-8f9f-a4fef7b84dc8/scratchpad/rw/erc8004/Scarb.toml",
+      "scarb_build_cold": {
+        "ok": false,
+        "runs": 3,
+        "median_ms": 11565.0,
+        "samples_ms": [
+          11565.0,
+          11378.3,
+          11744.4
+        ]
+      },
+      "scarb_build_warm": {
+        "ok": false,
+        "runs": 3,
+        "median_ms": 11466.7,
+        "samples_ms": [
+          11454.4,
+          11697.3,
+          11466.7
+        ]
+      },
+      "uc_build_cold": {
+        "ok": true,
+        "runs": 3,
+        "median_ms": 5962.3,
+        "samples_ms": [
+          5962.3,
+          6039.8,
+          5489.7
+        ]
+      },
+      "uc_build_warm": {
+        "ok": true,
+        "runs": 3,
+        "median_ms": 22.7,
+        "samples_ms": [
+          22.7,
+          22.9,
+          17.2
+        ]
+      },
+      "artifact_parity": {
+        "identical": [],
+        "differing": []
+      },
+      "snforge_test_cold": {
+        "ok": false,
+        "runs": 3,
+        "median_ms": 11565.9,
+        "samples_ms": [
+          11395.1,
+          11565.9,
+          11840.8
+        ]
+      },
+      "snforge_test_warm": {
+        "ok": false,
+        "runs": 3,
+        "median_ms": 11603.3,
+        "samples_ms": [
+          11563.1,
+          11603.3,
+          11645.9
+        ]
+      },
+      "uc_test_cold": {
+        "ok": true,
+        "runs": 3,
+        "median_ms": 61502.0,
+        "samples_ms": [
+          62189.6,
+          56360.3,
+          61502.0
+        ]
+      },
+      "uc_test_warm": {
+        "ok": true,
+        "runs": 3,
+        "median_ms": 55762.1,
+        "samples_ms": [
+          55985.5,
+          55762.1,
+          51327.9
+        ]
+      },
+      "uc_prove": {
+        "ms": 713.1,
+        "functions": 161,
+        "findings": 1,
+        "counterexamples": 0
+      }
+    },
+    {
+      "project": "betshare",
+      "manifest": "/private/tmp/claude-501/-Users-espejelomar-StarkNet-block-explorer/e8bbc75f-27a7-424b-8f9f-a4fef7b84dc8/scratchpad/rw/betshare/Scarb.toml",
+      "scarb_build_cold": {
+        "ok": true,
+        "runs": 3,
+        "median_ms": 11903.6,
+        "samples_ms": [
+          11534.1,
+          11903.6,
+          13273.0
+        ]
+      },
+      "scarb_build_warm": {
+        "ok": true,
+        "runs": 3,
+        "median_ms": 269.2,
+        "samples_ms": [
+          269.2,
+          317.5,
+          177.1
+        ]
+      },
+      "uc_build_cold": {
+        "ok": true,
+        "runs": 3,
+        "median_ms": 5234.5,
+        "samples_ms": [
+          5234.5,
+          5457.3,
+          5090.6
+        ]
+      },
+      "uc_build_warm": {
+        "ok": true,
+        "runs": 3,
+        "median_ms": 25.2,
+        "samples_ms": [
+          29.0,
+          23.2,
+          25.2
+        ]
+      },
+      "artifact_parity": {
+        "identical": [
+          "betshare_smartcontract.starknet_artifacts.json",
+          "betshare_smartcontract_AccountMock.compiled_contract_class.json",
+          "betshare_smartcontract_AccountMock.contract_class.json",
+          "betshare_smartcontract_BetshareToken.compiled_contract_class.json",
+          "betshare_smartcontract_BetshareToken.contract_class.json",
+          "betshare_smartcontract_CTF.compiled_contract_class.json",
+          "betshare_smartcontract_CTF.contract_class.json",
+          "betshare_smartcontract_ERC1155ReceiverMock.compiled_contract_class.json",
+          "betshare_smartcontract_ERC1155ReceiverMock.contract_class.json",
+          "betshare_smartcontract_MockERC20.compiled_contract_class.json",
+          "betshare_smartcontract_MockERC20.contract_class.json",
+          "betshare_smartcontract_SClob.compiled_contract_class.json",
+          "betshare_smartcontract_SClob.contract_class.json"
+        ],
+        "differing": []
+      },
+      "snforge_test_cold": {
+        "ok": true,
+        "runs": 3,
+        "median_ms": 15016.9,
+        "samples_ms": [
+          15927.8,
+          15016.9,
+          14344.9
+        ]
+      },
+      "snforge_test_warm": {
+        "ok": true,
+        "runs": 3,
+        "median_ms": 2427.9,
+        "samples_ms": [
+          2427.9,
+          2296.9,
+          2735.7
+        ]
+      },
+      "uc_test_cold": {
+        "ok": true,
+        "runs": 3,
+        "median_ms": 7861.3,
+        "samples_ms": [
+          8159.4,
+          7628.0,
+          7861.3
+        ]
+      },
+      "uc_test_warm": {
+        "ok": true,
+        "runs": 3,
+        "median_ms": 850.2,
+        "samples_ms": [
+          888.0,
+          816.8,
+          850.2
+        ]
+      },
+      "uc_prove": {
+        "ms": 289.5,
+        "functions": 82,
+        "findings": 2,
+        "counterexamples": 2
+      }
+    },
+    {
+      "project": "agent_account",
+      "manifest": "/private/tmp/claude-501/-Users-espejelomar-StarkNet-block-explorer/e8bbc75f-27a7-424b-8f9f-a4fef7b84dc8/scratchpad/rw/agent_account/Scarb.toml",
+      "scarb_build_cold": {
+        "ok": false,
+        "runs": 3,
+        "median_ms": 11453.1,
+        "samples_ms": [
+          11453.1,
+          11227.7,
+          11493.8
+        ]
+      },
+      "scarb_build_warm": {
+        "ok": false,
+        "runs": 3,
+        "median_ms": 11370.6,
+        "samples_ms": [
+          11370.6,
+          11429.0,
+          11334.2
+        ]
+      },
+      "uc_build_cold": {
+        "ok": true,
+        "runs": 3,
+        "median_ms": 5357.3,
+        "samples_ms": [
+          5986.7,
+          5357.3,
+          5196.9
+        ]
+      },
+      "uc_build_warm": {
+        "ok": true,
+        "runs": 3,
+        "median_ms": 32.9,
+        "samples_ms": [
+          29.8,
+          32.9,
+          83.6
+        ]
+      },
+      "artifact_parity": {
+        "identical": [],
+        "differing": []
+      },
+      "snforge_test_cold": {
+        "ok": false,
+        "runs": 3,
+        "median_ms": 11541.9,
+        "samples_ms": [
+          11395.4,
+          11583.9,
+          11541.9
+        ]
+      },
+      "snforge_test_warm": {
+        "ok": false,
+        "runs": 3,
+        "median_ms": 11674.6,
+        "samples_ms": [
+          11674.6,
+          11680.5,
+          11618.9
+        ]
+      },
+      "uc_test_cold": {
+        "ok": true,
+        "runs": 3,
+        "median_ms": 8823.1,
+        "samples_ms": [
+          9131.4,
+          8800.6,
+          8823.1
+        ]
+      },
+      "uc_test_warm": {
+        "ok": true,
+        "runs": 3,
+        "median_ms": 2237.5,
+        "samples_ms": [
+          2265.1,
+          2237.5,
+          2166.6
+        ]
+      },
+      "uc_prove": {
+        "ms": 306.5,
+        "functions": 88,
+        "findings": 0,
+        "counterexamples": 0
+      }
+    }
+  ]
+}

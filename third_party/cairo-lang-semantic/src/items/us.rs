@@ -329,8 +329,7 @@ fn priv_global_use_semantic_data_tracked_initial<'db>(
 ) -> Maybe<UseGlobalData<'db>> {
     let mut diagnostics = SemanticDiagnostics::new(global_use_id.parent_module(db));
     let global_use_ast = db.module_global_use_by_id(global_use_id)?;
-    let star_ast = ast::UsePath::Star(db.module_global_use_by_id(global_use_id)?);
-    let segments = get_use_path_segments(db, star_ast)?;
+    let segments = get_use_path_segments(db, ast::UsePath::Star(global_use_ast.clone()))?;
     let err = if segments.segments.len() == 1 {
         // `use bad_name::*`, will attempt to find `bad_name` in the current module's global
         // uses, which includes the global use `use bad_name::*` (itself) - but we don't want to

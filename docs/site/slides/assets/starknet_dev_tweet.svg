@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 360" width="880" height="360">
+  <rect width="880" height="360" rx="16" fill="#ffffff" stroke="#e2e8f0" stroke-width="2"/>
+  <circle cx="58" cy="54" r="24" fill="#5c3cbe"/>
+  <text x="58" y="61" text-anchor="middle" font-family="system-ui, sans-serif" font-size="18" font-weight="800" fill="#ffffff">ZK</text>
+  <text x="96" y="48" font-family="system-ui, sans-serif" font-size="18" font-weight="700" fill="#0f172a">Starknet Core Dev</text>
+  <text x="96" y="68" font-family="system-ui, sans-serif" font-size="14" fill="#64748b">@cairo_wizard · 2h</text>
+
+  <text x="36" y="110" font-family="system-ui, sans-serif" font-size="19" fill="#0f172a">Update: symlinked scarb, snforge, sncast, and starknet-devnet to <tspan font-family="ui-monospace, monospace" font-weight="700" fill="#5c3cbe">uc</tspan>.</text>
+  <text x="36" y="138" font-family="system-ui, sans-serif" font-size="19" fill="#0f172a">My CI went from 4m 12s to 6.8 seconds and <tspan font-family="ui-monospace, monospace" font-weight="700" fill="#5c3cbe">uc prove</tspan> caught an unchecked</text>
+  <text x="36" y="166" font-family="system-ui, sans-serif" font-size="19" fill="#0f172a">u64 multiplication overflow in our vault before testnet deploy.</text>
+
+  <!-- Quoted inner tweet -->
+  <rect x="36" y="188" width="808" height="122" rx="12" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
+  <text x="58" y="216" font-family="system-ui, sans-serif" font-size="15" font-weight="700" fill="#334155">Starknet Core Dev <tspan font-weight="400" fill="#64748b">@cairo_wizard · 3h</tspan></text>
+  <text x="58" y="244" font-family="system-ui, sans-serif" font-size="16" fill="#1e293b">Trying to run `snforge test` on a 3-month-old Cairo workspace.</text>
+  <text x="58" y="268" font-family="system-ui, sans-serif" font-size="16" fill="#1e293b">Scarb 2.18 says snforge_std version mismatch, universal-sierra-compiler</text>
+  <text x="58" y="292" font-family="system-ui, sans-serif" font-size="16" fill="#1e293b">panicked, and my laptop fan sounds like a jet engine. Wish me luck.</text>
+
+  <text x="36" y="338" font-family="system-ui, sans-serif" font-size="14" fill="#64748b">10:42 PM · Starknet Ecosystem · 94.2K Views</text>
+</svg>

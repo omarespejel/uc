@@ -1318,7 +1318,9 @@ fn toolchain_ensure_report_from_args_marks_missing_manifest_build_blocked() {
 #[cfg(feature = "native-compile")]
 #[test]
 fn toolchain_ensure_report_from_manifest_path_marks_builtin_lane_ready() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-toolchain-ensure-builtin-ready");
     let _cleanup = TestDirCleanup::new(&dir);
     let manifest_path = dir.join("Scarb.toml");
@@ -1353,7 +1355,9 @@ cairo-version = "{compiler_major}.{compiler_minor}.0"
 #[cfg(all(feature = "native-compile", unix))]
 #[test]
 fn toolchain_ensure_report_from_manifest_path_builds_productized_helper_to_default_path() {
-    let guard = integration_env_lock().lock().unwrap();
+    let guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-toolchain-ensure-build-helper");
     let _cleanup = TestDirCleanup::new(&dir);
     let manifest_path = dir.join("Scarb.toml");
@@ -1418,7 +1422,7 @@ chmod +x "$output"
 name = "demo"
 version = "0.1.0"
 edition = "2024_07"
-cairo-version = "{requested_major_minor}.0"
+cairo-version = "={requested_major_minor}.0"
 "#
         ),
     )
@@ -1460,7 +1464,9 @@ cairo-version = "{requested_major_minor}.0"
 #[cfg(feature = "native-compile")]
 #[test]
 fn toolchain_ensure_report_from_manifest_path_reports_missing_builder_as_structured_block() {
-    let guard = integration_env_lock().lock().unwrap();
+    let guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-toolchain-ensure-missing-builder");
     let _cleanup = TestDirCleanup::new(&dir);
     let manifest_path = dir.join("Scarb.toml");
@@ -1489,7 +1495,7 @@ fn toolchain_ensure_report_from_manifest_path_reports_missing_builder_as_structu
 name = "demo"
 version = "0.1.0"
 edition = "2024_07"
-cairo-version = "{requested_major_minor}.0"
+cairo-version = "={requested_major_minor}.0"
 "#
         ),
     )
@@ -1527,7 +1533,9 @@ cairo-version = "{requested_major_minor}.0"
 #[cfg(all(feature = "native-compile", unix))]
 #[test]
 fn toolchain_ensure_report_from_manifest_path_reports_spawn_failure_as_structured_block() {
-    let guard = integration_env_lock().lock().unwrap();
+    let guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-toolchain-ensure-spawn-failure");
     let _cleanup = TestDirCleanup::new(&dir);
     let manifest_path = dir.join("Scarb.toml");
@@ -1565,7 +1573,7 @@ fn toolchain_ensure_report_from_manifest_path_reports_spawn_failure_as_structure
 name = "demo"
 version = "0.1.0"
 edition = "2024_07"
-cairo-version = "{requested_major_minor}.0"
+cairo-version = "={requested_major_minor}.0"
 "#
         ),
     )
@@ -1604,7 +1612,9 @@ cairo-version = "{requested_major_minor}.0"
 #[cfg(all(feature = "native-compile", unix))]
 #[test]
 fn toolchain_ensure_report_from_manifest_path_preserves_attempted_state_after_issue_revalidation() {
-    let guard = integration_env_lock().lock().unwrap();
+    let guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-toolchain-ensure-after-issue");
     let _cleanup = TestDirCleanup::new(&dir);
     let manifest_path = dir.join("Scarb.toml");
@@ -1669,7 +1679,7 @@ chmod 0644 "$output"
 name = "demo"
 version = "0.1.0"
 edition = "2024_07"
-cairo-version = "{requested_major_minor}.0"
+cairo-version = "={requested_major_minor}.0"
 "#
         ),
     )
@@ -1689,7 +1699,9 @@ cairo-version = "{requested_major_minor}.0"
 #[cfg(all(feature = "native-compile", unix))]
 #[test]
 fn toolchain_ensure_report_from_manifest_path_reports_revalidation_failure_as_structured_block() {
-    let guard = integration_env_lock().lock().unwrap();
+    let guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-toolchain-ensure-revalidation-failure");
     let _cleanup = TestDirCleanup::new(&dir);
     let manifest_path = dir.join("Scarb.toml");
@@ -1758,7 +1770,7 @@ printf '[package\n' > '{}'
 name = "demo"
 version = "0.1.0"
 edition = "2024_07"
-cairo-version = "{requested_major_minor}.0"
+cairo-version = "={requested_major_minor}.0"
 "#
         ),
     )
@@ -1826,7 +1838,7 @@ cairo-version = "2.14.0
 fn fetch_report_from_manifest_path_is_ready_for_local_only_project_with_exact_toolchain_pin() {
     let guard = integration_env_lock()
         .lock()
-        .expect("integration env lock should succeed");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _scarb_version = ScopedEnvVar::set_with_lock(
         &guard,
         "UC_SCARB_VERSION_LINE",
@@ -2245,7 +2257,7 @@ fn materialize_fetch_entries_into_source_store_imports_remote_and_reports_missin
 fn source_store_prune_report_removes_oldest_entries_over_budget() {
     let guard = integration_env_lock()
         .lock()
-        .expect("integration env lock should succeed");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let store_root = unique_test_dir("uc-source-store-prune");
     let _cleanup = TestDirCleanup::new(&store_root);
     let source_a = store_root.join("sources/a");
@@ -3664,7 +3676,9 @@ fn daemon_build_request_roundtrip_preserves_async_cache_persist() {
 #[cfg(all(feature = "native-compile", unix))]
 #[test]
 fn execute_daemon_build_rejects_external_helper_native_request() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let requested_major_minor = "2.5";
     let requested_version = "2.5.3";
     let helper_env = native_toolchain_env_var_name_for_major_minor(requested_major_minor);
@@ -3740,7 +3754,9 @@ starknet = "={requested_version}"
 #[cfg(unix)]
 #[test]
 fn daemon_socket_path_for_external_helper_is_stable_and_helper_scoped() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-helper-daemon-socket");
     let _cleanup = TestDirCleanup::new(&dir);
     let helper_a = dir.join("uc-helper-a");
@@ -3768,6 +3784,10 @@ fn daemon_socket_path_for_external_helper_is_stable_and_helper_scoped() {
 #[cfg(unix)]
 #[test]
 fn build_uc_build_command_sets_helper_scoped_daemon_socket_override() {
+    // Other tests rewrite HOME under the integration lock; the helper socket path depends on it.
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-helper-build-command");
     let _cleanup = TestDirCleanup::new(&dir);
     let helper_path = dir.join("uc-helper-bin");
@@ -5314,6 +5334,7 @@ fn parse_cairo_version_major_minor_handles_common_formats() {
         Some((2, 14))
     );
     assert_eq!(parse_cairo_version_major_minor("2.15.0-rc1"), Some((2, 15)));
+    assert_eq!(parse_cairo_version_major_minor("=2.14.0"), Some((2, 14)));
     assert_eq!(parse_cairo_version_major_minor(">=2.14.0"), None);
     assert_eq!(parse_cairo_version_major_minor(""), None);
 }
@@ -5348,8 +5369,22 @@ cairo-version = "{compiler_major}.{}.0"
             compiler_minor - 1
         ))
         .expect("older-minor manifest should parse");
-        let err = ensure_native_manifest_cairo_version_supported(&older_minor_manifest)
-            .expect_err("older minor cairo-version should be rejected");
+        // Scarb semantics: a bare `2.{n-1}.0` is `^2.{n-1}.0`, satisfied by the in-process
+        // compiler, so it is accepted. Only an exact `=` pin needs a helper lane.
+        ensure_native_manifest_cairo_version_supported(&older_minor_manifest)
+            .expect("older minor caret cairo-version is satisfied by the in-process compiler");
+        let pinned_older_minor_manifest: TomlValue = toml::from_str(&format!(
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+cairo-version = "={compiler_major}.{}.0"
+"#,
+            compiler_minor - 1
+        ))
+        .expect("pinned older-minor manifest should parse");
+        let err = ensure_native_manifest_cairo_version_supported(&pinned_older_minor_manifest)
+            .expect_err("exact older minor cairo-version pin should be rejected");
         let rendered = format!("{err:#}");
         assert!(
             rendered.contains("helper lane"),
@@ -5630,7 +5665,9 @@ cairo-version = "2.14.0
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_support_report_from_manifest_path_marks_supported_and_unsupported_manifests() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-native-support-report");
     fs::create_dir_all(&dir).expect("create temp dir");
     let manifest_path = dir.join("Scarb.toml");
@@ -5683,7 +5720,7 @@ cairo-version = "{compiler_major}.{compiler_minor}.0"
 name = "demo"
 version = "0.1.0"
 edition = "2024_07"
-cairo-version = "{requested_major_minor}.0"
+cairo-version = "={requested_major_minor}.0"
 "#
         ),
     )
@@ -5749,7 +5786,9 @@ fn build_plan_report_from_args_marks_missing_manifest_build_blocked() {
 #[cfg(feature = "native-compile")]
 #[test]
 fn build_plan_report_from_args_marks_builtin_native_ready_plan() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-build-plan-native-ready");
     let _cleanup = TestDirCleanup::new(&dir);
     fs::create_dir_all(&dir).expect("create temp dir");
@@ -5810,7 +5849,9 @@ cairo-version = "{compiler_major}.{compiler_minor}.0"
 #[cfg(feature = "native-compile")]
 #[test]
 fn build_plan_report_from_args_marks_missing_helper_as_uc_scarb_plan() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-build-plan-missing-helper");
     let _cleanup = TestDirCleanup::new(&dir);
     fs::create_dir_all(&dir).expect("create temp dir");
@@ -5836,7 +5877,7 @@ fn build_plan_report_from_args_marks_missing_helper_as_uc_scarb_plan() {
 name = "demo"
 version = "0.1.0"
 edition = "2024_07"
-cairo-version = "{requested_major_minor}.0"
+cairo-version = "={requested_major_minor}.0"
 "#
         ),
     )
@@ -5915,10 +5956,14 @@ fn productized_native_toolchain_helper_lanes_match_workspace_metadata() {
 #[cfg(all(feature = "native-compile", unix))]
 #[test]
 fn select_native_toolchain_from_manifest_path_uses_lockfile_lane_helper() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let current = parse_cairo_version_major_minor(native_cairo_lang_compiler_version())
         .expect("compiler version should parse");
-    let requested = if current == (2, 14) { (2, 16) } else { (2, 14) };
+    // A lock pinned to a *newer* minor than the in-process compiler cannot be satisfied in
+    // process (an older one is a caret match and compiles in process, like scarb would).
+    let requested = (current.0, current.1 + 1);
     let requested_major_minor = format_cairo_version_major_minor(requested);
     let requested_version = format!("{requested_major_minor}.0");
     let helper_env = native_toolchain_env_var_name_for_major_minor(&requested_major_minor);
@@ -5998,7 +6043,9 @@ version = "{requested_version}"
 #[cfg(all(feature = "native-compile", unix))]
 #[test]
 fn native_support_report_from_manifest_path_uses_external_helper_toolchain_fields() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let current = parse_cairo_version_major_minor(native_cairo_lang_compiler_version())
         .expect("compiler version should parse");
     let requested = if current == (2, 14) { (2, 16) } else { (2, 14) };
@@ -6016,7 +6063,7 @@ fn native_support_report_from_manifest_path_uses_external_helper_toolchain_field
 name = "demo"
 version = "0.1.0"
 edition = "2024_07"
-cairo-version = "{requested_version}"
+cairo-version = "={requested_version}"
 "#
         ),
     )
@@ -6075,7 +6122,9 @@ cairo-version = "{requested_version}"
 #[cfg(all(feature = "native-compile", unix))]
 #[test]
 fn build_report_from_external_helper_preserves_fallback_backend() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let current = parse_cairo_version_major_minor(native_cairo_lang_compiler_version())
         .expect("compiler version should parse");
     let current_major_minor = format_cairo_version_major_minor(current);
@@ -6103,7 +6152,7 @@ fn build_report_from_external_helper_preserves_fallback_backend() {
 name = "demo"
 version = "0.1.0"
 edition = "2024_07"
-cairo-version = "{requested_version}"
+cairo-version = "={requested_version}"
 "#
         ),
     )
@@ -6158,7 +6207,9 @@ cairo-version = "{requested_version}"
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_support_report_from_manifest_path_reports_missing_toolchain_helper_diagnostic() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let current = parse_cairo_version_major_minor(native_cairo_lang_compiler_version())
         .expect("compiler version should parse");
     let requested = if current == (2, 14) { (2, 16) } else { (2, 14) };
@@ -6180,7 +6231,7 @@ fn native_support_report_from_manifest_path_reports_missing_toolchain_helper_dia
 name = "demo"
 version = "0.1.0"
 edition = "2024_07"
-cairo-version = "{requested_version}"
+cairo-version = "={requested_version}"
 "#
         ),
     )
@@ -6248,7 +6299,9 @@ cairo-version = "{requested_version}"
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_support_report_json_contract_includes_doctor_fields() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let current = parse_cairo_version_major_minor(native_cairo_lang_compiler_version())
         .expect("compiler version should parse");
     let requested = if current == (2, 14) { (2, 16) } else { (2, 14) };
@@ -6270,7 +6323,7 @@ fn native_support_report_json_contract_includes_doctor_fields() {
 name = "demo"
 version = "0.1.0"
 edition = "2024_07"
-cairo-version = "{requested_version}"
+cairo-version = "={requested_version}"
 "#
         ),
     )
@@ -6369,7 +6422,10 @@ cairo-version = "{requested_version}"
         json["toolchain"]["requested_major_minor"],
         requested_major_minor
     );
-    assert_eq!(json["toolchain"]["requested_version"], requested_version);
+    assert_eq!(
+        json["toolchain"]["requested_version"],
+        format!("={requested_version}")
+    );
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -6377,7 +6433,9 @@ cairo-version = "{requested_version}"
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_support_report_from_manifest_path_reports_unproductized_helper_lane() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let requested_major_minor = "2.5";
     let requested_version = "2.5.3";
     let helper_env = native_toolchain_env_var_name_for_major_minor(requested_major_minor);
@@ -6397,7 +6455,7 @@ fn native_support_report_from_manifest_path_reports_unproductized_helper_lane() 
 name = "demo"
 version = "0.1.0"
 edition = "2023_11"
-cairo-version = "{requested_version}"
+cairo-version = "={requested_version}"
 
 [dependencies]
 starknet = "={requested_version}"
@@ -6478,7 +6536,10 @@ starknet = "={requested_version}"
         json["toolchain"]["requested_major_minor"],
         requested_major_minor
     );
-    assert_eq!(json["toolchain"]["requested_version"], requested_version);
+    assert_eq!(
+        json["toolchain"]["requested_version"],
+        format!("={requested_version}")
+    );
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -6486,7 +6547,9 @@ starknet = "={requested_version}"
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_support_report_keeps_invalid_unproductized_helper_manual() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let requested_major_minor = "2.5";
     let requested_version = "2.5.3";
     let helper_env = native_toolchain_env_var_name_for_major_minor(requested_major_minor);
@@ -6501,7 +6564,7 @@ fn native_support_report_keeps_invalid_unproductized_helper_manual() {
 name = "demo"
 version = "0.1.0"
 edition = "2023_11"
-cairo-version = "{requested_version}"
+cairo-version = "={requested_version}"
 "#
         ),
     )
@@ -6606,7 +6669,7 @@ fn build_native_compile_context_rejects_unproductized_helper_lane() {
 name = "demo-native"
 version = "0.1.0"
 edition = "2023_11"
-cairo-version = "{requested_version}"
+cairo-version = "={requested_version}"
 
 [dependencies]
 starknet = "={requested_version}"
@@ -6650,7 +6713,9 @@ starknet = "={requested_version}"
 #[cfg(all(feature = "native-compile", unix))]
 #[test]
 fn native_support_report_from_manifest_path_allows_reviewed_unproductized_helper_env() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let requested_major_minor = "2.5";
     let requested_version = "2.5.3";
     let helper_env = native_toolchain_env_var_name_for_major_minor(requested_major_minor);
@@ -7837,7 +7902,7 @@ edition = "2024_07"
     let _path = ScopedEnvVar::set_with_lock(&_guard, "PATH", &no_scarb_path);
 
     let surface =
-        collect_native_dependency_surface_from_scarb_metadata(&manifest_path, "demo", false)
+        collect_native_dependency_surface_from_scarb_metadata(&manifest_path, "demo", false, false)
             .expect("native dependency surface collection should succeed")
             .expect("metadata cache hit should provide dependency surface");
     assert!(
@@ -14923,7 +14988,7 @@ fn native_should_capture_statement_locations_with_flags_keeps_incremental_enable
 fn native_should_persist_crate_cache_after_build_requires_daemon_context() {
     let guard = integration_env_lock()
         .lock()
-        .expect("failed to acquire integration env lock");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _cache_enabled = ScopedEnvVar::set_with_lock(&guard, "UC_NATIVE_CRATE_CACHE_ENABLED", "1");
 
     assert!(
@@ -14953,7 +15018,7 @@ fn native_should_persist_crate_cache_after_build_requires_daemon_context() {
 fn native_should_persist_crate_cache_after_build_respects_cache_toggle() {
     let guard = integration_env_lock()
         .lock()
-        .expect("failed to acquire integration env lock");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _cache_disabled = ScopedEnvVar::set_with_lock(&guard, "UC_NATIVE_CRATE_CACHE_ENABLED", "0");
 
     assert!(

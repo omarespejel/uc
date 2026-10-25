@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 440" width="960" height="440">
+  <rect width="960" height="440" rx="12" fill="#f8fafc" stroke="#cbd5e1" stroke-width="2"/>
+  <!-- Left Paper: Circle STARKs -->
+  <rect x="28" y="26" width="438" height="388" rx="8" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="247" y="58" text-anchor="middle" font-family="Georgia, serif" font-size="13" fill="#64748b">IACR Cryptology ePrint Archive 2024/278</text>
+  <text x="247" y="92" text-anchor="middle" font-family="Georgia, serif" font-size="22" font-weight="700" fill="#0f172a">Circle STARKs</text>
+  <text x="247" y="118" text-anchor="middle" font-family="Georgia, serif" font-size="14" font-style="italic" fill="#334155">Ulrich Haböck, David Levit, Shahar Papini (StarkWare)</text>
+  <line x1="58" y1="134" x2="436" y2="134" stroke="#e2e8f0" stroke-width="1.5"/>
+  <text x="48" y="162" font-family="system-ui, sans-serif" font-size="14" font-weight="700" fill="#003b4f">Why it changes compiler &amp; profiler design:</text>
+  <text x="48" y="190" font-family="system-ui, sans-serif" font-size="13.5" fill="#1e293b">• Stwo operates over the Mersenne prime field M31 = 2^31 - 1</text>
+  <text x="48" y="216" font-family="system-ui, sans-serif" font-size="13.5" fill="#1e293b">• Proving time is dominated by AIR table multiplicities:</text>
+  <text x="64" y="240" font-family="ui-monospace, monospace" font-size="12.5" fill="#5c3cbe">Pedersen (32x) &gt; Poseidon (12x) &gt; Bitwise (5x) &gt; Blake2s (2.5x)</text>
+  <text x="48" y="268" font-family="system-ui, sans-serif" font-size="13.5" fill="#1e293b">• L2 gas alone hides prover bottlenecks in ZK applications</text>
+  <rect x="48" y="294" width="398" height="96" rx="6" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="64" y="320" font-family="ui-monospace, monospace" font-size="13" font-weight="700" fill="#0f172a">$ uc profile --prover-air</text>
+  <text x="64" y="344" font-family="ui-monospace, monospace" font-size="12" fill="#334155">Computes exact Stwo Circle STARK builtin cell</text>
+  <text x="64" y="366" font-family="ui-monospace, monospace" font-size="12" fill="#334155">multiplicities &amp; recommends Blake2s / DivRem rewrites.</text>
+
+  <!-- Right Paper: Sierra SSA IR & Symbolic Analysis -->
+  <rect x="494" y="26" width="438" height="388" rx="8" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="713" y="58" text-anchor="middle" font-family="Georgia, serif" font-size="13" fill="#64748b">StarkWare &amp; Trail of Bits Security Research</text>
+  <text x="713" y="92" text-anchor="middle" font-family="Georgia, serif" font-size="21" font-weight="700" fill="#0f172a">Sierra: Safe Intermediate Representation</text>
+  <text x="713" y="118" text-anchor="middle" font-family="Georgia, serif" font-size="14" font-style="italic" fill="#334155">Shahar Papini, Ori Ziv + Crytic Caracal Taint Engine</text>
+  <line x1="524" y1="134" x2="902" y2="134" stroke="#e2e8f0" stroke-width="1.5"/>
+  <text x="514" y="162" font-family="system-ui, sans-serif" font-size="14" font-weight="700" fill="#003b4f">Starknet's unfair advantage over EVM bytecode:</text>
+  <text x="514" y="190" font-family="system-ui, sans-serif" font-size="13.5" fill="#1e293b">• EVM strips types into raw 256-bit stack opcodes</text>
+  <text x="514" y="216" font-family="system-ui, sans-serif" font-size="13.5" fill="#1e293b">• On-chain Starknet classes preserve full SSA Sierra IR:</text>
+  <text x="530" y="240" font-family="ui-monospace, monospace" font-size="12.5" fill="#5c3cbe">u64_wide_mul, u128_safe_divmod, storage_write_syscall</text>
+  <text x="514" y="268" font-family="system-ui, sans-serif" font-size="13.5" fill="#1e293b">• Every branch &amp; overflow check is an explicit SSA edge</text>
+  <rect x="514" y="294" width="398" height="96" rx="6" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="530" y="320" font-family="ui-monospace, monospace" font-size="13" font-weight="700" fill="#0f172a">$ uc prove &amp;&amp; uc decompile</text>
+  <text x="530" y="344" font-family="ui-monospace, monospace" font-size="12" fill="#334155">Symbolically solves every SSA path &amp; decompiles</text>
+  <text x="530" y="366" font-family="ui-monospace, monospace" font-size="12" fill="#334155">any on-chain class_hash without source code.</text>
+</svg>

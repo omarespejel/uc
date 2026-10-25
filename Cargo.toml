@@ -3,7 +3,7 @@ members = [
   "crates/uc-cli",
   "crates/uc-core",
 ]
-exclude = ["third_party/cairo-lang-filesystem", "third_party/cairo-lang-semantic", "third_party/cairo-lang-starknet"]
+exclude = ["third_party/cairo-lang-filesystem", "third_party/cairo-lang-runner", "third_party/cairo-lang-semantic", "third_party/cairo-lang-starknet", "third_party/corelib"]
 resolver = "2"
 
 [workspace.package]
@@ -14,26 +14,40 @@ version = "0.1.0"
 [workspace.dependencies]
 anyhow = "1"
 blake3 = "1"
-cairo-lang-compiler = "2.16.0"
-cairo-lang-defs = "2.16.0"
-cairo-lang-filesystem = "2.16.0"
-cairo-lang-lowering = "2.16.0"
-cairo-lang-semantic = "2.16.0"
-cairo-lang-starknet = "2.16.0"
-cairo-lang-starknet-classes = "2.16.0"
+cairo-lang-compiler = "2.18.0"
+cairo-lang-defs = "2.18.0"
+cairo-lang-filesystem = "2.18.0"
+cairo-lang-formatter = "2.18.0"
+cairo-lang-lowering = "2.18.0"
+cairo-lang-parser = "2.18.0"
+cairo-lang-semantic = "2.18.0"
+cairo-lang-sierra = "2.18.0"
+cairo-lang-starknet = "2.18.0"
+cairo-lang-starknet-classes = "2.18.0"
+cairo-lang-syntax = "2.18.0"
+cairo-lang-test-plugin = "2.18.0"
+cairo-lang-runner = "2.18.0"
+cairo-lang-sierra-to-casm = "2.18.0"
+starknet-crypto = "0.8.1"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 notify = "6"
 postcard = { version = "1", features = ["alloc"] }
+rayon = "1.11.0"
+semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 scarb-stable-hash = "1.0.0"
 salsa = "0.26.0"
+starknet-types-core = { version = "0.2.4", features = ["hash"] }
 sysinfo = "0.31"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 walkdir = "2"
+ruzstd = "0.8.3"
+sha2 = "0.10"
+hex = "0.4"
 
 [workspace.metadata.uc-native-toolchain-helpers."2.14"]
 cairo-version = "2.14.0"
@@ -43,5 +57,6 @@ patch-dir = "toolchains/cairo-2.14/patches"
 
 [patch.crates-io]
 cairo-lang-filesystem = { path = "third_party/cairo-lang-filesystem" }
+cairo-lang-runner = { path = "third_party/cairo-lang-runner" }
 cairo-lang-semantic = { path = "third_party/cairo-lang-semantic" }
 cairo-lang-starknet = { path = "third_party/cairo-lang-starknet" }

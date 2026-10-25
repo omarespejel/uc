@@ -5,7 +5,7 @@ use cairo_lang_debug::DebugWithDb;
 use cairo_lang_defs::db::DefsGroup;
 use cairo_lang_defs::ids::{
     ConstantId, ExternFunctionId, GenericParamId, LanguageElementId, LookupItemId, ModuleItemId,
-    NamedLanguageElementId, TopLevelLanguageElementId, TraitConstantId, TraitId, VarId,
+    NamedLanguageElementId, TraitConstantId, TraitId, VarId,
 };
 use cairo_lang_diagnostics::{
     DiagnosticAdded, DiagnosticEntry, DiagnosticNote, Diagnostics, Maybe, MaybeAsRef,
@@ -158,9 +158,7 @@ impl<'db> ConstValueId<'db> {
                 type_id.extract_generic_params(db, generic_parameters, visited)?
             }
             ConstValue::Enum(_, const_value_id) => {
-                const_value_id
-                    .ty(db)?
-                    .extract_generic_params(db, generic_parameters, visited)?
+                const_value_id.ty(db)?.extract_generic_params(db, generic_parameters, visited)?
             }
             ConstValue::NonZero(const_value_id) => {
                 const_value_id.extract_generic_params(db, generic_parameters, visited)?
@@ -727,7 +725,9 @@ impl<'a, 'r, 'mt> ConstantEvaluateContext<'a, 'r, 'mt> {
                                 .iter()
                                 .find(|(_, member_id)| m.id == *member_id)
                                 .map(|(expr_id, _)| self.evaluate(*expr_id))
-                                .expect("Should have been caught by semantic validation")
+                                // Semantic validation already reported an error, suppress cascading
+                                // errors from const evaluation.
+                                .unwrap_or_else(|| ConstValue::Missing(skip_diagnostic()).intern(db))
                         })
                         .collect(),
                     *ty,
@@ -901,15 +901,32 @@ impl<'a, 'r, 'mt> ConstantEvaluateContext<'a, 'r, 'mt> {
             return bool_value(args[0] == self.false_const);
         }
 
+        let mut all_args_concrete = true;
         let args = match args
             .into_iter()
-            .map(|arg| NumericArg::try_new(db, arg))
+            .map(|arg| {
+                // Track if any argument is not fully concrete (e.g., ImplConstant with a generic
+                // impl parameter) so we can report a diagnostic if NumericArg conversion fails.
+                if !arg.is_fully_concrete(db) && !matches!(arg.long(db), ConstValue::Missing(_)) {
+                    all_args_concrete = false;
+                }
+                NumericArg::try_new(db, arg)
+            })
             .collect::<Option<Vec<_>>>()
         {
             Some(args) => args,
-            // Diagnostic can be skipped as we would either have a semantic error for a bad arg for
-            // the function, or the arg itself couldn't have been calculated.
-            None => return to_missing(skip_diagnostic()),
+            None => {
+                return to_missing(if all_args_concrete {
+                    // Diagnostic can be skipped as there would be a semantic error for a bad arg,
+                    // or the arg itself is Missing.
+                    skip_diagnostic()
+                } else {
+                    self.diagnostics.report(
+                        expr.stable_ptr.untyped(),
+                        SemanticDiagnosticKind::UnsupportedConstant,
+                    )
+                });
+            }
         };
         let value = match imp.function {
             id if id == self.neg_fn => -&args[0].v,
@@ -1070,9 +1087,12 @@ impl<'a, 'r, 'mt> ConstantEvaluateContext<'a, 'r, 'mt> {
                     .intern(db),
                 );
             } else {
-                unreachable!(
-                    "Unexpected extern function in constant lowering: `{}`",
-                    extern_fn.full_path(db)
+                return Some(
+                    ConstValue::Missing(self.diagnostics.report(
+                        expr.stable_ptr.untyped(),
+                        SemanticDiagnosticKind::UnsupportedConstant,
+                    ))
+                    .intern(db),
                 );
             }
         }

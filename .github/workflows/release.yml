@@ -1,0 +1,55 @@
+name: Release Self-Contained Binaries (Linux & macOS)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-13
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build self-contained uc binary (with embedded Cairo corelib)
+        run: cargo build --release -p uc-cli --target ${{ matrix.target }}
+
+      - name: Verify standalone execution without external corelib
+        run: |
+          BIN="target/${{ matrix.target }}/release/uc"
+          "$BIN" --version
+          "$BIN" devnet --dump-accounts --accounts 2
+
+      - name: Package release archive
+        run: |
+          cd "target/${{ matrix.target }}/release"
+          tar -czf "uc-${{ matrix.target }}.tar.gz" uc
+          shasum -a 256 "uc-${{ matrix.target }}.tar.gz" > "uc-${{ matrix.target }}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: uc-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/uc-${{ matrix.target }}.tar.gz
+            target/${{ matrix.target }}/release/uc-${{ matrix.target }}.tar.gz.sha256

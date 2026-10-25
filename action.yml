@@ -1,0 +1,37 @@
+name: "Setup uc (Ultra Cairo Toolchain)"
+description: "Install the self-contained uc binary (replacing scarb, snforge, sncast, starknet-devnet, and formal prover) on Linux and macOS"
+author: "Omar Espejel"
+branding:
+  icon: "zap"
+  color: "purple"
+
+inputs:
+  version:
+    description: "Version of uc to install (default: latest)"
+    required: false
+    default: "latest"
+  drop-in-symlinks:
+    description: "Create drop-in symlinks for scarb, snforge, sncast, and starknet-devnet"
+    required: false
+    default: "true"
+  enable-cache:
+    description: "Cache ~/.uc and .uc incremental compilation & prover artifacts across CI runs"
+    required: false
+    default: "true"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install uc (Linux & macOS)
+      shell: bash
+      env:
+        UC_VERSION: ${{ inputs.version }}
+        UC_INSTALL_SYMLINKS: ${{ inputs.drop-in-symlinks == 'true' && '1' || '0' }}
+      run: |
+        mkdir -p "$HOME/.local/bin"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        if [ -f "${{ github.action_path }}/install.sh" ]; then
+          sh "${{ github.action_path }}/install.sh"
+        else
+          curl -LsSf https://raw.githubusercontent.com/omarespejel/uc/main/install.sh | sh
+        fi
