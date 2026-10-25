@@ -1166,10 +1166,10 @@ impl SierraCasmRunner {
         };
 
         // In case we don't have any costs - it means no gas equations were solved (and we are in
-        // the case of no gas checking enabled) - so the gas builtin is irrelevant, and we
-        // can return any value.
+        // the case of no gas checking enabled) - so Sierra never checks the gas builtin. Syscalls
+        // still charge it, so hand them the whole budget instead of zero.
         let Some(required_gas) = self.initial_required_gas(func) else {
-            return Ok(0);
+            return Ok(available_gas);
         };
 
         available_gas.checked_sub(required_gas).ok_or(RunnerError::NotEnoughGasToCall)
@@ -1266,7 +1266,7 @@ fn args_size(args: &[Arg]) -> usize {
 /// libfuncs), re-laying their statements contiguously and remapping intra-function branch
 /// targets. Type declarations are kept; libfunc declarations that name a dropped function are
 /// removed so the registry does not look it up. Returns the sliced program and the kept ids.
-fn slice_program_for_roots(
+pub fn slice_program_for_roots(
     program: &cairo_lang_sierra::program::Program,
     roots: &[cairo_lang_sierra::ids::FunctionId],
 ) -> (cairo_lang_sierra::program::Program, std::collections::HashSet<u64>) {

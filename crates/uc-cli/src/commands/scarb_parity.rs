@@ -3203,9 +3203,13 @@ pub(crate) struct AuditArgs {
     #[arg(long)]
     pub filter: Option<String>,
 
-    /// Maximum symbolic execution loop unrolling depth [default: 64]
-    #[arg(long, default_value_t = 64)]
+    /// Maximum statements followed along one symbolic path.
+    #[arg(long, default_value_t = 1024)]
     pub max_depth: usize,
+
+    /// Maximum symbolic paths explored per function.
+    #[arg(long, default_value_t = 1024)]
+    pub max_paths: usize,
 
     /// Write a full Markdown security audit report to `<OUTPUT>`
     #[arg(short = 'o', long)]
@@ -3428,6 +3432,7 @@ pub(crate) fn run_audit(args: AuditArgs) -> Result<()> {
             &inferred_crate,
             args.filter.as_deref(),
             args.max_depth,
+            args.max_paths,
             true,
         );
 

@@ -93,6 +93,7 @@ uc test                          # #[test] and snforge_std tests in-process, per
 uc test --gas-report               # per test: steps, syscalls, builtin instances, weighted resource gas
 uc test --fuzzer-runs 256
 uc prove                         # symbolic execution + Sierra taint detectors
+uc prove --emit-smt target/smt   # SMT-LIB obligations per function, checkable with z3
 uc prove --check-upgrade v1/Scarb.toml
 uc prove --check-equivalence v1/Scarb.toml
 uc audit 0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d --network mainnet
@@ -120,12 +121,29 @@ trace measurement.
 
 ## Formal verification and audit
 
-`uc prove` compiles the package, walks every Sierra function symbolically and classifies it:
+`uc prove` compiles the package, walks every Sierra function symbolically (up to `--max-depth`
+1024 statements per path and `--max-paths` 1024 paths per function) and classifies it:
 
-- `PROVEN_SAFE`: no panic path is satisfiable.
+- `PROVEN_SAFE`: every panic path was explored and none is satisfiable.
 - `GUARDED_SAFE`: panics exist only behind caller or calldata guards (`assert`, auth checks).
-- `COUNTEREXAMPLE_FOUND`: a concrete input reaches a panic after arithmetic; the witness is in
-  the JSON and `--emit-repro tests/repro.cairo` writes it as a `#[should_panic]` test.
+- `COUNTEREXAMPLE_FOUND`: a concrete input reaches a panic after arithmetic. The witness is in
+  the JSON as parameter values and as `counterexample_calldata` (wrapper calldata, `u256` as
+  low and high), `--emit-repro tests/repro.cairo` writes it as a `#[should_panic]` test, and
+  uc replays it through the entry point wrapper on a fresh state: `concrete_verified` is true
+  only when the runner panics for the predicted reason, false when the function returns or
+  panics on an unrelated assertion (the symbolic path then depends on storage the replay does
+  not have).
+- `BOUNDED_SAFE`: no explored panic path is satisfiable, but the depth or path budget was hit.
+- `UNDECIDED`: a panic path the in-process solver could neither satisfy nor refute.
+
+**Checkable proofs.** `uc prove --emit-smt target/smt` writes one SMT-LIB 2 file per function
+with every panic path's constraints as a `(check-sat)` obligation and the verdict uc expects
+(`unsat` for an unreachable panic, `sat` plus a pinned witness for a counterexample), and
+`obligations.json` listing them. `benchmarks/scripts/check_smt_obligations.py --dir target/smt`
+runs z3 or cvc5 over the files and reports every disagreement. On 2026-10-25 z3 agreed with uc on
+all 838 obligations of erc8004 and all 1,568 of the deployed STRK token class. The obligations
+cover the numeric path constraints uc reasons about; values uc treats as opaque (storage reads,
+call results) are free constants in the files, so agreement checks the solver, not the model.
 
 The taint detectors run on Sierra, so they also work on deployed classes with no debug names:
 entry points are named from the ABI by selector and `PanicResult` is recognised structurally.

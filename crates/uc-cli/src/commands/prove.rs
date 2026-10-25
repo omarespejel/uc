@@ -23,9 +23,14 @@ pub(crate) struct ProveArgs {
     #[arg(short = 'F', long)]
     pub features: Vec<String>,
 
-    /// Maximum symbolic execution branch depth (bounded model checking horizon).
-    #[arg(long, default_value_t = 64)]
+    /// Maximum statements followed along one symbolic path (bounded model checking horizon).
+    /// A function that hits it is reported with `exploration_truncated` and never PROVEN_SAFE.
+    #[arg(long, default_value_t = 1024)]
     pub max_depth: usize,
+
+    /// Maximum symbolic paths explored per function before exploration stops.
+    #[arg(long, default_value_t = 1024)]
+    pub max_paths: usize,
 
     /// Run modernized Trail of Bits Caracal Sierra IR taint, CFG dominance, and dataflow detectors.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -50,6 +55,13 @@ pub(crate) struct ProveArgs {
     /// Emit ready-to-run Cairo `#[test]` reproduction harnesses for all solved counterexamples.
     #[arg(long)]
     pub emit_repro: Option<PathBuf>,
+
+    /// Write one SMT-LIB 2 file per analysed function with every panic path's constraints as a
+    /// `(check-sat)` obligation, plus `obligations.json` listing the expected answers, so the
+    /// PROVEN_SAFE and COUNTEREXAMPLE_FOUND claims can be checked with z3 or cvc5
+    /// (`benchmarks/scripts/check_smt_obligations.py`).
+    #[arg(long, value_name = "DIR")]
+    pub emit_smt: Option<PathBuf>,
 
     /// Verify formal upgrade compatibility (storage slots, ABI arity, and auth guards) against a baseline manifest.
     #[arg(long)]
@@ -93,10 +105,33 @@ pub(crate) struct SymbolicFunctionProofReport {
     pub ok_paths: usize,
     pub panic_paths: usize,
     pub unreachable_panic_paths: usize,
+    /// Panic paths whose constraints the in-process solver could neither satisfy nor refute.
+    /// Any such path keeps the function out of PROVEN_SAFE (status UNDECIDED).
+    #[serde(default)]
+    pub undecided_panic_paths: usize,
+    /// True when exploration stopped at the depth or path budget, so unexplored paths remain.
+    #[serde(default)]
+    pub exploration_truncated: bool,
     pub proven_overflow_free: bool,
     pub preconditions: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub counterexample: Option<BTreeMap<String, String>>,
+    /// The counterexample as Starknet calldata felts in parameter order (`u256` as low, high),
+    /// ready for `uc call` / `uc invoke` or a devnet replay.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counterexample_calldata: Option<Vec<String>>,
+    /// Path of the SMT-LIB file written by `--emit-smt` for this function.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smt_file: Option<String>,
+    /// Every panic path's constraints and the solver's verdict, for the SMT-LIB export.
+    #[serde(skip)]
+    pub(crate) obligations: Vec<PathObligation>,
+    /// `(name, lower bound, upper bound)` per symbolic parameter, for the SMT-LIB export.
+    #[serde(skip)]
+    pub(crate) param_bounds: Vec<(String, i128, i128)>,
+    /// Sierra type name per symbolic parameter, for calldata encoding.
+    #[serde(skip)]
+    pub(crate) param_types: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub counterexample_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -161,6 +196,10 @@ pub(crate) struct PackageProveReport {
     pub proven_safe_count: usize,
     pub guarded_safe_count: usize,
     pub counterexample_count: usize,
+    #[serde(default)]
+    pub undecided_count: usize,
+    #[serde(default)]
+    pub bounded_safe_count: usize,
     pub caracal_findings_count: usize,
     pub symbolic_proofs: Vec<SymbolicFunctionProofReport>,
     pub caracal_findings: Vec<CaracalSierraFinding>,
@@ -1693,6 +1732,273 @@ impl SymConstraint {
     }
 }
 
+/// One panic path of a function: its path constraints and what the in-process solver said.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PathObligation {
+    /// `unsat` (panic unreachable), `sat` (witness found) or `unknown`.
+    pub(crate) expected: &'static str,
+    constraints: Vec<SymConstraint>,
+    pub(crate) witness: Option<Vec<i128>>,
+    pub(crate) reason: String,
+}
+
+fn smt_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    out
+}
+
+/// File stem for a function's obligations: the sanitized name, cut to 100 characters with a
+/// hash suffix when longer (generic-heavy Sierra names exceed the filesystem limit).
+fn smt_file_stem(function: &str) -> String {
+    let full = smt_name(function);
+    if full.len() <= 100 {
+        return full;
+    }
+    let digest = blake3::hash(function.as_bytes()).to_hex();
+    format!("{}__{}", &full[..100], &digest.as_str()[..12])
+}
+
+fn smt_int(v: i128) -> String {
+    if v < 0 { format!("(- {})", v.unsigned_abs()) } else { v.to_string() }
+}
+
+/// Renders a symbolic expression in SMT-LIB 2 over `Int`. Opaque values (storage reads, call
+/// results) become free constants collected in `opaque`, so they are unconstrained in the file,
+/// exactly as the in-process solver treats them.
+fn smt_expr(e: &SymExpr, opaque: &mut BTreeSet<String>) -> String {
+    match e {
+        SymExpr::Param(idx, _) => format!("p{idx}"),
+        SymExpr::Const(v) => smt_int(*v),
+        SymExpr::SymbolicOpaque(name) => {
+            let n = format!("o_{}", smt_name(name));
+            opaque.insert(n.clone());
+            n
+        }
+        SymExpr::Add(a, b) => format!("(+ {} {})", smt_expr(a, opaque), smt_expr(b, opaque)),
+        SymExpr::Sub(a, b) => format!("(- {} {})", smt_expr(a, opaque), smt_expr(b, opaque)),
+        SymExpr::Mul(a, b) => format!("(* {} {})", smt_expr(a, opaque), smt_expr(b, opaque)),
+        SymExpr::Div(a, b) => format!("(div {} {})", smt_expr(a, opaque), smt_expr(b, opaque)),
+        SymExpr::Rem(a, b) => format!("(mod {} {})", smt_expr(a, opaque), smt_expr(b, opaque)),
+    }
+}
+
+fn smt_constraint(c: &SymConstraint, opaque: &mut BTreeSet<String>) -> String {
+    let l = smt_expr(&c.lhs, opaque);
+    let r = smt_expr(&c.rhs, opaque);
+    match c.op {
+        CmpOp::Eq => format!("(= {l} {r})"),
+        CmpOp::Ne => format!("(not (= {l} {r}))"),
+        CmpOp::Lt => format!("(< {l} {r})"),
+        CmpOp::Le => format!("(<= {l} {r})"),
+        CmpOp::Gt => format!("(> {l} {r})"),
+        CmpOp::Ge => format!("(>= {l} {r})"),
+    }
+}
+
+/// Renders a function's proof obligations as one SMT-LIB 2 script. Each panic path becomes a
+/// `(push 1) ... (check-sat) (pop 1)` block preceded by `; expected: <verdict>`; a `sat` path
+/// gets a second block that pins the witness values, which must also be `sat`.
+pub(crate) fn render_smt_obligations(proof: &SymbolicFunctionProofReport) -> String {
+    let mut opaque = BTreeSet::new();
+    let mut blocks = String::new();
+    for (i, ob) in proof.obligations.iter().enumerate() {
+        let asserts: Vec<String> = ob
+            .constraints
+            .iter()
+            .map(|c| format!("  (assert {}) ; {}", smt_constraint(c, &mut opaque), c.reason.replace('\n', " ")))
+            .collect();
+        blocks.push_str(&format!("; obligation {i}: expected {}\n(push 1)\n", ob.expected));
+        if asserts.is_empty() {
+            blocks.push_str("  ; no path constraints\n");
+        }
+        blocks.push_str(&asserts.join("\n"));
+        blocks.push_str("\n(check-sat)\n(pop 1)\n");
+        if let Some(w) = &ob.witness {
+            blocks.push_str(&format!("; obligation {i} witness: expected sat\n(push 1)\n"));
+            blocks.push_str(&asserts.join("\n"));
+            for (idx, v) in w.iter().enumerate() {
+                blocks.push_str(&format!("\n  (assert (= p{idx} {}))", smt_int(*v)));
+            }
+            blocks.push_str("\n(check-sat)\n(pop 1)\n");
+        }
+    }
+    let mut out = String::new();
+    out.push_str(&format!("; uc prove obligations for {}\n", proof.function));
+    out.push_str(&format!("; status: {}; panic paths: {}; unreachable: {}; undecided: {}\n",
+        proof.status, proof.panic_paths, proof.unreachable_panic_paths, proof.undecided_panic_paths));
+    out.push_str("; Integers model Cairo's unsigned types with their bounds asserted below; div and mod are\n");
+    out.push_str("; SMT-LIB Euclidean operations, equal to Cairo's for non-negative operands. Opaque values\n");
+    out.push_str("; (storage reads, call results, non-numeric data) are free constants.\n");
+    out.push_str("(set-logic QF_NIA)\n");
+    for (idx, (name, lo, hi)) in proof.param_bounds.iter().enumerate() {
+        out.push_str(&format!("(declare-const p{idx} Int) ; {name}\n(assert (and (<= {} p{idx}) (<= p{idx} {})))\n", smt_int(*lo), smt_int(*hi)));
+    }
+    for o in &opaque {
+        out.push_str(&format!("(declare-const {o} Int)\n"));
+    }
+    out.push_str(&blocks);
+    out
+}
+
+/// Writes `<dir>/<function>.smt2` for every function with panic paths and `<dir>/obligations.json`
+/// listing each obligation's expected verdict. Returns the number of files written.
+pub(crate) fn write_smt_obligations(dir: &Path, proofs: &mut [SymbolicFunctionProofReport]) -> Result<usize> {
+    fs::create_dir_all(dir)?;
+    let mut manifest = Vec::new();
+    let mut written = 0usize;
+    for proof in proofs.iter_mut() {
+        if proof.obligations.is_empty() {
+            continue;
+        }
+        let file = format!("{}.smt2", smt_file_stem(&proof.function));
+        fs::write(dir.join(&file), render_smt_obligations(proof))?;
+        for (i, ob) in proof.obligations.iter().enumerate() {
+            manifest.push(serde_json::json!({
+                "function": proof.function,
+                "status": proof.status,
+                "file": file,
+                "obligation": i,
+                "expected": ob.expected,
+                "reason": ob.reason,
+                "witness": ob.witness,
+            }));
+        }
+        proof.smt_file = Some(dir.join(&file).display().to_string());
+        written += 1;
+    }
+    fs::write(dir.join("obligations.json"), serde_json::to_string_pretty(&manifest)?)?;
+    Ok(written)
+}
+
+/// Encodes a witness as the calldata an entry point wrapper deserializes, in parameter order:
+/// the contract state is skipped, `u256` becomes `(low, high)`, spans and arrays become empty
+/// (`[0]`), a `ByteArray` becomes empty (`[0, 0, 0]`), everything else one felt. Negative
+/// values wrap into the field.
+pub(crate) fn witness_calldata(witness: &[i128], param_types: &[String]) -> Vec<String> {
+    use starknet_types_core::felt::Felt;
+    let mut out = Vec::new();
+    for (i, v) in witness.iter().enumerate() {
+        let ty = param_types.get(i).map(String::as_str).unwrap_or("");
+        if ty.ends_with("::ContractState") {
+            continue;
+        }
+        if ty.contains("core::array::Span::<") || ty.contains("core::array::Array::<") {
+            out.push("0x0".to_string());
+            continue;
+        }
+        if ty.ends_with("::ByteArray") {
+            out.extend(["0x0", "0x0", "0x0"].map(str::to_string));
+            continue;
+        }
+        let felt = if *v < 0 { Felt::ZERO - Felt::from(v.unsigned_abs()) } else { Felt::from(*v as u128) };
+        out.push(format!("{felt:#x}"));
+        if ty.ends_with("::u256") {
+            out.push("0x0".to_string());
+        }
+    }
+    out
+}
+
+/// Replays every counterexample in `proofs` on a runner built from the slice of `program`
+/// reachable from the functions involved, so even a whole test crate's program (far too large
+/// to assemble as one CASM program) gets its witnesses executed.
+fn replay_counterexamples_on_slice(program: &Program, proofs: &mut [SymbolicFunctionProofReport]) {
+    use cairo_lang_runner::{slice_program_for_roots, SierraCasmRunner};
+    let mut roots = Vec::new();
+    for proof in proofs.iter() {
+        if proof.status != "COUNTEREXAMPLE_FOUND" || proof.function.contains('[') {
+            continue;
+        }
+        if let Some(wrapper) = find_entry_point_wrapper(program, &proof.function) {
+            roots.push(wrapper.id.clone());
+        } else if let Some(f) = program.funcs.iter().find(|f| {
+            f.id.debug_name.as_ref().is_some_and(|dn| dn.as_str() == proof.function)
+        }) {
+            roots.push(f.id.clone());
+        }
+    }
+    if roots.is_empty() {
+        return;
+    }
+    let debug = std::env::var("UC_PROVE_DEBUG_REPLAY").is_ok();
+    let t0 = std::time::Instant::now();
+    let (sliced, _) = slice_program_for_roots(program, &roots);
+    if debug {
+        eprintln!(
+            "replay slice: {} of {} statements, {} roots, {:.1} ms",
+            sliced.statements.len(),
+            program.statements.len(),
+            roots.len(),
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    // No gas equations: Sierra gas checks are off and syscalls draw on the replay budget.
+    let t1 = std::time::Instant::now();
+    if let Ok(runner) = SierraCasmRunner::new(sliced.clone(), None, Default::default(), None) {
+        if debug {
+            eprintln!("replay runner built in {:.1} ms", t1.elapsed().as_secs_f64() * 1000.0);
+        }
+        let t2 = std::time::Instant::now();
+        verify_counterexamples_concretely(&runner, &sliced, proofs);
+        if debug {
+            eprintln!("replay ran in {:.1} ms", t2.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+}
+
+/// Whether a concrete panic confirms the symbolic witness: harness artefacts (malformed
+/// calldata, missing contracts, gas) never do, and a predicted arithmetic failure must surface
+/// as one (`Overflow`, `Division by 0`, ...), not as an unrelated assertion the path never
+/// reasoned about.
+fn concrete_panic_confirms_witness(predicted_reason: &str, panic_message: &str) -> bool {
+    let harness_artefact = [
+        "Failed to deserialize param",
+        "Input too long for arguments",
+        "CONTRACT_NOT_DEPLOYED",
+        "ENTRYPOINT_NOT_FOUND",
+        "out of gas",
+        "Out of gas",
+    ]
+    .iter()
+    .any(|needle| panic_message.contains(needle));
+    if harness_artefact {
+        return false;
+    }
+    let predicted = predicted_reason.to_ascii_lowercase();
+    if predicted.contains("overflow") || predicted.contains("underflow") {
+        return panic_message.contains("Overflow") || panic_message.contains("overflow");
+    }
+    if predicted.contains("division") || predicted.contains("div") || predicted.contains("_is_zero") {
+        return panic_message.contains("Division by 0")
+            || panic_message.contains("Overflow")
+            || panic_message.contains("is_zero");
+    }
+    true
+}
+
+/// Finds the entry point wrapper (`__wrapper__<Impl>__<name>` or `__wrapper__<name>`) generated
+/// for a contract method, if the function is one.
+fn find_entry_point_wrapper<'p>(program: &'p Program, function: &str) -> Option<&'p cairo_lang_sierra::program::Function> {
+    let (module, rest) = function.rsplit_once("::")?;
+    let short = rest;
+    let (contract_module, impl_name) = module.rsplit_once("::")?;
+    let candidates = [
+        format!("{contract_module}::__wrapper__{impl_name}__{short}"),
+        format!("{contract_module}::__wrapper__{short}"),
+        format!("{module}::__wrapper__{short}"),
+    ];
+    program.funcs.iter().find(|f| {
+        f.id.debug_name.as_ref().is_some_and(|dn| candidates.iter().any(|c| c == dn.as_str()))
+    })
+}
+
 /// Builtin pointer types (`RangeCheck`, `GasBuiltin`, `System`, ...) that libfuncs thread through
 /// every call. They carry no caller data, so taint must not ride on them.
 fn is_builtin_sierra_type(ty_name: &str) -> bool {
@@ -2098,6 +2404,7 @@ fn run_symbolic_verification_for_function(
     summaries: &[FunctionInterprocSummary],
     func_idx: usize,
     max_depth: usize,
+    max_paths: usize,
 ) -> SymbolicFunctionProofReport {
     let fname = index.func_name(func_idx);
     let (_, short_name) = extract_contract_and_short_name(&fname);
@@ -2126,6 +2433,7 @@ fn run_symbolic_verification_for_function(
     let mut param_bounds: Vec<(String, i128, i128)> = Vec::new();
     let mut initial_vars: HashMap<u64, SymExpr> = HashMap::new();
     let mut param_descriptions: Vec<String> = Vec::new();
+    let mut param_types: Vec<String> = Vec::new();
 
     for p in &index.program.funcs[func_idx].params {
         let ty_name = index.type_name(&p.ty);
@@ -2148,6 +2456,7 @@ fn run_symbolic_verification_for_function(
             .unwrap_or_else(|| format!("arg_{p_idx}"));
         let max_b = max_bound_for_sierra_type(&ty_name);
         param_bounds.push((pname.clone(), 0, max_b));
+        param_types.push(ty_name.clone());
         param_descriptions.push(format!("{pname}: {ty_name}"));
         initial_vars.insert(p.id.id, SymExpr::Param(p_idx, pname));
     }
@@ -2168,17 +2477,25 @@ fn run_symbolic_verification_for_function(
     let mut proven_overflow_free = true;
     let mut preconditions: Vec<String> = Vec::new();
     let mut first_counterexample: Option<(BTreeMap<String, String>, String)> = None;
+    let mut first_witness: Option<Vec<i128>> = None;
+    let mut undecided_panic_paths = 0usize;
+    let mut exploration_truncated = false;
+    let mut obligations: Vec<PathObligation> = Vec::new();
 
-    let max_paths = 256usize;
+    let max_paths = max_paths.max(1);
 
     while let Some(mut state) = queue.pop_front() {
         if explored_paths >= max_paths {
+            exploration_truncated = true;
             break;
         }
 
         loop {
             if state.stmt_idx < start || state.stmt_idx >= end || state.depth > max_depth {
                 explored_paths += 1;
+                if state.depth > max_depth {
+                    exploration_truncated = true;
+                }
                 break;
             }
 
@@ -2199,7 +2516,24 @@ fn run_symbolic_verification_for_function(
                             .cloned()
                             .collect();
 
-                        match solve_path_constraints(&param_bounds, &meaningful_constraints) {
+                        let verdict = solve_path_constraints(&param_bounds, &meaningful_constraints);
+                        obligations.push(PathObligation {
+                            expected: match &verdict {
+                                SolverOutcome::Unsat => "unsat",
+                                SolverOutcome::Sat(_) => "sat",
+                                SolverOutcome::Unknown => "unknown",
+                            },
+                            constraints: meaningful_constraints.clone(),
+                            witness: match &verdict {
+                                SolverOutcome::Sat(w) => Some(w.clone()),
+                                _ => None,
+                            },
+                            reason: meaningful_constraints
+                                .last()
+                                .map(|c| c.reason.clone())
+                                .unwrap_or_else(|| "panic path".to_string()),
+                        });
+                        match verdict {
                             SolverOutcome::Unsat => {
                                 unreachable_panic_paths += 1;
                             }
@@ -2242,9 +2576,12 @@ fn run_symbolic_verification_for_function(
                                         .map(|c| c.reason.clone())
                                         .unwrap_or_else(|| "panic path reachable".to_string());
                                     first_counterexample = Some((ce_map, reason));
+                                    first_witness = Some(witness.clone());
                                 }
                             }
-                            SolverOutcome::Unknown => {}
+                            SolverOutcome::Unknown => {
+                                undecided_panic_paths += 1;
+                            }
                         }
                     } else {
                         ok_paths += 1;
@@ -2522,8 +2859,14 @@ fn run_symbolic_verification_for_function(
 
     let status = if first_counterexample.is_some() {
         "COUNTEREXAMPLE_FOUND".to_string()
+    } else if undecided_panic_paths > 0 {
+        // A panic path the solver could not refute is not a proof of anything.
+        "UNDECIDED".to_string()
     } else if !preconditions.is_empty() {
         "GUARDED_SAFE".to_string()
+    } else if exploration_truncated {
+        // Every explored panic path is unreachable, but paths past the budget were not seen.
+        "BOUNDED_SAFE".to_string()
     } else {
         "PROVEN_SAFE".to_string()
     };
@@ -2532,6 +2875,7 @@ fn run_symbolic_verification_for_function(
         Some((ce, reason)) => (Some(ce), Some(reason)),
         None => (None, None),
     };
+    let counterexample_calldata = first_witness.as_deref().map(|w| witness_calldata(w, &param_types));
 
     SymbolicFunctionProofReport {
         function: fname,
@@ -2542,9 +2886,16 @@ fn run_symbolic_verification_for_function(
         ok_paths,
         panic_paths,
         unreachable_panic_paths,
+        undecided_panic_paths,
+        exploration_truncated,
         proven_overflow_free,
         preconditions,
         counterexample,
+        counterexample_calldata,
+        smt_file: None,
+        obligations,
+        param_bounds,
+        param_types,
         counterexample_reason,
         concrete_verified: None,
         concrete_panic_data: None,
@@ -2558,6 +2909,7 @@ pub(crate) fn analyze_sierra_program(
     crate_name: &str,
     filter: Option<&str>,
     max_depth: usize,
+    max_paths: usize,
     enable_caracal: bool,
 ) -> (Vec<SymbolicFunctionProofReport>, Vec<CaracalSierraFinding>) {
     let index = SierraProgramIndex::build(program);
@@ -2589,7 +2941,7 @@ pub(crate) fn analyze_sierra_program(
         if is_plain_test {
             continue;
         }
-        let proof = run_symbolic_verification_for_function(&index, &summaries, func_idx, max_depth);
+        let proof = run_symbolic_verification_for_function(&index, &summaries, func_idx, max_depth, max_paths);
         symbolic_proofs.push(proof);
     }
 
@@ -2637,6 +2989,37 @@ fn verify_counterexamples_concretely(
         }
 
         if proof.function.contains('[') || proof.function.contains("__wrapper__") {
+            continue;
+        }
+        // Contract methods replay through their entry point wrapper with the witness encoded as
+        // calldata, so storage reads see the default (zero) state exactly as a fresh deployment.
+        if let (Some(wrapper), Some(calldata)) =
+            (find_entry_point_wrapper(program, &proof.function), proof.counterexample_calldata.as_ref())
+        {
+            let felts: Vec<Arg> = calldata
+                .iter()
+                .map(|h| Arg::Value(Felt252::from_hex(h).unwrap_or(Felt252::ZERO)))
+                .collect();
+            match runner.run_function_with_starknet_context(
+                wrapper,
+                vec![Arg::Array(felts)],
+                Some(1_000_000_000),
+                StarknetState::default(),
+            ) {
+                Ok(run_res) => match run_res.value {
+                    RunResultValue::Panic(felts) => {
+                        let msg = format_for_panic(felts.into_iter());
+                        proof.concrete_verified =
+                            Some(concrete_panic_confirms_witness(reason_comment, &msg));
+                        proof.concrete_panic_data = Some(msg);
+                    }
+                    RunResultValue::Success(_) => proof.concrete_verified = Some(false),
+                },
+                Err(err) => {
+                    proof.concrete_verified = Some(false);
+                    proof.concrete_panic_data = Some(format!("replay error: {err}"));
+                }
+            }
             continue;
         }
         let Some(func) = program.funcs.iter().find(|f| {
@@ -3166,7 +3549,7 @@ fn check_functional_equivalence_against_baseline(
 
     let base_prog = &base_comp.sierra_program.program;
     let cand_prog = &candidate_compilation.sierra_program.program;
-    let (base_proofs, _) = analyze_sierra_program(base_prog, &base_crate, None, 64, false);
+    let (base_proofs, _) = analyze_sierra_program(base_prog, &base_crate, None, 1024, 1024, false);
     let base_index = SierraProgramIndex::build(base_prog);
     let cand_index = SierraProgramIndex::build(cand_prog);
 
@@ -3587,6 +3970,7 @@ fn prove_single_package(
         crate_name,
         args.filter.as_deref(),
         args.max_depth,
+        args.max_paths,
         args.caracal,
     );
     // A `#[should_panic]` test exists to panic: a satisfiable panic path there is the test
@@ -3622,8 +4006,11 @@ fn prove_single_package(
                 })
             }));
 
+    if has_counterexamples {
+        replay_counterexamples_on_slice(program, &mut symbolic_proofs);
+    }
     let mut stateful_invariants = Vec::new();
-    if (has_counterexamples || has_invariant_candidates) && program.statements.len() <= 8_000 {
+    if has_invariant_candidates && program.statements.len() <= 8_000 {
         let metadata_cfg = if program.statements.len() <= 2_500 {
             Some(MetadataComputationConfig {
                 function_set_costs: compilation.metadata.function_set_costs.clone(),
@@ -3638,10 +4025,7 @@ fn prove_single_package(
             compilation.metadata.contracts_info.clone(),
             None,
         ) {
-            if has_counterexamples {
-                verify_counterexamples_concretely(&runner, program, &mut symbolic_proofs);
-            }
-            if has_invariant_candidates {
+            {
                 let index = SierraProgramIndex::build(program);
                 stateful_invariants = run_medusa_stateful_campaign(
                     &runner,
@@ -3691,6 +4075,11 @@ fn prove_single_package(
         .iter()
         .filter(|p| p.status == "COUNTEREXAMPLE_FOUND")
         .count();
+    let undecided_count = symbolic_proofs.iter().filter(|p| p.status == "UNDECIDED").count();
+    let bounded_safe_count = symbolic_proofs.iter().filter(|p| p.status == "BOUNDED_SAFE").count();
+    if let Some(dir) = &args.emit_smt {
+        write_smt_obligations(&dir.join(package_name), &mut symbolic_proofs)?;
+    }
 
     Ok(PackageProveReport {
         package_name: package_name.to_string(),
@@ -3700,6 +4089,8 @@ fn prove_single_package(
         proven_safe_count,
         guarded_safe_count,
         counterexample_count,
+        undecided_count,
+        bounded_safe_count,
         caracal_findings_count: caracal_findings.len(),
         symbolic_proofs,
         caracal_findings,
@@ -3760,13 +4151,22 @@ pub(crate) fn run_prove(args: ProveArgs) -> Result<()> {
                 .and_then(|dn| dn.split("::").next())
                 .unwrap_or("sierra_target")
                 .to_string();
-            let (symbolic_proofs, caracal_findings) = analyze_sierra_program(
+            let (mut symbolic_proofs, caracal_findings) = analyze_sierra_program(
                 &program,
                 &inferred_crate,
                 args.filter.as_deref(),
                 args.max_depth,
+                args.max_paths,
                 args.caracal,
             );
+            if symbolic_proofs.iter().any(|p| p.status == "COUNTEREXAMPLE_FOUND") {
+                replay_counterexamples_on_slice(&program, &mut symbolic_proofs);
+            }
+            let undecided_count = symbolic_proofs.iter().filter(|p| p.status == "UNDECIDED").count();
+            let bounded_safe_count = symbolic_proofs.iter().filter(|p| p.status == "BOUNDED_SAFE").count();
+            if let Some(dir) = &args.emit_smt {
+                write_smt_obligations(&dir.join(&inferred_crate), &mut symbolic_proofs)?;
+            }
             let proven_safe_count = symbolic_proofs
                 .iter()
                 .filter(|p| p.status == "PROVEN_SAFE")
@@ -3787,6 +4187,8 @@ pub(crate) fn run_prove(args: ProveArgs) -> Result<()> {
                 proven_safe_count,
                 guarded_safe_count,
                 counterexample_count,
+                undecided_count,
+                bounded_safe_count,
                 caracal_findings_count: caracal_findings.len(),
                 symbolic_proofs,
                 caracal_findings,
@@ -3923,6 +4325,8 @@ pub(crate) fn run_prove(args: ProveArgs) -> Result<()> {
                     "PROVEN_SAFE" => "[PROVEN SAFE]",
                     "GUARDED_SAFE" => "[GUARDED SAFE]",
                     "COUNTEREXAMPLE_FOUND" => "[COUNTEREXAMPLE]",
+                    "UNDECIDED" => "[UNDECIDED]",
+                    "BOUNDED_SAFE" => "[BOUNDED SAFE]",
                     _ => "[BOUNDED]",
                 };
                 println!(
@@ -3957,6 +4361,12 @@ pub(crate) fn run_prove(args: ProveArgs) -> Result<()> {
                         "      counterexample: ({}) -> {}{}",
                         formatted_ce, panic_msg, verified_tag
                     );
+                    if let Some(calldata) = &proof.counterexample_calldata {
+                        println!("      calldata: [{}]", calldata.join(", "));
+                    }
+                }
+                if let Some(smt) = &proof.smt_file {
+                    println!("      smt: {smt}");
                 }
             }
             if !pkg.stateful_invariants.is_empty() {
@@ -4071,6 +4481,121 @@ pub(crate) fn run_prove(args: ProveArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn smt_export_renders_bounds_obligations_and_witness_blocks() {
+        use super::*;
+        let p0 = SymExpr::Param(0, "amount".to_string());
+        let unsat = SymConstraint {
+            lhs: p0.clone(),
+            op: CmpOp::Gt,
+            rhs: SymExpr::Const(300),
+            reason: "overflow in u8_overflowing_add".to_string(),
+            is_overflow_branch: true,
+        };
+        let sat = SymConstraint {
+            lhs: SymExpr::Add(Box::new(p0.clone()), Box::new(SymExpr::SymbolicOpaque("storage read".to_string()))),
+            op: CmpOp::Ge,
+            rhs: SymExpr::Const(-1),
+            reason: "line\nbreak".to_string(),
+            is_overflow_branch: false,
+        };
+        let proof = SymbolicFunctionProofReport {
+            function: "demo::Vault::deposit".to_string(),
+            kind: "function".to_string(),
+            params: vec!["amount: core::integer::u8".to_string()],
+            status: "COUNTEREXAMPLE_FOUND".to_string(),
+            explored_paths: 2,
+            ok_paths: 0,
+            panic_paths: 2,
+            unreachable_panic_paths: 1,
+            undecided_panic_paths: 0,
+            exploration_truncated: false,
+            proven_overflow_free: false,
+            preconditions: Vec::new(),
+            counterexample: None,
+            counterexample_calldata: None,
+            smt_file: None,
+            obligations: vec![
+                PathObligation { expected: "unsat", constraints: vec![unsat], witness: None, reason: "a".to_string() },
+                PathObligation { expected: "sat", constraints: vec![sat], witness: Some(vec![7]), reason: "b".to_string() },
+            ],
+            param_bounds: vec![("amount".to_string(), 0, 255)],
+            param_types: vec!["core::integer::u8".to_string()],
+            counterexample_reason: None,
+            concrete_verified: None,
+            concrete_panic_data: None,
+            repro_test: None,
+        };
+        let text = render_smt_obligations(&proof);
+        assert!(text.contains("(set-logic QF_NIA)"));
+        assert!(text.contains("(declare-const p0 Int) ; amount"));
+        assert!(text.contains("(assert (and (<= 0 p0) (<= p0 255)))"));
+        assert!(text.contains("(declare-const o_storage_read Int)"));
+        assert!(text.contains("; obligation 0: expected unsat"));
+        assert!(text.contains("(assert (> p0 300)) ; overflow in u8_overflowing_add"));
+        assert!(text.contains("; obligation 1: expected sat"));
+        assert!(text.contains("(assert (>= (+ p0 o_storage_read) (- 1))) ; line break"));
+        assert!(text.contains("; obligation 1 witness: expected sat"));
+        assert!(text.contains("(assert (= p0 7))"));
+        assert_eq!(text.matches("(check-sat)").count(), 3);
+        assert_eq!(text.matches("(push 1)").count(), text.matches("(pop 1)").count());
+
+        let dir = std::env::temp_dir().join(format!("uc-smt-export-{}", std::process::id()));
+        let mut proofs = vec![proof];
+        let written = write_smt_obligations(&dir, &mut proofs).expect("write smt");
+        assert_eq!(written, 1);
+        assert_eq!(proofs[0].smt_file.as_deref(), Some(dir.join("demo__Vault__deposit.smt2").to_str().unwrap()));
+        let manifest: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(dir.join("obligations.json")).unwrap()).unwrap();
+        assert_eq!(manifest.len(), 2);
+        assert_eq!(manifest[1]["expected"], "sat");
+        assert_eq!(manifest[1]["witness"][0], 7);
+        let _ = fs::remove_dir_all(&dir);
+
+        let long_name = format!("demo::{}::f", "x".repeat(300));
+        let stem = smt_file_stem(&long_name);
+        assert!(stem.len() < 120, "{stem}");
+        assert_ne!(stem, smt_file_stem(&format!("{long_name}2")));
+    }
+
+    #[test]
+    fn concrete_panic_confirmation_rejects_harness_artefacts_and_unrelated_asserts() {
+        use super::concrete_panic_confirms_witness;
+        let overflow = "arithmetic overflow in `u64_overflowing_add`: (a + b) > 18446744073709551615";
+        assert!(concrete_panic_confirms_witness(overflow, "Panicked with 'u64_add Overflow'."));
+        assert!(!concrete_panic_confirms_witness(overflow, "Panicked with 'clientAddresses required'."));
+        assert!(!concrete_panic_confirms_witness(overflow, "Panicked with 'Syscall out of gas'."));
+        assert!(!concrete_panic_confirms_witness("panic path", "Failed to deserialize param #2"));
+        assert!(concrete_panic_confirms_witness("panic path", "Panicked with 'THRESHOLD_EXCEEDED'."));
+        assert!(concrete_panic_confirms_witness("u64_is_zero(x) branch 1", "Panicked with 'Division by 0'."));
+    }
+
+    #[test]
+    fn witness_calldata_encodes_by_parameter_type() {
+        use super::witness_calldata;
+        let types: Vec<String> = [
+            "demo::Vault::ContractState",
+            "core::integer::u256",
+            "core::array::Span::<core::starknet::contract_address::ContractAddress>",
+            "core::byte_array::ByteArray",
+            "core::integer::u64",
+            "core::felt252",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        let calldata = witness_calldata(&[0, 5, 0, 0, 18446744073709551615, -1], &types);
+        assert_eq!(
+            calldata,
+            vec![
+                "0x5", "0x0",            // u256 low, high
+                "0x0",                   // empty span
+                "0x0", "0x0", "0x0",     // empty ByteArray
+                "0xffffffffffffffff",    // u64
+                "0x800000000000011000000000000000000000000000000000000000000000000", // -1 mod P
+            ]
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -4255,6 +4780,7 @@ pub mod Loops {
             "loop_demo",
             &ProveArgs {
                 max_depth: 64,
+                max_paths: 1024,
                 caracal: true,
                 stateful_runs: 0,
                 ..ProveArgs::default()
@@ -4376,6 +4902,7 @@ mod tests {
             "formal_demo",
             &ProveArgs {
                 max_depth: 64,
+                max_paths: 1024,
                 caracal: true,
                 stateful_runs: 16,
                 ..ProveArgs::default()
@@ -4530,6 +5057,7 @@ pub mod Vault {
 
         let args = ProveArgs {
             max_depth: 64,
+            max_paths: 1024,
             caracal: true,
             stateful_runs: 16,
             check_upgrade: Some(baseline_dir.clone()),

@@ -28,6 +28,7 @@ uc build --json                      # Sierra + CASM artifacts, byte-identical t
 | Fuzz | `uc test --fuzzer-runs 256 --json` |
 | Formal verification + taint | `uc prove --json` |
 | Write counterexamples as tests | `uc prove --emit-repro tests/repro.cairo` |
+| Checkable proof obligations (SMT-LIB) | `uc prove --emit-smt target/smt --json` |
 | Upgrade safety vs baseline | `uc prove --check-upgrade <baseline_dir> --json` |
 | Functional equivalence vs baseline | `uc prove --check-equivalence <baseline_dir> --json` |
 | Audit a deployed class, no source | `uc audit <address or class hash> --network mainnet --json` |
@@ -53,10 +54,16 @@ endpoints). Every report includes the `rpc_url` used.
 - Exit `0`: success (`passed = true`, no errors, no unguarded counterexamples with
   `--fail-on-findings`). Exit `1`: compilation error, test failure, lint error, upgrade
   regression, or a counterexample under `--fail-on-findings`.
-- `uc prove` statuses per Sierra function: `PROVEN_SAFE` (no satisfiable panic path),
-  `GUARDED_SAFE` (panics only behind caller or calldata guards), `COUNTEREXAMPLE_FOUND` (concrete
-  inputs in `counterexample`; `concrete_verified` is set when it was replayed in the runner).
+- `uc prove` statuses per Sierra function: `PROVEN_SAFE` (every panic path explored, none
+  satisfiable), `GUARDED_SAFE` (panics only behind caller or calldata guards),
+  `COUNTEREXAMPLE_FOUND` (inputs in `counterexample`, wrapper calldata in
+  `counterexample_calldata`; `concrete_verified` true when the replay panicked for the predicted
+  reason, false when it returned or hit an unrelated assertion), `BOUNDED_SAFE` (depth or path
+  budget hit, nothing found), `UNDECIDED` (a panic path the solver could not decide).
+  `exploration_truncated` says whether `--max-depth` / `--max-paths` (both 1024) were hit.
   Plain `#[test]` bodies are not symbolic targets; `prove_*`, `invariant_*`, `check_*` are.
+- `uc prove --emit-smt <dir>` writes SMT-LIB obligations per function plus `obligations.json`;
+  `benchmarks/scripts/check_smt_obligations.py --dir <dir>` checks them with z3 or cvc5.
 - Detector findings carry `severity`, `confidence`, `detector`, `function`,
   `sierra_statement_idx`, `description`, `recommendation`, `taint_flow`. Guarded
   check-effects-interactions shapes (a write before the external call) are reported at `Low`.
