@@ -1149,6 +1149,11 @@ fn run_caracal_sierra_analysis(
         // A storage write that precedes the first external call is the shape of a reentrancy
         // guard or a lock (`start()` writes, call, `end()` writes).
         let mut storage_write_before_external_call = false;
+        // Lock recognition: a slot that is read, then written before the external call, is a
+        // lock held across the call; writing it back after the call releases it.
+        let mut slot_of_var: HashMap<u64, starknet_types_core::felt::Felt> = HashMap::new();
+        let mut slots_read: HashSet<starknet_types_core::felt::Felt> = HashSet::new();
+        let mut lock_slots: HashSet<starknet_types_core::felt::Felt> = HashSet::new();
         let mut divmod_numerator_vars: HashMap<u64, usize> = HashMap::new();
 
         for stmt_idx in start..end {
@@ -1175,6 +1180,20 @@ fn run_caracal_sierra_analysis(
                 for b in &inv.branches {
                     for r in &b.results {
                         root_var.insert(r.id, root);
+                    }
+                }
+            }
+
+            track_detector_storage_slot(&mut slot_of_var, gid, lf, inv);
+            if gid == "storage_read_syscall" {
+                if let Some(slot) = inv.args.last().and_then(|a| slot_of_var.get(&a.id)) {
+                    slots_read.insert(*slot);
+                }
+            }
+            if gid == "storage_write_syscall" && seen_external_call_stmt.is_none() && inv.args.len() >= 2 {
+                if let Some(slot) = slot_of_var.get(&inv.args[inv.args.len() - 2].id) {
+                    if slots_read.contains(slot) {
+                        lock_slots.insert(*slot);
                     }
                 }
             }
@@ -1387,36 +1406,58 @@ fn run_caracal_sierra_analysis(
                     }
                 }
 
-                // Detector 4: Check-Effects-Interactions (CEI) Reentrancy on Sierra IR
+            }
+
+            // Detector 4: Check-Effects-Interactions (CEI) Reentrancy on Sierra IR. Runs on the
+            // function that holds the call / write sequence, wrapper or not; one finding per
+            // contract method.
+            if is_state_write && !is_constructor && !fname.contains('[') {
                 if seen_external_call_stmt.is_none() {
                     storage_write_before_external_call = true;
                 }
                 if let Some(call_stmt) = seen_external_call_stmt {
-                    if call_stmt < stmt_idx {
+                    let written_slot = (gid == "storage_write_syscall" && inv.args.len() >= 2)
+                        .then(|| slot_of_var.get(&inv.args[inv.args.len() - 2].id).copied())
+                        .flatten();
+                    // Writing a lock slot back after the call is the release, not a violation.
+                    let releases_lock = written_slot.is_some_and(|slot| lock_slots.contains(&slot));
+                    if call_stmt < stmt_idx && !releases_lock {
                         let key = (
                             "caracal-cei-reentrancy-sierra".to_string(),
                             contract_or_mod.clone(),
                             short_name.clone(),
                         );
                         if seen_keys.insert(key) {
-                            let guarded = storage_write_before_external_call;
+                            let under_lock = !lock_slots.is_empty();
+                            let guarded = under_lock || storage_write_before_external_call;
                             findings.push(CaracalSierraFinding {
                                 detector: "caracal-cei-reentrancy-sierra".to_string(),
                                 severity: if guarded { "Low".to_string() } else { "High".to_string() },
-                                confidence: if guarded { "Low".to_string() } else { "Medium".to_string() },
+                                confidence: if under_lock {
+                                    "Low".to_string()
+                                } else if guarded {
+                                    "Medium".to_string()
+                                } else {
+                                    "Medium".to_string()
+                                },
                                 contract_or_module: contract_or_mod.clone(),
                                 function: short_name.clone(),
                                 sierra_statement_idx: stmt_idx,
-                                description: if guarded {
+                                description: if under_lock {
                                     format!(
-                                        "`{contract_or_mod}::{short_name}` writes storage before and after an external call (statement #{call_stmt}); this is the shape of a reentrancy guard or lock. Verify the pre-call write actually blocks re-entry into every state-changing entrypoint."
+                                        "`{contract_or_mod}::{short_name}` writes storage at statement #{stmt_idx} after an external call (statement #{call_stmt}) while holding a lock: slot {} is read, written before the call and written back after it. Re-entry is blocked only if every state-changing entrypoint checks that lock.",
+                                        lock_slots.iter().map(|f| format!("{f:#x}")).collect::<Vec<_>>().join(", ")
+                                    )
+                                } else if guarded {
+                                    format!(
+                                        "`{contract_or_mod}::{short_name}` writes storage before and after an external call (statement #{call_stmt}). The pre-call write is not a lock (its slot is never read first), so it does not block re-entry on its own; the post-call write at statement #{stmt_idx} still runs on reentered state."
                                     )
                                 } else {
                                     format!(
                                         "Check-Effects-Interactions violation in `{contract_or_mod}::{short_name}`: external contract call at Sierra statement #{call_stmt} precedes storage write at statement #{stmt_idx} with no prior state write that could act as a guard."
                                     )
                                 },
-                                recommendation: "Perform all `storage_write_syscall` state updates before invoking `call_contract_syscall`.".to_string(),
+                                recommendation: "Perform all `storage_write_syscall` state updates before invoking `call_contract_syscall`, or hold a lock (read, assert, write) across the call and release it after.".to_string(),
                                 taint_flow: vec![
                                     format!("call_contract_syscall@stmt_{call_stmt}"),
                                     format!("{gid}@stmt_{stmt_idx}"),
@@ -2127,6 +2168,51 @@ fn has_entry_point_wrapper(index: &SierraProgramIndex<'_>, short_name: &str) -> 
             || other.ends_with(&format!("::__l1_handler::{short_name}"))
             || (other.contains("::__wrapper__") && other.ends_with(&suffix))
     })
+}
+
+/// Follows concrete storage base addresses through the libfuncs that build and copy them, for
+/// the detectors' linear walk (no path state): `storage_base_address_const` / `const_as_immediate`
+/// produce one, `storage_address_from_base[_and_offset]`, copies and `StoragePointer` struct
+/// construction and deconstruction keep it. Offsets are ignored: the base identifies the field.
+fn track_detector_storage_slot(
+    slot_of_var: &mut HashMap<u64, starknet_types_core::felt::Felt>,
+    gid: &str,
+    lf: &LibfuncMeta,
+    inv: &cairo_lang_sierra::program::Invocation,
+) {
+    use starknet_types_core::felt::Felt;
+    if inv.branches.len() != 1 {
+        return;
+    }
+    let branch = &inv.branches[0];
+    let Some(res) = branch.results.first() else { return };
+    if gid == "storage_base_address_const" || gid == "const_as_immediate" {
+        let value = lf
+            .big_const_hex
+            .as_deref()
+            .and_then(|h| Felt::from_hex(&format!("0x{h}")).ok())
+            .or_else(|| lf.const_value.filter(|v| *v >= 0).map(|v| Felt::from(v as u128)));
+        if let Some(addr) = value {
+            slot_of_var.insert(res.id, addr);
+        }
+    } else if matches!(
+        gid,
+        "storage_address_from_base" | "storage_address_from_base_and_offset" | "rename" | "dup" | "store_temp" | "store_local" | "snapshot_take" | "unbox"
+    ) {
+        if let Some(arg) = inv.args.first() {
+            if let Some(addr) = slot_of_var.get(&arg.id).copied() {
+                for r in &branch.results {
+                    slot_of_var.insert(r.id, addr);
+                }
+            }
+        }
+    } else if gid == "struct_construct" || gid == "struct_deconstruct" {
+        if let Some(first) = inv.args.first() {
+            if let Some(addr) = slot_of_var.get(&first.id).copied() {
+                slot_of_var.insert(res.id, addr);
+            }
+        }
+    }
 }
 
 /// Builtin pointer types (`RangeCheck`, `GasBuiltin`, `System`, ...) that libfuncs thread through
@@ -5227,6 +5313,92 @@ pub mod Counter {
         assert_eq!(huge.read_small(&len_key), None);
         assert_eq!(status_with(Some(&huge)).0, opaque);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(feature = "native-test-runner")]
+    fn cei_detector_tells_a_held_lock_from_an_unrelated_pre_call_write() {
+        let root = std::env::temp_dir().join(format!("uc-cei-lock-test-{}-{}", std::process::id(), epoch_ms_u64().unwrap_or(1)));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("Scarb.toml"), "[package]\nname = \"cei_demo\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n\n[dependencies]\nstarknet = \"2.18.0\"\n").unwrap();
+        fs::write(root.join("src/lib.cairo"), r#"
+use starknet::ContractAddress;
+#[starknet::interface]
+pub trait ICallee<T> { fn ping(ref self: T) -> felt252; }
+
+#[starknet::interface]
+pub trait IVault<T> { fn withdraw(ref self: T, target: ContractAddress); }
+
+#[starknet::contract]
+pub mod LockedVault {
+    use starknet::ContractAddress;
+    use starknet::storage::{StoragePointerReadAccess, StoragePointerWriteAccess};
+    use super::{ICalleeDispatcher, ICalleeDispatcherTrait};
+    #[storage]
+    struct Storage { locked: bool, balance: u64 }
+    #[abi(embed_v0)]
+    impl VaultImpl of super::IVault<ContractState> {
+        fn withdraw(ref self: ContractState, target: ContractAddress) {
+            assert(!self.locked.read(), 'LOCKED');
+            self.locked.write(true);
+            ICalleeDispatcher { contract_address: target }.ping();
+            self.balance.write(0);
+            self.locked.write(false);
+        }
+    }
+}
+
+#[starknet::contract]
+pub mod UnrelatedWriteVault {
+    use starknet::ContractAddress;
+    use starknet::storage::{StoragePointerReadAccess, StoragePointerWriteAccess};
+    use super::{ICalleeDispatcher, ICalleeDispatcherTrait};
+    #[storage]
+    struct Storage { last_target: ContractAddress, balance: u64 }
+    #[abi(embed_v0)]
+    impl VaultImpl of super::IVault<ContractState> {
+        fn withdraw(ref self: ContractState, target: ContractAddress) {
+            self.last_target.write(target);
+            ICalleeDispatcher { contract_address: target }.ping();
+            self.balance.write(0);
+        }
+    }
+}
+
+#[starknet::contract]
+pub mod NakedVault {
+    use starknet::ContractAddress;
+    use starknet::storage::{StoragePointerReadAccess, StoragePointerWriteAccess};
+    use super::{ICalleeDispatcher, ICalleeDispatcherTrait};
+    #[storage]
+    struct Storage { balance: u64 }
+    #[abi(embed_v0)]
+    impl VaultImpl of super::IVault<ContractState> {
+        fn withdraw(ref self: ContractState, target: ContractAddress) {
+            ICalleeDispatcher { contract_address: target }.ping();
+            self.balance.write(0);
+        }
+    }
+}
+"#).unwrap();
+        let (comp, _, _) = compile_or_load_native_tests(&root.join("Scarb.toml"), &root, "cei_demo", "cei_demo", &[], true).expect("compile");
+        let (_, findings) = analyze_sierra_program(&comp.sierra_program.program, "cei_demo", None, 1024, 1024, true, None);
+        let _ = fs::remove_dir_all(&root);
+        // Methods that stay out of line keep their impl name as module (`VaultImpl::withdraw`),
+        // so the three verdicts are told apart by their text.
+        let cei: Vec<(String, String)> = findings
+            .iter()
+            .filter(|f| f.detector == "caracal-cei-reentrancy-sierra" && f.function == "withdraw")
+            .map(|f| (f.severity.clone(), f.description.clone()))
+            .collect();
+        assert_eq!(cei.len(), 3, "one verdict per vault: {cei:?}");
+        let locked = cei.iter().find(|(_, d)| d.contains("holding a lock")).expect("lock verdict");
+        assert_eq!(locked.0, "Low", "{locked:?}");
+        let unrelated = cei.iter().find(|(_, d)| d.contains("not a lock")).expect("unrelated pre-write verdict");
+        assert_eq!(unrelated.0, "Low", "{unrelated:?}");
+        let naked = cei.iter().find(|(_, d)| d.contains("no prior state write")).expect("naked verdict");
+        assert_eq!(naked.0, "High", "{naked:?}");
     }
 
     #[test]
