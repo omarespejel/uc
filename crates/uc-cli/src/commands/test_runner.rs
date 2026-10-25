@@ -179,8 +179,137 @@ pub(crate) struct SingleTestResultReport {
     /// Wall-clock execution time of this test (including fuzz runs), in milliseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<f64>,
+    /// Builtin instances used by the VM run, nested calls included (`range_check`, `pedersen`,
+    /// `poseidon`, `bitwise`, `ec_op`, `keccak`, `range_check96`, `add_mod`, `mul_mod`, `ecdsa`).
+    /// For fuzz tests: the sum over all runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub builtins: Option<BTreeMap<String, usize>>,
+    /// Steps and builtins weighted with Starknet's L2 gas costs per resource; shows which
+    /// resource dominates the cost of this test's execution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_gas: Option<ResourceGasBreakdown>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
+}
+
+/// L2 gas per VM resource, from blockifier's `os_constants` (`step_gas_cost`,
+/// `builtin_gas_costs`) for Starknet 0.13.4 and later. These weights are what the sequencer
+/// charges per step and per builtin instance; they also rank the AIR components by how much
+/// trace each one costs the prover, which is what the weights were derived from.
+pub(crate) const STEP_GAS_COST: u64 = 100;
+pub(crate) const BUILTIN_GAS_COSTS: &[(&str, u64)] = &[
+    ("range_check", 70),
+    ("range_check96", 56),
+    ("pedersen", 4050),
+    ("poseidon", 491),
+    ("bitwise", 583),
+    ("ec_op", 4085),
+    ("ecdsa", 10561),
+    ("keccak", 136189),
+    ("add_mod", 230),
+    ("mul_mod", 604),
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct ResourceGasBreakdown {
+    /// `steps * STEP_GAS_COST + sum(builtin instances * weight)`.
+    pub total: u64,
+    pub steps: u64,
+    /// Gas attributed to each builtin that was used at least once.
+    pub builtins: BTreeMap<String, u64>,
+    /// The resource with the largest share (`steps` or a builtin name).
+    pub dominant: String,
+    /// Share of `total` taken by `dominant`, in percent.
+    pub dominant_pct: f64,
+}
+
+/// Weighs a run's steps and builtin instances with Starknet's L2 gas costs.
+pub(crate) fn resource_gas_breakdown(
+    n_steps: usize,
+    builtins: &BTreeMap<String, usize>,
+) -> ResourceGasBreakdown {
+    let steps = n_steps as u64 * STEP_GAS_COST;
+    let mut weighted = BTreeMap::new();
+    for (name, count) in builtins {
+        if *count == 0 {
+            continue;
+        }
+        let weight = BUILTIN_GAS_COSTS
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, w)| *w)
+            .unwrap_or(0);
+        weighted.insert(name.clone(), *count as u64 * weight);
+    }
+    let total = steps + weighted.values().sum::<u64>();
+    let (dominant, share) = weighted
+        .iter()
+        .map(|(n, g)| (n.as_str(), *g))
+        .chain(std::iter::once(("steps", steps)))
+        .max_by_key(|(_, g)| *g)
+        .unwrap_or(("steps", 0));
+    let dominant = dominant.to_string();
+    ResourceGasBreakdown {
+        total,
+        steps,
+        builtins: weighted,
+        dominant,
+        dominant_pct: if total == 0 { 0.0 } else { share as f64 * 100.0 / total as f64 },
+    }
+}
+
+/// Builtin instance counts of a run as `{builtin name: instances}`, zero entries dropped.
+fn builtin_counts(resources: &cairo_lang_runner::StarknetExecutionResources) -> BTreeMap<String, usize> {
+    resources
+        .basic_resources
+        .builtin_instance_counter
+        .iter()
+        .filter(|(_, n)| **n > 0)
+        .map(|(name, n)| (name.to_str().to_string(), *n))
+        .collect()
+}
+
+fn builtins_or_none(map: BTreeMap<String, usize>) -> Option<BTreeMap<String, usize>> {
+    if map.is_empty() { None } else { Some(map) }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SuiteResourceTotals {
+    pub steps: usize,
+    pub builtins: BTreeMap<String, usize>,
+    pub resource_gas: ResourceGasBreakdown,
+    /// Tests ranked by weighted resource gas, heaviest first (at most ten).
+    pub heaviest_tests: Vec<(String, u64)>,
+}
+
+/// Sums steps and builtin instances over every test that ran, and ranks the heaviest tests.
+pub(crate) fn suite_resource_totals(results: &[SingleTestResultReport]) -> Option<SuiteResourceTotals> {
+    let mut steps = 0usize;
+    let mut builtins: BTreeMap<String, usize> = BTreeMap::new();
+    let mut ranked = Vec::new();
+    let mut any = false;
+    for t in results {
+        if let Some(s) = t.steps {
+            // Fuzz tests report the average per run; count the whole test once.
+            steps += s * t.fuzz_runs.unwrap_or(1);
+            any = true;
+        }
+        if let Some(b) = &t.builtins {
+            for (k, v) in b {
+                *builtins.entry(k.clone()).or_insert(0) += v;
+            }
+        }
+        if let Some(r) = &t.resource_gas {
+            ranked.push((t.name.clone(), r.total));
+        }
+    }
+    if !any {
+        return None;
+    }
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked.truncate(10);
+    let resource_gas = resource_gas_breakdown(steps, &builtins);
+    Some(SuiteResourceTotals { steps, builtins, resource_gas, heaviest_tests: ranked })
 }
 
 fn scan_cairo_module_digests_and_imports(
@@ -2775,6 +2904,8 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
                         gas_used: None,
                         steps: None,
                         syscalls: None,
+                        builtins: None,
+                        resource_gas: None,
                         fuzz_runs: None,
                         fuzz_seed: None,
                         shrunk_counterexample: None,
@@ -2794,6 +2925,8 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
                         gas_used: None,
                         steps: None,
                         syscalls: None,
+                        builtins: None,
+                        resource_gas: None,
                         fuzz_runs: None,
                         fuzz_seed: None,
                         shrunk_counterexample: None,
@@ -2830,6 +2963,7 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
                     let mut total_steps = 0usize;
                     let mut last_gas_used = None;
                     let mut merged_syscalls: BTreeMap<String, usize> = BTreeMap::new();
+                    let mut merged_builtins: BTreeMap<String, usize> = BTreeMap::new();
 
                     for run_idx in 0..total_runs {
                         let cov_before = runner.covered_statement_count();
@@ -2866,6 +3000,9 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
                                 }
                                 for (k, v) in result.used_resources.syscalls.clone() {
                                     *merged_syscalls.entry(k).or_insert(0) += v;
+                                }
+                                for (k, v) in builtin_counts(&result.used_resources) {
+                                    *merged_builtins.entry(k).or_insert(0) += v;
                                 }
                                 let (passed, fail_msg) =
                                     evaluate_outcome(&result, &test_cfg.expectation);
@@ -2957,6 +3094,8 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
                                         } else {
                                             Some(merged_syscalls)
                                         },
+                                        builtins: None,
+                                        resource_gas: None,
                                         fuzz_runs: Some(run_idx + 1),
                                         fuzz_seed: Some(base_seed),
                                         shrunk_counterexample: Some(shrunk_strs.clone()),
@@ -2981,6 +3120,8 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
                                     gas_used: last_gas_used,
                                     steps: Some(total_steps),
                                     syscalls: None,
+                                    builtins: None,
+                                    resource_gas: None,
                                     fuzz_runs: Some(run_idx + 1),
                                     fuzz_seed: Some(base_seed),
                                     shrunk_counterexample: Some(shrunk_strs),
@@ -3005,6 +3146,8 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
                         } else {
                             Some(merged_syscalls)
                         },
+                        resource_gas: Some(resource_gas_breakdown(total_steps, &merged_builtins)),
+                        builtins: builtins_or_none(merged_builtins),
                         fuzz_runs: Some(total_runs),
                         fuzz_seed: Some(base_seed),
                         shrunk_counterexample: None,
@@ -3041,6 +3184,12 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
                         } else {
                             Some(syscalls_map)
                         };
+                        let builtin_map = builtin_counts(&result.used_resources);
+                        let resource_gas = Some(resource_gas_breakdown(
+                            result.used_resources.basic_resources.n_steps,
+                            &builtin_map,
+                        ));
+                        let builtins = builtins_or_none(builtin_map);
 
                         let (passed, failure_reason) =
                             evaluate_outcome(&result, &test_cfg.expectation);
@@ -3059,6 +3208,8 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
                             gas_used,
                             steps,
                             syscalls,
+                            builtins,
+                            resource_gas,
                             fuzz_runs: None,
                             fuzz_seed: None,
                             shrunk_counterexample: None,
@@ -3076,6 +3227,8 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
                         gas_used: None,
                         steps: None,
                         syscalls: None,
+                        builtins: None,
+                        resource_gas: None,
                         fuzz_runs: None,
                         fuzz_seed: None,
                         shrunk_counterexample: None,
@@ -3325,6 +3478,7 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
         }
 
         let status = if failed_count == 0 { "passed" } else { "failed" };
+        let resource_totals = suite_resource_totals(&results);
         let report = serde_json::json!({
             "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
             "status": status,
@@ -3344,6 +3498,7 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
             "coverage": coverage_report,
             "snapshot_regressions": if snapshot_regressions.is_empty() { None } else { Some(&snapshot_regressions) },
             "mutation_testing": mutation_report,
+            "resource_totals": resource_totals,
             "tests": results,
         });
 
@@ -3381,6 +3536,17 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
                                 sys.iter().map(|(k, v)| format!("{k}={v}")).collect();
                             parts.push(format!("syscalls: [{}]", sys_str.join(", ")));
                         }
+                        if let Some(b) = &t.builtins {
+                            let b_str: Vec<String> =
+                                b.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                            parts.push(format!("builtins: [{}]", b_str.join(", ")));
+                        }
+                        if let Some(r) = &t.resource_gas {
+                            parts.push(format!(
+                                "resource gas: {} ({} {:.0}%)",
+                                r.total, r.dominant, r.dominant_pct
+                            ));
+                        }
                     }
                     if !parts.is_empty() {
                         metrics_suffix = format!(" ({})", parts.join(", "));
@@ -3389,6 +3555,26 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
                 println!("test {} ... {}{}", t.name, t.status, metrics_suffix);
                 if let Some(reason) = &t.failure_reason {
                     println!("  failure: {reason}");
+                }
+            }
+            if args.gas_report {
+                if let Some(totals) = &resource_totals {
+                    let b_str: Vec<String> = totals
+                        .builtins
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect();
+                    println!(
+                        "resources: steps={} builtins=[{}] resource gas={} ({} {:.0}%)",
+                        totals.steps,
+                        b_str.join(", "),
+                        totals.resource_gas.total,
+                        totals.resource_gas.dominant,
+                        totals.resource_gas.dominant_pct
+                    );
+                    for (name, gas) in totals.heaviest_tests.iter().take(5) {
+                        println!("  heaviest: {name} ({gas} resource gas)");
+                    }
                 }
             }
             if let Some(cov) = &coverage_report {
@@ -4166,6 +4352,41 @@ fn cheat_caller_before_deploy_reaches_constructor() {
         assert_eq!(report["passed_count"], 2);
         let first = &report["tests"][0];
         assert!(first["elapsed_ms"].as_f64().is_some(), "per-test elapsed_ms must be reported");
+        // Builtin instances come from the VM, nested deploy and call included.
+        let rc = first["builtins"]["range_check"].as_u64().unwrap_or(0);
+        assert!(rc > 0, "range_check instances must be counted: {}", first["builtins"]);
+        let gas = &first["resource_gas"];
+        assert_eq!(
+            gas["steps"].as_u64().unwrap(),
+            first["steps"].as_u64().unwrap() * STEP_GAS_COST
+        );
+        assert_eq!(gas["builtins"]["range_check"].as_u64().unwrap(), rc * 70);
+        assert!(gas["total"].as_u64().unwrap() >= gas["steps"].as_u64().unwrap() + rc * 70);
+        let totals = &report["resource_totals"];
+        assert!(totals["steps"].as_u64().unwrap() > 0);
+        assert_eq!(totals["heaviest_tests"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn resource_gas_breakdown_weighs_builtins_and_names_the_dominant_resource() {
+        let mut b = BTreeMap::new();
+        b.insert("range_check".to_string(), 10usize);
+        b.insert("pedersen".to_string(), 3usize);
+        b.insert("unknown_builtin".to_string(), 5usize);
+        b.insert("keccak".to_string(), 0usize);
+        let r = resource_gas_breakdown(50, &b);
+        assert_eq!(r.steps, 5_000);
+        assert_eq!(r.builtins.get("range_check"), Some(&700));
+        assert_eq!(r.builtins.get("pedersen"), Some(&12_150));
+        assert_eq!(r.builtins.get("unknown_builtin"), Some(&0));
+        assert!(!r.builtins.contains_key("keccak"), "zero-count builtins are dropped");
+        assert_eq!(r.total, 17_850);
+        assert_eq!(r.dominant, "pedersen");
+        assert!((r.dominant_pct - 68.07).abs() < 0.01);
+
+        let empty = resource_gas_breakdown(0, &BTreeMap::new());
+        assert_eq!(empty.dominant, "steps");
+        assert_eq!(empty.dominant_pct, 0.0);
     }
 
     #[test]

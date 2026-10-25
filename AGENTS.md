@@ -23,6 +23,7 @@ uc build --json                      # Sierra + CASM artifacts, byte-identical t
 | Build artifacts | `uc build --json` |
 | Download registry deps without scarb | `uc fetch --json` |
 | Run all tests, per-test timings | `uc test --json` |
+| Builtin instances and weighted resource gas per test | `uc test --gas-report` (`--json`: `builtins`, `resource_gas`, `resource_totals.heaviest_tests`) |
 | Run one test | `uc test <name> --exact --json` |
 | Fuzz | `uc test --fuzzer-runs 256 --json` |
 | Formal verification + taint | `uc prove --json` |

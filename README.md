@@ -90,7 +90,8 @@ uc new my_vault --starknet       # scaffold a contract package
 uc check                         # typecheck, cached on sources + deps + lockfile + compiler
 uc build                         # Sierra + CASM, byte-identical to scarb 2.18
 uc test                          # #[test] and snforge_std tests in-process, per-test timings
-uc test --fuzzer-runs 256 --gas-report
+uc test --gas-report               # per test: steps, syscalls, builtin instances, weighted resource gas
+uc test --fuzzer-runs 256
 uc prove                         # symbolic execution + Sierra taint detectors
 uc prove --check-upgrade v1/Scarb.toml
 uc prove --check-equivalence v1/Scarb.toml
@@ -104,6 +105,18 @@ uc get nonce 0x... --network mainnet
 ```
 
 Every command takes `--json` for machine-readable output and `--report-path <file>` to write it.
+
+## Resource accounting in `uc test`
+
+Every test result carries the VM's builtin instance counts (`range_check`, `pedersen`,
+`poseidon`, `bitwise`, `ec_op`, `keccak`, ...) across nested calls, and a `resource_gas`
+breakdown that weighs steps and builtins with Starknet's L2 gas costs per resource (blockifier
+`os_constants` for 0.13.4+: 100 per step, 70 per range check, 4050 per Pedersen hash, 491 per
+Poseidon, 136189 per Keccak, and so on). The breakdown names the dominant resource, so a suite
+that is 36% Pedersen stands out at once. `--gas-report` prints it per test plus suite totals and
+the ten heaviest tests; `--json` carries `builtins`, `resource_gas` and `resource_totals`. The
+weights are the sequencer's and track prover trace cost by construction; they are not a Stwo
+trace measurement.
 
 ## Formal verification and audit
 
