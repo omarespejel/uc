@@ -4043,6 +4043,19 @@ fn test_vault_with_snforge_cheatcodes() {
     }
 
     #[test]
+    fn fuzz_coverage_guard_is_thread_scoped_and_restored_on_drop() {
+        use cairo_lang_runner::{thread_coverage_override, ScopedCoverage};
+        assert_eq!(thread_coverage_override(), None);
+        {
+            let _fuzzing = ScopedCoverage::new(true);
+            assert_eq!(thread_coverage_override(), Some(true));
+            let other_thread = std::thread::spawn(thread_coverage_override).join().unwrap();
+            assert_eq!(other_thread, None, "coverage must not leak to other test threads");
+        }
+        assert_eq!(thread_coverage_override(), None, "coverage must not leak to later tests");
+    }
+
+    #[test]
     fn native_test_runner_precalculate_address_matches_deploy_and_cheats_reach_constructor() {
         // Regression: `precalculate_address` used to return the class hash, so a caller cheat
         // set on the precalculated address never applied to the constructor (snforge parity).

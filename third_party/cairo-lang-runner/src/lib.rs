@@ -185,13 +185,18 @@ thread_local! {
     static COVERAGE_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// Returns the current thread's coverage override, if any (for tests and diagnostics).
+pub fn thread_coverage_override() -> Option<bool> {
+    COVERAGE_OVERRIDE.with(|c| c.get())
+}
+
 /// Restores the previous thread-scoped coverage setting on drop.
 pub struct ScopedCoverage {
     previous: Option<bool>,
 }
 
 impl ScopedCoverage {
-    fn new(enabled: bool) -> Self {
+    pub fn new(enabled: bool) -> Self {
         let previous = COVERAGE_OVERRIDE.with(|c| c.replace(Some(enabled)));
         Self { previous }
     }
@@ -203,25 +208,6 @@ impl Drop for ScopedCoverage {
     }
 }
 
-#[cfg(test)]
-mod scoped_coverage_tests {
-    use super::*;
-
-    #[test]
-    fn scoped_coverage_restores_previous_setting_on_drop() {
-        assert_eq!(COVERAGE_OVERRIDE.with(|c| c.get()), None);
-        {
-            let _outer = ScopedCoverage::new(true);
-            assert_eq!(COVERAGE_OVERRIDE.with(|c| c.get()), Some(true));
-            {
-                let _inner = ScopedCoverage::new(false);
-                assert_eq!(COVERAGE_OVERRIDE.with(|c| c.get()), Some(false));
-            }
-            assert_eq!(COVERAGE_OVERRIDE.with(|c| c.get()), Some(true));
-        }
-        assert_eq!(COVERAGE_OVERRIDE.with(|c| c.get()), None);
-    }
-}
 
 /// Cached assembled VM program and header hints for a single Sierra function.
 #[derive(Clone)]
