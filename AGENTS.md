@@ -64,7 +64,8 @@ endpoints). Every report includes the `rpc_url` used.
 
 - `uc devnet` without an external `starknet-devnet` on `PATH` is a protocol stub: JSON-RPC shape
   only, no transaction execution. It says so on start.
-- Heavy contract-call test suites run slower than snforge (nested calls reload the program).
-- `uc fetch` does not write `Scarb.lock` yet.
+- `--coverage` and `--lcov` run every test on the unsliced program (slower); plain runs and fuzz
+  runs use per-test and per-class program slices.
+- `uc fetch` writes `Scarb.lock` only when the package has none.
 - If a build falls back to scarb and scarb is missing, the error names the native reason to
   check with `uc support native --json`.

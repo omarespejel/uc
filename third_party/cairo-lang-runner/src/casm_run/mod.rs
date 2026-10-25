@@ -1410,7 +1410,7 @@ impl CairoHintProcessor<'_> {
             let old_addrs = self
                 .starknet_state
                 .open_caller_context((deployed_contract_address, deployer_address));
-            let res = self.call_entry_point(gas_counter, runner, constructor, calldata, vm);
+            let res = self.call_entry_point(gas_counter, runner, &class_hash, constructor, calldata, vm);
             self.starknet_state.close_caller_context(old_addrs);
             match res {
                 Ok(value) => value,
@@ -1458,7 +1458,7 @@ impl CairoHintProcessor<'_> {
         }
 
         // Get the class hash of the contract.
-        let Some(class_hash) = self.starknet_state.deployed_contracts.get(&contract_address) else {
+        let Some(class_hash) = self.starknet_state.deployed_contracts.get(&contract_address).copied() else {
             if contract_address == Felt252::from(0x17e57_u64) {
                 fail_syscall!([b"ENTRYPOINT_NOT_FOUND", b"ENTRYPOINT_FAILED"]);
             }
@@ -1469,7 +1469,7 @@ impl CairoHintProcessor<'_> {
         let runner = self.runner.expect("Runner is needed for starknet.");
         let contract_info = runner
             .starknet_contracts_info
-            .get(class_hash)
+            .get(&class_hash)
             .expect("Deployed contract not found in registry.");
 
         // Call the function.
@@ -1481,7 +1481,7 @@ impl CairoHintProcessor<'_> {
             contract_address,
             self.starknet_state.exec_info.contract_address,
         ));
-        let res = self.call_entry_point(gas_counter, runner, entry_point, calldata, vm);
+        let res = self.call_entry_point(gas_counter, runner, &class_hash, entry_point, calldata, vm);
         self.starknet_state.close_caller_context(old_addrs);
 
         match res {
@@ -1514,7 +1514,7 @@ impl CairoHintProcessor<'_> {
         let Some(entry_point) = contract_info.externals.get(&selector) else {
             fail_syscall!([b"ENTRYPOINT_NOT_FOUND", b"ENTRYPOINT_FAILED"]);
         };
-        match self.call_entry_point(gas_counter, runner, entry_point, calldata, vm) {
+        match self.call_entry_point(gas_counter, runner, &class_hash, entry_point, calldata, vm) {
             Ok((res_data_start, res_data_end)) => {
                 Ok(SyscallResult::Success(vec![res_data_start.into(), res_data_end.into()]))
             }
@@ -1567,10 +1567,15 @@ impl CairoHintProcessor<'_> {
         &mut self,
         gas_counter: &mut usize,
         runner: &SierraCasmRunner,
+        class_hash: &Felt252,
         entry_point: &FunctionId,
         calldata: Vec<Felt252>,
         vm: &mut dyn VMWrapper,
     ) -> Result<(Relocatable, Relocatable), Vec<Felt252>> {
+        // Prefer the per-class slice of the program: loading it costs a fraction of the whole
+        // test crate, which matters when a test makes hundreds of nested calls.
+        let class_runner = runner.class_runner(class_hash);
+        let runner: &SierraCasmRunner = class_runner.as_deref().unwrap_or(runner);
         let function = runner
             .builder
             .registry()

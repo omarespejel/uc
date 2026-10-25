@@ -181,6 +181,48 @@ pub struct PreparedStarknetContext {
     pub builtins: Vec<BuiltinName>,
 }
 
+thread_local! {
+    static COVERAGE_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Restores the previous thread-scoped coverage setting on drop.
+pub struct ScopedCoverage {
+    previous: Option<bool>,
+}
+
+impl ScopedCoverage {
+    fn new(enabled: bool) -> Self {
+        let previous = COVERAGE_OVERRIDE.with(|c| c.replace(Some(enabled)));
+        Self { previous }
+    }
+}
+
+impl Drop for ScopedCoverage {
+    fn drop(&mut self) {
+        COVERAGE_OVERRIDE.with(|c| c.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+mod scoped_coverage_tests {
+    use super::*;
+
+    #[test]
+    fn scoped_coverage_restores_previous_setting_on_drop() {
+        assert_eq!(COVERAGE_OVERRIDE.with(|c| c.get()), None);
+        {
+            let _outer = ScopedCoverage::new(true);
+            assert_eq!(COVERAGE_OVERRIDE.with(|c| c.get()), Some(true));
+            {
+                let _inner = ScopedCoverage::new(false);
+                assert_eq!(COVERAGE_OVERRIDE.with(|c| c.get()), Some(false));
+            }
+            assert_eq!(COVERAGE_OVERRIDE.with(|c| c.get()), Some(true));
+        }
+        assert_eq!(COVERAGE_OVERRIDE.with(|c| c.get()), None);
+    }
+}
+
 /// Cached assembled VM program and header hints for a single Sierra function.
 #[derive(Clone)]
 struct CachedFunctionProgram {
@@ -212,9 +254,33 @@ pub struct SierraCasmRunner {
     new_coverage_statements_counter: std::sync::atomic::AtomicUsize,
     /// Whether to record statement coverage from `relocated_trace` during execution.
     collect_coverage: std::sync::atomic::AtomicBool,
+    /// The full Sierra program and metadata config, kept so nested contract calls can run on a
+    /// per-class slice of the program instead of reloading everything for every call.
+    source_program: Option<Arc<(cairo_lang_sierra::program::Program, Option<MetadataComputationConfig>)>>,
+    /// Per-class sub-runners, shared between the root runner and every sub-runner.
+    class_runners: Arc<std::sync::RwLock<HashMap<Felt252, Arc<SierraCasmRunner>>>>,
+    /// Lock-free snapshot of `class_runners` once every class has been built (`freeze`).
+    /// Nested calls on the hot path read this instead of taking the RwLock.
+    class_runners_frozen: Arc<std::sync::OnceLock<HashMap<Felt252, Arc<SierraCasmRunner>>>>,
+    /// Lock-free snapshot of `program_cache` for a class runner's entry points.
+    programs_frozen: std::sync::OnceLock<HashMap<cairo_lang_sierra::ids::FunctionId, CachedFunctionProgram>>,
+    /// Per-test-function sub-runners (the slice reachable from one entry function).
+    function_runners: std::sync::RwLock<HashMap<cairo_lang_sierra::ids::FunctionId, Arc<SierraCasmRunner>>>,
 }
 impl SierraCasmRunner {
     pub fn new(
+        sierra_program: cairo_lang_sierra::program::Program,
+        metadata_config: Option<MetadataComputationConfig>,
+        starknet_contracts_info: OrderedHashMap<Felt252, ContractInfo>,
+        run_profiler: Option<ProfilingInfoCollectionConfig>,
+    ) -> Result<Self, RunnerError> {
+        let source = Arc::new((sierra_program.clone(), metadata_config.clone()));
+        let mut runner = Self::new_inner(sierra_program, metadata_config, starknet_contracts_info, run_profiler)?;
+        runner.source_program = Some(source);
+        Ok(runner)
+    }
+
+    fn new_inner(
         sierra_program: cairo_lang_sierra::program::Program,
         metadata_config: Option<MetadataComputationConfig>,
         starknet_contracts_info: OrderedHashMap<Felt252, ContractInfo>,
@@ -257,13 +323,210 @@ impl SierraCasmRunner {
             coverage_bitmap,
             new_coverage_statements_counter: std::sync::atomic::AtomicUsize::new(0),
             collect_coverage: std::sync::atomic::AtomicBool::new(false),
+            source_program: None,
+            class_runners: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            class_runners_frozen: Arc::new(std::sync::OnceLock::new()),
+            programs_frozen: std::sync::OnceLock::new(),
+            function_runners: std::sync::RwLock::new(HashMap::new()),
         })
+    }
+
+    /// Builds a sub-runner for the slice of the program reachable from `roots`, sharing this
+    /// runner's class runners so nested calls keep working. `None` when slicing is disabled
+    /// (coverage, profiling, `UC_NESTED_CALL_FULL_PROGRAM`) or fails.
+    fn sliced_runner(&self, roots: &[cairo_lang_sierra::ids::FunctionId]) -> Option<SierraCasmRunner> {
+        if self.run_profiler.is_some()
+            || self.coverage_enabled()
+            || std::env::var("UC_NESTED_CALL_FULL_PROGRAM").is_ok()
+        {
+            return None;
+        }
+        let source = self.source_program.as_ref()?;
+        let (program, kept) = slice_program_for_roots(&source.0, roots);
+        let metadata_config = source.1.as_ref().map(|cfg| MetadataComputationConfig {
+            function_set_costs: cfg
+                .function_set_costs
+                .iter()
+                .filter(|(fid, _)| kept.contains(&fid.id))
+                .map(|(fid, costs)| (fid.clone(), costs.clone()))
+                .collect(),
+            ..cfg.clone()
+        });
+        let mut sub = Self::new_inner(program, metadata_config, self.starknet_contracts_info.clone(), None).ok()?;
+        sub.source_program = Some(Arc::clone(source));
+        sub.class_runners = Arc::clone(&self.class_runners);
+        sub.class_runners_frozen = Arc::clone(&self.class_runners_frozen);
+        Some(sub)
+    }
+
+    /// Runs `func` (a test or entry function) on a sub-runner holding only the code reachable
+    /// from it. The whole test crate's program is never loaded into the VM for a single test.
+    /// Falls back to the full program when slicing is unavailable.
+    pub fn run_function_with_starknet_context_sliced(
+        &self,
+        func: &Function,
+        args: Vec<Arg>,
+        available_gas: Option<usize>,
+        starknet_state: StarknetState,
+    ) -> Result<RunResultStarknet, RunnerError> {
+        let cached = self.function_runners.read().ok().and_then(|m| m.get(&func.id).cloned());
+        let debug = std::env::var("UC_NESTED_CALL_DEBUG").is_ok();
+        let build_started = std::time::Instant::now();
+        let sub = match cached {
+            Some(sub) => Some(sub),
+            None => match self.sliced_runner(std::slice::from_ref(&func.id)) {
+                Some(built) => {
+                    if debug {
+                        eprintln!(
+                            "function runner {}: {} statements built in {:.1} ms",
+                            func.id,
+                            built.builder.sierra_program().statements.len(),
+                            build_started.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
+                    let built = Arc::new(built);
+                    if let Ok(mut m) = self.function_runners.write() {
+                        m.insert(func.id.clone(), Arc::clone(&built));
+                    }
+                    Some(built)
+                }
+                None => None,
+            },
+        };
+        match sub {
+            Some(sub) => {
+                let Ok(sub_func) = sub.builder.registry().get_function(&func.id) else {
+                    return self.run_function_with_starknet_context(func, args, available_gas, starknet_state);
+                };
+                let run_started = std::time::Instant::now();
+                let res = sub.run_function_with_starknet_context(sub_func, args, available_gas, starknet_state);
+                if debug {
+                    eprintln!("function run {}: {:.1} ms", func.id, run_started.elapsed().as_secs_f64() * 1000.0);
+                }
+                res
+            }
+            None => self.run_function_with_starknet_context(func, args, available_gas, starknet_state),
+        }
+    }
+
+    /// Finalizes the per-class runners: snapshots them into a lock-free map and pre-assembles
+    /// every entry point's program, so nested calls never take a lock. Call once after warming
+    /// all classes with [Self::class_runner]; later classes fall back to `self`.
+    pub fn freeze_class_runners(&self) {
+        let Ok(map) = self.class_runners.read() else { return };
+        for (class_hash, sub) in map.iter() {
+            let Some(info) = self.starknet_contracts_info.get(class_hash) else { continue };
+            let mut programs = HashMap::new();
+            for fid in info.constructor.iter().chain(info.externals.values()).chain(info.l1_handlers.values()) {
+                if let Ok(func) = sub.builder.registry().get_function(fid) {
+                    if let Ok(cached) = sub.get_or_build_cached_program(func) {
+                        programs.insert(fid.clone(), cached);
+                    }
+                }
+            }
+            let _ = sub.programs_frozen.set(programs);
+        }
+        let _ = self.class_runners_frozen.set(map.clone());
+    }
+
+    /// Returns a runner whose program contains only the functions reachable from `class_hash`'s
+    /// entry points. Nested `call_contract` / `library_call` / `deploy` run on it, so each call
+    /// loads a program the size of one contract instead of the whole test crate. Built once per
+    /// class and shared. Returns `None` (caller keeps using `self`) when coverage or profiling
+    /// is on, since those are keyed to the full program's statement indices, or when the class
+    /// cannot be sliced.
+    pub fn class_runner(&self, class_hash: &Felt252) -> Option<Arc<SierraCasmRunner>> {
+        if self.run_profiler.is_some()
+            || self.coverage_enabled()
+            || std::env::var("UC_NESTED_CALL_FULL_PROGRAM").is_ok()
+        {
+            return None;
+        }
+        if let Some(frozen) = self.class_runners_frozen.get() {
+            return frozen.get(class_hash).cloned();
+        }
+        if let Some(found) = self.class_runners.read().ok()?.get(class_hash) {
+            return Some(Arc::clone(found));
+        }
+        // Build under the write lock so parallel tests do not each compile the same slice.
+        let mut map = self.class_runners.write().ok()?;
+        if let Some(found) = map.get(class_hash) {
+            return Some(Arc::clone(found));
+        }
+        let info = self.starknet_contracts_info.get(class_hash)?;
+        let roots: Vec<cairo_lang_sierra::ids::FunctionId> = info
+            .constructor
+            .iter()
+            .chain(info.externals.values())
+            .chain(info.l1_handlers.values())
+            .cloned()
+            .collect();
+        let sub = self.sliced_runner(&roots)?;
+        if std::env::var("UC_NESTED_CALL_DEBUG").is_ok() {
+            eprintln!(
+                "class runner {class_hash:#x}: {} statements, {} funcs",
+                sub.builder.sierra_program().statements.len(),
+                sub.builder.sierra_program().funcs.len()
+            );
+        }
+        let sub = Arc::new(sub);
+        map.insert(*class_hash, Arc::clone(&sub));
+        Some(sub)
+    }
+
+    /// Drops the cached per-function runner for `func` (call when a test has finished all of
+    /// its runs); keeping hundreds of compiled slices alive costs memory, not time.
+    pub fn release_function_runner(&self, func: &Function) {
+        if let Ok(mut m) = self.function_runners.write() {
+            m.remove(&func.id);
+        }
+    }
+
+    /// Builds and registers the per-class runner for `class_hash` without holding the lock
+    /// during compilation (used for parallel warmup over distinct classes).
+    pub fn warm_class_runner(&self, class_hash: &Felt252) {
+        if self.class_runners.read().ok().is_some_and(|m| m.contains_key(class_hash)) {
+            return;
+        }
+        let Some(info) = self.starknet_contracts_info.get(class_hash) else { return };
+        let roots: Vec<cairo_lang_sierra::ids::FunctionId> = info
+            .constructor
+            .iter()
+            .chain(info.externals.values())
+            .chain(info.l1_handlers.values())
+            .cloned()
+            .collect();
+        if let Some(sub) = self.sliced_runner(&roots) {
+            if let Ok(mut m) = self.class_runners.write() {
+                m.entry(*class_hash).or_insert_with(|| Arc::new(sub));
+            }
+        }
+    }
+
+    /// Class hashes known to this runner (for warming per-class runners up front).
+    pub fn known_class_hashes(&self) -> Vec<Felt252> {
+        self.starknet_contracts_info.keys().copied().collect()
     }
 
     /// Enables or disables Sierra statement coverage collection during VM execution.
     pub fn set_collect_coverage(&self, enabled: bool) {
         self.collect_coverage
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether statement coverage is recorded for runs on the current thread: a thread-scoped
+    /// override (see [Self::scoped_coverage]) wins over the runner-wide flag.
+    pub fn coverage_enabled(&self) -> bool {
+        COVERAGE_OVERRIDE
+            .with(|c| c.get())
+            .unwrap_or_else(|| self.collect_coverage.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Enables coverage recording for runs on the current thread only, until the guard drops.
+    /// Used by fuzzing for corpus guidance so other tests, and the tests that run afterwards,
+    /// keep the fast sliced path.
+    pub fn scoped_coverage(&self, enabled: bool) -> ScopedCoverage {
+        ScopedCoverage::new(enabled)
     }
 
     /// Returns user-visible parameter `(generic_type_id, felt_word_size)` pairs for `func`.
@@ -336,6 +599,9 @@ impl SierraCasmRunner {
         &self,
         func: &Function,
     ) -> Result<CachedFunctionProgram, RunnerError> {
+        if let Some(cached) = self.programs_frozen.get().and_then(|m| m.get(&func.id)) {
+            return Ok(cached.clone());
+        }
         if let Some(cached) = self.program_cache.read().unwrap().get(&func.id).cloned() {
             return Ok(cached);
         }
@@ -521,7 +787,7 @@ impl SierraCasmRunner {
 
         // The real program starts right after the header.
         let load_offset = header_end + 1;
-        if self.collect_coverage.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.coverage_enabled() {
             let base_len = self.base_bytecode.len();
             for entry in &relocated_trace {
                 if entry.pc >= load_offset {
@@ -601,7 +867,7 @@ impl SierraCasmRunner {
         let Self { builder, starknet_contracts_info: _, run_profiler, .. } = self;
 
         let load_offset = header_end + 1;
-        if self.collect_coverage.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.coverage_enabled() {
             let base_len = self.base_bytecode.len();
             for entry in &relocated_trace {
                 if entry.pc >= load_offset {
@@ -1007,4 +1273,113 @@ pub fn initialize_vm(vm: &mut VirtualMachine, data_len: usize) -> Result<(), Box
 /// The size in memory of the arguments.
 fn args_size(args: &[Arg]) -> usize {
     args.iter().map(Arg::size).sum()
+}
+
+
+/// Keeps only the functions reachable from `roots` (through `function_call` and coupon
+/// libfuncs), re-laying their statements contiguously and remapping intra-function branch
+/// targets. Type declarations are kept; libfunc declarations that name a dropped function are
+/// removed so the registry does not look it up. Returns the sliced program and the kept ids.
+fn slice_program_for_roots(
+    program: &cairo_lang_sierra::program::Program,
+    roots: &[cairo_lang_sierra::ids::FunctionId],
+) -> (cairo_lang_sierra::program::Program, std::collections::HashSet<u64>) {
+    use cairo_lang_sierra::program::{GenBranchTarget, GenStatement, StatementIdx};
+    use std::collections::{HashSet, VecDeque};
+
+    let n = program.funcs.len();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| program.funcs[i].entry_point.0);
+    let mut ranges = vec![(0usize, 0usize); n];
+    for (pos, &i) in order.iter().enumerate() {
+        let start = program.funcs[i].entry_point.0;
+        let end = order.get(pos + 1).map(|&j| program.funcs[j].entry_point.0).unwrap_or(program.statements.len());
+        ranges[i] = (start, end);
+    }
+    let by_id: HashMap<u64, usize> = program.funcs.iter().enumerate().map(|(i, f)| (f.id.id, i)).collect();
+    let libfunc_callee: HashMap<u64, u64> = program
+        .libfunc_declarations
+        .iter()
+        .filter_map(|ld| {
+            ld.long_id.generic_args.iter().find_map(|a| match a {
+                GenericArg::UserFunc(fid) => Some((ld.id.id, fid.id)),
+                _ => None,
+            })
+        })
+        .collect();
+
+    let mut kept: HashSet<u64> = HashSet::new();
+    let mut queue: VecDeque<usize> = roots.iter().filter_map(|r| by_id.get(&r.id).copied()).collect();
+    while let Some(i) = queue.pop_front() {
+        if !kept.insert(program.funcs[i].id.id) {
+            continue;
+        }
+        let (start, end) = ranges[i];
+        for stmt in &program.statements[start..end] {
+            if let GenStatement::Invocation(inv) = stmt {
+                if let Some(callee) = libfunc_callee.get(&inv.libfunc_id.id) {
+                    if let Some(&ci) = by_id.get(callee) {
+                        if !kept.contains(callee) {
+                            queue.push_back(ci);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut statements = Vec::new();
+    let mut funcs = Vec::new();
+    for &i in &order {
+        if !kept.contains(&program.funcs[i].id.id) {
+            continue;
+        }
+        let (start, end) = ranges[i];
+        let new_start = statements.len();
+        for stmt in &program.statements[start..end] {
+            statements.push(match stmt {
+                GenStatement::Invocation(inv) => GenStatement::Invocation(cairo_lang_sierra::program::GenInvocation {
+                    libfunc_id: inv.libfunc_id.clone(),
+                    args: inv.args.clone(),
+                    branches: inv
+                        .branches
+                        .iter()
+                        .map(|b| cairo_lang_sierra::program::GenBranchInfo {
+                            target: match b.target {
+                                GenBranchTarget::Fallthrough => GenBranchTarget::Fallthrough,
+                                GenBranchTarget::Statement(StatementIdx(t)) => {
+                                    GenBranchTarget::Statement(StatementIdx(t - start + new_start))
+                                }
+                            },
+                            results: b.results.clone(),
+                        })
+                        .collect(),
+                }),
+                GenStatement::Return(vars) => GenStatement::Return(vars.clone()),
+            });
+        }
+        let mut f = program.funcs[i].clone();
+        f.entry_point = StatementIdx(new_start);
+        funcs.push(f);
+    }
+    let libfunc_declarations = program
+        .libfunc_declarations
+        .iter()
+        .filter(|ld| {
+            ld.long_id.generic_args.iter().all(|a| match a {
+                GenericArg::UserFunc(fid) => kept.contains(&fid.id),
+                _ => true,
+            })
+        })
+        .cloned()
+        .collect();
+    (
+        cairo_lang_sierra::program::Program {
+            type_declarations: program.type_declarations.clone(),
+            libfunc_declarations,
+            statements,
+            funcs,
+        },
+        kept,
+    )
 }

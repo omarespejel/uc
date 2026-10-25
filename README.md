@@ -53,9 +53,10 @@ shared machine, load average 60): betshare cold build 11.90 s scarb vs 5.23 s uc
 0.03 s, 41 tests warm 2.43 s snforge vs 0.85 s uc, 13 of 13 artifacts identical. On the two
 OpenZeppelin-v3 git projects scarb could not reach the registry to refresh the lockfile during
 the run, so those baselines are missing from that file; earlier the same day on erc8004: cold
-`scarb build` 15.0 s, warm 7.0 s, warm `uc build` 2.9 s. Heavy contract-call suites (erc8004's
-six tests with over a million VM steps each) are still about 3x slower than snforge because every
-nested call reloads the whole CASM program. That gap is real and listed below.
+`scarb build` 15.0 s, warm 7.0 s, warm `uc build` 2.9 s. Nested contract calls run on per-class program slices and each test on a slice
+of its own, so the heavy erc8004 suite (seven tests with over a million VM steps each) now runs
+in 11.6 s under uc against 16.9 s under snforge 0.60 (warm, same machine, load average 38), with
+a peak of 2.2 GB against 3.3 GB.
 
 ## Install
 
@@ -126,8 +127,8 @@ bitwise parity. `#[test]` bodies are never symbolic targets; `prove_*`, `invaria
 
 - `uc devnet` without an external `starknet-devnet` binary is a JSON-RPC protocol stub with
   predeployed account addresses and no transaction execution. It prints that on start.
-- Nested contract calls in tests reload the whole program per call; heavy integration suites are
-  slower than snforge (see the head-to-head numbers).
+- Fuzz runs collect statement coverage for corpus guidance on their own thread only; `--coverage`
+  and `--lcov` still switch the whole run to the unsliced program, which is slower.
 - `uc fetch` writes `Scarb.lock` only when the package has none; it does not update an existing
   lock, and it leaves `snforge_std` for scarb to add.
 - Windows is not built.

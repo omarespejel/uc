@@ -2691,8 +2691,16 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
         )
         .context("failed to initialize Cairo SierraCasmRunner")?;
 
-        if args.coverage || args.lcov_path.is_some() || args.fuzz_runs > 0 {
+        if args.coverage || args.lcov_path.is_some() {
             runner.set_collect_coverage(true);
+        } else {
+            // Compile the per-class program slices once, in parallel, before the tests fan out;
+            // nested contract calls then run on a program the size of one contract.
+            runner
+                .known_class_hashes()
+                .par_iter()
+                .for_each(|class_hash| runner.warm_class_runner(class_hash));
+            runner.freeze_class_runners();
         }
 
         let evaluate_outcome = |result: &cairo_lang_runner::RunResultStarknet,
@@ -2735,6 +2743,13 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
             }
         };
 
+        /// Drops the per-test compiled program slice once every run of that test is done.
+        struct ReleaseFunctionRunner<'a>(&'a SierraCasmRunner, &'a cairo_lang_sierra::program::Function);
+        impl Drop for ReleaseFunctionRunner<'_> {
+            fn drop(&mut self) {
+                self.0.release_function_runner(self.1);
+            }
+        }
         let results: Vec<SingleTestResultReport> = filtered_named_tests
             .par_iter()
             .map(|(name, test_cfg)| {
@@ -2786,6 +2801,7 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
                         failure_reason: Some(format!("function `{name}` not found in Sierra program")),
                     };
                 };
+                let _release = ReleaseFunctionRunner(&runner, func);
 
                 let param_specs = runner.user_param_types_and_sizes(func);
                 let is_fuzz_or_invariant = !param_specs.is_empty()
@@ -2795,7 +2811,9 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
                         || short_name.contains("prop"));
 
                 if is_fuzz_or_invariant {
-                    runner.set_collect_coverage(true);
+                    // Coverage guides the corpus; keep it on this thread only so the other tests
+                    // (and the ones that run after this one) stay on the sliced fast path.
+                    let _coverage = runner.scoped_coverage(true);
                     let total_runs = if args.fuzz_runs > 0 {
                         args.fuzz_runs
                     } else {
@@ -2825,7 +2843,7 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
                                 )
                             })
                             .collect();
-                        let run_res = runner.run_function_with_starknet_context(
+                        let run_res = runner.run_function_with_starknet_context_sliced(
                             func,
                             vm_args,
                             test_cfg.available_gas,
@@ -2865,7 +2883,7 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
                                                 )
                                             })
                                             .collect();
-                                        match runner.run_function_with_starknet_context(
+                                        match runner.run_function_with_starknet_context_sliced(
                                             func,
                                             cand_args,
                                             test_cfg.available_gas,
@@ -2995,7 +3013,7 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
                     };
                 }
 
-                let run_res = runner.run_function_with_starknet_context(
+                let run_res = runner.run_function_with_starknet_context_sliced(
                     func,
                     vec![],
                     test_cfg.available_gas,
@@ -3219,7 +3237,7 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
                                     was_killed = true;
                                     break;
                                 };
-                                match mut_runner.run_function_with_starknet_context(
+                                match mut_runner.run_function_with_starknet_context_sliced(
                                     f,
                                     vec![],
                                     t_cfg.available_gas,

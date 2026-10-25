@@ -1,0 +1,161 @@
+{
+  "prime": "0x800000000000011000000000000000000000000000000000000000000000001",
+  "compiler_version": "2.18.0",
+  "bytecode": [
+    "0xa0680017fff8000",
+    "0x7",
+    "0x482680017ffa8000",
+    "0x100000000000000000000000000000000",
+    "0x400280007ff97fff",
+    "0x10780017fff7fff",
+    "0x21",
+    "0x4825800180007ffa",
+    "0x0",
+    "0x400280007ff97fff",
+    "0x48297ffc80007ffd",
+    "0x20680017fff7fff",
+    "0x4",
+    "0x10780017fff7fff",
+    "0xd",
+    "0x1104800180018000",
+    "0x22",
+    "0x482680017ff98000",
+    "0x1",
+    "0x48127ff57fff8000",
+    "0x480a7ffb7fff8000",
+    "0x480680017fff8000",
+    "0x1",
+    "0x48127ffa7fff8000",
+    "0x48127ffa7fff8000",
+    "0x208b7fff7fff7ffe",
+    "0x40780017fff7fff",
+    "0x1",
+    "0x482680017ff98000",
+    "0x1",
+    "0x482480017ffc8000",
+    "0x21b6",
+    "0x480a7ffb7fff8000",
+    "0x480680017fff8000",
+    "0x0",
+    "0x48127ffb7fff8000",
+    "0x48127ffa7fff8000",
+    "0x208b7fff7fff7ffe",
+    "0x1104800180018000",
+    "0x10",
+    "0x482680017ff98000",
+    "0x1",
+    "0x480a7ffa7fff8000",
+    "0x480a7ffb7fff8000",
+    "0x480680017fff8000",
+    "0x1",
+    "0x48127ffa7fff8000",
+    "0x48127ffa7fff8000",
+    "0x208b7fff7fff7ffe",
+    "0x480680017fff8000",
+    "0x496e70757420746f6f206c6f6e6720666f7220617267756d656e7473",
+    "0x1104800180018000",
+    "0x8",
+    "0x208b7fff7fff7ffe",
+    "0x480680017fff8000",
+    "0x4f7574206f6620676173",
+    "0x1104800180018000",
+    "0x3",
+    "0x208b7fff7fff7ffe",
+    "0x40780017fff7fff",
+    "0x1",
+    "0x400180007fff7ffd",
+    "0x48127fff7fff8000",
+    "0x482480017ffe8000",
+    "0x1",
+    "0x208b7fff7fff7ffe"
+  ],
+  "bytecode_segment_lengths": [
+    49,
+    5,
+    5,
+    7
+  ],
+  "hints": [
+    [
+      0,
+      [
+        {
+          "TestLessThanOrEqual": {
+            "lhs": {
+              "Immediate": "0x0"
+            },
+            "rhs": {
+              "Deref": {
+                "register": "FP",
+                "offset": -6
+              }
+            },
+            "dst": {
+              "register": "AP",
+              "offset": 0
+            }
+          }
+        }
+      ]
+    ],
+    [
+      26,
+      [
+        {
+          "AllocSegment": {
+            "dst": {
+              "register": "AP",
+              "offset": 0
+            }
+          }
+        }
+      ]
+    ],
+    [
+      59,
+      [
+        {
+          "AllocSegment": {
+            "dst": {
+              "register": "AP",
+              "offset": 0
+            }
+          }
+        }
+      ]
+    ]
+  ],
+  "pythonic_hints": [
+    [
+      0,
+      [
+        "memory[ap + 0] = 0 <= memory[fp + -6]"
+      ]
+    ],
+    [
+      26,
+      [
+        "memory[ap + 0] = segments.add()"
+      ]
+    ],
+    [
+      59,
+      [
+        "memory[ap + 0] = segments.add()"
+      ]
+    ]
+  ],
+  "entry_points_by_type": {
+    "EXTERNAL": [
+      {
+        "selector": "0x1fc3f77ebc090777f567969ad9823cf6334ab888acb385ca72668ec5adbde80",
+        "offset": 0,
+        "builtins": [
+          "range_check"
+        ]
+      }
+    ],
+    "L1_HANDLER": [],
+    "CONSTRUCTOR": []
+  }
+}
