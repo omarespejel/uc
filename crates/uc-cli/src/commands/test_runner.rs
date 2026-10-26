@@ -2112,10 +2112,11 @@ pub(crate) fn compile_or_load_native_tests(
             .as_ref()
             .is_some_and(|dn| dn.as_str() == format!("{crate_name}::main") || dn.as_str().ends_with("::main"))
     });
-    let total_src_bytes: u64 = tracked_sources.values().map(|s| s.size_bytes).sum();
-    if (final_sierra_program.program.funcs.is_empty() || (named_tests.is_empty() && !has_main_fn))
-        && total_src_bytes <= 32_768
-    {
+    // Without tests or a `main`, the test compiler emits nothing: compile the whole crate so
+    // `uc prove` and `uc test --coverage` see every function. (A 32 KB source cap used to skip
+    // this and left larger libraries silently unanalysed.)
+    let _total_src_bytes: u64 = tracked_sources.values().map(|s| s.size_bytes).sum();
+    if final_sierra_program.program.funcs.is_empty() || (named_tests.is_empty() && !has_main_fn) {
         #[cfg(not(feature = "helper-cairo-214"))]
         {
             let exec_crate_ids = CrateInput::into_crate_ids(&db, test_crate_inputs.clone());
