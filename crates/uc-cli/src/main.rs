@@ -120,7 +120,7 @@ use commands::{
     ListVersionsArgs, LspArgs, ManifestPathArgs, MulticallArgs, NewArgs, OptimizeInliningArgs,
     PackageCmdArgs, ProcMacroServerArgs, ProfileArgs, ProveArgs, PublishArgs, RemoveArgs,
     RunScriptArgs, ScriptCmdArgs, SelectorArgs, ShowConfigArgs, TestArgs, TraceTxArgs, TreeArgs,
-    TxStatusArgs, UpdateArgs, UtilsArgs, VerifyOnchainArgs, WatchArgs, run_abi, run_account, run_add,
+    TxStatusArgs, UpdateArgs, UtilsArgs, VerifyOnchainArgs, WatchArgs, DoctorArgs, run_abi, run_account, run_add,
     run_audit, run_balance, run_build, run_call, run_check, run_check_requirements, run_class_hash,
     run_clean, run_clean_cache, run_commands_list, run_compare_build, run_completions, run_declare,
     run_declare_from, run_decompile, run_deploy, run_devnet, run_diff, run_doc, run_execute,
@@ -128,7 +128,7 @@ use commands::{
     run_manifest_path, run_metadata, run_migrate, run_multicall, run_new, run_optimize_inlining,
     run_package, run_proc_macro_server, run_profile, run_prove, run_publish, run_remove,
     run_script, run_script_cmd, run_selector, run_show_config, run_test, run_trace_tx, run_tree,
-    run_tx_status, run_update, run_utils, run_verify_onchain, run_watch,
+    run_tx_status, run_update, run_utils, run_verify_onchain, run_watch, run_doctor,
 };
 #[allow(unused_imports)]
 use daemon::*;
@@ -450,6 +450,8 @@ enum Commands {
     Audit(AuditArgs),
     /// Watch a deployed contract: re-audit whenever its class changes and report new and resolved findings
     Watch(WatchArgs),
+    /// Check this machine for what uc's network and build commands need (cache, HTTPS, RPC reachability, Starkscan key)
+    Doctor(DoctorArgs),
 }
 
 #[derive(Args, Debug)]
@@ -3085,6 +3087,7 @@ fn main() -> Result<()> {
         Commands::Devnet(args) => run_devnet(args),
         Commands::Audit(args) => run_audit(args),
         Commands::Watch(args) => run_watch(args),
+        Commands::Doctor(args) => run_doctor(args),
     }
 }
 

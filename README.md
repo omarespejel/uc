@@ -318,6 +318,11 @@ by Sierra structure. A removed slot, a removed entry point, an arity change or a
 the upgrade `UPGRADE_UNSAFE`; `uc declare` then refuses to build the transaction unless
 `--allow-unsafe-upgrade` is passed, and puts the report in its JSON either way.
 
+`uc doctor` checks what the network and build commands need on this machine. It covers the
+cache directory, the HTTPS transport, whether the mainnet and Sepolia RPCs answer, IPv4 against
+IPv6, whether this binary may open connections itself, and whether the Starkscan key is accepted.
+It exits 1 when a required check fails.
+
 ## What uc does not do yet
 
 - `uc devnet` measures L2 gas with cairo-lang-runner's syscall costs, which are lighter than

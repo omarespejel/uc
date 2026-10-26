@@ -19,6 +19,7 @@ uc build --json                      # Sierra + CASM artifacts, byte-identical t
 | Task | Command |
 | :--- | :--- |
 | Toolchain version in use | `uc --version` (prints cairo and sierra versions) |
+| Check this machine (cache, HTTPS transport, RPC reachability over IPv4/IPv6, Starkscan key) | `uc doctor --json` (`--offline` skips the network); exit 1 when a check fails |
 | Fast check | `uc check --json` |
 | Build artifacts | `uc build --json` |
 | Download registry deps without scarb | `uc fetch --json` |
