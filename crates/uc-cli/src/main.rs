@@ -12737,65 +12737,82 @@ fn resolve_native_corelib_src(workspace_root: &Path) -> Result<PathBuf> {
 #[cfg(feature = "native-compile")]
 const UC_EMBEDDED_CORELIB_PACK: &[u8] = include_bytes!("embedded_corelib.bin");
 
+/// Unpacks the corelib embedded in the binary under the global cache. The directory name carries
+/// the pack's digest and only appears by renaming a fully written staging directory, so a
+/// compile never reads a half-written corelib, even when several uc processes start at once on a
+/// fresh cache, and a binary with a different pack never reuses another binary's files.
 #[cfg(feature = "native-compile")]
 fn materialize_embedded_corelib_src() -> Result<PathBuf> {
-    let version = native_cairo_lang_compiler_version();
-    let base_dir = native_global_cache_root_dir()
-        .unwrap_or_else(|| std::env::temp_dir().join("uc-global-cache"))
-        .join(format!("embedded-corelib-v{version}"));
+    let pack = UC_EMBEDDED_CORELIB_PACK;
+    let digest = blake3::hash(pack).to_hex();
+    let cache_root = native_global_cache_root_dir()
+        .unwrap_or_else(|| std::env::temp_dir().join("uc-global-cache"));
+    let base_dir = cache_root.join(format!(
+        "embedded-corelib-v{}-{}",
+        native_cairo_lang_compiler_version(),
+        &digest[..12]
+    ));
     let src_dir = base_dir.join("src");
-    if src_dir.join("lib.cairo").is_file()
-        && src_dir.join("prelude.cairo").is_file()
-        && src_dir.join("ops.cairo").is_file()
-        && base_dir.join("Scarb.toml").is_file()
-    {
-        return Ok(src_dir.canonicalize().unwrap_or(src_dir));
+    if !src_dir.join("lib.cairo").is_file() {
+        fs::create_dir_all(&cache_root)
+            .with_context(|| format!("failed to create {}", cache_root.display()))?;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        let staging = cache_root.join(format!(
+            ".embedded-corelib-{}-{nanos}.tmp",
+            std::process::id()
+        ));
+        let installed = unpack_embedded_corelib(pack, &staging).and_then(|()| {
+            match fs::rename(&staging, &base_dir) {
+                Ok(()) => Ok(()),
+                // Another process installed the same pack first.
+                Err(_) if src_dir.join("lib.cairo").is_file() => Ok(()),
+                Err(err) => Err(err.into()),
+            }
+        });
+        let _ = fs::remove_dir_all(&staging);
+        installed.with_context(|| {
+            format!(
+                "failed to unpack the embedded corelib into {}",
+                base_dir.display()
+            )
+        })?;
     }
+    Ok(src_dir.canonicalize().unwrap_or(src_dir))
+}
 
-    let bytes = UC_EMBEDDED_CORELIB_PACK;
-    if bytes.len() < 4 {
-        bail!("embedded corelib archive is truncated");
+/// Writes the files of the embedded corelib pack (format in `scripts/pack_embedded_corelib.py`)
+/// under `dest`.
+#[cfg(feature = "native-compile")]
+fn unpack_embedded_corelib(pack: &[u8], dest: &Path) -> Result<()> {
+    fn take<'a>(pack: &'a [u8], offset: &mut usize, len: usize) -> Result<&'a [u8]> {
+        let bytes = pack
+            .get(*offset..*offset + len)
+            .context("embedded corelib archive is truncated")?;
+        *offset += len;
+        Ok(bytes)
     }
-    let count = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-    let mut offset = 4usize;
+    fn take_u32(pack: &[u8], offset: &mut usize) -> Result<usize> {
+        let bytes = take(pack, offset, 4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize)
+    }
+    let mut offset = 0usize;
+    let count = take_u32(pack, &mut offset)?;
     for _ in 0..count {
-        if offset + 4 > bytes.len() {
-            bail!("embedded corelib archive path header truncated");
-        }
-        let path_len = u32::from_le_bytes([
-            bytes[offset],
-            bytes[offset + 1],
-            bytes[offset + 2],
-            bytes[offset + 3],
-        ]) as usize;
-        offset += 4;
-        if offset + path_len + 4 > bytes.len() {
-            bail!("embedded corelib archive path body truncated");
-        }
-        let rel_path = std::str::from_utf8(&bytes[offset..offset + path_len])
+        let path_len = take_u32(pack, &mut offset)?;
+        let rel_path = std::str::from_utf8(take(pack, &mut offset, path_len)?)
             .context("invalid utf-8 in embedded corelib path")?;
-        offset += path_len;
-        let data_len = u32::from_le_bytes([
-            bytes[offset],
-            bytes[offset + 1],
-            bytes[offset + 2],
-            bytes[offset + 3],
-        ]) as usize;
-        offset += 4;
-        if offset + data_len > bytes.len() {
-            bail!("embedded corelib archive file content truncated");
-        }
-        let content = &bytes[offset..offset + data_len];
-        offset += data_len;
-
-        let dest = base_dir.join(rel_path);
-        if let Some(parent) = dest.parent() {
+        let data_len = take_u32(pack, &mut offset)?;
+        let content = take(pack, &mut offset, data_len)?;
+        let file = dest.join(rel_path);
+        if let Some(parent) = file.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&dest, content)?;
+        fs::write(&file, content)?;
     }
-
-    Ok(src_dir.canonicalize().unwrap_or(src_dir))
+    Ok(())
 }
 
 #[cfg(feature = "native-compile")]

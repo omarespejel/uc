@@ -4,10 +4,10 @@
 Usage:
     scripts/pack_embedded_corelib.py [--corelib third_party/corelib] [--out crates/uc-cli/src/embedded_corelib.bin]
 
-Format (read by `materialize_embedded_corelib_src` in crates/uc-cli/src/main.rs):
+Format (read by `unpack_embedded_corelib` in crates/uc-cli/src/main.rs):
     u32 count, then `count` entries of: u32 path_len, path bytes, u32 data_len, data bytes.
 The corelib version must match the `cairo-lang-*` crates pinned in Cargo.toml; the binary
-extracts it under `<uc cache>/embedded-corelib-v<cairo version>/`.
+extracts it under `<uc cache>/embedded-corelib-v<cairo version>-<pack digest>/`.
 """
 import argparse
 import os

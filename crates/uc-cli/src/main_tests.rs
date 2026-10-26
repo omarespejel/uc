@@ -247,6 +247,69 @@ exit 64
 }
 
 #[cfg(feature = "native-compile")]
+#[test]
+fn embedded_corelib_installs_whole_when_many_processes_start_at_once() {
+    let guard = integration_env_lock()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cache = unique_test_dir("uc-embedded-corelib-race");
+    let _cache = ScopedEnvVar::set_with_lock(&guard, "UC_GLOBAL_CACHE_DIR", &cache);
+    let done = AtomicBool::new(false);
+    let installed: Vec<PathBuf> = thread::scope(|scope| {
+        // A compile that finds `lib.cairo` must also find the rest of the corelib.
+        let observer = scope.spawn(|| {
+            let mut torn_reads = 0usize;
+            while !done.load(Ordering::Acquire) {
+                for entry in fs::read_dir(&cache).into_iter().flatten().flatten() {
+                    let dir = entry.path();
+                    let staging = entry.file_name().to_string_lossy().starts_with('.');
+                    if !staging
+                        && dir.join("src/lib.cairo").is_file()
+                        && !dir.join("Scarb.toml").is_file()
+                    {
+                        torn_reads += 1;
+                    }
+                }
+            }
+            torn_reads
+        });
+        let workers: Vec<_> = (0..8)
+            .map(|_| scope.spawn(materialize_embedded_corelib_src))
+            .collect();
+        let installed = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("worker").expect("corelib installs"))
+            .collect();
+        done.store(true, Ordering::Release);
+        assert_eq!(
+            observer.join().expect("observer"),
+            0,
+            "saw a partial corelib"
+        );
+        installed
+    });
+    assert!(installed.windows(2).all(|pair| pair[0] == pair[1]));
+    let lib = fs::read_to_string(installed[0].join("lib.cairo")).expect("lib.cairo");
+    assert!(lib.contains("mod traits;") && lib.contains("mod integer;"));
+    let entries: Vec<String> = fs::read_dir(&cache)
+        .expect("cache dir")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "one install and no staging leftovers: {entries:?}"
+    );
+    fs::remove_dir_all(&cache).ok();
+}
+
+#[cfg(feature = "native-compile")]
 fn native_progress_hook_lock() -> &'static Mutex<()> {
     static LOCK: TestOnceLock<Mutex<()>> = TestOnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
