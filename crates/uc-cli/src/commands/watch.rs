@@ -591,6 +591,7 @@ mod tests {
     #[test]
     #[cfg(feature = "native-test-runner")]
     fn declared_class_feed_audits_sierra_declarations_and_lists_cairo0_ones() {
+        let _env = crate::test_env_shared();
         let root = std::env::temp_dir().join(format!("uc-declared-feed-{}-{}", std::process::id(), epoch_ms_u64().unwrap_or(1)));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("src")).unwrap();

@@ -1834,6 +1834,7 @@ mod tests {
     #[test]
     #[cfg(feature = "native-test-runner")]
     fn devnet_validates_charges_fees_and_reverts_like_a_sequencer() {
+        let _env = crate::test_env_shared();
         let mut chain = test_chain();
         let id = chain.chain_id;
         let acc = chain.accounts[0].clone();
@@ -1922,6 +1923,7 @@ mod tests {
     #[test]
     #[cfg(feature = "native-test-runner")]
     fn devnet_declares_deploys_and_deploys_accounts() {
+        let _env = crate::test_env_shared();
         let mut chain = test_chain();
         let id = chain.chain_id;
         let acc = chain.accounts[0].clone();

@@ -3414,6 +3414,7 @@ mod tests {
 
     #[test]
     fn mock_rpc_and_starkscan_server_end_to_end_onchain_suite() {
+        let _env = crate::test_env_shared();
         let dir = TempOnchainDir::new("mock_rpc");
         let manifest_path = dir.dir.join("Scarb.toml");
         fs::write(
@@ -3888,6 +3889,7 @@ accounts-file = "{}"
 
     #[test]
     fn diverse_real_world_starknet_contracts_corpus_build_test_and_verify() {
+        let _env = crate::test_env_shared();
         let dir = TempOnchainDir::new("corpus_8_archetypes");
         let manifest_path = dir.dir.join("Scarb.toml");
         fs::write(
@@ -4230,6 +4232,7 @@ mod corpus_tests {
 
     #[test]
     fn multi_edition_and_multi_version_native_compile_and_verify_matrix() {
+        let _env = crate::test_env_shared();
         let matrix = [
             ("2023_01", "2.8.0"),
             ("2023_10", "2.11.4"),

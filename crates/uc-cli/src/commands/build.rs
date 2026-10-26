@@ -2822,7 +2822,6 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::sync::{Mutex, OnceLock};
 
     fn unique_test_dir(prefix: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -2834,9 +2833,8 @@ mod tests {
         dir
     }
 
-    fn env_var_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    fn env_var_lock() -> &'static std::sync::RwLock<()> {
+        crate::test_env_lock()
     }
 
     struct ScopedEnvVar {
@@ -3370,7 +3368,7 @@ mod tests {
     #[test]
     fn load_daemon_local_probe_hint_reads_legacy_hint_location() {
         let _guard = env_var_lock()
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _retry_interval_guard =
             ScopedEnvVar::set(UC_NATIVE_FALLBACK_HINT_RETRY_SECS_ENV, "1800");
@@ -3400,7 +3398,7 @@ mod tests {
     #[test]
     fn load_daemon_local_probe_hint_ignores_stale_hint_when_retry_interval_is_zero() {
         let _guard = env_var_lock()
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _retry_interval_guard = ScopedEnvVar::set(UC_NATIVE_FALLBACK_HINT_RETRY_SECS_ENV, "0");
         let workspace = unique_test_dir("uc-daemon-probe-hint-stale");
@@ -3433,7 +3431,7 @@ mod tests {
     #[test]
     fn daemon_local_probe_hint_roundtrip_and_clear() {
         let _guard = env_var_lock()
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _retry_interval_guard =
             ScopedEnvVar::set(UC_NATIVE_FALLBACK_HINT_RETRY_SECS_ENV, "1800");
@@ -3816,7 +3814,7 @@ mod tests {
     #[test]
     fn native_auto_preflight_hint_reason_short_circuits_when_fallback_hint_exists() {
         let _guard = env_var_lock()
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _retry_interval_guard =
             ScopedEnvVar::set(UC_NATIVE_FALLBACK_HINT_RETRY_SECS_ENV, "1800");
@@ -3839,7 +3837,7 @@ mod tests {
     #[test]
     fn native_auto_preflight_hint_reason_prefers_native_supported_hint() {
         let _guard = env_var_lock()
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _retry_interval_guard =
             ScopedEnvVar::set(UC_NATIVE_FALLBACK_HINT_RETRY_SECS_ENV, "1800");
@@ -3864,7 +3862,7 @@ mod tests {
     #[test]
     fn native_auto_preflight_hint_reason_prefers_unsupported_hint_over_fallback_hint() {
         let _guard = env_var_lock()
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _retry_interval_guard =
             ScopedEnvVar::set(UC_NATIVE_FALLBACK_HINT_RETRY_SECS_ENV, "1800");
@@ -3894,7 +3892,7 @@ mod tests {
     #[test]
     fn native_auto_preflight_hint_state_resolves_supported_hint() {
         let _guard = env_var_lock()
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _retry_interval_guard =
             ScopedEnvVar::set(UC_NATIVE_FALLBACK_HINT_RETRY_SECS_ENV, "1800");
@@ -3917,7 +3915,7 @@ mod tests {
     #[test]
     fn native_auto_preflight_hint_state_resolves_fallback_hint() {
         let _guard = env_var_lock()
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _retry_interval_guard =
             ScopedEnvVar::set(UC_NATIVE_FALLBACK_HINT_RETRY_SECS_ENV, "1800");
@@ -3940,7 +3938,7 @@ mod tests {
     #[test]
     fn native_auto_preflight_hint_state_resolves_unsupported_hint() {
         let _guard = env_var_lock()
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _retry_interval_guard =
             ScopedEnvVar::set(UC_NATIVE_FALLBACK_HINT_RETRY_SECS_ENV, "1800");
@@ -3969,7 +3967,7 @@ mod tests {
     #[test]
     fn native_auto_preflight_hint_state_defaults_to_unknown_without_hints() {
         let _guard = env_var_lock()
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _retry_interval_guard =
             ScopedEnvVar::set(UC_NATIVE_FALLBACK_HINT_RETRY_SECS_ENV, "1800");

@@ -23431,5 +23431,21 @@ fn validate_scarb_toolchain() -> Result<()> {
     Ok(())
 }
 
+/// Process environment shared by the tests in this binary. Tests that change variables such as
+/// `HOME` or `UC_NATIVE_CORELIB_SRC` hold it for writing; tests that compile Cairo hold it for
+/// reading, so a compile never resolves another test's temporary home or mock corelib.
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> &'static std::sync::RwLock<()> {
+    static LOCK: OnceLock<std::sync::RwLock<()>> = OnceLock::new();
+    LOCK.get_or_init(|| std::sync::RwLock::new(()))
+}
+
+#[cfg(test)]
+pub(crate) fn test_env_shared() -> std::sync::RwLockReadGuard<'static, ()> {
+    test_env_lock()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod main_tests;

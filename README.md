@@ -340,7 +340,7 @@ It exits 1 when a required check fails.
 ```bash
 cargo build --release           # ~5 min cold, incremental afterwards (nightly from rust-toolchain)
 cargo +stable build --release   # what the release workflow builds; verified 2026-10-25 (8 min)
-cargo test --release            # 518 tests; run them alone, a concurrent uc process sharing ~/.uc/cache makes three flaky
+cargo test --release            # 520 tests
 python3 benchmarks/scripts/run_head_to_head.py --uc target/release/uc --project <dir> ...
 python3 benchmarks/scripts/run_mainnet_audit.py --uc target/release/uc
 ```

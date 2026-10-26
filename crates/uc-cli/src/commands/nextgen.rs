@@ -3993,6 +3993,7 @@ mod tests {
     #[cfg(feature = "native-compile")]
     #[test]
     fn fmt_check_and_in_place_formatting_work_with_manifest_tool_fmt_config() {
+        let _env = crate::test_env_shared();
         let dir = TestTempDir::new();
         let manifest_path = dir.path().join("Scarb.toml");
         fs::write(
@@ -4043,6 +4044,7 @@ mod tests {
 
     #[test]
     fn new_init_add_remove_tree_and_clean_roundtrip_work() {
+        let _env = crate::test_env_shared();
         let dir = TestTempDir::new();
         let proj_dir = dir.path().join("my_nextgen_contract");
 

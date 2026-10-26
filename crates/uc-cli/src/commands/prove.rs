@@ -6237,6 +6237,7 @@ mod tests {
     #[test]
     #[cfg(feature = "native-test-runner")]
     fn upgrade_check_against_class_without_debug_names_detects_removed_slot_and_entrypoint() {
+        let _env = crate::test_env_shared();
         let root = std::env::temp_dir().join(format!(
             "uc-upgrade-onchain-test-{}-{}",
             std::process::id(),
@@ -6391,6 +6392,7 @@ pub mod Vault {
     #[test]
     #[cfg(feature = "native-test-runner")]
     fn storage_oracle_decides_storage_dependent_overflow_paths() {
+        let _env = crate::test_env_shared();
         let root = std::env::temp_dir().join(format!(
             "uc-storage-oracle-test-{}-{}",
             std::process::id(),
@@ -6463,6 +6465,7 @@ pub mod Counter {
     #[test]
     #[cfg(feature = "native-test-runner")]
     fn cei_detector_tells_a_held_lock_from_an_unrelated_pre_call_write() {
+        let _env = crate::test_env_shared();
         let root = std::env::temp_dir().join(format!("uc-cei-lock-test-{}-{}", std::process::id(), epoch_ms_u64().unwrap_or(1)));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("src")).unwrap();
@@ -6551,6 +6554,7 @@ pub mod NakedVault {
     #[test]
     #[cfg(feature = "native-test-runner")]
     fn prover_regressions_found_by_the_differential_campaigns() {
+        let _env = crate::test_env_shared();
         let root = std::env::temp_dir().join(format!("uc-prove-regressions-{}-{}", std::process::id(), epoch_ms_u64().unwrap_or(1)));
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("Scarb.toml"), "[package]\nname = \"regress\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n").unwrap();
@@ -6746,6 +6750,7 @@ pub fn sum_below_twenty() -> u64 {
     #[test]
     #[cfg(feature = "native-test-runner")]
     fn caracal_loop_bound_detector_flags_only_uncapped_numeric_entrypoint_bounds() {
+        let _env = crate::test_env_shared();
         let root = std::env::temp_dir().join(format!(
             "uc-prove-loopbound-test-{}-{}",
             std::process::id(),
@@ -6889,6 +6894,7 @@ pub mod Loops {
     #[test]
     #[cfg(feature = "native-test-runner")]
     fn prove_and_caracal_sierra_analyzer_distinguishes_insecure_from_secure_contracts() {
+        let _env = crate::test_env_shared();
         let root = std::env::temp_dir().join(format!(
             "uc-prove-caracal-test-{}-{}",
             std::process::id(),
@@ -7057,6 +7063,7 @@ mod tests {
     #[test]
     #[cfg(feature = "native-test-runner")]
     fn medusa_stateful_campaign_upgrade_safety_and_sarif_export_work() {
+        let _env = crate::test_env_shared();
         let root = std::env::temp_dir().join(format!(
             "uc-prove-medusa-upgrade-{}-{}",
             std::process::id(),

@@ -3655,6 +3655,7 @@ mod tests {
 
     #[test]
     fn native_test_runner_executes_cairo_and_starknet_tests_in_process() {
+        let _env = crate::test_env_shared();
         let proj = TempTestProject::new("basic");
         let manifest_path = proj.dir.join("Scarb.toml");
         fs::write(
@@ -3763,6 +3764,7 @@ mod tests {
 
     #[test]
     fn native_test_runner_affected_mode_selects_only_impacted_modules() {
+        let _env = crate::test_env_shared();
         let proj = TempTestProject::new("affected");
         let manifest_path = proj.dir.join("Scarb.toml");
         fs::write(
@@ -3892,6 +3894,7 @@ mod vault_tests {
 
     #[test]
     fn native_build_and_test_support_features_and_multi_package_workspace() {
+        let _env = crate::test_env_shared();
         let ws = TempTestProject::new("workspace_features");
         let root_manifest = ws.dir.join("Scarb.toml");
         fs::write(
@@ -4066,6 +4069,7 @@ pub mod PoolB {
 
     #[test]
     fn native_test_runner_executes_snforge_std_cheatcodes_and_integration_tests_in_process() {
+        let _env = crate::test_env_shared();
         let proj = TempTestProject::new("snforge_cheatcodes");
         let manifest_path = proj.dir.join("Scarb.toml");
         fs::write(
@@ -4244,6 +4248,7 @@ fn test_vault_with_snforge_cheatcodes() {
 
     #[test]
     fn native_test_runner_precalculate_address_matches_deploy_and_cheats_reach_constructor() {
+        let _env = crate::test_env_shared();
         // Regression: `precalculate_address` used to return the class hash, so a caller cheat
         // set on the precalculated address never applied to the constructor (snforge parity).
         let proj = TempTestProject::new("precalc_addr");
@@ -4392,6 +4397,7 @@ fn cheat_caller_before_deploy_reaches_constructor() {
 
     #[test]
     fn native_test_runner_coverage_guided_fuzzer_and_counterexample_shrinking() {
+        let _env = crate::test_env_shared();
         let proj = TempTestProject::new("fuzzer_shrink");
         let manifest_path = proj.dir.join("Scarb.toml");
         fs::write(
@@ -4480,6 +4486,7 @@ mod tests {
 
     #[test]
     fn native_test_runner_coverage_lcov_and_gas_snapshot_regression_check() {
+        let _env = crate::test_env_shared();
         let proj = TempTestProject::new("cov_snapshot");
         let manifest_path = proj.dir.join("Scarb.toml");
         fs::write(
@@ -4609,6 +4616,7 @@ mod tests {
 
     #[test]
     fn native_test_runner_semantic_mutation_testing_calculates_mutation_score() {
+        let _env = crate::test_env_shared();
         let proj = TempTestProject::new("mutation_testing");
         let manifest_path = proj.dir.join("Scarb.toml");
         fs::write(
