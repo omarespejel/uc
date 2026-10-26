@@ -513,7 +513,7 @@ $ uc audit 0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d --
 # the deployed STRK token, no source: 178 functions, 106 proven safe, 72 guarded, 0 counterexamples, 5 findings</code></pre>
       </div>
       <p>
-        <code>uc audit</code> takes a contract address, a class hash, a <code>.contract_class.json</code> or a <code>Scarb.toml</code>. For deployed classes the entry points are named from the ABI by selector and <code>PanicResult</code> is recognised structurally, so every detector above runs on bytecode. <code>benchmarks/scripts/run_mainnet_audit.py</code> audits 20 well-known mainnet contracts this way (16 Sierra classes, 2,843 functions, 92 findings, 23 counterexamples; 32 s on an idle machine, 118 s at load average 60) and writes the results to <code>benchmarks/results/</code>.
+        <code>uc audit</code> takes a contract address, a class hash, a <code>.contract_class.json</code> or a <code>Scarb.toml</code>. For deployed classes the entry points are named from the ABI by selector and <code>PanicResult</code> is recognised structurally, so every detector above runs on bytecode. <code>benchmarks/scripts/run_mainnet_audit.py</code> audits 20 well-known mainnet contracts this way (16 Sierra classes, 2,843 functions, 92 findings, 6 counterexamples, 32 s) and writes the results to <code>benchmarks/results/</code>.
       </p>
 
       <h2 id="watch">Watching a Deployment, Upgrade Gate, Starkscan</h2>

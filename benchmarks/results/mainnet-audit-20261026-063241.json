@@ -1,0 +1,813 @@
+{
+  "stamp": "20261026-063241",
+  "uc": "uc 0.1.0 (cairo 2.18.0, sierra 1.8.0)",
+  "network": "mainnet",
+  "results": [
+    {
+      "ok": true,
+      "ms": 2456,
+      "functions": 178,
+      "sierra_statements": null,
+      "status_counts": {
+        "GUARDED_SAFE": 101,
+        "PROVEN_SAFE": 71,
+        "BOUNDED_SAFE": 6
+      },
+      "findings": [
+        {
+          "severity": "High",
+          "detector": "caracal-unprotected-state-mutation",
+          "function": "Contract::approve_l1_address"
+        },
+        {
+          "severity": "Low",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_63"
+        },
+        {
+          "severity": "Medium",
+          "detector": "caracal-swallowed-syscall-error",
+          "function": "internal::fn_101"
+        },
+        {
+          "severity": "Low",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_101"
+        },
+        {
+          "severity": "Low",
+          "detector": "caracal-redundant-divrem-sierra",
+          "function": "internal::fn_134"
+        }
+      ],
+      "counterexamples": [],
+      "label": "STRK token",
+      "address": "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d"
+    },
+    {
+      "ok": true,
+      "ms": 1700,
+      "functions": 161,
+      "sierra_statements": null,
+      "status_counts": {
+        "GUARDED_SAFE": 93,
+        "PROVEN_SAFE": 62,
+        "BOUNDED_SAFE": 6
+      },
+      "findings": [
+        {
+          "severity": "High",
+          "detector": "caracal-unprotected-state-mutation",
+          "function": "Contract::approve_l1_address"
+        },
+        {
+          "severity": "Medium",
+          "detector": "caracal-swallowed-syscall-error",
+          "function": "internal::fn_72"
+        },
+        {
+          "severity": "Low",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_72"
+        },
+        {
+          "severity": "Low",
+          "detector": "caracal-redundant-divrem-sierra",
+          "function": "internal::fn_130"
+        }
+      ],
+      "counterexamples": [],
+      "label": "ETH token",
+      "address": "0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7"
+    },
+    {
+      "ok": true,
+      "ms": 1010,
+      "functions": 212,
+      "sierra_statements": null,
+      "status_counts": {
+        "GUARDED_SAFE": 87,
+        "UNDECIDED": 34,
+        "PROVEN_SAFE": 91
+      },
+      "findings": [
+        {
+          "severity": "Medium",
+          "detector": "caracal-swallowed-syscall-error",
+          "function": "internal::fn_46"
+        },
+        {
+          "severity": "Low",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_46"
+        }
+      ],
+      "counterexamples": [],
+      "label": "USDC token",
+      "address": "0x053c91253bc9682c04929ca02ed00b3e423f6710d2ee7e0d5ebb06f3ecf368a8"
+    },
+    {
+      "ok": true,
+      "ms": 1457,
+      "functions": 161,
+      "sierra_statements": null,
+      "status_counts": {
+        "GUARDED_SAFE": 93,
+        "PROVEN_SAFE": 62,
+        "BOUNDED_SAFE": 6
+      },
+      "findings": [
+        {
+          "severity": "High",
+          "detector": "caracal-unprotected-state-mutation",
+          "function": "Contract::approve_l1_address"
+        },
+        {
+          "severity": "Medium",
+          "detector": "caracal-swallowed-syscall-error",
+          "function": "internal::fn_72"
+        },
+        {
+          "severity": "Low",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_72"
+        },
+        {
+          "severity": "Low",
+          "detector": "caracal-redundant-divrem-sierra",
+          "function": "internal::fn_130"
+        }
+      ],
+      "counterexamples": [],
+      "label": "USDT token",
+      "address": "0x068f5c6a61780768455de69077e07e89787839bf8166decfbf92b645209c0fb8"
+    },
+    {
+      "ok": true,
+      "ms": 1814,
+      "functions": 161,
+      "sierra_statements": null,
+      "status_counts": {
+        "GUARDED_SAFE": 93,
+        "PROVEN_SAFE": 62,
+        "BOUNDED_SAFE": 6
+      },
+      "findings": [
+        {
+          "severity": "High",
+          "detector": "caracal-unprotected-state-mutation",
+          "function": "Contract::approve_l1_address"
+        },
+        {
+          "severity": "Medium",
+          "detector": "caracal-swallowed-syscall-error",
+          "function": "internal::fn_72"
+        },
+        {
+          "severity": "Low",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_72"
+        },
+        {
+          "severity": "Low",
+          "detector": "caracal-redundant-divrem-sierra",
+          "function": "internal::fn_130"
+        }
+      ],
+      "counterexamples": [],
+      "label": "DAI v2 token",
+      "address": "0x05574eb6b8789a91466f902c380d978e472db68170ff82a5b650b95a58ddf4ad"
+    },
+    {
+      "ok": true,
+      "ms": 1306,
+      "functions": 212,
+      "sierra_statements": null,
+      "status_counts": {
+        "GUARDED_SAFE": 87,
+        "UNDECIDED": 34,
+        "PROVEN_SAFE": 91
+      },
+      "findings": [
+        {
+          "severity": "Medium",
+          "detector": "caracal-swallowed-syscall-error",
+          "function": "internal::fn_46"
+        },
+        {
+          "severity": "Low",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_46"
+        }
+      ],
+      "counterexamples": [],
+      "label": "wstETH token",
+      "address": "0x042b8f0484674ca266ac5d08e4ac6a3fe65bd3129795def2dca5c34ecc5f96d2"
+    },
+    {
+      "ok": true,
+      "ms": 2118,
+      "functions": 208,
+      "sierra_statements": null,
+      "status_counts": {
+        "GUARDED_SAFE": 90,
+        "PROVEN_SAFE": 101,
+        "UNDECIDED": 14,
+        "BOUNDED_SAFE": 3
+      },
+      "findings": [
+        {
+          "severity": "High",
+          "detector": "caracal-unprotected-state-mutation",
+          "function": "Contract::clear_core_protocol_fee"
+        },
+        {
+          "severity": "Low",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_59"
+        },
+        {
+          "severity": "Low",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_61"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_64"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_67"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_70"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_71"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_73"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_80"
+        },
+        {
+          "severity": "Low",
+          "detector": "caracal-redundant-divrem-sierra",
+          "function": "internal::fn_92"
+        },
+        {
+          "severity": "Low",
+          "detector": "caracal-bitwise-parity-sierra",
+          "function": "internal::fn_93"
+        },
+        {
+          "severity": "Low",
+          "detector": "caracal-bitwise-parity-sierra",
+          "function": "internal::fn_97"
+        },
+        {
+          "severity": "Low",
+          "detector": "caracal-bitwise-parity-sierra",
+          "function": "internal::fn_124"
+        },
+        {
+          "severity": "Low",
+          "detector": "caracal-redundant-divrem-sierra",
+          "function": "internal::fn_152"
+        },
+        {
+          "severity": "Low",
+          "detector": "caracal-redundant-divrem-sierra",
+          "function": "internal::fn_202"
+        }
+      ],
+      "counterexamples": [],
+      "label": "Ekubo core",
+      "address": "0x00000005dd3d2f4429af886cd1a3b08289dbcea99a294197e9eb43b0e0325b4b"
+    },
+    {
+      "ok": true,
+      "ms": 1691,
+      "functions": 197,
+      "sierra_statements": null,
+      "status_counts": {
+        "GUARDED_SAFE": 109,
+        "PROVEN_SAFE": 81,
+        "BOUNDED_SAFE": 6,
+        "UNDECIDED": 1
+      },
+      "findings": [
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_114"
+        },
+        {
+          "severity": "Low",
+          "detector": "caracal-bitwise-parity-sierra",
+          "function": "internal::fn_124"
+        }
+      ],
+      "counterexamples": [],
+      "label": "Ekubo positions",
+      "address": "0x02e0af29598b407c8716b17f6d2795eca1b471413fa03fb145a5e33722184067"
+    },
+    {
+      "ok": true,
+      "ms": 1276,
+      "functions": 120,
+      "sierra_statements": null,
+      "status_counts": {
+        "GUARDED_SAFE": 54,
+        "PROVEN_SAFE": 60,
+        "BOUNDED_SAFE": 6
+      },
+      "findings": [
+        {
+          "severity": "High",
+          "detector": "caracal-unprotected-state-mutation",
+          "function": "Contract::initialize"
+        }
+      ],
+      "counterexamples": [],
+      "label": "AVNU exchange",
+      "address": "0x04270219d365d6b017231b52e92b3fb5d7c8378b05e9abc97724537a80e93b0f"
+    },
+    {
+      "ok": false,
+      "error": "Error: `0x041fd22b238fa21cfcf5dd45a8548974d8263b3a531a60388411c5e230f97023` is not a Sierra contract class (Cairo 0 classes cannot be analysed)\n\nCaused by:\n    missing field `kind`",
+      "ms": 483,
+      "label": "JediSwap v1 router",
+      "address": "0x041fd22b238fa21cfcf5dd45a8548974d8263b3a531a60388411c5e230f97023"
+    },
+    {
+      "ok": true,
+      "ms": 807,
+      "functions": 10,
+      "sierra_statements": null,
+      "status_counts": {
+        "GUARDED_SAFE": 8,
+        "PROVEN_SAFE": 2
+      },
+      "findings": [],
+      "counterexamples": [],
+      "label": "MySwap AMM",
+      "address": "0x010884171baf1914edc28d7afb619b40a4051cfae78a094a55d230f19e944a28"
+    },
+    {
+      "ok": true,
+      "ms": 1852,
+      "functions": 95,
+      "sierra_statements": null,
+      "status_counts": {
+        "GUARDED_SAFE": 80,
+        "PROVEN_SAFE": 12,
+        "UNDECIDED": 2,
+        "BOUNDED_SAFE": 1
+      },
+      "findings": [
+        {
+          "severity": "Low",
+          "detector": "caracal-bitwise-parity-sierra",
+          "function": "internal::fn_43"
+        },
+        {
+          "severity": "Low",
+          "detector": "caracal-bitwise-parity-sierra",
+          "function": "internal::fn_44"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_60"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_62"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_65"
+        },
+        {
+          "severity": "Low",
+          "detector": "caracal-bitwise-parity-sierra",
+          "function": "internal::fn_75"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_82"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_83"
+        },
+        {
+          "severity": "Low",
+          "detector": "caracal-bitwise-parity-sierra",
+          "function": "internal::fn_84"
+        }
+      ],
+      "counterexamples": [],
+      "label": "zkLend market",
+      "address": "0x04c0a5193d58f74fbace4b74dcf65481e734ed1714121bdc571da345540efa05"
+    },
+    {
+      "ok": false,
+      "error": "Error: failed to fetch class for `0x057146f6409deb4c9fa12866915dd952aa07c1eb2752e451d7f3b042086bdeb` from https://api.cartridge.gg/x/starknet/mainnet (tried starknet_getClassAt and starknet_getClass)\n\nCaused by:\n    Starknet JSON-RPC `starknet_getClass` error: {\"code\":28,\"message\":\"Class hash not found\"}",
+      "ms": 769,
+      "label": "Nostra ETH interest token",
+      "address": "0x057146f6409deb4c9fa12866915dd952aa07c1eb2752e451d7f3b042086bdeb"
+    },
+    {
+      "ok": true,
+      "ms": 1405,
+      "functions": 332,
+      "sierra_statements": null,
+      "status_counts": {
+        "GUARDED_SAFE": 139,
+        "UNDECIDED": 38,
+        "PROVEN_SAFE": 155
+      },
+      "findings": [
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_71"
+        },
+        {
+          "severity": "Medium",
+          "detector": "caracal-swallowed-syscall-error",
+          "function": "internal::fn_77"
+        },
+        {
+          "severity": "Low",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_77"
+        },
+        {
+          "severity": "Medium",
+          "detector": "caracal-swallowed-syscall-error",
+          "function": "internal::fn_110"
+        },
+        {
+          "severity": "Medium",
+          "detector": "caracal-swallowed-syscall-error",
+          "function": "internal::fn_144"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_146"
+        },
+        {
+          "severity": "Medium",
+          "detector": "caracal-swallowed-syscall-error",
+          "function": "internal::fn_147"
+        },
+        {
+          "severity": "Medium",
+          "detector": "caracal-swallowed-syscall-error",
+          "function": "internal::fn_212"
+        },
+        {
+          "severity": "Medium",
+          "detector": "caracal-swallowed-syscall-error",
+          "function": "internal::fn_249"
+        }
+      ],
+      "counterexamples": [],
+      "label": "StarkGate ETH bridge",
+      "address": "0x073314940630fd6dcda0d772d4c972c4e0a9946bef9dabf4ef84eda8ef542b82"
+    },
+    {
+      "ok": true,
+      "ms": 3126,
+      "functions": 100,
+      "sierra_statements": null,
+      "status_counts": {
+        "UNDECIDED": 30,
+        "GUARDED_SAFE": 54,
+        "PROVEN_SAFE": 14,
+        "COUNTEREXAMPLE_FOUND": 2
+      },
+      "findings": [
+        {
+          "severity": "High",
+          "detector": "caracal-unprotected-state-mutation",
+          "function": "Contract::migrate_domain"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_46"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_47"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_48"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_49"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_50"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_51"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_52"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_53"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_54"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_55"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_56"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_59"
+        }
+      ],
+      "counterexamples": [
+        {
+          "function": "audit_target::internal::fn_76",
+          "witness": {
+            "arg_0": "0",
+            "arg_1": "0",
+            "arg_2": "0",
+            "arg_3": "60"
+          },
+          "reason": "underflow / inequality in `u16_overflowing_sub`: (2 * 30) < arg_3"
+        },
+        {
+          "function": "audit_target::internal::fn_99",
+          "witness": {
+            "arg_0": "0",
+            "arg_1": "0",
+            "arg_2": "254"
+          },
+          "reason": "arithmetic overflow in `u8_overflowing_add`: (arg_2 + 1) > 255"
+        }
+      ],
+      "label": "Starknet ID naming",
+      "address": "0x06ac597f8116f886fa1c97a23fa4e08299975ecaf6b598873ca6792b9bbfb678"
+    },
+    {
+      "ok": true,
+      "ms": 2085,
+      "functions": 96,
+      "sierra_statements": null,
+      "status_counts": {
+        "GUARDED_SAFE": 76,
+        "PROVEN_SAFE": 13,
+        "BOUNDED_SAFE": 4,
+        "UNDECIDED": 3
+      },
+      "findings": [
+        {
+          "severity": "Medium",
+          "detector": "caracal-swallowed-syscall-error",
+          "function": "internal::fn_84"
+        }
+      ],
+      "counterexamples": [],
+      "label": "Starknet ID identity",
+      "address": "0x05dbdedc203e92749e2e746e2d40a768d966bd243df04a6b712e222bc040a9af"
+    },
+    {
+      "ok": false,
+      "error": "Error: `0x041a78e741e5af2fec34b695679bc6891742439f7afb8484ecd7766661ad02bf` is not a Sierra contract class (Cairo 0 classes cannot be analysed)\n\nCaused by:\n    missing field `kind`",
+      "ms": 191,
+      "label": "Universal Deployer",
+      "address": "0x041a78e741e5af2fec34b695679bc6891742439f7afb8484ecd7766661ad02bf"
+    },
+    {
+      "ok": false,
+      "error": "Error: failed to fetch class for `0x00ca1702e64c81d9a07b86bd2c540188d92a2c73cf5cc0e508d4e85d3e9e5c6a` from https://api.cartridge.gg/x/starknet/mainnet (tried starknet_getClassAt and starknet_getClass)\n\nCaused by:\n    Starknet JSON-RPC `starknet_getClass` error: {\"code\":28,\"message\":\"Class hash not found\"}",
+      "ms": 399,
+      "label": "Starknet staking",
+      "address": "0x00ca1702e64c81d9a07b86bd2c540188d92a2c73cf5cc0e508d4e85d3e9e5c6a"
+    },
+    {
+      "ok": true,
+      "ms": 3249,
+      "functions": 148,
+      "sierra_statements": null,
+      "status_counts": {
+        "GUARDED_SAFE": 117,
+        "PROVEN_SAFE": 25,
+        "BOUNDED_SAFE": 3,
+        "UNDECIDED": 3
+      },
+      "findings": [
+        {
+          "severity": "Low",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_69"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_71"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_74"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_76"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_80"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_81"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_84"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_85"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_87"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_98"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_105"
+        },
+        {
+          "severity": "Low",
+          "detector": "caracal-bitwise-parity-sierra",
+          "function": "internal::fn_120"
+        },
+        {
+          "severity": "Low",
+          "detector": "caracal-redundant-divrem-sierra",
+          "function": "internal::fn_120"
+        }
+      ],
+      "counterexamples": [],
+      "label": "Vesu singleton",
+      "address": "0x02545b2e5d519fc230e9cd781046d3a64e092114f07e44771e0d719d148725ef"
+    },
+    {
+      "ok": true,
+      "ms": 4326,
+      "functions": 452,
+      "sierra_statements": null,
+      "status_counts": {
+        "UNDECIDED": 84,
+        "GUARDED_SAFE": 196,
+        "PROVEN_SAFE": 157,
+        "BOUNDED_SAFE": 11,
+        "COUNTEREXAMPLE_FOUND": 4
+      },
+      "findings": [
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_79"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_102"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_206"
+        },
+        {
+          "severity": "High",
+          "detector": "caracal-cei-reentrancy-sierra",
+          "function": "internal::fn_223"
+        },
+        {
+          "severity": "Medium",
+          "detector": "caracal-swallowed-syscall-error",
+          "function": "internal::fn_241"
+        },
+        {
+          "severity": "Medium",
+          "detector": "caracal-swallowed-syscall-error",
+          "function": "internal::fn_316"
+        },
+        {
+          "severity": "Medium",
+          "detector": "caracal-swallowed-syscall-error",
+          "function": "internal::fn_317"
+        },
+        {
+          "severity": "Low",
+          "detector": "caracal-bitwise-parity-sierra",
+          "function": "internal::fn_409"
+        }
+      ],
+      "counterexamples": [
+        {
+          "function": "audit_target::internal::fn_142",
+          "witness": {
+            "arg_0": "0",
+            "arg_1": "2",
+            "arg_2": "0"
+          },
+          "reason": "u128_eq(((arg_1 - arg_2) % 2), 0) branch 1"
+        },
+        {
+          "function": "audit_target::internal::fn_143",
+          "witness": {
+            "arg_0": "0",
+            "arg_1": "0",
+            "arg_2": "2"
+          },
+          "reason": "u128_eq((arg_2 % 2), 0) branch 1"
+        },
+        {
+          "function": "audit_target::internal::fn_381",
+          "witness": {
+            "arg_0": "0",
+            "arg_1": "3"
+          },
+          "reason": "u32_eq(((arg_1 - 1) - 1), 0) branch 0"
+        },
+        {
+          "function": "audit_target::internal::fn_433",
+          "witness": {
+            "arg_0": "0",
+            "arg_1": "0",
+            "arg_2": "254"
+          },
+          "reason": "arithmetic overflow in `u8_overflowing_add`: (arg_2 + 1) > 255"
+        }
+      ],
+      "label": "Pragma oracle",
+      "address": "0x02a85bd616f912537c50a49a4076db02c00b29b2cdc8a197ce92ed1837fa875b"
+    }
+  ]
+}

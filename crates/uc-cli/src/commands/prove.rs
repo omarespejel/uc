@@ -1,7 +1,7 @@
 use super::*;
 use cairo_lang_sierra::ids::ConcreteTypeId;
 use cairo_lang_sierra::program::{BranchTarget, GenericArg, Program, Statement};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
@@ -252,6 +252,9 @@ pub(crate) struct ProveWorkspaceReport {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct LibfuncMeta {
+    /// Per branch, which results are builtins (range check, gas, bitwise, ...), from the
+    /// libfunc's signature; empty when the program registry could not be built.
+    builtin_results: Vec<Vec<bool>>,
     generic_id: String,
     debug_name: String,
     user_func_callee: Option<u64>,
@@ -286,6 +289,9 @@ struct SierraProgramIndex<'a> {
 
 impl<'a> SierraProgramIndex<'a> {
     fn build(program: &'a Program) -> Self {
+        use cairo_lang_sierra::extensions::core::{CoreLibfunc, CoreType};
+        use cairo_lang_sierra::extensions::ConcreteLibfunc;
+        let registry = cairo_lang_sierra::program_registry::ProgramRegistry::<CoreType, CoreLibfunc>::new(program).ok();
         let mut types: HashMap<u64, TypeMeta> = HashMap::new();
         for td in &program.type_declarations {
             let generic_id = td.long_id.generic_id.0.as_str().to_string();
@@ -492,9 +498,25 @@ impl<'a> SierraProgramIndex<'a> {
                     _ => {}
                 }
             }
+            let builtin_results = registry
+                .as_ref()
+                .and_then(|r| r.get_libfunc(&ld.id).ok())
+                .map(|lf| {
+                    lf.branch_signatures()
+                        .iter()
+                        .map(|b| {
+                            b.vars
+                                .iter()
+                                .map(|v| types.get(&v.ty.id).is_some_and(|t| is_builtin_generic(&t.generic_id)))
+                                .collect()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             libfuncs.insert(
                 ld.id.id,
                 LibfuncMeta {
+                    builtin_results,
                     generic_id,
                     debug_name,
                     user_func_callee,
@@ -1839,6 +1861,29 @@ impl SymExpr {
         }
     }
 
+    /// Sets `seen[i]` for every parameter `i` the expression mentions.
+    fn mark_params(&self, seen: &mut [bool]) {
+        match self {
+            Self::Param(i, _) => {
+                if let Some(slot) = seen.get_mut(*i) {
+                    *slot = true;
+                }
+            }
+            Self::Const(_) | Self::SymbolicOpaque(_) => {}
+            Self::Add(a, b)
+            | Self::Sub(a, b)
+            | Self::Mul(a, b)
+            | Self::Div(a, b)
+            | Self::Rem(a, b)
+            | Self::BitAnd(a, b)
+            | Self::BitOr(a, b)
+            | Self::BitXor(a, b) => {
+                a.mark_params(seen);
+                b.mark_params(seen);
+            }
+        }
+    }
+
     fn mentions_param(&self) -> bool {
         match self {
             Self::Param(_, _) => true,
@@ -2392,6 +2437,85 @@ enum SolverOutcome {
 }
 
 /// In-process Interval + Relational Algebraic Constraint Solver over Sierra path conditions.
+/// `Σ coefficient · parameter + constant` when `e` is linear in the parameters (sums,
+/// differences and products by constants of parameters and constants).
+fn linear_form(e: &SymExpr) -> Option<(BTreeMap<usize, i128>, i128)> {
+    match e {
+        SymExpr::Param(i, _) => Some((BTreeMap::from([(*i, 1)]), 0)),
+        SymExpr::Const(v) => Some((BTreeMap::new(), *v)),
+        SymExpr::Add(a, b) | SymExpr::Sub(a, b) => {
+            let sign: i128 = if matches!(e, SymExpr::Sub(..)) { -1 } else { 1 };
+            let (mut coeffs, ka) = linear_form(a)?;
+            let (cb, kb) = linear_form(b)?;
+            for (i, c) in cb {
+                let slot = coeffs.entry(i).or_insert(0);
+                *slot = slot.checked_add(sign.checked_mul(c)?)?;
+            }
+            coeffs.retain(|_, c| *c != 0);
+            Some((coeffs, ka.checked_add(sign.checked_mul(kb)?)?))
+        }
+        SymExpr::Mul(a, b) => {
+            let ((ca, ka), (cb, kb)) = (linear_form(a)?, linear_form(b)?);
+            let (coeffs, k, factor) = match (ca.is_empty(), cb.is_empty()) {
+                (_, true) => (ca, ka, kb),
+                (true, false) => (cb, kb, ka),
+                (false, false) => return None,
+            };
+            let scaled: Option<BTreeMap<usize, i128>> = coeffs.into_iter().map(|(i, c)| c.checked_mul(factor).map(|v| (i, v))).collect();
+            let mut scaled = scaled?;
+            scaled.retain(|_, c| *c != 0);
+            Some((scaled, k.checked_mul(factor)?))
+        }
+        _ => None,
+    }
+}
+
+/// `lhs - rhs` of a constraint as a linear form, so the constraint reads `form op 0`.
+fn constraint_linear_form(c: &SymConstraint) -> Option<(BTreeMap<usize, i128>, i128)> {
+    let (mut coeffs, kl) = linear_form(&c.lhs)?;
+    let (cr, kr) = linear_form(&c.rhs)?;
+    for (i, v) in cr {
+        let slot = coeffs.entry(i).or_insert(0);
+        *slot = slot.checked_sub(v)?;
+    }
+    coeffs.retain(|_, v| *v != 0);
+    Some((coeffs, kl.checked_sub(kr)?))
+}
+
+/// `c · p + k op 0` as a bound on `p`: `(op', b)` meaning `p op' b` over the integers, with
+/// the division rounded the way `op'` needs. `None` for `c = 0` or an overflow.
+fn linear_bound(coeff: i128, k: i128, op: CmpOp) -> Option<(CmpOp, i128)> {
+    // Make the coefficient positive: `-c·p - k op~ 0` with the comparison mirrored.
+    let (c, k, op) = if coeff < 0 {
+        let mirrored = match op {
+            CmpOp::Lt => CmpOp::Gt,
+            CmpOp::Le => CmpOp::Ge,
+            CmpOp::Gt => CmpOp::Lt,
+            CmpOp::Ge => CmpOp::Le,
+            other => other,
+        };
+        (coeff.checked_neg()?, k.checked_neg()?, mirrored)
+    } else if coeff > 0 {
+        (coeff, k, op)
+    } else {
+        return None;
+    };
+    let target = k.checked_neg()?; // c·p op target
+    let floor = |a: i128| a.div_euclid(c);
+    let ceil = |a: i128| a.checked_neg().map(|n| -n.div_euclid(c));
+    Some(match op {
+        CmpOp::Lt => (CmpOp::Le, floor(target.checked_sub(1)?)),
+        CmpOp::Le => (CmpOp::Le, floor(target)),
+        CmpOp::Gt => (CmpOp::Ge, ceil(target.checked_add(1)?)?),
+        CmpOp::Ge => (CmpOp::Ge, ceil(target)?),
+        // An equality without an integer solution has an empty range: `p >= b+1` and `p <= b`.
+        CmpOp::Eq if target.rem_euclid(c) != 0 => (CmpOp::Lt, i128::MIN),
+        CmpOp::Eq => (CmpOp::Eq, target / c),
+        CmpOp::Ne if target.rem_euclid(c) != 0 => return None,
+        CmpOp::Ne => (CmpOp::Ne, target / c),
+    })
+}
+
 /// Interval of the values `e` takes when each parameter ranges over `[lo, hi]`; `None` when
 /// unknown (opaque values) or out of `i128`. An over-approximation, so a constraint that fails
 /// on the whole interval fails everywhere.
@@ -2537,6 +2661,30 @@ fn solve_path_constraints(
     // Iterative interval tightening
     for _iter in 0..8 {
         for c in constraints {
+            // `c·p + k op 0`, however the sums are nested: a bound on `p` and its boundary values.
+            if let Some((coeffs, k)) = constraint_linear_form(c) {
+                if let (1, Some((&idx, &coeff))) = (coeffs.len(), coeffs.iter().next()) {
+                    if let Some((op, b)) = linear_bound(coeff, k, c.op) {
+                        if b != i128::MIN {
+                            candidate_constants.extend([b.saturating_sub(1), b, b.saturating_add(1)]);
+                        }
+                        match op {
+                            CmpOp::Eq => {
+                                lo[idx] = lo[idx].max(b);
+                                hi[idx] = hi[idx].min(b);
+                            }
+                            CmpOp::Ne => {
+                                excluded[idx].insert(b);
+                            }
+                            CmpOp::Lt => hi[idx] = hi[idx].min(b.saturating_sub(1)),
+                            CmpOp::Le => hi[idx] = hi[idx].min(b),
+                            CmpOp::Gt => lo[idx] = lo[idx].max(b.saturating_add(1)),
+                            CmpOp::Ge => lo[idx] = lo[idx].max(b),
+                        }
+                        continue;
+                    }
+                }
+            }
             match (&c.lhs, c.op, &c.rhs) {
                 (SymExpr::Param(idx, _), op, SymExpr::Const(val)) => {
                     candidate_constants.extend([val.saturating_sub(1), *val, val.saturating_add(1)]);
@@ -2697,9 +2845,20 @@ fn solve_path_constraints(
         return SolverOutcome::Unsat;
     }
 
-    // Build per-parameter candidate witness sets from solved interval boundaries & algebraic relations
+    // Build per-parameter candidate witness sets from solved interval boundaries & algebraic
+    // relations. A parameter no constraint mentions gets one candidate, so it does not multiply
+    // the search.
+    let mut mentioned = vec![false; n];
+    for c in constraints {
+        c.lhs.mark_params(&mut mentioned);
+        c.rhs.mark_params(&mut mentioned);
+    }
     let mut per_param_candidates: Vec<Vec<i128>> = Vec::with_capacity(n);
     for idx in 0..n {
+        if !mentioned[idx] {
+            per_param_candidates.push(vec![lo[idx]]);
+            continue;
+        }
         let mut pts = BTreeSet::new();
         pts.insert(lo[idx]);
         pts.insert(hi[idx]);
@@ -2750,11 +2909,27 @@ fn solve_path_constraints(
 const MAX_SYM_EXPR_NODES: usize = 96;
 
 fn cap_sym_expr(expr: SymExpr, var_id: u64) -> SymExpr {
-    if expr.exceeds(MAX_SYM_EXPR_NODES) {
-        SymExpr::SymbolicOpaque(format!("v{var_id}"))
-    } else {
+    if !expr.exceeds(MAX_SYM_EXPR_NODES) {
         expr
+    } else if expr.mentions_param() || expr.mentions_unknown() {
+        // Still a function of the parameters: an unknown one, never an environment value.
+        opaque_var(UNKNOWN_PREFIX, var_id)
+    } else {
+        opaque_var("v", var_id)
     }
+}
+
+thread_local! {
+    /// Serial of the inlined call whose statement is being processed (0 for the analysed
+    /// function). Variable ids repeat in every inlined call, so opaque values are named
+    /// `<prefix><id>@<serial>` there: equal ids in different calls stay different unknowns,
+    /// for the solver and in the SMT-LIB export.
+    static FRAME_SERIAL: Cell<u32> = const { Cell::new(0) };
+}
+
+fn opaque_var(prefix: &str, id: u64) -> SymExpr {
+    let serial = FRAME_SERIAL.with(Cell::get);
+    SymExpr::SymbolicOpaque(if serial == 0 { format!("{prefix}{id}") } else { format!("{prefix}{id}@{serial}") })
 }
 
 /// Whether panic-path obligations are kept on the reports (only `--emit-smt` needs them; for a
@@ -2821,6 +2996,24 @@ fn search_witness_recursive(
     // Also derive relational values from already-bound parameters (`x + y == target`, `x == y`, etc.)
     let mut dynamic_pts = candidates[param_idx].clone();
     for c in constraints {
+        // A linear constraint whose other parameters are bound pins this one's boundary.
+        if let Some((coeffs, k)) = constraint_linear_form(c) {
+            if let Some(&coeff) = coeffs.get(&param_idx) {
+                if coeffs.keys().all(|&i| i <= param_idx) {
+                    let rest = coeffs
+                        .iter()
+                        .filter(|(&i, _)| i != param_idx)
+                        .try_fold(k, |acc, (&i, &ci)| acc.checked_add(ci.checked_mul(env[i])?));
+                    if let Some((_, b)) = rest.and_then(|r| linear_bound(coeff, r, c.op)).filter(|(_, b)| *b != i128::MIN) {
+                        for v in [b.saturating_sub(1), b, b.saturating_add(1)] {
+                            if v >= lo[param_idx] && v <= hi[param_idx] {
+                                dynamic_pts.insert(0, v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if let (SymExpr::Add(a, b), op, SymExpr::Const(target)) = (&c.lhs, c.op, &c.rhs) {
             if let (SymExpr::Param(i, _), SymExpr::Param(j, _)) = (a.as_ref(), b.as_ref()) {
                 let other = if *i == param_idx && *j < param_idx {
@@ -2892,6 +3085,17 @@ struct SymPathState {
     /// The path went through the `Err` branch of a callee that was not inlined: its panic
     /// condition is unknown, so a panic on this path is undecided, never a counterexample.
     unknown_panic: bool,
+    /// Serial of the inlined call the path is in (see `FRAME_SERIAL`), and the last one issued.
+    frame_serial: u32,
+    next_serial: u32,
+    /// Where `unknown_panic` was set (libfunc and statement), for `UC_PROVE_DEBUG_PATHS`.
+    unknown_reason: Option<Rc<str>>,
+    /// The path is the `Err` branch of a callee whose own verdict is guarded: it panics only
+    /// behind the callee's guards, a precondition, never a counterexample.
+    guarded_callee: bool,
+    /// The path took a branch whose condition the engine does not express (an array bound, an
+    /// enum read from data): what panics behind it depends on that data.
+    unmodeled_branch: bool,
     vars: HashMap<u64, SymExpr>,
     /// Concrete storage addresses flowing through `storage_base_address_const`,
     /// `storage_address_from_base[_and_offset]` and copies, for the storage oracle.
@@ -2966,12 +3170,15 @@ enum CompVal {
     Expr(Option<SymExpr>),
     Struct(Vec<CompVal>),
     Enum(usize, Box<CompVal>),
+    /// The `PanicResult` of a call that was not inlined, with the callee's index.
+    CallResult(usize),
 }
 
 /// The caller's state while an inlined callee runs.
 #[derive(Debug, Clone)]
 struct CallFrame {
     caller_func: usize,
+    caller_serial: u32,
     return_stmt: usize,
     result_ids: Vec<u64>,
     vars: HashMap<u64, SymExpr>,
@@ -2984,28 +3191,81 @@ struct CallFrame {
 /// unrolling; deeper calls are not inlined and their panics count as undecided.
 const MAX_INLINE_FRAMES: usize = 10;
 
+/// Builtin types: values threaded through calls that never carry caller data.
+fn is_builtin_generic(generic_id: &str) -> bool {
+    matches!(
+        generic_id,
+        "RangeCheck" | "RangeCheck96" | "GasBuiltin" | "Bitwise" | "Pedersen" | "Poseidon" | "EcOp" | "SegmentArena"
+            | "System" | "AddMod" | "MulMod" | "Blake"
+    )
+}
+
 /// Name prefix of opaque values that are unknown functions of the parameters.
 const UNKNOWN_PREFIX: &str = "unknown:";
+
+/// Operands of a comparison or a checked operation. When one side has an expression and the
+/// other does not (an environment value: storage, caller, call result), the other becomes an
+/// opaque value so the condition is still recorded; with neither, it is a condition on state.
+fn half_known(a: Option<SymExpr>, b: Option<SymExpr>, lhs_id: u64, rhs_id: u64) -> (Option<SymExpr>, Option<SymExpr>) {
+    match (a, b) {
+        (None, None) => (None, None),
+        (a, b) => (
+            Some(a.unwrap_or_else(|| opaque_var("v", lhs_id))),
+            Some(b.unwrap_or_else(|| opaque_var("v", rhs_id))),
+        ),
+    }
+}
+
+/// A parameter, a constant or an environment value: no arithmetic.
+fn is_raw(e: &SymExpr) -> bool {
+    matches!(e, SymExpr::Param(..) | SymExpr::Const(_) | SymExpr::SymbolicOpaque(_))
+}
+
+/// A test of the inputs themselves (`a < 5`, `x != 0`, `a == b`, which lowers to
+/// `a - b == 0`), as opposed to a condition on a value computed from them.
+fn is_raw_test(c: &SymConstraint) -> bool {
+    match (&c.lhs, c.op, &c.rhs) {
+        (SymExpr::Sub(a, b), CmpOp::Eq | CmpOp::Ne, SymExpr::Const(0))
+        | (SymExpr::Const(0), CmpOp::Eq | CmpOp::Ne, SymExpr::Sub(a, b)) => is_raw(a) && is_raw(b),
+        (l, _, r) => is_raw(l) && is_raw(r),
+    }
+}
 
 fn comp_depends_on_params(c: &CompVal) -> bool {
     match c {
         CompVal::Expr(e) => e.as_ref().is_some_and(|e| e.mentions_param() || e.mentions_unknown()),
         CompVal::Struct(members) => members.iter().any(comp_depends_on_params),
         CompVal::Enum(_, payload) => comp_depends_on_params(payload),
+        CompVal::CallResult(_) => false,
     }
 }
 
-/// Results of a libfunc the engine does not model are unknown functions of its inputs. When an
-/// input depends on the parameters, the results are marked `unknown:<id>`: a constraint on them
-/// cannot confirm a counterexample. Syscall results (storage reads, caller address, call
-/// results) are environment values the caller does not choose, so they stay unmarked.
+/// Libfuncs that compute a number from their inputs: integer, felt252 and bounded-int
+/// arithmetic, conversions and bitwise operations. Libfuncs that take data apart or move it
+/// (structs, enums, arrays, boxes, snapshots) or hash it are not on the list: their results are
+/// pieces of the input the caller chooses freely, or values no solver can invert.
+fn computes_number(gid: &str) -> bool {
+    const FAMILIES: [&str; 15] = [
+        "u8_", "u16_", "u32_", "u64_", "u128_", "u256_", "u512_", "i8_", "i16_", "i32_", "i64_", "i128_", "felt252_",
+        "bounded_int_", "bool_",
+    ];
+    (FAMILIES.iter().any(|f| gid.starts_with(f)) && !gid.starts_with("felt252_dict"))
+        || matches!(gid, "downcast" | "upcast" | "bitwise")
+}
+
+/// Results of a numeric libfunc the engine does not model are unknown functions of its inputs.
+/// When an input depends on the parameters, the results are marked `unknown:<id>`: a constraint
+/// on them cannot confirm a counterexample. Syscall results (storage reads, caller address,
+/// call results) are environment values the caller does not choose, so they stay unmarked.
 fn mark_unknown_results(
     state: &mut SymPathState,
-    gid: &str,
+    lf: &LibfuncMeta,
     inv: &cairo_lang_sierra::program::Invocation,
-    branch: &cairo_lang_sierra::program::BranchInfo,
+    b_idx: usize,
 ) {
-    if gid.ends_with("_syscall") {
+    let gid = lf.generic_id.as_str();
+    let branch = &inv.branches[b_idx];
+    if gid.ends_with("_syscall") || !computes_number(gid) {
         return;
     }
     let depends = inv.args.iter().any(|a| {
@@ -3015,9 +3275,11 @@ fn mark_unknown_results(
     if !depends {
         return;
     }
-    for r in &branch.results {
-        if !state.vars.contains_key(&r.id) && !state.comps.contains_key(&r.id) {
-            state.vars.insert(r.id, SymExpr::SymbolicOpaque(format!("{UNKNOWN_PREFIX}{}", r.id)));
+    // Without the libfunc's signature the builtin results cannot be told apart: mark nothing.
+    let Some(builtins) = lf.builtin_results.get(b_idx) else { return };
+    for (r, is_builtin) in branch.results.iter().zip(builtins) {
+        if !is_builtin && !state.vars.contains_key(&r.id) && !state.comps.contains_key(&r.id) {
+            state.vars.insert(r.id, opaque_var(UNKNOWN_PREFIX, r.id));
         }
     }
 }
@@ -3090,6 +3352,7 @@ fn run_symbolic_verification_for_function(
     max_paths: usize,
     oracle: Option<&StorageOracle>,
     panic_cache: &RefCell<HashMap<usize, Rc<HashSet<u64>>>>,
+    callee_verdicts: &HashMap<usize, String>,
 ) -> SymbolicFunctionProofReport {
     let fname = index.func_name(func_idx);
     let (_, short_name) = extract_contract_and_short_name(&fname);
@@ -3121,6 +3384,8 @@ fn run_symbolic_verification_for_function(
 
     let (_, start, end) = index.func_ranges[func_idx];
     let debug_timing = std::env::var("UC_PROVE_DEBUG_TIMING").is_ok();
+    // `UC_PROVE_DEBUG_PATHS=<substring>` prints every panic path of matching functions.
+    let debug_paths = std::env::var("UC_PROVE_DEBUG_PATHS").ok();
     let phase_started = std::time::Instant::now();
     let panic_vars = panic_vars_cached(index, summaries, panic_cache, func_idx);
     let _ = (start, end);
@@ -3172,6 +3437,11 @@ fn run_symbolic_verification_for_function(
         frames: Vec::new(),
         comps: HashMap::new(),
         unknown_panic: false,
+        frame_serial: 0,
+        next_serial: 0,
+        unknown_reason: None,
+        guarded_callee: false,
+        unmodeled_branch: false,
         vars: initial_vars,
         storage_addrs: HashMap::new(),
         var_max: initial_var_max,
@@ -3199,6 +3469,7 @@ fn run_symbolic_verification_for_function(
     // every pending fork of a looping function alive (gigabytes for one Ekubo function).
     let pending_cap = max_paths.saturating_mul(4).max(64);
     while let Some(mut state) = queue.pop_back() {
+        FRAME_SERIAL.with(|f| f.set(state.frame_serial));
         if explored_paths >= max_paths || function_started.elapsed() > function_budget {
             exploration_truncated = true;
             break;
@@ -3233,6 +3504,8 @@ fn run_symbolic_verification_for_function(
                         state.storage_addrs = frame.storage_addrs;
                         state.comps = frame.comps;
                         state.cur_func = frame.caller_func;
+                        state.frame_serial = frame.caller_serial;
+                        FRAME_SERIAL.with(|f| f.set(state.frame_serial));
                         for (rid, val) in frame.result_ids.iter().zip(vals) {
                             assign_val(&mut state, *rid, val);
                         }
@@ -3266,24 +3539,6 @@ fn run_symbolic_verification_for_function(
                                 param_bounds.len()
                             );
                         }
-                        if KEEP_OBLIGATIONS.load(std::sync::atomic::Ordering::Relaxed) {
-                            obligations.push(PathObligation {
-                            expected: match &verdict {
-                                SolverOutcome::Unsat => "unsat",
-                                SolverOutcome::Sat(_) => "sat",
-                                SolverOutcome::Unknown => "unknown",
-                            },
-                            constraints: meaningful_constraints.clone(),
-                            witness: match &verdict {
-                                SolverOutcome::Sat(w) => Some(w.clone()),
-                                _ => None,
-                            },
-                            reason: meaningful_constraints
-                                .last()
-                                .map(|c| c.reason.clone())
-                                .unwrap_or_else(|| "panic path".to_string()),
-                            });
-                        }
                         // A witness from the solver covers the constraints it could evaluate; it
                         // only proves the panic if every path constraint that depends on the
                         // parameters holds for it (constraints on state alone are guards).
@@ -3296,10 +3551,50 @@ fn run_symbolic_verification_for_function(
                                     || c.rhs.mentions_unknown()),
                             })
                         };
+                        if KEEP_OBLIGATIONS.load(std::sync::atomic::Ordering::Relaxed) {
+                            // A witness the engine cannot confirm (it needs a value of state or
+                            // of an unmodeled computation) is not a decision: export `unknown`.
+                            let confirmed_witness = match &verdict {
+                                SolverOutcome::Sat(w) if witness_confirmed(w) => Some(w.clone()),
+                                _ => None,
+                            };
+                            obligations.push(PathObligation {
+                            expected: match (&verdict, &confirmed_witness) {
+                                (SolverOutcome::Unsat, _) => "unsat",
+                                (SolverOutcome::Sat(_), Some(_)) => "sat",
+                                _ => "unknown",
+                            },
+                            constraints: meaningful_constraints.clone(),
+                            witness: confirmed_witness,
+                            reason: meaningful_constraints
+                                .last()
+                                .map(|c| c.reason.clone())
+                                .unwrap_or_else(|| "panic path".to_string()),
+                            });
+                        }
                         let verdict = match verdict {
                             SolverOutcome::Sat(_) if state.unknown_panic => SolverOutcome::Unknown,
                             other => other,
                         };
+                        if debug_paths.as_deref().is_some_and(|f| fname.contains(f)) {
+                            let confirmed = match &verdict { SolverOutcome::Sat(w) => Some(witness_confirmed(w)), _ => None };
+                            eprintln!(
+                                "prove path: {fname} verdict={} confirmed={confirmed:?} computation={} unknown_panic={} ({}) meaningful={}",
+                                match &verdict { SolverOutcome::Unsat => "unsat", SolverOutcome::Sat(_) => "sat", SolverOutcome::Unknown => "unknown" },
+                                state.performed_computation,
+                                state.unknown_panic,
+                                state.unknown_reason.as_deref().unwrap_or("-"),
+                                meaningful_constraints.len()
+                            );
+                            let witness = match &verdict { SolverOutcome::Sat(w) => Some(w.clone()), _ => None };
+                            if let Some(w) = &witness {
+                                eprintln!("    witness {w:?}");
+                            }
+                            for c in &state.constraints {
+                                let holds = witness.as_ref().map(|w| c.eval(w));
+                                eprintln!("    {} [{}] holds={holds:?}", c.reason, if meaningful_constraints.contains(c) { "meaningful" } else { "dropped" });
+                            }
+                        }
                         match verdict {
                             SolverOutcome::Unsat => {
                                 unreachable_panic_paths += 1;
@@ -3311,17 +3606,41 @@ fn run_symbolic_verification_for_function(
                                 if has_overflow {
                                     proven_overflow_free = false;
                                 }
-                                let is_precondition_guard = meaningful_constraints.is_empty()
-                                    || (!state.performed_computation
+                                // A panic behind tests of the inputs themselves is a precondition the
+                                // caller must meet; one that depends only on state is a state guard;
+                                // an overflow in a helper is a precondition on its caller.
+                                let on_params: Vec<&SymConstraint> = meaningful_constraints
+                                    .iter()
+                                    .filter(|c| c.lhs.mentions_param() || c.rhs.mentions_param())
+                                    .collect();
+                                let state_dependent = state.constraints.len() > meaningful_constraints.len();
+                                // A witness that holds once state (storage, caller, call results)
+                                // takes suitable values is a state guard; one blocked by a value
+                                // computed from the parameters, or contradicted, is undecided.
+                                let blocked_by_state = !confirmed
+                                    && state.constraints.iter().all(|c| match c.eval(&witness) {
+                                        Some(holds) => holds,
+                                        None => !(c.lhs.mentions_unknown() || c.rhs.mentions_unknown()),
+                                    });
+                                let is_precondition_guard = state.guarded_callee
+                                    || blocked_by_state
+                                    || (on_params.is_empty()
+                                    && (state_dependent || state.unmodeled_branch || meaningful_constraints.is_empty()))
+                                    || (!on_params.is_empty()
+                                        && on_params.iter().all(|c| is_raw_test(c))
                                         && !has_overflow
-                                        && !is_test_or_property
-                                        && !summaries[func_idx].is_recursive_loop)
+                                        && !is_test_or_property)
                                     || (has_overflow && !params_externally_controlled);
 
                                 if !confirmed && !is_precondition_guard {
+                                    if debug_paths.as_deref().is_some_and(|f| fname.contains(f)) {
+                                        eprintln!("prove undecided: {fname} cause=unconfirmed-witness");
+                                    }
                                     undecided_panic_paths += 1;
                                 } else if is_precondition_guard {
-                                    let pre = if meaningful_constraints.is_empty() {
+                                    let pre = if state.guarded_callee {
+                                        "callee_guard".to_string()
+                                    } else if meaningful_constraints.is_empty() {
                                         "caller_auth_or_calldata_guard".to_string()
                                     } else {
                                         meaningful_constraints
@@ -3351,6 +3670,10 @@ fn run_symbolic_verification_for_function(
                                 }
                             }
                             SolverOutcome::Unknown => {
+                                if debug_paths.as_deref().is_some_and(|f| fname.contains(f)) {
+                                    let cause = state.unknown_reason.as_deref().unwrap_or("solver gave up");
+                                    eprintln!("prove undecided: {fname} cause={}", cause.split(" at #").next().unwrap_or(cause));
+                                }
                                 undecided_panic_paths += 1;
                             }
                         }
@@ -3390,6 +3713,7 @@ fn run_symbolic_verification_for_function(
                                     };
                                     let frame = CallFrame {
                                         caller_func: state.cur_func,
+                                        caller_serial: state.frame_serial,
                                         return_stmt,
                                         result_ids: branch.results.iter().map(|r| r.id).collect(),
                                         vars: std::mem::take(&mut state.vars),
@@ -3398,6 +3722,9 @@ fn run_symbolic_verification_for_function(
                                         comps: std::mem::take(&mut state.comps),
                                     };
                                     state.frames.push(Rc::new(frame));
+                                    state.next_serial += 1;
+                                    state.frame_serial = state.next_serial;
+                                    FRAME_SERIAL.with(|f| f.set(state.frame_serial));
                                     for (i, p) in callee_fn.params.iter().enumerate() {
                                         assign_val(&mut state, p.id.id, arg_vals[i].clone());
                                         let ty_max = sierra_type_max(index, &p.ty);
@@ -3414,10 +3741,14 @@ fn run_symbolic_verification_for_function(
                                     continue;
                                 }
                             }
-                            // Not inlined: the results stay unknown.
+                            // Not inlined: the results stay unknown, and the `PanicResult` remembers
+                            // its callee so the callee's verdict can decide the `Err` branch.
                             for r in &branch.results {
                                 state.vars.remove(&r.id);
                                 state.comps.remove(&r.id);
+                            }
+                            if let (Some(cidx), Some(last)) = (callee, branch.results.last()) {
+                                state.comps.insert(last.id, CompVal::CallResult(cidx));
                             }
                         } else if gid == "struct_construct" {
                             if let Some(res) = branch.results.first() {
@@ -3497,12 +3828,12 @@ fn run_symbolic_verification_for_function(
                                 .vars
                                 .get(&lhs_id)
                                 .cloned()
-                                .unwrap_or_else(|| SymExpr::SymbolicOpaque(format!("v{lhs_id}")));
+                                .unwrap_or_else(|| opaque_var("v", lhs_id));
                             let b = state
                                 .vars
                                 .get(&rhs_id)
                                 .cloned()
-                                .unwrap_or_else(|| SymExpr::SymbolicOpaque(format!("v{rhs_id}")));
+                                .unwrap_or_else(|| opaque_var("v", rhs_id));
                             if let Some(r) = branch.results.last() {
                                 let expr = if gid.ends_with("_wide_mul") || gid == "bounded_int_mul" {
                                     SymExpr::Mul(Box::new(a), Box::new(b))
@@ -3548,17 +3879,16 @@ fn run_symbolic_verification_for_function(
                                 .vars
                                 .get(&lhs_id)
                                 .cloned()
-                                .unwrap_or_else(|| SymExpr::SymbolicOpaque(format!("v{lhs_id}")));
+                                .unwrap_or_else(|| opaque_var("v", lhs_id));
                             let b = state
                                 .vars
                                 .get(&rhs_id)
                                 .cloned()
-                                .unwrap_or_else(|| SymExpr::SymbolicOpaque(format!("v{rhs_id}")));
+                                .unwrap_or_else(|| opaque_var("v", rhs_id));
                             if let Some(r) = branch.results.last() {
                                 state
                                     .vars
                                     .insert(r.id, cap_sym_expr(SymExpr::Sub(Box::new(a), Box::new(b)), r.id));
-                                state.performed_computation = true;
                             }
                         } else if gid.ends_with("_safe_divmod") && inv.args.len() >= 2 {
                             let lhs_id = inv.args[inv.args.len() - 2].id;
@@ -3567,12 +3897,12 @@ fn run_symbolic_verification_for_function(
                                 .vars
                                 .get(&lhs_id)
                                 .cloned()
-                                .unwrap_or_else(|| SymExpr::SymbolicOpaque(format!("v{lhs_id}")));
+                                .unwrap_or_else(|| opaque_var("v", lhs_id));
                             let b = state
                                 .vars
                                 .get(&rhs_id)
                                 .cloned()
-                                .unwrap_or_else(|| SymExpr::SymbolicOpaque(format!("v{rhs_id}")));
+                                .unwrap_or_else(|| opaque_var("v", rhs_id));
                             if branch.results.len() >= 3 {
                                 let type_max = lf.type_args.first().and_then(|t| sierra_type_max(index, t))
                                     .or_else(|| {
@@ -3594,7 +3924,7 @@ fn run_symbolic_verification_for_function(
                             }
                         }
 
-                        mark_unknown_results(&mut state, gid, inv, branch);
+                        mark_unknown_results(&mut state, lf, inv, 0);
                         state.stmt_idx = match branch.target {
                             BranchTarget::Fallthrough => state.stmt_idx + 1,
                             BranchTarget::Statement(s) => s.0,
@@ -3621,6 +3951,44 @@ fn run_symbolic_verification_for_function(
                                 }
                             }
                         }
+                        // A call that was not inlined: the callee's verdict, when there is one,
+                        // decides its `Err` branch. A proven callee cannot panic; a guarded one
+                        // panics only behind its own guards.
+                        if gid == "enum_match" && lf.is_panic_result_enum {
+                            let verdict = match inv.args.last().map(|a| val_of(&state, a.id)) {
+                                Some(CompVal::CallResult(cidx)) => callee_verdicts.get(&cidx).map(String::as_str),
+                                _ => None,
+                            };
+                            if let Some(verdict @ ("PROVEN_SAFE" | "GUARDED_SAFE" | "BOUNDED_SAFE")) = verdict {
+                                if verdict != "PROVEN_SAFE" {
+                                    if let Some(err_branch) = inv.branches.get(1) {
+                                        let mut child = state.clone();
+                                        child.stmt_idx = match err_branch.target {
+                                            BranchTarget::Fallthrough => state.stmt_idx + 1,
+                                            BranchTarget::Statement(s) => s.0,
+                                        };
+                                        child.depth += 1;
+                                        child.guarded_callee = true;
+                                        if queue.len() < pending_cap {
+                                            queue.push_back(child);
+                                        } else {
+                                            exploration_truncated = true;
+                                        }
+                                    }
+                                }
+                                let ok_branch = &inv.branches[0];
+                                for r in &ok_branch.results {
+                                    state.vars.remove(&r.id);
+                                    state.comps.remove(&r.id);
+                                }
+                                state.stmt_idx = match ok_branch.target {
+                                    BranchTarget::Fallthrough => state.stmt_idx + 1,
+                                    BranchTarget::Statement(s) => s.0,
+                                };
+                                state.depth += 1;
+                                continue;
+                            }
+                        }
                         // The result of a call that was not inlined: its `Ok` branch continues, and
                         // its `Err` branch is a panic whose condition is unknown.
                         let cur_panic_vars = if state.cur_func == func_idx {
@@ -3640,6 +4008,7 @@ fn run_symbolic_verification_for_function(
                                 };
                                 child.depth += 1;
                                 child.unknown_panic = true;
+                                child.unknown_reason = Some(Rc::from(format!("{} at #{} (callee not inlined)", lf.debug_name, state.stmt_idx)));
                                 if queue.len() < pending_cap {
                                     queue.push_back(child);
                                 } else {
@@ -3748,7 +4117,7 @@ fn run_symbolic_verification_for_function(
                                 let rhs_id = inv.args[inv.args.len() - 1].id;
                                 let a = state.vars.get(&lhs_id).cloned();
                                 let b = state.vars.get(&rhs_id).cloned();
-                                if let (Some(lhs), Some(rhs)) = (a, b) {
+                                if let (Some(lhs), Some(rhs)) = half_known(a, b, lhs_id, rhs_id) {
                                     let op = if b_idx == 0 { CmpOp::Ne } else { CmpOp::Eq };
                                     child.constraints.push(SymConstraint {
                                         lhs: lhs.clone(),
@@ -3767,7 +4136,7 @@ fn run_symbolic_verification_for_function(
                                 let rhs_id = inv.args[inv.args.len() - 1].id;
                                 let a = state.vars.get(&lhs_id).cloned();
                                 let b = state.vars.get(&rhs_id).cloned();
-                                if let (Some(lhs), Some(rhs)) = (a, b) {
+                                if let (Some(lhs), Some(rhs)) = half_known(a, b, lhs_id, rhs_id) {
                                     let op = if b_idx == 0 { CmpOp::Ge } else { CmpOp::Lt };
                                     child.constraints.push(SymConstraint {
                                         lhs: lhs.clone(),
@@ -3786,7 +4155,7 @@ fn run_symbolic_verification_for_function(
                                 let rhs_id = inv.args[inv.args.len() - 1].id;
                                 let a = state.vars.get(&lhs_id).cloned();
                                 let b = state.vars.get(&rhs_id).cloned();
-                                if let (Some(lhs), Some(rhs)) = (a, b) {
+                                if let (Some(lhs), Some(rhs)) = half_known(a, b, lhs_id, rhs_id) {
                                     let op = if b_idx == 0 { CmpOp::Gt } else { CmpOp::Le };
                                     child.constraints.push(SymConstraint {
                                         lhs: lhs.clone(),
@@ -3806,6 +4175,11 @@ fn run_symbolic_verification_for_function(
                                 let ty_prefix = gid.split('_').next().unwrap_or("u128");
                                 let max_val = max_bound_for_sierra_type(ty_prefix);
                                 if let Some(arg_expr) = state.vars.get(&arg_id).cloned() {
+                                    // Narrowing a computed felt252 (`(a - b).try_into()`) is
+                                    // arithmetic; an equality test (`a - b` then `is_zero`) is not.
+                                    if !matches!(arg_expr, SymExpr::Param(..) | SymExpr::Const(_) | SymExpr::SymbolicOpaque(_)) {
+                                        child.performed_computation = true;
+                                    }
                                     // A negative integer reading is a field element above every
                                     // integer type, so it lands on the failure branch too.
                                     let negative_possible = arg_expr.may_be_negative();
@@ -3833,7 +4207,7 @@ fn run_symbolic_verification_for_function(
                                                 "{gid}({}) branch 1: negative, wraps above the type",
                                                 arg_expr.format_human()
                                             ),
-                                            is_overflow_branch: false,
+                                            is_overflow_branch: !is_raw(&arg_expr),
                                         });
                                         if queue.len() < pending_cap {
                                             queue.push_back(below);
@@ -3847,7 +4221,7 @@ fn run_symbolic_verification_for_function(
                                         op,
                                         rhs: SymExpr::Const(max_val),
                                         reason: format!("{gid}({}) branch {b_idx}", arg_expr.format_human()),
-                                        is_overflow_branch: false,
+                                        is_overflow_branch: b_idx == 1 && !is_raw(&arg_expr),
                                     });
                                 } else if b_idx == 0 {
                                     if let Some(res_var) = branch.results.last() {
@@ -3907,7 +4281,7 @@ fn run_symbolic_verification_for_function(
                                 let b = state.vars.get(&rhs_id).cloned();
                                 let ty_prefix = gid.split('_').next().unwrap_or("u128");
                                 let max_val = max_bound_for_sierra_type(ty_prefix);
-                                if let (Some(lhs), Some(rhs)) = (a, b) {
+                                if let (Some(lhs), Some(rhs)) = half_known(a, b, lhs_id, rhs_id) {
                                     let sum_expr = cap_sym_expr(
                                         SymExpr::Add(Box::new(lhs.clone()), Box::new(rhs.clone())),
                                         branch.results.last().map(|r| r.id).unwrap_or(0),
@@ -3934,7 +4308,7 @@ fn run_symbolic_verification_for_function(
                                 let rhs_id = inv.args[inv.args.len() - 1].id;
                                 let a = state.vars.get(&lhs_id).cloned();
                                 let b = state.vars.get(&rhs_id).cloned();
-                                if let (Some(lhs), Some(rhs)) = (a, b) {
+                                if let (Some(lhs), Some(rhs)) = half_known(a, b, lhs_id, rhs_id) {
                                     let diff_expr = cap_sym_expr(
                                         SymExpr::Sub(Box::new(lhs.clone()), Box::new(rhs.clone())),
                                         branch.results.last().map(|r| r.id).unwrap_or(0),
@@ -3952,17 +4326,27 @@ fn run_symbolic_verification_for_function(
                                             lhs.format_human(),
                                             rhs.format_human()
                                         ),
-                                        is_overflow_branch: b_idx == 1 && state.performed_computation,
+                                        is_overflow_branch: b_idx == 1 && !(is_raw(&lhs) && is_raw(&rhs)),
                                     });
                                 }
                             }
 
-                            // A branch whose condition the engine could not express is not
-                            // unconstrained: whatever panics behind it has an unknown condition.
-                            if condition_libfunc && child.constraints.len() == constraints_before {
-                                child.unknown_panic = true;
+                            // A branch the engine could not express on values computed from the
+                            // parameters is not unconstrained: whatever panics behind it has an
+                            // unknown condition. On environment values (storage, caller, call
+                            // results; they carry no expression) it is a state guard.
+                            let on_parameters = inv.args.iter().any(|a| {
+                                state.vars.get(&a.id).is_some_and(|e| e.mentions_param() || e.mentions_unknown())
+                                    || state.comps.get(&a.id).is_some_and(comp_depends_on_params)
+                            });
+                            if child.constraints.len() == constraints_before {
+                                child.unmodeled_branch = true;
                             }
-                            mark_unknown_results(&mut child, gid, inv, branch);
+                            if condition_libfunc && on_parameters && child.constraints.len() == constraints_before {
+                                child.unknown_panic = true;
+                                child.unknown_reason = Some(Rc::from(format!("{} at #{} branch {b_idx} (condition not modeled)", lf.debug_name, state.stmt_idx)));
+                            }
+                            mark_unknown_results(&mut child, lf, inv, b_idx);
                             if queue.len() >= pending_cap {
                                 exploration_truncated = true;
                                 continue;
@@ -4025,6 +4409,33 @@ fn run_symbolic_verification_for_function(
 }
 
 /// Runs formal verification + Caracal Sierra IR analysis directly on an in-memory `Program`.
+/// `roots` and every function they call, transitively, each after the functions it calls (a
+/// cycle, as a loop is, is cut where it closes).
+fn callees_first(summaries: &[FunctionInterprocSummary], roots: &[usize]) -> Vec<usize> {
+    let mut order = Vec::new();
+    let mut seen = vec![false; summaries.len()];
+    for &root in roots {
+        if seen[root] {
+            continue;
+        }
+        seen[root] = true;
+        let mut stack = vec![(root, 0usize)];
+        while let Some((f, next)) = stack.pop() {
+            match summaries[f].call_sites.get(next) {
+                Some(&(callee, _)) => {
+                    stack.push((f, next + 1));
+                    if !seen[callee] {
+                        seen[callee] = true;
+                        stack.push((callee, 0));
+                    }
+                }
+                None => order.push(f),
+            }
+        }
+    }
+    order
+}
+
 pub(crate) fn analyze_sierra_program(
     program: &Program,
     crate_name: &str,
@@ -4043,32 +4454,34 @@ pub(crate) fn analyze_sierra_program(
         Vec::new()
     };
 
-    let mut symbolic_proofs = Vec::new();
     let panic_cache: RefCell<HashMap<usize, Rc<HashSet<u64>>>> = RefCell::new(HashMap::new());
-    for func_idx in 0..program.funcs.len() {
-        let fname = index.func_name(func_idx);
-        if !fname.starts_with(&format!("{crate_name}::")) {
-            continue;
-        }
-        if let Some(f) = filter {
-            if !fname.contains(f) {
-                continue;
+    let roots: Vec<usize> = (0..program.funcs.len())
+        .filter(|&func_idx| {
+            let fname = index.func_name(func_idx);
+            if !fname.starts_with(&format!("{crate_name}::")) || filter.is_some_and(|f| !fname.contains(f)) {
+                return false;
             }
-        }
-        // `#[test]`/`#[fuzzer]` bodies deploy contracts and use cheatcodes the symbolic engine
-        // does not model; `uc test` runs them concretely. Only property-style functions
-        // (`prove_*`, `invariant_*`, `check_*`) are symbolic targets.
-        let (_, short) = extract_contract_and_short_name(&fname);
-        let is_plain_test = (fname.contains("::tests::") || short.starts_with("test_"))
-            && !(short.starts_with("prove_") || short.starts_with("invariant_") || short.starts_with("check_"));
-        if is_plain_test {
-            continue;
-        }
+            // `#[test]`/`#[fuzzer]` bodies deploy contracts and use cheatcodes the symbolic engine
+            // does not model; `uc test` runs them concretely. Only property-style functions
+            // (`prove_*`, `invariant_*`, `check_*`) are symbolic targets.
+            let (_, short) = extract_contract_and_short_name(&fname);
+            let is_plain_test = (fname.contains("::tests::") || short.starts_with("test_"))
+                && !(short.starts_with("prove_") || short.starts_with("invariant_") || short.starts_with("check_"));
+            !is_plain_test
+        })
+        .collect();
+    // Callees before callers, so a call the engine does not inline is decided by the verdict the
+    // callee already has; functions outside the crate are analysed for that and not reported.
+    let root_set: HashSet<usize> = roots.iter().copied().collect();
+    let mut verdicts: HashMap<usize, String> = HashMap::new();
+    let mut reports: HashMap<usize, SymbolicFunctionProofReport> = HashMap::new();
+    for func_idx in callees_first(&summaries, &roots) {
+        let fname = index.func_name(func_idx);
         let started = std::time::Instant::now();
         if std::env::var("UC_PROVE_DEBUG_TIMING").is_ok() {
             eprintln!("prove start: {fname}");
         }
-        let proof = run_symbolic_verification_for_function(&index, &summaries, func_idx, max_depth, max_paths, oracle, &panic_cache);
+        let proof = run_symbolic_verification_for_function(&index, &summaries, func_idx, max_depth, max_paths, oracle, &panic_cache, &verdicts);
         if std::env::var("UC_PROVE_DEBUG_TIMING").is_ok() {
             let ms = started.elapsed().as_secs_f64() * 1000.0;
             if ms > 100.0 {
@@ -4078,8 +4491,12 @@ pub(crate) fn analyze_sierra_program(
                 );
             }
         }
-        symbolic_proofs.push(proof);
+        verdicts.insert(func_idx, proof.status.clone());
+        if root_set.contains(&func_idx) {
+            reports.insert(func_idx, proof);
+        }
     }
+    let symbolic_proofs = roots.iter().filter_map(|f| reports.remove(f)).collect();
 
     (symbolic_proofs, caracal_findings)
 }
@@ -5704,6 +6121,31 @@ pub(crate) fn run_prove(args: ProveArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn linear_bounds_round_toward_the_integer_solutions() {
+        use super::*;
+        // 2p - 255 <= 0  ->  p <= 127;  2p > 0  ->  p >= 1;  3p - 7 < 0  ->  p <= 2;  -2p + 9 >= 0  ->  p <= 4
+        assert_eq!(linear_bound(2, -255, CmpOp::Le), Some((CmpOp::Le, 127)));
+        assert_eq!(linear_bound(2, 0, CmpOp::Gt), Some((CmpOp::Ge, 1)));
+        assert_eq!(linear_bound(3, -7, CmpOp::Lt), Some((CmpOp::Le, 2)));
+        assert_eq!(linear_bound(-2, 9, CmpOp::Ge), Some((CmpOp::Le, 4)));
+        // 2p - 7 == 0 has no integer solution; 2p - 8 == 0 has p = 4.
+        assert_eq!(linear_bound(2, -7, CmpOp::Eq), Some((CmpOp::Lt, i128::MIN)));
+        assert_eq!(linear_bound(2, -8, CmpOp::Eq), Some((CmpOp::Eq, 4)));
+        // The betshare loop: p0 + 2 > 255, p0 < 2·p1 - 1, 2·p1 <= 255 is unsatisfiable over u8.
+        let p0 = SymExpr::Param(0, "a".into());
+        let p1 = SymExpr::Param(1, "b".into());
+        let two_p1 = SymExpr::Mul(Box::new(p1.clone()), Box::new(SymExpr::Const(2)));
+        let mk = |lhs: SymExpr, op, rhs: SymExpr| SymConstraint { lhs, op, rhs, reason: String::new(), is_overflow_branch: false };
+        let constraints = vec![
+            mk(two_p1.clone(), CmpOp::Le, SymExpr::Const(255)),
+            mk(p0.clone(), CmpOp::Lt, SymExpr::Sub(Box::new(two_p1), Box::new(SymExpr::Const(1)))),
+            mk(SymExpr::Add(Box::new(p0), Box::new(SymExpr::Const(2))), CmpOp::Gt, SymExpr::Const(255)),
+        ];
+        let bounds = vec![("a".to_string(), 0, 255), ("b".to_string(), 0, 255)];
+        assert!(matches!(solve_path_constraints(&bounds, &constraints), SolverOutcome::Unsat));
+    }
+
+    #[test]
     fn smt_export_renders_bounds_obligations_and_witness_blocks() {
         use super::*;
         let p0 = SymExpr::Param(0, "amount".to_string());
@@ -6147,6 +6589,35 @@ pub fn checked_never_panics(a: u8, b: u8) -> u8 {
         Option::None => 0,
     }
 }
+// The loop grows `acc`'s expression past the engine's size cap; the capped value is still a
+// function of the parameters, so the never-failing `try_into` must not become a counterexample.
+pub fn p1800(a: u8) -> u8 {
+    let mut acc: u8 = (a ^ a);
+    let mut i: u32 = 0;
+    while i < 4 {
+        acc = ({ let fa: felt252 = (acc).into(); let fb: felt252 = (acc).into(); let n: u8 = (fa - fb).try_into().unwrap(); n }) & (128_u8 | acc);
+        i += 1;
+    }
+    0_u8
+}
+// `a != 0` is a test of the input, a precondition, not a bug.
+pub fn rejects_zero(a: felt252) -> felt252 {
+    assert(a != 0, 'zero');
+    a
+}
+// Twenty iterations are deeper than the engine inlines: the caller takes the loop's own verdict.
+fn sum_below(n: u32) -> u64 {
+    let mut i: u32 = 0;
+    let mut total: u64 = 0;
+    while i < n {
+        total += i.into();
+        i += 1;
+    }
+    total
+}
+pub fn sum_below_twenty() -> u64 {
+    sum_below(20)
+}
 "#).unwrap();
         let (comp, _, _) = compile_or_load_native_tests(&root.join("Scarb.toml"), &root, "regress", "regress", &[], true).expect("compile");
         let (proofs, _) = analyze_sierra_program(&comp.sierra_program.program, "regress", None, 1024, 1024, false, None);
@@ -6173,6 +6644,9 @@ pub fn checked_never_panics(a: u8, b: u8) -> u8 {
         assert_ne!(proof("masked_never_overflows").status, "COUNTEREXAMPLE_FOUND");
         assert!(witness("narrow")[0] > 255);
         assert_eq!(proof("checked_never_panics").status, "PROVEN_SAFE");
+        assert_ne!(proof("p1800").status, "COUNTEREXAMPLE_FOUND", "{:?}", proof("p1800"));
+        assert_eq!(proof("rejects_zero").status, "GUARDED_SAFE", "{:?}", proof("rejects_zero"));
+        assert!(matches!(proof("sum_below_twenty").status.as_str(), "PROVEN_SAFE" | "GUARDED_SAFE" | "BOUNDED_SAFE"), "{:?}", proof("sum_below_twenty"));
     }
 
     #[test]

@@ -66,11 +66,14 @@ verification record, and `uc verify-onchain --submit` writes it.
   `--fail-on-findings`). Exit `1`: compilation error, test failure, lint error, upgrade
   regression, or a counterexample under `--fail-on-findings`.
 - `uc prove` statuses per Sierra function: `PROVEN_SAFE` (every panic path explored, none
-  satisfiable), `GUARDED_SAFE` (panics only behind caller or calldata guards),
+  satisfiable), `GUARDED_SAFE` (panics only behind tests of the inputs, conditions on state, or
+  a callee's guards),
   `COUNTEREXAMPLE_FOUND` (inputs in `counterexample`, wrapper calldata in
   `counterexample_calldata`; `concrete_verified` true when the replay panicked for the predicted
   reason, false when it returned or hit an unrelated assertion), `BOUNDED_SAFE` (depth or path
-  budget hit, nothing found), `UNDECIDED` (a panic path the solver could not decide).
+  budget hit, nothing found), `UNDECIDED` (a panic path the solver could not decide, or behind
+  a callee that is itself undecided). Calls are inlined ten frames deep; a call that is not
+  inlined takes the callee's verdict (callees are analysed first).
   `exploration_truncated` says whether `--max-depth` / `--max-paths` (both 1024) were hit.
   Counterexamples are reported only where the caller chooses the values (entry surface,
   property functions); bound-hitting overflows inside internal helpers and loop bodies are

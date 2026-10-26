@@ -66,9 +66,9 @@ programs with an exact Python model of their semantics and compares uc with the 
 
 **Real bytecode.** `benchmarks/scripts/run_mainnet_audit.py` fetches 20 well-known mainnet
 classes over JSON-RPC and audits them with no source: 16 are Sierra classes (4 are Cairo 0 or
-misaddressed), 2,843 functions analysed, 23 reachable-panic witnesses, 92 detector findings
-(`mainnet-audit-20261025-224629.json`, 118 s on a machine at load average 60; the same run took 32 s
-earlier in the day at lower load). Each function gets a 15 s budget, 1024 statements per path and
+misaddressed). It analyses 2,843 functions and reports 92 detector findings and 6
+reachable-panic witnesses (`mainnet-audit-20261026-063241.json`, 32 s). The witnesses were 23
+before callees were inlined and callee verdicts used. Each function gets a 15 s budget, 1024 statements per path and
 1024 paths; the explorer is depth-first with a bounded pending set, so the largest class in the
 corpus (Ekubo core, 208 functions) peaks below 50 MB. Results are written to
 `benchmarks/results/`. They are a measurement of the prover, not a security review of those
@@ -158,7 +158,9 @@ trace measurement.
 1024 statements per path and `--max-paths` 1024 paths per function) and classifies it:
 
 - `PROVEN_SAFE`: every panic path was explored and none is satisfiable.
-- `GUARDED_SAFE`: panics exist only behind caller or calldata guards (`assert`, auth checks).
+- `GUARDED_SAFE`: panics exist only behind guards. These are tests of the inputs themselves
+  (`assert(amount <= cap)`, a zero-address check), conditions on state (a storage value, the
+  caller), or the guards of a function it calls.
 - `COUNTEREXAMPLE_FOUND`: a concrete input reaches a panic after arithmetic. The witness is in
   the JSON as parameter values and as `counterexample_calldata` (wrapper calldata, `u256` as
   low and high), `--emit-repro tests/repro.cairo` writes it as a `#[should_panic]` test, and
@@ -168,7 +170,15 @@ trace measurement.
   not have).
 - `BOUNDED_SAFE`: no explored panic path is satisfiable, but the depth or path budget was hit.
 - `UNDECIDED`: a panic path the in-process solver could neither satisfy nor refute (its witness
-  search is capped at 20,000 partial assignments per path).
+  search is capped at 20,000 partial assignments per path), one whose witness needs a value the
+  engine computes but does not model, or one behind a call whose own verdict is undecided.
+
+Calls are inlined up to ten frames deep, so loops, which Cairo lowers to recursive functions,
+unroll that far. A call the engine does not inline takes the verdict the callee already has:
+callees are analysed first. A `PROVEN_SAFE` callee cannot panic there, and a `GUARDED_SAFE` one
+panics only behind its own guards. The solver reasons about linear constraints
+(`c·x + k op 0`, however the sums nest), so loop counters near a type's bound are decided
+rather than left open.
 
 A counterexample is only reported where the caller chooses the values: entry points,
 constructors, handlers, property functions and uncalled functions. In an internal helper or a
@@ -193,8 +203,10 @@ that appeared or disappeared relative to the previous class. State lives in
 with every panic path's constraints as a `(check-sat)` obligation and the verdict uc expects
 (`unsat` for an unreachable panic, `sat` plus a pinned witness for a counterexample), and
 `obligations.json` listing them. `benchmarks/scripts/check_smt_obligations.py --dir target/smt`
-runs z3 or cvc5 over the files and reports every disagreement. On 2026-10-25 z3 agreed with uc on
-all 838 obligations of erc8004 and all 1,568 of the deployed STRK token class. The obligations
+runs z3 or cvc5 over the files and reports every disagreement. On 2026-10-26 z3 checked
+102,344 obligations from erc8004, betshare and the deployed STRK class and disagreed with
+none. It agreed with all 94,490 that uc decided; the other 7,854 are paths uc leaves
+undecided or decides only up to state, exported as `unknown`. The obligations
 cover the numeric path constraints uc reasons about; values uc treats as opaque (storage reads,
 call results) are free constants in the files, so agreement checks the solver, not the model.
 
@@ -323,7 +335,7 @@ the upgrade `UPGRADE_UNSAFE`; `uc declare` then refuses to build the transaction
 ```bash
 cargo build --release           # ~5 min cold, incremental afterwards (nightly from rust-toolchain)
 cargo +stable build --release   # what the release workflow builds; verified 2026-10-25 (8 min)
-cargo test --release            # 505 tests; run them alone, a concurrent uc process sharing ~/.uc/cache makes three flaky
+cargo test --release            # 518 tests; run them alone, a concurrent uc process sharing ~/.uc/cache makes three flaky
 python3 benchmarks/scripts/run_head_to_head.py --uc target/release/uc --project <dir> ...
 python3 benchmarks/scripts/run_mainnet_audit.py --uc target/release/uc
 ```
