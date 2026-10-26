@@ -26,6 +26,8 @@ native-compile = [
   "dep:rayon",
   "dep:scarb-stable-hash",
   "dep:starknet-types-core",
+  "dep:cairo-lang-sierra-to-casm",
+  "dep:cairo-lang-sierra-type-size",
 ]
 native-test-runner = [
   "native-compile",
@@ -50,6 +52,7 @@ cairo-lang-runner = { workspace = true, optional = true }
 cairo-lang-semantic = { workspace = true, optional = true }
 cairo-lang-sierra = { workspace = true, optional = true }
 cairo-lang-sierra-to-casm = { workspace = true, optional = true }
+cairo-lang-sierra-type-size = { workspace = true, optional = true }
 cairo-lang-starknet = { workspace = true, optional = true }
 cairo-lang-starknet-classes = { workspace = true, optional = true }
 cairo-lang-syntax = { workspace = true, optional = true }

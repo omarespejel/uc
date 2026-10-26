@@ -28,6 +28,7 @@ cairo-lang-syntax = "2.18.0"
 cairo-lang-test-plugin = "2.18.0"
 cairo-lang-runner = "2.18.0"
 cairo-lang-sierra-to-casm = "2.18.0"
+cairo-lang-sierra-type-size = "2.18.0"
 starknet-crypto = "0.8.1"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"

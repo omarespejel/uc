@@ -1808,6 +1808,10 @@ struct NativeCompileContext {
     cairo_project_dir: PathBuf,
     corelib_src: PathBuf,
     starknet_target: NativeStarknetTargetProps,
+    /// The `[lib]` target, present when the manifest declares it or declares no target at all.
+    lib_target: Option<NativeLibTargetProps>,
+    /// Whether the manifest declares `[[target.starknet-contract]]`.
+    contract_target: bool,
     manifest_content_hash: String,
     external_non_starknet_dependencies: Vec<String>,
     path_dependency_roots: Vec<NativePathDependencyRoot>,
@@ -1818,6 +1822,16 @@ struct NativeCompileContext {
 #[cfg(feature = "native-compile")]
 struct NativeStarknetTargetProps {
     sierra: bool,
+    casm: bool,
+}
+
+/// `[lib]` target outputs, with Scarb's defaults: `<name>.sierra.json` on, `<name>.sierra` text
+/// and `<name>.casm` off.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[cfg(feature = "native-compile")]
+struct NativeLibTargetProps {
+    sierra: bool,
+    sierra_text: bool,
     casm: bool,
 }
 
@@ -14302,6 +14316,8 @@ fn build_native_compile_context_uncached_with_features(
     validate_manifest_dependency_sanity_from_manifest(manifest_path, &manifest)?;
     let starknet_target = resolve_manifest_native_starknet_target_props(&manifest)
         .map_err(mark_native_fallback_eligible)?;
+    let (lib_target, contract_target) =
+        resolve_manifest_native_build_targets(&manifest).map_err(mark_native_fallback_eligible)?;
     let package_table = manifest
         .get("package")
         .and_then(TomlValue::as_table)
@@ -14476,6 +14492,8 @@ fn build_native_compile_context_uncached_with_features(
         cairo_project_dir,
         corelib_src,
         starknet_target,
+        lib_target,
+        contract_target,
         manifest_content_hash,
         external_non_starknet_dependencies,
         path_dependency_roots,
@@ -16438,7 +16456,7 @@ fn native_compile_session_signature(
 #[cfg(feature = "native-compile")]
 fn native_compile_session_signature_hash(signature: &NativeCompileSessionSignature) -> String {
     let mut hasher = Hasher::new();
-    hasher.update(b"uc-native-session-image-signature-v1");
+    hasher.update(b"uc-native-session-image-signature-v2");
     hasher.update(normalize_fingerprint_path(&signature.manifest_path).as_bytes());
     hasher.update(signature.manifest_content_hash.as_bytes());
     hasher.update(signature.context.package_name.as_bytes());
@@ -16455,6 +16473,7 @@ fn native_compile_session_signature_hash(signature: &NativeCompileSessionSignatu
     } else {
         b"0"
     });
+    hasher.update(format!("{:?}{}", signature.context.lib_target, signature.context.contract_target).as_bytes());
     #[cfg(not(feature = "helper-cairo-214"))]
     {
         hasher.update(if signature.skip_unused_import_diagnostics {
@@ -20021,21 +20040,24 @@ fn native_target_dir(workspace_root: &Path, profile: &str) -> Result<PathBuf> {
     Ok(target_dir)
 }
 
+/// Writes target outputs into `target_dir`, removes this package's stale outputs, and returns
+/// the written file names.
 #[cfg(feature = "native-compile")]
-fn write_native_sierra_artifact(
+fn write_native_target_outputs(
     target_dir: &Path,
     package_name: &str,
-    output_name: &str,
-    sierra_program: &str,
-) -> Result<()> {
-    let output_path = target_dir.join(output_name);
-    ensure_path_within_root(target_dir, &output_path, "native sierra artifact path")?;
+    outputs: &[(String, Vec<u8>)],
+) -> Result<Vec<String>> {
     let mut keep_files = BTreeSet::new();
-    keep_files.insert(output_name.to_string());
-    fs::write(&output_path, sierra_program)
-        .with_context(|| format!("failed to write native artifact {}", output_name))?;
+    for (name, bytes) in outputs {
+        let output_path = target_dir.join(name);
+        ensure_path_within_root(target_dir, &output_path, "native artifact output path")?;
+        fs::write(&output_path, bytes)
+            .with_context(|| format!("failed to write native artifact {name}"))?;
+        keep_files.insert(name.clone());
+    }
     prune_native_target_outputs(target_dir, package_name, &keep_files)?;
-    Ok(())
+    Ok(keep_files.into_iter().collect())
 }
 
 #[inline(never)]
@@ -20091,7 +20113,8 @@ fn run_native_build_inner(
                 &session.removed_files,
                 session.contract_output_plans.is_empty(),
             );
-            if native_should_try_cached_noop_reuse(
+            if context.contract_target
+                && native_should_try_cached_noop_reuse(
                 &session.changed_files,
                 &session.removed_files,
                 session.journal_fallback_full_scan,
@@ -20123,7 +20146,8 @@ fn run_native_build_inner(
                     ));
                 }
             }
-            if !session.contract_output_plans.is_empty()
+            if context.contract_target
+                && !session.contract_output_plans.is_empty()
                 && (!session.changed_files.is_empty() || !session.removed_files.is_empty())
             {
                 if !native_changed_files_affect_tracked_contracts(
@@ -20165,7 +20189,9 @@ fn run_native_build_inner(
             let crate_ids =
                 CrateInput::into_crate_ids(&session.db, session.main_crate_inputs.iter().cloned());
             let (contracts, mut module_paths, mut contract_source_paths, mut all_plans) =
-                if session.removed_files.is_empty()
+                if !context.contract_target {
+                    (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                } else if session.removed_files.is_empty()
                     && !session.contract_output_plans.is_empty()
                 {
                     native_progress_log(format!(
@@ -20229,8 +20255,6 @@ fn run_native_build_inner(
 
             let codegen_opts = resolve_manifest_native_cairo_codegen_options(manifest_path);
             if contracts.is_empty() {
-                native_progress_log("native cairo program compile start");
-                let _heartbeat = NativeProgressHeartbeat::start("native cairo program compile");
                 let frontend_compile_start = Instant::now();
                 let mut compiler_config = native_compiler_config(
                     &session.main_crate_inputs,
@@ -20241,25 +20265,28 @@ fn run_native_build_inner(
                     compiler_config.replace_ids = replace_ids;
                 }
                 #[cfg(not(feature = "helper-cairo-214"))]
-                let (output_name, serialized_program) = {
-                    let program_artifact = compile_prepared_db_program_artifact(
-                        &session.db,
-                        crate_ids,
-                        compiler_config,
-                    )
-                    .map_err(|err| {
-                        mark_native_fallback_eligible_for_external_dependencies(
-                            err.context("native cairo compile failed"),
-                            &context,
+                let mut outputs = match context.lib_target {
+                    Some(props) => {
+                        native_progress_log("native cairo program compile start");
+                        let _heartbeat =
+                            NativeProgressHeartbeat::start("native cairo program compile");
+                        let program_artifact = compile_prepared_db_program_artifact(
+                            &session.db,
+                            crate_ids,
+                            compiler_config,
                         )
-                    })?;
-                    let versioned = VersionedProgram::from(program_artifact);
-                    let json_text = serde_json::to_string_pretty(&versioned)
-                        .context("failed to serialize native VersionedProgram (.sierra.json)")?;
-                    (format!("{}.sierra.json", context.package_name), json_text)
+                        .map_err(|err| {
+                            mark_native_fallback_eligible_for_external_dependencies(
+                                err.context("native cairo compile failed"),
+                                &context,
+                            )
+                        })?;
+                        native_lib_target_outputs(program_artifact, &context.package_name, props)?
+                    }
+                    None => Vec::new(),
                 };
                 #[cfg(feature = "helper-cairo-214")]
-                let (output_name, serialized_program) = {
+                let mut outputs = {
                     let program = compile_prepared_db_program(
                         &session.db,
                         crate_ids,
@@ -20271,27 +20298,31 @@ fn run_native_build_inner(
                             &context,
                         )
                     })?;
-                    (format!("{}.sierra", context.package_name), program.to_string())
+                    vec![(format!("{}.sierra", context.package_name), program.to_string().into_bytes())]
                 };
+                if context.contract_target {
+                    // Scarb writes the manifest even when the target finds no contract.
+                    let manifest = StarknetArtifactsManifest { version: 1, contracts: Vec::new() };
+                    outputs.push((
+                        format!("{}.starknet_artifacts.json", context.package_name),
+                        serde_json::to_vec(&manifest)?,
+                    ));
+                }
                 let frontend_compile_ms = frontend_compile_start.elapsed().as_secs_f64() * 1000.0;
                 native_progress_log(format!(
                     "native cairo program compile finished in {:.1}ms",
                     frontend_compile_ms
                 ));
                 let artifact_write_start = Instant::now();
-                write_native_sierra_artifact(
-                    &target_dir,
-                    &context.package_name,
-                    &output_name,
-                    &serialized_program,
-                )?;
+                let produced =
+                    write_native_target_outputs(&target_dir, &context.package_name, &outputs)?;
                 let artifact_write_ms = artifact_write_start.elapsed().as_secs_f64() * 1000.0;
                 return Ok((
-                    1,
+                    produced.len(),
                     frontend_compile_ms,
                     0.0,
                     artifact_write_ms,
-                    vec![output_name],
+                    produced,
                     session.changed_files.len() as u64,
                     session.removed_files.len() as u64,
                     0_u64,
@@ -20666,6 +20697,41 @@ fn run_native_build_inner(
             )?;
             write_json_file_compact(&manifest_path, &manifest)
                 .with_context(|| format!("failed to write {}", manifest_path.display()))?;
+            // A package that declares `[lib]` next to the contract target builds both, as Scarb does.
+            #[cfg(not(feature = "helper-cairo-214"))]
+            let lib_compile_ms = if let Some(props) = context.lib_target {
+                let lib_started = Instant::now();
+                let mut compiler_config = native_compiler_config(
+                    &session.main_crate_inputs,
+                    profile,
+                    capture_statement_locations,
+                );
+                if let Some(replace_ids) = codegen_opts.sierra_replace_ids {
+                    compiler_config.replace_ids = replace_ids;
+                }
+                let crate_ids = CrateInput::into_crate_ids(
+                    &session.db,
+                    session.main_crate_inputs.iter().cloned(),
+                );
+                let program_artifact =
+                    compile_prepared_db_program_artifact(&session.db, crate_ids, compiler_config)
+                        .context("native cairo compile of the [lib] target failed")?;
+                for (name, bytes) in
+                    native_lib_target_outputs(program_artifact, &context.package_name, props)?
+                {
+                    let output_path = target_dir.join(&name);
+                    ensure_path_within_root(&target_dir, &output_path, "native artifact output path")?;
+                    fs::write(&output_path, bytes)
+                        .with_context(|| format!("failed to write {}", output_path.display()))?;
+                    keep_files.insert(name);
+                }
+                lib_started.elapsed().as_secs_f64() * 1000.0
+            } else {
+                0.0
+            };
+            #[cfg(feature = "helper-cairo-214")]
+            let lib_compile_ms = 0.0;
+            let frontend_compile_ms = frontend_compile_ms + lib_compile_ms;
             prune_native_target_outputs(&target_dir, &context.package_name, &keep_files)?;
             let artifact_pipeline_ms = artifact_pipeline_start.elapsed().as_secs_f64() * 1000.0;
             let artifact_write_ms = (artifact_pipeline_ms - casm_ms).max(0.0);
@@ -22597,6 +22663,87 @@ fn resolve_manifest_native_cairo_codegen_options_from_toml(
         }
     }
     opts
+}
+
+/// The targets `scarb build` builds for this manifest. Scarb decides from the manifest alone:
+/// `[lib]` when declared, a default `[lib]` when no target is declared at all, and
+/// `[[target.starknet-contract]]` when declared, whatever the sources contain.
+#[cfg(feature = "native-compile")]
+fn resolve_manifest_native_build_targets(
+    manifest: &TomlValue,
+) -> Result<(Option<NativeLibTargetProps>, bool)> {
+    let targets = manifest.get("target").and_then(TomlValue::as_table);
+    let contract_target = targets.is_some_and(|t| t.contains_key("starknet-contract"));
+    let any_target = contract_target
+        || manifest.get("executable").is_some()
+        || targets.is_some_and(|t| !t.is_empty());
+    let lib_target = match manifest.get("lib") {
+        Some(TomlValue::Table(table)) => {
+            let flag = |key: &str, default: bool| -> Result<bool> {
+                table.get(key).map_or(Ok(default), |value| {
+                    value
+                        .as_bool()
+                        .with_context(|| format!("native compile expects [lib].{key} to be a boolean"))
+                })
+            };
+            Some(NativeLibTargetProps {
+                sierra: flag("sierra", true)?,
+                sierra_text: flag("sierra-text", false)?,
+                casm: flag("casm", false)?,
+            })
+        }
+        Some(_) => bail!("native compile expects [lib] to be a table"),
+        None if !any_target => Some(NativeLibTargetProps {
+            sierra: true,
+            sierra_text: false,
+            casm: false,
+        }),
+        None => None,
+    };
+    Ok((lib_target, contract_target))
+}
+
+/// The files a `[lib]` target writes, byte for byte as Scarb 2.18 writes them: the
+/// `VersionedProgram` as compact JSON, the program text, and the CASM text.
+#[cfg(all(feature = "native-compile", not(feature = "helper-cairo-214")))]
+fn native_lib_target_outputs(
+    program_artifact: cairo_lang_sierra::program::ProgramArtifact,
+    package_name: &str,
+    props: NativeLibTargetProps,
+) -> Result<Vec<(String, Vec<u8>)>> {
+    let versioned = VersionedProgram::from(program_artifact);
+    let mut outputs = Vec::new();
+    if props.sierra {
+        let json = serde_json::to_vec(&versioned)
+            .context("failed to serialize native VersionedProgram (.sierra.json)")?;
+        outputs.push((format!("{package_name}.sierra.json"), json));
+    }
+    if props.sierra_text {
+        outputs.push((format!("{package_name}.sierra"), versioned.to_string().into_bytes()));
+    }
+    if props.casm {
+        let program = versioned.into_v1()?.program;
+        let program_info = cairo_lang_sierra_type_size::ProgramRegistryInfo::new(&program)
+            .map_err(|err| anyhow!("failed to build the Sierra registry for CASM: {err}"))?;
+        let metadata = cairo_lang_sierra_to_casm::metadata::calc_metadata(
+            &program,
+            &program_info,
+            Default::default(),
+        )
+        .map_err(|err| anyhow!("failed to compute CASM metadata: {err}"))?;
+        let casm = cairo_lang_sierra_to_casm::compiler::compile(
+            &program,
+            &program_info,
+            &metadata,
+            cairo_lang_sierra_to_casm::compiler::SierraToCasmConfig {
+                gas_usage_check: true,
+                max_bytecode_size: usize::MAX,
+            },
+        )
+        .map_err(|err| anyhow!("failed to compile the library to CASM: {err}"))?;
+        outputs.push((format!("{package_name}.casm"), casm.to_string().into_bytes()));
+    }
+    Ok(outputs)
 }
 
 #[cfg(feature = "native-compile")]

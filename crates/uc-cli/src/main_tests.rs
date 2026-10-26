@@ -7088,6 +7088,8 @@ fn native_compile_context_cache_ttl_eviction_prunes_stale_entries() {
             sierra: true,
             casm: true,
         },
+        lib_target: None,
+        contract_target: true,
         manifest_content_hash: "manifest-blake3:demo".to_string(),
         external_non_starknet_dependencies: Vec::new(),
         path_dependency_roots: Vec::new(),
@@ -11005,7 +11007,7 @@ fn native_contract_file_stems_disambiguate_non_injective_module_path_collisions(
 
 #[cfg(feature = "native-compile")]
 #[test]
-fn write_native_sierra_artifact_does_not_prune_when_write_fails() {
+fn write_native_target_outputs_does_not_prune_when_write_fails() {
     let dir = unique_test_dir("uc-native-write-before-prune");
     let target_dir = dir.join("target/dev");
     fs::create_dir_all(&target_dir).expect("failed to create target directory");
@@ -11014,7 +11016,8 @@ fn write_native_sierra_artifact_does_not_prune_when_write_fails() {
     fs::create_dir_all(target_dir.join("demo.sierra"))
         .expect("failed to create blocking output directory");
 
-    let err = write_native_sierra_artifact(&target_dir, "demo", "demo.sierra", "fn main() {}\n")
+    let outputs = [("demo.sierra".to_string(), b"fn main() {}\n".to_vec())];
+    let err = write_native_target_outputs(&target_dir, "demo", &outputs)
         .expect_err("write should fail when the output path is a directory");
     assert!(
         format!("{err:#}").contains("failed to write native artifact demo.sierra"),
@@ -11108,6 +11111,8 @@ fn native_test_compile_session_signature(
                 sierra: true,
                 casm: true,
             },
+            lib_target: None,
+            contract_target: true,
             manifest_content_hash: manifest_hash.to_string(),
             external_non_starknet_dependencies: vec!["serde".to_string()],
             path_dependency_roots: vec![NativePathDependencyRoot {
@@ -12205,6 +12210,8 @@ mod AtomicLock {
             sierra: true,
             casm: true,
         },
+        lib_target: None,
+        contract_target: true,
         manifest_content_hash: "manifest-blake3:demo".to_string(),
         external_non_starknet_dependencies: Vec::new(),
         path_dependency_roots: Vec::new(),
@@ -12307,6 +12314,8 @@ mod contract_b {
             sierra: true,
             casm: true,
         },
+        lib_target: None,
+        contract_target: true,
         manifest_content_hash: "manifest-blake3:pkg".to_string(),
         external_non_starknet_dependencies: Vec::new(),
         path_dependency_roots: Vec::new(),
@@ -14488,6 +14497,8 @@ fn native_compile_source_roots_include_main_and_dependency_roots_without_duplica
             sierra: true,
             casm: true,
         },
+        lib_target: None,
+        contract_target: true,
         manifest_content_hash: "manifest-blake3:demo".to_string(),
         external_non_starknet_dependencies: Vec::new(),
         path_dependency_roots: vec![
@@ -15227,6 +15238,8 @@ fn mark_native_fallback_eligible_for_external_dependencies_only_marks_when_prese
             sierra: true,
             casm: true,
         },
+        lib_target: None,
+        contract_target: true,
         manifest_content_hash: "manifest-blake3:demo".to_string(),
         external_non_starknet_dependencies: Vec::new(),
         path_dependency_roots: Vec::new(),
@@ -16485,4 +16498,27 @@ pub mod Counter {
     let mut as_rpc: serde_json::Value = serde_json::from_str(&text).unwrap();
     as_rpc["abi"] = serde_json::json!(declared_abi_string(&as_rpc));
     assert_eq!(compute_class_hash_from_json(&as_rpc).as_deref(), Some(expected));
+}
+
+#[test]
+#[cfg(feature = "native-compile")]
+fn native_build_targets_follow_the_manifest_like_scarb() {
+    let parse = |text: &str| -> toml::Value { toml::from_str(text).unwrap() };
+    let pkg = "[package]\nname = \"p\"\nversion = \"0.1.0\"\n";
+    let default_lib = NativeLibTargetProps { sierra: true, sierra_text: false, casm: false };
+    assert_eq!(resolve_manifest_native_build_targets(&parse(pkg)).unwrap(), (Some(default_lib), false));
+    assert_eq!(
+        resolve_manifest_native_build_targets(&parse(&format!("{pkg}[[target.starknet-contract]]\n"))).unwrap(),
+        (None, true)
+    );
+    assert_eq!(
+        resolve_manifest_native_build_targets(&parse(&format!("{pkg}[lib]\nsierra-text = true\ncasm = true\n[[target.starknet-contract]]\n"))).unwrap(),
+        (Some(NativeLibTargetProps { sierra: true, sierra_text: true, casm: true }), true)
+    );
+    assert_eq!(
+        resolve_manifest_native_build_targets(&parse(&format!("{pkg}[lib]\nsierra = false\nsierra-text = true\n"))).unwrap(),
+        (Some(NativeLibTargetProps { sierra: false, sierra_text: true, casm: false }), false)
+    );
+    assert_eq!(resolve_manifest_native_build_targets(&parse(&format!("{pkg}[executable]\n"))).unwrap(), (None, false));
+    assert!(resolve_manifest_native_build_targets(&parse(&format!("{pkg}[lib]\ncasm = \"yes\"\n"))).is_err());
 }
