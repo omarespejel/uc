@@ -70,9 +70,13 @@ fn fee_fields_hash(tx: &serde_json::Value) -> Result<Felt> {
     ]))
 }
 
+/// Version of a V3 query transaction (`2^128 + 3`): nodes run it for estimates and simulations
+/// only, so a signature over one can never be replayed as a real transaction.
+pub(crate) const QUERY_VERSION_V3: &str = "0x100000000000000000000000000000003";
+
 fn common_prefix(kind: &str, tx: &serde_json::Value, sender_field: &str, chain_id: Felt) -> Result<Vec<Felt>> {
     let version = felt_of(tx.get("version").unwrap_or(&serde_json::json!("0x3")))?;
-    if version != Felt::from(3u64) {
+    if version != Felt::from(3u64) && version != Felt::from_hex(QUERY_VERSION_V3)? {
         bail!("only V3 transactions are hashed (got version {version:#x})");
     }
     let sender = felt_of(tx.get(sender_field).ok_or_else(|| anyhow!("{sender_field} is required"))?)?;

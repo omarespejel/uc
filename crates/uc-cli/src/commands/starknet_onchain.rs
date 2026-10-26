@@ -1821,20 +1821,37 @@ fn resolve_effective_private_key(
 /// Asks the node for a fee estimate (validation skipped: the transaction is not signed yet) and
 /// writes 1.5x the estimated amounts and prices into `resource_bounds`. The node's error is
 /// returned verbatim so a transaction that cannot execute is never broadcast blind.
+/// L2 gas added to the bound when the estimate skipped validation (no key to sign a query
+/// transaction): account validation costs roughly 100k to 400k L2 gas on Starknet.
+const UNVALIDATED_ESTIMATE_L2_ALLOWANCE: u128 = 1_000_000;
+
+/// Estimates `tx` and sets its resource bounds to 1.5 times the estimate. With a key it estimates
+/// a signed query-version copy, so the account's validation is included (as starknet-rs does);
+/// without one it skips validation and adds `UNVALIDATED_ESTIMATE_L2_ALLOWANCE` of L2 gas.
 fn estimate_and_autoscale_v3_resource_bounds(
     rpc_url: &str,
     tx: &mut serde_json::Value,
+    chain_id: starknet_types_core::felt::Felt,
+    signing_key: Option<&starknet_types_core::felt::Felt>,
 ) -> Result<serde_json::Value, String> {
-    let mut unsigned = tx.clone();
-    if unsigned.get("type").and_then(|t| t.as_str()) == Some("DECLARE") {
-        if let Some(map) = unsigned.as_object_mut() {
+    let mut request = tx.clone();
+    let (flags, l2_allowance) = match signing_key {
+        Some(key) => {
+            request["version"] = serde_json::json!(QUERY_VERSION_V3);
+            sign_v3_transaction(&mut request, chain_id, Some(key)).map_err(|e| e.to_string())?;
+            (serde_json::json!([]), 0)
+        }
+        None => (serde_json::json!(["SKIP_VALIDATE"]), UNVALIDATED_ESTIMATE_L2_ALLOWANCE),
+    };
+    if request.get("type").and_then(|t| t.as_str()) == Some("DECLARE") {
+        if let Some(map) = request.as_object_mut() {
             map.remove("class_hash");
         }
     }
     let est = starknet_rpc_request(
         rpc_url,
         "starknet_estimateFee",
-        serde_json::json!({ "request": [unsigned], "simulation_flags": ["SKIP_VALIDATE"], "block_id": "latest" }),
+        serde_json::json!({ "request": [request], "simulation_flags": flags, "block_id": "latest" }),
     )
     .map_err(|e| e.to_string())?;
     let first = est.as_array().and_then(|a| a.first()).unwrap_or(&est);
@@ -1867,7 +1884,8 @@ fn estimate_and_autoscale_v3_resource_bounds(
             serde_json::json!(scale_1_5x(l1_price));
     }
     if let Some(l2_gas) = parse_u128_hex_or_dec(first.get("l2_gas_consumed")) {
-        tx["resource_bounds"]["l2_gas"]["max_amount"] = serde_json::json!(scale_1_5x(l2_gas));
+        let bound = u128::from_str_radix(scale_1_5x(l2_gas).trim_start_matches("0x"), 16).unwrap_or(u128::MAX);
+        tx["resource_bounds"]["l2_gas"]["max_amount"] = serde_json::json!(format!("{:#x}", bound.saturating_add(l2_allowance)));
     }
     if let Some(l2_price) = parse_u128_hex_or_dec(first.get("l2_gas_price")) {
         tx["resource_bounds"]["l2_gas"]["max_price_per_unit"] =
@@ -2140,7 +2158,7 @@ pub(crate) fn run_declare(args: DeclareArgs) -> Result<()> {
 
         let chain_id = resolve_chain_id(prof.url.as_deref(), prof.network.as_deref());
         if let Some(rpc_url) = prof.url.as_deref() {
-            match estimate_and_autoscale_v3_resource_bounds(rpc_url, &mut declare_tx) {
+            match estimate_and_autoscale_v3_resource_bounds(rpc_url, &mut declare_tx, chain_id, signing_key.as_ref()) {
                 Ok(est) => fee_estimate = Some(est),
                 Err(e) if args.dry_run => fee_estimate_error = Some(e),
                 Err(e) => bail!("fee estimation failed, transaction not sent: {e}"),
@@ -2326,7 +2344,7 @@ pub(crate) fn run_deploy(args: DeployArgs) -> Result<()> {
         let mut confirmation_status: Option<serde_json::Value> = None;
         let chain_id = resolve_chain_id(prof.url.as_deref(), prof.network.as_deref());
         if let Some(rpc_url) = prof.url.as_deref() {
-            match estimate_and_autoscale_v3_resource_bounds(rpc_url, &mut invoke_tx) {
+            match estimate_and_autoscale_v3_resource_bounds(rpc_url, &mut invoke_tx, chain_id, signing_key.as_ref()) {
                 Ok(est) => fee_estimate = Some(est),
                 Err(e) if args.dry_run => fee_estimate_error = Some(e),
                 Err(e) => bail!("fee estimation failed, transaction not sent: {e}"),
@@ -2469,7 +2487,7 @@ pub(crate) fn run_invoke(args: InvokeArgs) -> Result<()> {
         let mut confirmation_status: Option<serde_json::Value> = None;
         let chain_id = resolve_chain_id(prof.url.as_deref(), prof.network.as_deref());
         if let Some(rpc_url) = prof.url.as_deref() {
-            match estimate_and_autoscale_v3_resource_bounds(rpc_url, &mut invoke_tx) {
+            match estimate_and_autoscale_v3_resource_bounds(rpc_url, &mut invoke_tx, chain_id, signing_key.as_ref()) {
                 Ok(est) => fee_estimate = Some(est),
                 Err(e) if args.dry_run => fee_estimate_error = Some(e),
                 Err(e) => bail!("fee estimation failed, transaction not sent: {e}"),
@@ -2645,7 +2663,7 @@ fn run_account_deploy(args: AccountDeployArgs) -> Result<()> {
     let mut fee_estimate = None;
     let mut fee_estimate_error: Option<String> = None;
     if let Some(rpc) = rpc_url.as_deref() {
-        match estimate_and_autoscale_v3_resource_bounds(rpc, &mut tx) {
+        match estimate_and_autoscale_v3_resource_bounds(rpc, &mut tx, chain_id, Some(&private_key)) {
             Ok(est) => fee_estimate = Some(est),
             Err(e) if args.dry_run => fee_estimate_error = Some(e),
             Err(e) => bail!("fee estimation failed, transaction not sent: {e}"),
