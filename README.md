@@ -40,6 +40,30 @@ extracted into scarb's cache layout), built 13 artifacts and ran the 41 betshare
 uc reads packages scarb downloaded; scarb keeps its own download ledger and will fetch again
 what uc downloaded.
 
+**Differential testing at scale (2026-10-26).** `benchmarks/differential/` generates random Cairo
+programs with an exact Python model of their semantics and compares uc with the reference tools:
+
+- *Tests:* 16,000 generated cases (checked arithmetic, division by zero, bitwise ops, `if`,
+  loops, calls between generated functions, `Checked*` traits matched on `Option`, struct round
+  trips, arithmetic in the wider type narrowed back with `try_into().unwrap()`, `felt252`
+  arithmetic that wraps modulo the prime, `assert`). `uc test`, snforge 0.60 and the Python model
+  agree on every case. On the last 8,000 cases the suites took 90 s under uc and 246 s under
+  snforge.
+- *Builds:* 40 generated packages and 120 contract artifacts are byte-identical to scarb 2.18.
+  `build_matrix.py` covers 48 manifest shapes (`[lib]`, `[[target.starknet-contract]]`, both,
+  `sierra-text`, `casm`, `sierra = false`, with and without a contract module). It found that uc
+  chose targets from the sources instead of the manifest; after the fix all 48 match.
+- *Hashes:* against starknet-py, 1,000 selectors, 2,000 UDC addresses, 1,000 SNIP-8 V3
+  transaction hashes, 47 class hashes and 35 Blake2s compiled class hashes are all equal. 138
+  addresses also match `sncast utils contract-address`. `onchain_class_hash.py` re-hashed 66 live
+  mainnet Sierra classes (Sierra 1.3 to 1.9, from 321 addresses), and every one matches the chain.
+- *Prover:* `uc prove` runs on thousands of generated `u8` functions, and brute force over the
+  whole input space decides each verdict. A `PROVEN_SAFE` function that can panic would be
+  unsound. A counterexample whose witness does not panic is a false positive. The campaigns found
+  three false-positive causes, all fixed: constant divisors declared after their use,
+  `felt252` conversions the engine did not model, and constraints on unmodeled values read as
+  state guards. Since then they have found neither unsound verdicts nor false counterexamples.
+
 **Real bytecode.** `benchmarks/scripts/run_mainnet_audit.py` fetches 20 well-known mainnet
 classes over JSON-RPC and audits them with no source: 16 are Sierra classes (4 are Cairo 0 or
 misaddressed), 2,843 functions analysed, 23 reachable-panic witnesses, 92 detector findings
@@ -201,7 +225,10 @@ uc call --contract-address 0x... --function get --url http://127.0.0.1:5050/rpc
 ```
 
 `uc declare`, `uc deploy`, `uc invoke` and `uc account deploy` build V3 transactions, estimate
-fees on the node (and refuse to broadcast when the estimate fails), hash them per SNIP-8
+fees on the node and refuse to broadcast when the estimate fails. The estimate covers a signed
+query-version copy of the transaction (version 2^128 + 3), so the account's validation is
+included, as with starknet-rs. Without a key, uc skips validation and adds 1M L2 gas to the bound.
+They hash transactions per SNIP-8
 (`poseidon` over prefix, version, sender, fee fields, paymaster data, chain id, nonce, DA modes
 and the type-specific fields) and sign with the account key; reports carry
 `computed_transaction_hash`. Against starknet-devnet 0.10.1 (RPC 0.10.2) all four transaction
@@ -214,17 +241,40 @@ Python's JSON form (`", "` and `": "` separators). uc hashed a pretty-printed AB
 disagreed with the chain; now `uc class-hash` returns the chain's hash for local artifacts and
 for classes saved from a node (checked on the deployed STRK and Ekubo core classes).
 
+`uc deploy` goes through OpenZeppelin's Cairo 1 Universal Deployer at
+`0x02ceed65a4bd731034c01113685c831b01c15d7d432f71afb1cf1634b53a2125`, as sncast 0.60 does. The
+legacy UDC is still deployed, but `--unique` addresses computed against it differ. `uc devnet`
+deploys both.
+
+The devnet behaves like a sequencer:
+
+- *Validation:* the accounts check ECDSA signatures in `__validate__`, and a failure is error 55.
+  Compiled class hashes must be the Blake2s hash of the declared class (error 60). Query
+  versions are refused for real transactions (error 61).
+- *Bounds and balance:* a gas price under the block's is error 53, and a payer that cannot
+  cover the maximum fee is error 54.
+- *Fees:* every transaction pays in STRK, through a transfer to the sequencer (`0x1000`) that
+  shows up in the receipt. L2 gas is the Sierra gas that validation and execution consume, plus
+  1,280 per byte of declared code. L1 data gas follows blockifier's state-diff count, at 32 per
+  felt. All prices are 1e9.
+- *Reverts:* a panicking or out-of-gas execution reverts but keeps the nonce bump and the fee.
+- *Simulation:* `estimateFee` and `simulateTransactions` run on a copy of the state.
+- *Reporting:* traces carry the validate, execute and fee-transfer invocations and the state
+  diff. Blocks carry their state updates, and events carry transaction and event indexes.
+
+`benchmarks/differential/devnet_diff.py` runs one scenario against both nodes: declare, deploy,
+invoke, call, then reverts, a stale nonce, a bad signature, estimates and simulation. Against
+starknet-devnet 0.10.1 all 21 probes return the same fields. Error codes and L1 data gas are
+equal, but L2 gas is not (see below).
+
 Served: `starknet_addDeclareTransaction`, `addDeployAccountTransaction`, `addInvokeTransaction`,
-`call`, `estimateFee`, `getNonce`, `getClassHashAt`, `getClass`, `getClassAt`, `getStorageAt`,
+`call`, `estimateFee`, `simulateTransactions`, `getNonce`, `getClassHashAt`, `getClass`, `getClassAt`, `getStorageAt`,
 `getTransactionByHash` / `Receipt` / `Status`, `getBlockWithTxHashes` / `WithTxs`, `getEvents`,
 `getStateUpdate`, `traceTransaction`, `blockNumber`, `chainId`, `specVersion`, plus `devnet_mint`,
 `devnet_createBlock`, `devnet_setTime`, `devnet_increaseTime`, `devnet_getPredeployedAccounts`
 and the `/predeployed_accounts`, `/mint`, `/create_block`, `/is_alive` routes. One block per
 transaction (`--block-generation-on demand` to batch). Receipts carry events, revert reasons from
-nested calls, steps and builtin counts. Nonces are enforced; signatures and fees are not (a
-devnet signs nothing worth protecting). `uc declare` now carries the class in the transaction and
-every write command fetches the account nonce first; both were missing before, so they would
-have been rejected by any node.
+nested calls, the fee and the gas used.
 
 ## Starkscan
 
@@ -258,9 +308,10 @@ the upgrade `UPGRADE_UNSAFE`; `uc declare` then refuses to build the transaction
 
 ## What uc does not do yet
 
-- `uc devnet` does not charge fees or run `__validate__`; `estimateFee` returns a flat figure and
-  `simulateTransactions` is not implemented. It does verify signatures against the embedded
-  account's public key and reports SNIP-8 transaction hashes.
+- `uc devnet` measures L2 gas with cairo-lang-runner's syscall costs, which are lighter than
+  blockifier's. A counter increment costs about 69k L2 gas there and 1.14M on starknet-devnet.
+  Block commitments are `0x0`, nested calls are not broken out in traces, and the block-hash
+  contract at `0x1` is not kept.
 - Fuzz runs collect statement coverage for corpus guidance on their own thread only; `--coverage`
   and `--lcov` still switch the whole run to the unsliced program, which is slower.
 - `uc fetch` writes `Scarb.lock` only when the package has none; it does not update an existing

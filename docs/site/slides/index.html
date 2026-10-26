@@ -511,12 +511,13 @@ Omar Espejel
 
 <img data-src="./assets/uc.svg" title="uc benchmark" style="width:65.0%" class="r-stretch quarto-figure-center"><p class="caption">betshare, 2026-10-25, same window (<code>benchmarks/results/head-to-head-20261025-162907.json</code>): cold build scarb 11.90 s vs uc 5.23 s; warm 0.27 s vs 0.03 s; 41 tests warm snforge 2.43 s vs uc 0.85 s; 13/13 artifacts byte-identical. erc8004 (168 tests, seven with over a million VM steps): uc 11.6 s and 2.2 GB peak vs snforge 0.60 16.9 s and 3.3 GB, same machine.</p></section>
 <section id="uv-1" class="slide level2">
-<h2>uc — What Is Actually Verified (2026-10-25)</h2>
+<h2>uc — What Is Actually Verified (2026-10-26)</h2>
 <ul>
 <li><strong>Byte-identical artifacts</strong>: on erc8004 (6 contracts, OpenZeppelin v3) all 13 files from <code>uc build</code> equal <code>scarb 2.18 build</code> byte for byte, Sierra and CASM included</li>
 <li><strong>Same test verdicts as snforge 0.60</strong>: betshare 41/41, erc8004 168/168; a mutated contract fails the right test under uc</li>
 <li><strong>Fresh machine</strong>: empty HOME, empty cache, no scarb on PATH: uc fetched 12 OpenZeppelin packages from scarbs.xyz (SHA-256 checked), built 13 artifacts, ran 41 tests green</li>
 <li><strong>Real bytecode</strong>: 16 deployed mainnet classes (STRK, ETH, USDC, Ekubo, AVNU, zkLend, StarkGate, Vesu, Pragma...) audited from chain with no source: 2,843 Sierra functions, 92 findings, 23 counterexamples, 32 s on an idle machine</li>
+<li><strong>Random programs, thousands of cases</strong>: 16,000 generated test cases give the same verdict under uc, snforge 0.60 and a Python model; 120 artifacts and 48 manifest shapes match scarb; 4,000 hashes match starknet-py; 66 live mainnet classes re-hash to the chain's hash; brute force over thousands of generated functions finds no unsound <code>uc prove</code> verdict</li>
 <li><strong>Self-contained</strong>: Cairo 2.18.0 compiler and 164 corelib files embedded; <code>uc --version</code> says which</li>
 </ul>
 </section>
@@ -581,7 +582,7 @@ Omar Espejel
 <section id="drop-in-replacement-for-pip-tools" class="slide level2">
 <h2>Drop-In Parity: <code>sncast</code> and a Local Chain</h2>
 <ul>
-<li><code>uc devnet</code> runs a Starknet chain in process: embedded account, fee token and deployer compiled by uc itself; declare, deploy, invoke, call, receipts, events, blocks; nonces enforced, no fees or signature checks. The same <code>uc declare / deploy / invoke / call</code> commands drive it:</li>
+<li><code>uc devnet</code> runs a Starknet chain in process: embedded account, fee token and deployer compiled by uc itself; declare, deploy, invoke, call, receipts, events, blocks. Accounts validate signatures, fees are paid in STRK, bounds and balances are checked as a sequencer checks them, and <code>estimateFee</code> and <code>simulateTransactions</code> run on a copy of the state. The same <code>uc declare / deploy / invoke / call</code> commands drive it:</li>
 </ul>
 <div class="sourceCode" id="cb16"><pre class="sourceCode numberSource shell number-lines code-with-copy"><code class="sourceCode"><span id="cb16-1"><a href=""></a>uc devnet --port 5050 --seed 42 --accounts 10 --fork-network $MAINNET_RPC</span></code><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></pre></div>
 <ul>

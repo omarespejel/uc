@@ -42,6 +42,8 @@ uc build --json                      # Sierra + CASM artifacts, byte-identical t
 | Format | `uc fmt` |
 | Class hash offline | `uc class-hash --casm --json` |
 | Selector | `uc selector <name_or_hex> --json` |
+| Address of a UDC deployment | `uc utils contract-address --class-hash 0x.. --salt 0x.. [--unique --deployer-address 0x..] --constructor-calldata ..` (OpenZeppelin's Cairo 1 UDC, as sncast 0.60) |
+| SNIP-8 hash of a V3 transaction | `uc utils tx-hash --tx tx.json --chain-id SN_SEPOLIA --json` (INVOKE, DECLARE, DEPLOY_ACCOUNT) |
 | Read-only call | `uc call --contract-address 0x.. --function <name> --network mainnet --json` |
 | Nonce, class hash at, balance | `uc get nonce 0x.. --network mainnet`, `uc get class-hash-at 0x.. --network mainnet`, `uc balance --token strk --account 0x.. --network mainnet` |
 | Transaction trace, calls named from class ABIs | `uc trace <tx_hash> --network mainnet --json` (`calls[]`, `participants`) |
@@ -82,12 +84,15 @@ verification record, and `uc verify-onchain --submit` writes it.
 
 ## Known limits (do not work around silently)
 
-- `uc devnet` executes declare / deploy / invoke / call in process (embedded account, fee token
-  and deployer; one block per transaction; nonces and signatures enforced, SNIP-8 hashes). It
-  charges no fees; `simulateTransactions` is not served. `--backend starknet-devnet` runs the
-  external binary instead.
+- `uc devnet` executes declare / deploy / invoke / call in process. Accounts validate ECDSA
+  signatures, and fees are charged in STRK to the sequencer. Bounds, balances and Blake2s
+  compiled class hashes are checked, as a sequencer does: errors 53, 54, 55 and 60. `estimateFee`
+  and `simulateTransactions` run on a copy of the state. L2 gas is lower than on starknet-devnet,
+  because the runner's syscall costs are lighter. `--backend starknet-devnet` runs the external
+  binary instead.
 - Write commands sign the SNIP-8 V3 hash with `--private-key` / keystore; `--dry-run` reports
-  `computed_transaction_hash` and the signed payload without sending. `uc account deploy
+  `computed_transaction_hash` and the signed payload without sending. Fee estimates use a signed
+  query-version copy (validation included); bounds are 1.5x the estimate. `uc account deploy
   --class-hash <hash> --private-key <key> --salt <salt>` deploys an account (fund the
   `contract_address` from its `--dry-run` report first).
 - `--coverage` and `--lcov` run every test on the unsliced program (slower); plain runs and fuzz
