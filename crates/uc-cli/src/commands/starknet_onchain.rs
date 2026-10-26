@@ -1203,15 +1203,35 @@ pub(crate) fn run_class_hash(args: ClassHashArgs) -> Result<()> {
     if let Some(target_str) = args.target.as_deref() {
         let candidate_path = PathBuf::from(target_str);
         if candidate_path.is_file() {
-            let text = fs::read_to_string(&candidate_path)
+            let raw_text = fs::read_to_string(&candidate_path)
                 .with_context(|| format!("failed to read {}", candidate_path.display()))?;
+            // Classes saved from a node carry the ABI as a string; the class hash commits to that
+            // exact string, so hash it as declared and parse the rest as a local artifact.
+            let raw_value: Option<serde_json::Value> = serde_json::from_str(&raw_text).ok();
+            let declared_hash = raw_value
+                .as_ref()
+                .filter(|v| v.get("sierra_program").is_some() && v.get("abi").is_some_and(|a| a.is_string()))
+                .and_then(compute_class_hash_from_json);
+            let text = match (&raw_value, &declared_hash) {
+                (Some(v), Some(_)) => {
+                    let mut typed = v.clone();
+                    if let Some(abi) = typed.get("abi").and_then(|a| a.as_str()).and_then(|a| serde_json::from_str::<serde_json::Value>(a).ok()) {
+                        typed["abi"] = abi;
+                    }
+                    typed.to_string()
+                }
+                _ => raw_text.clone(),
+            };
             #[cfg(feature = "native-compile")]
             {
                 if let Ok(sierra_class) =
                     serde_json::from_str::<ContractClass>(&text)
                 {
-                    let class_hash = compute_starknet_sierra_class_hash(&sierra_class)
-                        .ok_or_else(|| anyhow!("failed to compute Sierra class_hash"))?;
+                    let class_hash = match declared_hash.clone() {
+                        Some(h) => h,
+                        None => compute_starknet_sierra_class_hash(&sierra_class)
+                            .ok_or_else(|| anyhow!("failed to compute Sierra class_hash"))?,
+                    };
                     let compiled_class_hash = if args.casm {
                         let casm = compile_native_casm_contract(
                             sierra_class,
@@ -1800,8 +1820,10 @@ fn estimate_and_autoscale_v3_resource_bounds(
     tx: &mut serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let mut unsigned = tx.clone();
-    if let Some(map) = unsigned.as_object_mut() {
-        map.remove("class_hash");
+    if unsigned.get("type").and_then(|t| t.as_str()) == Some("DECLARE") {
+        if let Some(map) = unsigned.as_object_mut() {
+            map.remove("class_hash");
+        }
     }
     let est = starknet_rpc_request(
         rpc_url,
@@ -1925,8 +1947,10 @@ pub(crate) fn fetch_account_nonce(rpc_url: Option<&str>, address: &str) -> Strin
 /// as a string, everything else verbatim.
 pub(crate) fn declare_contract_class_payload(class_json: &serde_json::Value) -> serde_json::Value {
     let mut payload = class_json.clone();
-    if let Some(abi) = payload.get("abi").filter(|a| !a.is_string()).cloned() {
-        payload["abi"] = serde_json::json!(serde_json::to_string(&abi).unwrap_or_default());
+    if payload.get("abi").is_some_and(|a| !a.is_string()) {
+        // The class hash commits to the exact ABI string; send the same pythonic form uc hashes
+        // (and sncast sends), never a re-serialization with other separators or key order.
+        payload["abi"] = serde_json::json!(declared_abi_string(class_json));
     }
     payload
 }

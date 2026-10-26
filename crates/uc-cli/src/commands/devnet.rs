@@ -571,7 +571,8 @@ impl DevnetChain {
     fn declare(&mut self, class_json: serde_json::Value, block: u64) -> Result<Felt, RpcError> {
         let class: ContractClass = serde_json::from_value(normalize_class_json(class_json.clone()))
             .map_err(|e| RpcError::new(ERR_INVALID_PARAMS, format!("not a Sierra contract class: {e}")))?;
-        let class_hash_hex = compute_starknet_sierra_class_hash(&class)
+        // The class hash commits to the ABI string as declared (a string in DECLARE payloads).
+        let class_hash_hex = compute_class_hash_from_json(&class_json)
             .ok_or_else(|| RpcError::new(ERR_INVALID_PARAMS, "could not hash the class"))?;
         let class_hash = felt(&class_hash_hex)?;
         if self.classes.contains_key(&class_hash) {
@@ -597,7 +598,11 @@ impl DevnetChain {
             info.constructor = fn_id(ep.function_idx);
         }
         self.infos.insert(class_hash, info);
-        self.classes.insert(class_hash, DeclaredClass { class_json, program, declared_in_block: block });
+        let mut stored = class_json;
+        if stored.get("abi").is_some_and(|a| !a.is_string()) {
+            stored["abi"] = serde_json::json!(declared_abi_string(&stored));
+        }
+        self.classes.insert(class_hash, DeclaredClass { class_json: stored, program, declared_in_block: block });
         self.rebuild_runners().map_err(|e| RpcError::new(ERR_CONTRACT_ERROR, format!("failed to prepare class runners: {e}")))?;
         Ok(class_hash)
     }

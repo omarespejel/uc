@@ -234,6 +234,25 @@ mod tests {
         assert_ne!(v3_transaction_hash(&other, chain).unwrap(), d);
     }
 
+    /// Transactions accepted by starknet-devnet 0.10.1 (Starknet RPC 0.10.2, chain SN_SEPOLIA).
+    /// The DECLARE was built and signed by sncast 0.60 (starknet-rs), the others by uc; in all
+    /// three the node reported `transaction_hash` after recomputing it, so these are
+    /// node-attested SNIP-8 vectors.
+    #[test]
+    fn v3_hashes_match_node_attested_vectors() {
+        let chain = short_string("SN_SEPOLIA");
+        let vectors = [
+            r#"{"transaction_hash": "0x263d232968eb61f080469761ff1639679e595c68baf4d39ca1a45154df7973", "type": "DECLARE", "version": "0x3", "nonce": "0x0", "resource_bounds": {"l1_gas": {"max_amount": "0x0", "max_price_per_unit": "0x59682f00"}, "l1_data_gas": {"max_amount": "0x120", "max_price_per_unit": "0x59682f00"}, "l2_gas": {"max_amount": "0x34f49a0", "max_price_per_unit": "0x59682f00"}}, "tip": "0x0", "paymaster_data": [], "nonce_data_availability_mode": "L1", "fee_data_availability_mode": "L1", "sender_address": "0x260a8311b4f1092db620b923e8d7d20e76dedcc615fb4b6fdf28315b81de201", "compiled_class_hash": "0x24c9bb910638f458bc22d0ac057d438fa6ec0ea4d0f531c2c037368c61d07ac", "class_hash": "0x2e895de4b82503229f12daf608c7f99ac1b9933d5ce77ff57fa7832453f2391", "account_deployment_data": []}"#,
+            r#"{"transaction_hash": "0x5d7a1c422e8a1959a39da772a53b7133611fc2b64e2d7d179da11c04c696dfb", "type": "INVOKE", "version": "0x3", "nonce": "0x2", "resource_bounds": {"l1_gas": {"max_amount": "0x1", "max_price_per_unit": "0x59682f00"}, "l1_data_gas": {"max_amount": "0x180", "max_price_per_unit": "0x59682f00"}, "l2_gas": {"max_amount": "0x161ca0", "max_price_per_unit": "0x59682f00"}}, "tip": "0x0", "paymaster_data": [], "nonce_data_availability_mode": "L1", "fee_data_availability_mode": "L1", "account_deployment_data": [], "sender_address": "0x260a8311b4f1092db620b923e8d7d20e76dedcc615fb4b6fdf28315b81de201", "calldata": ["0x1", "0x4a7c8d27155fdd205908f671a63355564b9ff05b504a1c3d81f1b713ffdd442", "0x9be09a9a955d79baeb70c3b225ab5090fb9bc543cf23547b9f095c38a27574", "0x1", "0x2"]}"#,
+            r#"{"transaction_hash": "0x2791d27afaee3756bc9be9d0c6cdb98585ada7e00f046d74edda2546e50fec4", "type": "DEPLOY_ACCOUNT", "version": "0x3", "nonce": "0x0", "resource_bounds": {"l1_gas": {"max_amount": "0x1", "max_price_per_unit": "0x59682f00"}, "l1_data_gas": {"max_amount": "0x2a0", "max_price_per_unit": "0x59682f00"}, "l2_gas": {"max_amount": "0x313f08", "max_price_per_unit": "0x59682f00"}}, "tip": "0x0", "paymaster_data": [], "nonce_data_availability_mode": "L1", "fee_data_availability_mode": "L1", "contract_address_salt": "0x42", "constructor_calldata": ["0x40e67ff2c1b2b9fd7cf483125ac0c1647f4165cc0b8f860adb8b489e90d0468"], "class_hash": "0x5b4b537eaa2399e3aa99c4e2e0208ebd6c71bc1467938cd52c798c601e43564"}"#,
+        ];
+        for raw in vectors {
+            let tx: serde_json::Value = serde_json::from_str(raw).unwrap();
+            let expected = parse_felt_str(tx["transaction_hash"].as_str().unwrap()).unwrap();
+            assert_eq!(v3_transaction_hash(&tx, chain).unwrap(), expected, "{} hash", tx["type"]);
+        }
+    }
+
     #[test]
     fn signing_round_trips_through_verification() {
         let pk = Felt::from_hex("0x1234abcd").unwrap();

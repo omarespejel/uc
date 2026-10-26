@@ -204,7 +204,15 @@ uc call --contract-address 0x... --function get --url http://127.0.0.1:5050/rpc
 fees on the node (and refuse to broadcast when the estimate fails), hash them per SNIP-8
 (`poseidon` over prefix, version, sender, fee fields, paymaster data, chain id, nonce, DA modes
 and the type-specific fields) and sign with the account key; reports carry
-`computed_transaction_hash`, which equals the hash the node returns.
+`computed_transaction_hash`. Against starknet-devnet 0.10.1 (RPC 0.10.2) all four transaction
+types are accepted and the node reports the same hash uc computed; the vectors are in the unit
+tests, one of them built by sncast.
+
+Class hashes commit to the ABI string exactly as declared, and the network's tools declare it in
+Python's JSON form (`", "` and `": "` separators). uc hashed a pretty-printed ABI until
+2026-10-26, so its class hashes, `uc deploy -c`, `uc declare` signatures and `verify-onchain`
+disagreed with the chain; now `uc class-hash` returns the chain's hash for local artifacts and
+for classes saved from a node (checked on the deployed STRK and Ekubo core classes).
 
 Served: `starknet_addDeclareTransaction`, `addDeployAccountTransaction`, `addInvokeTransaction`,
 `call`, `estimateFee`, `getNonce`, `getClassHashAt`, `getClass`, `getClassAt`, `getStorageAt`,
@@ -253,10 +261,6 @@ the upgrade `UPGRADE_UNSAFE`; `uc declare` then refuses to build the transaction
 - `uc devnet` does not charge fees or run `__validate__`; `estimateFee` returns a flat figure and
   `simulateTransactions` is not implemented. It does verify signatures against the embedded
   account's public key and reports SNIP-8 transaction hashes.
-- The DECLARE and DEPLOY_ACCOUNT hashes were checked against uc's own verifier and the formula;
-  the INVOKE hash was checked against starknet-devnet 0.7.1 (the node reports the same hash and
-  executes the transaction). That devnet cannot compile Sierra 1.8.0 classes, so DECLARE of a
-  Cairo 2.18 class could not be sent to it.
 - Fuzz runs collect statement coverage for corpus guidance on their own thread only; `--coverage`
   and `--lcov` still switch the whole run to the unsliced program, which is slower.
 - `uc fetch` writes `Scarb.lock` only when the package has none; it does not update an existing

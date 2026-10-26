@@ -7596,7 +7596,73 @@ struct BuildReceiptFile {
 }
 
 #[cfg(feature = "native-compile")]
+/// JSON with Python's default separators (`", "` and `": "`) and non-ASCII characters escaped
+/// as `\uXXXX`, which is how starknet-rs (sncast, starkli) and the Python tooling serialize a
+/// class's ABI when they declare it. The class hash commits to that exact string, so every
+/// class hash uc computes for a local artifact uses this form.
+pub(crate) fn pythonic_json_string<T: serde::Serialize + ?Sized>(value: &T) -> String {
+    struct Pythonic;
+    impl serde_json::ser::Formatter for Pythonic {
+        fn begin_array_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W, first: bool) -> std::io::Result<()> {
+            if first { Ok(()) } else { w.write_all(b", ") }
+        }
+        fn begin_object_key<W: ?Sized + std::io::Write>(&mut self, w: &mut W, first: bool) -> std::io::Result<()> {
+            if first { Ok(()) } else { w.write_all(b", ") }
+        }
+        fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+            w.write_all(b": ")
+        }
+        fn write_string_fragment<W: ?Sized + std::io::Write>(&mut self, w: &mut W, fragment: &str) -> std::io::Result<()> {
+            let mut buf = [0u16; 2];
+            for c in fragment.chars() {
+                if c.is_ascii() {
+                    w.write_all(&[c as u8])?;
+                } else {
+                    for unit in c.encode_utf16(&mut buf) {
+                        write!(w, "\\u{:04x}", unit)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+    let mut out = Vec::with_capacity(256);
+    let mut ser = serde_json::Serializer::with_formatter(&mut out, Pythonic);
+    if value.serialize(&mut ser).is_err() {
+        return String::new();
+    }
+    String::from_utf8(out).unwrap_or_default()
+}
+
+/// The ABI string a declared class commits to: the string itself when the class came from a
+/// node or a DECLARE transaction (`abi` is a JSON string there), else the pythonic form of the
+/// ABI array of a local artifact.
+pub(crate) fn declared_abi_string(class_json: &serde_json::Value) -> String {
+    match class_json.get("abi") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(abi) if !abi.is_null() => serde_json::from_value::<ContractClass>(class_json.clone())
+            .ok()
+            .and_then(|c| c.abi.map(|a| pythonic_json_string(&a)))
+            .unwrap_or_else(|| pythonic_json_string(abi)),
+        _ => String::new(),
+    }
+}
+
+/// Class hash of a class given as JSON, with the ABI string exactly as it would be declared.
+pub(crate) fn compute_class_hash_from_json(class_json: &serde_json::Value) -> Option<String> {
+    let abi = declared_abi_string(class_json);
+    let mut typed = class_json.clone();
+    typed["abi"] = serde_json::Value::Array(Vec::new());
+    let class: ContractClass = serde_json::from_value(typed).ok()?;
+    Some(sierra_class_hash_with_abi(&class, &abi))
+}
+
 pub(crate) fn compute_starknet_sierra_class_hash(contract_class: &ContractClass) -> Option<String> {
+    let abi_str = contract_class.abi.as_ref().map(pythonic_json_string).unwrap_or_default();
+    Some(sierra_class_hash_with_abi(contract_class, &abi_str))
+}
+
+fn sierra_class_hash_with_abi(contract_class: &ContractClass, abi_str: &str) -> String {
     use cairo_lang_starknet_classes::keccak::starknet_keccak;
     use starknet_types_core::felt::Felt;
     use starknet_types_core::hash::{Poseidon, StarkHash};
@@ -7615,11 +7681,6 @@ pub(crate) fn compute_starknet_sierra_class_hash(contract_class: &ContractClass)
     let l1_handler_hash = hash_entry_points(&contract_class.entry_points_by_type.l1_handler);
     let constructor_hash = hash_entry_points(&contract_class.entry_points_by_type.constructor);
 
-    let abi_str = contract_class
-        .abi
-        .as_ref()
-        .map(|abi| abi.json())
-        .unwrap_or_default();
     let abi_hash = Felt::from(starknet_keccak(abi_str.as_bytes()));
 
     let sierra_felts: Vec<Felt> = contract_class
@@ -7637,7 +7698,7 @@ pub(crate) fn compute_starknet_sierra_class_hash(contract_class: &ContractClass)
         abi_hash,
         sierra_program_hash,
     ]);
-    Some(format!("{:#x}", class_hash))
+    format!("{:#x}", class_hash)
 }
 
 #[cfg(feature = "native-compile")]
@@ -7757,10 +7818,10 @@ fn inspect_contract_artifacts_in_workspace(
             let (class_hash, abi_value, entry_points_value, compiler_ver) = {
                 let contract_class: ContractClass = serde_json::from_slice(&sierra_bytes)
                     .with_context(|| format!("failed to parse {}", sierra_path.display()))?;
-                let computed_hash = receipt_entry
-                    .filter(|r| r.sierra_blake3 == sierra_blake3)
-                    .and_then(|r| r.class_hash.clone())
-                    .or_else(|| compute_starknet_sierra_class_hash(&contract_class));
+                // Recomputed every time (about a millisecond): receipts written by older uc
+                // versions carry class hashes over a differently serialized ABI.
+                let _ = receipt_entry;
+                let computed_hash = compute_starknet_sierra_class_hash(&contract_class);
                 let abi_val = serde_json::to_value(&contract_class.abi).unwrap_or(serde_json::Value::Null);
                 let ep_val = serde_json::to_value(&contract_class.entry_points_by_type)
                     .unwrap_or(serde_json::Value::Null);

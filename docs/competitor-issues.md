@@ -13,3 +13,13 @@ Observed on 2026-10-25 while running `uc` side by side with scarb 2.18.0, snforg
 | 7 | scarb 2.18.0 | When `Scarb.lock` needs refreshing (a dev-dependency pin changed), `scarb build` and `snforge test` contact the registry even though every package is already in the local cache, and a dropped connection fails the build with `client error (Connect)`. | Offline or flaky-network builds fail for a lookup that is not needed. uc resolves from the cache first and only fetches what is missing. | erc8004, agent-account copies during the head-to-head run |
 
 Things uc had to get right because the tools above do not: a single binary that carries its own corelib and compiler (no `asdf`, no `scarb` cache migrations), byte-identical artifacts to scarb 2.18 (verified on all 13 erc8004 artifacts: Sierra, CASM and `starknet_artifacts.json`), a cheatcode runtime that does not care which `snforge_std` the manifest pins, and a native registry client that downloads, checksums and extracts `scarbs.xyz` packages into the cache layout scarb uses (uc reuses scarb's downloads; scarb's own ledger does not see uc's).
+
+## uc's own bugs found by the same method (2026-10-26)
+
+| Area | What happened | Fixed by |
+| :--- | :--- | :--- |
+| Class hash | uc hashed the ABI pretty-printed; the network hashes the string as declared, which starknet-rs sends in Python's JSON form. Every uc class hash differed from the chain's. | pythonic ABI serialization; golden test against a node-attested hash |
+| DECLARE | the transaction never carried the class and sent `class_hash`, a field nodes reject | class embedded, derived field stripped |
+| Nonces | lookups used block id `pending`, which RPC 0.10 renamed `pre_confirmed`; the error was swallowed and every write sent nonce 0 | `latest`, errors surfaced |
+| Signatures | write commands signed a Poseidon hash of three fields instead of the SNIP-8 transaction hash | SNIP-8 V3 hashing; vectors attested by starknet-devnet 0.10.1 |
+| Fee bounds | a failed estimate was ignored and the default L2 gas bound was zero, so every transaction was rejected for insufficient resources | estimate failure stops the send; non-zero defaults |

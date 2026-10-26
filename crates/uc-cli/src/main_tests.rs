@@ -16427,3 +16427,62 @@ mode = "safe"
 
     fs::remove_dir_all(&dir).ok();
 }
+
+
+#[test]
+fn pythonic_json_uses_python_separators_and_ascii_escapes() {
+    let v = serde_json::json!([{"type": "function", "name": "f", "inputs": [], "note": "caf\u{e9}"}]);
+    // serde_json's default map sorts keys; the class hash path serializes the typed ABI, which
+    // keeps declaration order. Here only the separators and escapes are under test.
+    let s = pythonic_json_string(&v);
+    assert!(s.starts_with("[{\"inputs\": [], \"name\": \"f\", "), "{s}");
+    assert!(s.contains("\"note\": \"caf\\u00e9\""), "{s}");
+    assert!(!s.contains('\n'));
+    assert_eq!(pythonic_json_string(&serde_json::json!({"a": [1, 2]})), "{\"a\": [1, 2]}");
+}
+
+#[test]
+#[cfg(feature = "native-compile")]
+fn class_hash_matches_the_network_for_a_cairo_2_18_contract() {
+    // Class hash attested by starknet-devnet 0.10.1 and sncast 0.60 when this exact source was
+    // declared (the network commits to the ABI in Python's JSON form; uc used to hash a
+    // pretty-printed ABI and got 0x6aede13e...a791 instead).
+    let root = std::env::temp_dir().join(format!("uc-classhash-golden-{}-{}", std::process::id(), epoch_ms_u64().unwrap_or(1)));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("Scarb.toml"), "[package]\nname = \"counter\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n\n[dependencies]\nstarknet = \"2.18.0\"\n\n[[target.starknet-contract]]\nsierra = true\ncasm = false\n").unwrap();
+    fs::write(root.join("src/lib.cairo"), r#"#[starknet::interface]
+pub trait ICounter<T> { fn increase(ref self: T, by: u64); fn get(self: @T) -> u64; }
+#[starknet::contract]
+pub mod Counter {
+    use starknet::storage::{StoragePointerReadAccess, StoragePointerWriteAccess};
+    #[storage]
+    struct Storage { value: u64 }
+    #[event]
+    #[derive(Drop, starknet::Event)]
+    pub enum Event { Increased: Increased }
+    #[derive(Drop, starknet::Event)]
+    pub struct Increased { pub by: u64, pub value: u64 }
+    #[constructor]
+    fn constructor(ref self: ContractState, start: u64) { self.value.write(start); }
+    #[abi(embed_v0)]
+    impl CounterImpl of super::ICounter<ContractState> {
+        fn increase(ref self: ContractState, by: u64) { let v = self.value.read() + by; self.value.write(v); self.emit(Increased { by, value: v }); }
+        fn get(self: @ContractState) -> u64 { self.value.read() }
+    }
+}
+"#).unwrap();
+    run_build(BuildArgs {
+        common: BuildCommonArgs { manifest_path: Some(root.join("Scarb.toml")), package: None, workspace: false, features: Vec::new(), offline: true, release: false, profile: Some("dev".to_string()) },
+        engine: EngineArg::Uc, daemon_mode: DaemonModeArg::Off, report_path: Some(root.join("build.json")), record_failure: None, json: false, plan_only: false,
+    }).expect("build counter");
+    let text = fs::read_to_string(root.join("target/dev/counter_Counter.contract_class.json")).unwrap();
+    let _ = fs::remove_dir_all(&root);
+    let class: ContractClass = serde_json::from_str(&text).unwrap();
+    let expected = "0x2e895de4b82503229f12daf608c7f99ac1b9933d5ce77ff57fa7832453f2391";
+    assert_eq!(compute_starknet_sierra_class_hash(&class).as_deref(), Some(expected));
+    // The same class as a node returns it (ABI as a string) hashes the same way.
+    let mut as_rpc: serde_json::Value = serde_json::from_str(&text).unwrap();
+    as_rpc["abi"] = serde_json::json!(declared_abi_string(&as_rpc));
+    assert_eq!(compute_class_hash_from_json(&as_rpc).as_deref(), Some(expected));
+}
