@@ -136,34 +136,9 @@ pub(crate) fn index_prefix(name: &str) -> String {
     }
 }
 
-fn curl(args: &[&str]) -> Result<Vec<u8>> {
-    let run = |force_ipv4: bool| -> Result<std::process::Output> {
-        let mut cmd = Command::new("curl");
-        cmd.args(["-sS", "-L", "--fail", "--retry", "2", "--max-time", "120"]);
-        if force_ipv4 {
-            cmd.arg("-4");
-        }
-        cmd.args(args);
-        cmd.output().context("failed to execute curl (required for registry downloads)")
-    };
-    let output = run(false)?;
-    if output.status.success() {
-        return Ok(output.stdout);
-    }
-    // Hosts with broken IPv6 routes fail the first attempt; retry pinned to IPv4.
-    let retry = run(true)?;
-    if retry.status.success() {
-        return Ok(retry.stdout);
-    }
-    bail!(
-        "registry request failed: {}",
-        String::from_utf8_lossy(&retry.stderr).trim()
-    );
-}
-
 fn fetch_index(name: &str) -> Result<Vec<IndexEntry>> {
     let url = format!("{}/index/{}/{}.json", registry_api_base(), index_prefix(name), name);
-    let body = curl(&[&url]).with_context(|| format!("package `{name}` not found in registry index"))?;
+    let body = http_get_bytes(&url).with_context(|| format!("package `{name}` not found in registry index"))?;
     serde_json::from_slice::<Vec<IndexEntry>>(&body)
         .with_context(|| format!("registry index for `{name}` is not valid JSON"))
 }
@@ -343,7 +318,7 @@ fn package_dir_ready(dir: &Path) -> bool {
 /// Downloads, verifies and extracts one package into the shared cache.
 fn fetch_package(src_dir: &Path, spec: &RegistryPackageSpec) -> Result<()> {
     let url = format!("{}/dl/{}/{}", registry_api_base(), spec.name, spec.version);
-    let archive = curl(&[&url])
+    let archive = http_get_bytes(&url)
         .with_context(|| format!("failed to download {}@{}", spec.name, spec.version))?;
     if let Some(expected) = spec.checksum.as_deref() {
         let expected_hex = expected.strip_prefix("sha256:").unwrap_or(expected);

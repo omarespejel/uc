@@ -1,7 +1,5 @@
 use super::*;
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::time::Duration;
 
 /// Universal Deployer Contract that `uc deploy` calls: OpenZeppelin's Cairo 1 UDC, the one sncast
@@ -701,165 +699,44 @@ pub(crate) fn resolve_sncast_profile_config(
     resolved
 }
 
-/// Sends a JSON-RPC or HTTP POST payload to `url`.
-/// Uses native `TcpStream` HTTP/1.1 for `http://` URLs (zero external process overhead, <1ms latency)
-/// and falls back to `curl` for `https://` URLs.
-/// A parsed HTTP response: status code and JSON body (`null` when the body was empty).
+/// A parsed HTTP response: status code and JSON body (`null` when the body is empty or not JSON).
 pub(crate) struct HttpJsonResponse {
     pub status: u16,
     pub body: serde_json::Value,
 }
 
-/// GET / PUT / POST a JSON document. Plain `http://` goes over a raw socket; `https://` through
-/// `curl`. Unlike [http_post_json] this reports the status code instead of failing on it.
+/// GET / PUT / POST a JSON document. Unlike [http_post_json] this reports the status code
+/// instead of failing on it.
 pub(crate) fn http_request_json(
     method: &str,
     url: &str,
     payload: Option<&serde_json::Value>,
     extra_headers: &[(&str, &str)],
 ) -> Result<HttpJsonResponse> {
-    let body_bytes = match payload {
-        Some(p) => serde_json::to_vec(p).context("failed to serialize JSON payload")?,
-        None => Vec::new(),
-    };
-    let parse = |text: &str| -> serde_json::Value {
-        let trimmed = extract_http_json_body(text.trim());
-        serde_json::from_str(trimmed).unwrap_or(serde_json::Value::Null)
-    };
-    if let Some(rest) = url.strip_prefix("http://") {
-        let (host_port, path) = match rest.split_once('/') {
-            Some((hp, p)) => (hp, format!("/{p}")),
-            None => (rest, "/".to_string()),
-        };
-        let addr_str = if host_port.contains(':') { host_port.to_string() } else { format!("{host_port}:80") };
-        let mut stream = TcpStream::connect(&addr_str).with_context(|| format!("failed to connect to {addr_str}"))?;
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
-        let mut req = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
-            body_bytes.len()
-        );
-        for (k, v) in extra_headers {
-            req.push_str(&format!("{k}: {v}\r\n"));
-        }
-        req.push_str("\r\n");
-        stream.write_all(req.as_bytes())?;
-        stream.write_all(&body_bytes)?;
-        stream.flush()?;
-        let mut resp_bytes = Vec::new();
-        stream.read_to_end(&mut resp_bytes)?;
-        let resp_str = String::from_utf8_lossy(&resp_bytes);
-        let status = resp_str
-            .split_whitespace()
-            .nth(1)
-            .and_then(|code| code.parse::<u16>().ok())
-            .unwrap_or(0);
-        let (_, body_part) = resp_str
-            .split_once("\r\n\r\n")
-            .or_else(|| resp_str.split_once("\n\n"))
-            .unwrap_or(("", &resp_str));
-        return Ok(HttpJsonResponse { status, body: parse(body_part) });
-    }
-    let mut cmd = Command::new("curl");
-    cmd.arg("-sS").arg("-X").arg(method).arg("-H").arg("Content-Type: application/json").arg("-H").arg("Accept: application/json");
-    for (k, v) in extra_headers {
-        cmd.arg("-H").arg(format!("{k}: {v}"));
-    }
-    if payload.is_some() {
-        cmd.arg("--data-binary").arg(String::from_utf8_lossy(&body_bytes).as_ref());
-    }
-    // Status code on the last line, body before it.
-    cmd.arg("-w").arg("\n%{http_code}").arg(url);
-    let output = cmd.output().with_context(|| format!("failed to execute curl for {url}"))?;
-    if !output.status.success() {
-        bail!("HTTPS request to {url} failed: {}", String::from_utf8_lossy(&output.stderr));
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let (body_text, code) = text.rsplit_once('\n').unwrap_or((&text, "0"));
-    Ok(HttpJsonResponse { status: code.trim().parse().unwrap_or(0), body: parse(body_text) })
+    let body = payload.map(serde_json::to_vec).transpose().context("failed to serialize JSON payload")?;
+    let mut headers = vec![("Content-Type", "application/json"), ("Accept", "application/json")];
+    headers.extend_from_slice(extra_headers);
+    let response = http_request(method, url, body.as_deref(), &headers)?;
+    Ok(HttpJsonResponse { status: response.status, body: serde_json::from_slice(&response.body).unwrap_or(serde_json::Value::Null) })
 }
 
+/// POSTs a JSON document and parses the JSON reply (JSON-RPC answers errors with a JSON body).
 pub(crate) fn http_post_json(
     url: &str,
     payload: &serde_json::Value,
     extra_headers: &[(&str, &str)],
 ) -> Result<serde_json::Value> {
-    let body_bytes = serde_json::to_vec(payload).context("failed to serialize JSON payload")?;
-    if let Some(rest) = url.strip_prefix("http://") {
-        let (host_port, path) = match rest.split_once('/') {
-            Some((hp, p)) => (hp, format!("/{p}")),
-            None => (rest, "/".to_string()),
-        };
-        let addr_str = if host_port.contains(':') {
-            host_port.to_string()
-        } else {
-            format!("{host_port}:80")
-        };
-        let mut stream = TcpStream::connect(&addr_str)
-            .with_context(|| format!("failed to connect to {addr_str}"))?;
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
-
-        let mut req = format!(
-            "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
-            body_bytes.len()
-        );
-        for (k, v) in extra_headers {
-            req.push_str(&format!("{k}: {v}\r\n"));
-        }
-        req.push_str("\r\n");
-        stream.write_all(req.as_bytes())?;
-        stream.write_all(&body_bytes)?;
-        stream.flush()?;
-
-        let mut resp_bytes = Vec::new();
-        stream.read_to_end(&mut resp_bytes)?;
-        let resp_str = String::from_utf8_lossy(&resp_bytes);
-        let (_, body_part) = resp_str
-            .split_once("\r\n\r\n")
-            .or_else(|| resp_str.split_once("\n\n"))
-            .unwrap_or(("", &resp_str));
-        let trimmed_body = extract_http_json_body(body_part.trim());
-        let parsed: serde_json::Value = serde_json::from_str(trimmed_body).with_context(|| {
-            format!("failed to parse JSON response from {url}: {trimmed_body}")
-        })?;
-        return Ok(parsed);
-    }
-
-    // HTTPS fallback via curl
-    let mut cmd = Command::new("curl");
-    cmd.arg("-sS")
-        .arg("-X")
-        .arg("POST")
-        .arg("-H")
-        .arg("Content-Type: application/json");
-    for (k, v) in extra_headers {
-        cmd.arg("-H").arg(format!("{k}: {v}"));
-    }
-    let output = cmd
-        .arg("--data-binary")
-        .arg(String::from_utf8_lossy(&body_bytes).as_ref())
-        .arg(url)
-        .output()
-        .with_context(|| format!("failed to execute curl for {url}"))?;
-    if !output.status.success() {
-        bail!(
-            "HTTPS request to {url} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .with_context(|| format!("failed to parse JSON response from {url}"))?;
-    Ok(parsed)
-}
-
-fn extract_http_json_body(raw: &str) -> &str {
-    if let (Some(start), Some(end)) = (raw.find('{'), raw.rfind('}')) {
-        if start <= end {
-            return &raw[start..=end];
-        }
-    }
-    raw
+    let body = serde_json::to_vec(payload).context("failed to serialize JSON payload")?;
+    let mut headers = vec![("Content-Type", "application/json"), ("Accept", "application/json")];
+    headers.extend_from_slice(extra_headers);
+    let response = http_request("POST", url, Some(&body), &headers)?;
+    serde_json::from_slice(&response.body).with_context(|| {
+        format!(
+            "HTTP {} from {url} is not JSON: {}",
+            response.status,
+            String::from_utf8_lossy(&response.body[..response.body.len().min(300)])
+        )
+    })
 }
 
 pub(crate) fn starknet_rpc_request(
@@ -3428,7 +3305,7 @@ pub(crate) fn run_verify_onchain(args: VerifyOnchainArgs) -> Result<()> {
 #[cfg(all(test, feature = "native-test-runner"))]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     /// `sncast deploy --unique` on starknet-devnet 0.10.1 deployed this class at this address

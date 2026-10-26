@@ -61,6 +61,7 @@ clap.workspace = true
 libc.workspace = true
 notify = { workspace = true, optional = true }
 postcard.workspace = true
+ureq.workspace = true
 rayon = { workspace = true, optional = true }
 semver.workspace = true
 serde.workspace = true
