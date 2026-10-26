@@ -2581,8 +2581,11 @@ pub(crate) enum UtilsSubcommand {
         class_hash: String,
         #[arg(short = 's', long, default_value = "0x0")]
         salt: String,
+        /// Address as a `--unique` UDC deployment derives it: salt `pedersen(deployer, salt)`,
+        /// deployed from the UDC.
         #[arg(long)]
         unique: bool,
+        /// Account that calls the UDC; only used with `--unique` (default 0, as in sncast).
         #[arg(short = 'd', long, default_value = "0x0")]
         deployer_address: String,
         #[arg(short = 'c', long, num_args = 0..)]
@@ -2615,33 +2618,37 @@ pub(crate) fn run_utils(args: UtilsArgs) -> Result<()> {
             class_hash,
             salt,
             unique,
+            deployer_address,
             constructor_calldata,
             json,
-            ..
         } => {
-            let dep_args = DeployArgs {
-                class_hash: Some(class_hash),
-                contract: None,
-                constructor_calldata,
-                salt,
+            let class_hash = format_felt_hex(&parse_felt_str(&class_hash)?);
+            let calldata = encode_starknet_calldata(&constructor_calldata, None)?;
+            let address = compute_udc_deployed_address(
+                &class_hash,
+                &salt,
                 unique,
-                url: None,
-                network: None,
-                sncast_profile: None,
-                account: None,
-                account_address: None,
-                private_key: None,
-                keystore: None,
-                password: None,
-                accounts_file: None,
-                dry_run: true,
-                wait: false,
-                wait_timeout: 30,
-                manifest_path: None,
-                json,
-                report_path: None,
-            };
-            run_deploy(dep_args)
+                Some(&deployer_address),
+                &calldata,
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
+                        "contract_address": address,
+                        "class_hash": class_hash,
+                        "salt": format_felt_hex(&parse_felt_str(&salt)?),
+                        "unique": unique,
+                        "deployer_address": format_felt_hex(&parse_felt_str(&deployer_address)?),
+                        "udc_address": STARKNET_UDC_ADDRESS,
+                        "constructor_calldata": calldata,
+                    }))?
+                );
+            } else {
+                println!("{address}");
+            }
+            Ok(())
         }
     }
 }
@@ -2951,7 +2958,7 @@ pub(crate) fn run_devnet(args: DevnetArgs) -> Result<()> {
     };
     let eth_fee_token = "0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7";
     let strk_fee_token = "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d";
-    let udc_address = "0x041a78e741e5af2fec34b695679bc6891742439f7afb8484ecd7766661ad02bf";
+    let udc_address = STARKNET_UDC_ADDRESS;
 
     let summary_json = serde_json::json!({
         "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,

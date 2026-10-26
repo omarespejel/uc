@@ -4,8 +4,14 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-/// Universal Deployer Contract (UDC) canonical address on Starknet Mainnet & Sepolia.
+/// Universal Deployer Contract that `uc deploy` calls: OpenZeppelin's Cairo 1 UDC, the one sncast
+/// 0.60 uses, at this address on mainnet, Sepolia and starknet-devnet. Same `deployContract` entry
+/// point and unique-salt rule (`pedersen(caller, salt)`) as the legacy UDC below, so only
+/// `--unique` addresses depend on which one deployed the contract.
 pub(crate) const STARKNET_UDC_ADDRESS: &str =
+    "0x02ceed65a4bd731034c01113685c831b01c15d7d432f71afb1cf1634b53a2125";
+/// The legacy Cairo 0 UDC, still deployed on every network; `uc devnet` predeploys both.
+pub(crate) const LEGACY_UDC_ADDRESS: &str =
     "0x041a78e741e5af2fec34b695679bc6891742439f7afb8484ecd7766661ad02bf";
 
 /// Public fallback endpoints, used when no `STARKSCAN_API_KEY` is configured.
@@ -3406,6 +3412,23 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    /// `sncast deploy --unique` on starknet-devnet 0.10.1 deployed this class at this address
+    /// through the Cairo 1 UDC; the legacy UDC would have given another one.
+    #[test]
+    fn unique_udc_address_matches_an_sncast_deployment() {
+        let address = compute_udc_deployed_address(
+            "0x2e895de4b82503229f12daf608c7f99ac1b9933d5ce77ff57fa7832453f2391",
+            "0x7",
+            true,
+            Some("0x260a8311b4f1092db620b923e8d7d20e76dedcc615fb4b6fdf28315b81de201"),
+            &["0x5".to_string()],
+        )
+        .unwrap();
+        assert_eq!(address, "0x01dea26f5d68184d94788eb03924f8b25137cdf009d659bb42d51348ce13554b");
+        let not_unique = compute_udc_deployed_address("0x2e895de4b82503229f12daf608c7f99ac1b9933d5ce77ff57fa7832453f2391", "0x7", false, None, &["0x5".to_string()]).unwrap();
+        assert_eq!(not_unique, compute_starknet_contract_address("0x2e895de4b82503229f12daf608c7f99ac1b9933d5ce77ff57fa7832453f2391", "0x7", &["0x5".to_string()], "0x0").unwrap());
+    }
 
     struct TempOnchainDir {
         dir: PathBuf,
