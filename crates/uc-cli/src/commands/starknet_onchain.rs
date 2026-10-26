@@ -1694,10 +1694,6 @@ fn resolve_effective_private_key(
     Ok(profile_private_key.map(str::to_string))
 }
 
-/// Calls `starknet_estimateFee` and auto-scales `resource_bounds` (`l1_gas`, `l2_gas`, `l1_data_gas`) by `1.5x`.
-/// Asks the node for a fee estimate (validation skipped: the transaction is not signed yet) and
-/// writes 1.5x the estimated amounts and prices into `resource_bounds`. The node's error is
-/// returned verbatim so a transaction that cannot execute is never broadcast blind.
 /// L2 gas added to the bound when the estimate skipped validation (no key to sign a query
 /// transaction): account validation costs roughly 100k to 400k L2 gas on Starknet.
 const UNVALIDATED_ESTIMATE_L2_ALLOWANCE: u128 = 1_000_000;

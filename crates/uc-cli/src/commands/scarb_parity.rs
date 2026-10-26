@@ -3033,6 +3033,12 @@ pub(crate) fn run_devnet(args: DevnetArgs) -> Result<()> {
     }
 
     let bind_addr = format!("{}:{}", args.host, args.port);
+    if !matches!(args.host.as_str(), "127.0.0.1" | "localhost" | "::1") {
+        eprintln!(
+            "warning: uc devnet on {} is reachable from other machines, and it serves its accounts' private keys at /predeployed_accounts",
+            args.host
+        );
+    }
     let listener = std::net::TcpListener::bind(&bind_addr)
         .with_context(|| format!("failed to bind Starknet Devnet listener on {bind_addr}"))?;
     let local_addr = listener.local_addr()?;

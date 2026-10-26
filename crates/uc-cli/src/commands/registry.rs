@@ -124,6 +124,19 @@ pub(crate) fn registry_src_dir() -> Result<PathBuf> {
     Ok(src_root.join(DEFAULT_REGISTRY_SRC_DIR))
 }
 
+/// Package names are Cairo identifiers (letters, digits, `_`; `-` is tolerated): anything else,
+/// such as `/` or `..`, would reach a URL or a cache path.
+pub(crate) fn validate_package_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('-')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !ok {
+        bail!("refusing registry package name `{name}`: package names are letters, digits and `_`");
+    }
+    Ok(())
+}
+
 /// Sparse-index path prefix, identical to the cargo/scarb layout.
 pub(crate) fn index_prefix(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
@@ -288,6 +301,8 @@ pub(crate) fn extract_tar_strip_root(tar: &[u8], dest: &Path) -> Result<usize> {
         if rel.is_empty()
             || rel.split('/').any(|c| c == ".." || c.is_empty())
             || rel.starts_with('/')
+            || rel.contains('\\')
+            || rel.contains(':')
         {
             bail!("refusing to extract unsafe archive path `{full_name}`");
         }
@@ -301,13 +316,20 @@ pub(crate) fn extract_tar_strip_root(tar: &[u8], dest: &Path) -> Result<usize> {
     Ok(written)
 }
 
+/// Largest package a registry archive may expand to; a bigger one is refused, not unpacked.
+const MAX_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
+
 fn decompress_zstd(bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut decoder = ruzstd::decoding::StreamingDecoder::new(bytes)
+    let decoder = ruzstd::decoding::StreamingDecoder::new(bytes)
         .map_err(|e| anyhow!("invalid zstd archive: {e}"))?;
-    let mut out = Vec::with_capacity(bytes.len() * 8);
+    let mut out = Vec::with_capacity(bytes.len().saturating_mul(8).min(MAX_PACKAGE_BYTES as usize));
     decoder
+        .take(MAX_PACKAGE_BYTES + 1)
         .read_to_end(&mut out)
         .map_err(|e| anyhow!("failed to decompress zstd archive: {e}"))?;
+    if out.len() as u64 > MAX_PACKAGE_BYTES {
+        bail!("registry archive expands past {MAX_PACKAGE_BYTES} bytes; refusing it");
+    }
     Ok(out)
 }
 
@@ -387,6 +409,9 @@ pub(crate) fn ensure_registry_dependencies(manifest_path: &Path) -> Result<Regis
         if BUILTIN_PACKAGES.contains(&name.as_str()) {
             continue;
         }
+        // Names come from manifests and from the registry's own index (transitive
+        // dependencies) and end up in URLs and cache paths.
+        validate_package_name(&name)?;
         let reqs = requirements.entry(name.clone()).or_default();
         if !reqs.contains(&req) {
             reqs.push(req.clone());
@@ -584,6 +609,16 @@ mod tests {
         out.extend_from_slice(data);
         out.resize(out.len() + (512 - data.len() % 512) % 512, 0);
         out
+    }
+
+    #[test]
+    fn package_names_that_could_reach_a_path_are_refused() {
+        for good in ["openzeppelin_token", "alexandria_math", "snforge_std", "garaga", "a-b"] {
+            assert!(validate_package_name(good).is_ok(), "{good}");
+        }
+        for bad in ["", "../x", "a/b", "..", "-x", "a\\b", "a b", "a.b"] {
+            assert!(validate_package_name(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
