@@ -141,6 +141,21 @@ pub(crate) struct TestArgs {
     #[arg(long)]
     pub offline: bool,
 
+    /// Prove each passing test with a Stwo prover (Chihuahua by default) and write the proofs
+    /// with a manifest to `target/proofs/<crate>/`.
+    #[arg(long)]
+    pub prove: bool,
+
+    /// Check the proofs in `target/proofs/<crate>/` against the current sources instead of
+    /// running the tests.
+    #[arg(long, conflicts_with = "prove")]
+    pub verify_proofs: bool,
+
+    /// Directory with the prover's `run_and_prove` and `verify` binaries (default `UC_PROVER_DIR`,
+    /// then `~/.uc/provers/chihuahua/bin`).
+    #[arg(long)]
+    pub prover_dir: Option<PathBuf>,
+
     #[arg(long)]
     pub json: bool,
 
@@ -1780,60 +1795,33 @@ fn merge_dev_dependencies_into_manifest(manifest: &TomlValue) -> TomlValue {
     cloned
 }
 
+/// The Cairo project uc writes under `.uc/native-test-project/<crate>` to compile a package's tests.
 #[cfg(feature = "native-test-runner")]
-pub(crate) fn compile_or_load_native_tests(
+pub(crate) struct NativeTestProject {
+    pub cairo_project_dir: PathBuf,
+    pub integration_crate_name: String,
+    pub has_integration_tests: bool,
+}
+
+/// A database holding a package's test crates, ready for `compile_test_prepared_db`.
+#[cfg(feature = "native-test-runner")]
+pub(crate) struct NativeTestDb {
+    pub db: RootDatabase,
+    pub test_crate_inputs: Vec<cairo_lang_filesystem::ids::CrateInput>,
+}
+
+#[cfg(feature = "native-test-runner")]
+pub(crate) fn write_native_test_project(
     manifest_path: &Path,
     workspace_root: &Path,
     package_name: &str,
     crate_name: &str,
-    features: &[String],
-    no_cache: bool,
-) -> Result<(cairo_lang_test_plugin::TestCompilation<'static>, bool, f64)> {
-    use cairo_lang_compiler::diagnostics::DiagnosticsReporter;
-    use cairo_lang_defs::ids::NamedLanguageElementId;
-    use cairo_lang_filesystem::cfg::{Cfg, CfgSet};
-    use cairo_lang_filesystem::db::{FilesGroup, init_dev_corelib};
-    use cairo_lang_filesystem::ids::CrateInput;
-
-    let compile_start = Instant::now();
-    let manifest_text = read_text_file_with_limit(manifest_path, MAX_MANIFEST_BYTES, "manifest")?;
-    let manifest = parse_manifest_toml(&manifest_text, manifest_path, "manifest")?;
-    let resolved_features = resolve_manifest_native_features(&manifest, features);
+    manifest: &TomlValue,
+) -> Result<NativeTestProject> {
     let manifest_dir = manifest_path.parent().unwrap_or(workspace_root);
     let src_dir = manifest_dir.join("src");
     let tests_dir = manifest_dir.join("tests");
-
-    // Compute source hash for compiled TestCompilation cache (including tests/ if present)
-    let mut tracked_roots = vec![src_dir.clone()];
-    if tests_dir.is_dir() {
-        tracked_roots.push(tests_dir.clone());
-    }
-    let (tracked_sources, _) = native_collect_tracked_sources(workspace_root, &tracked_roots)?;
-    let sources_hash = native_tracked_sources_content_hash(workspace_root, &tracked_sources)?;
-    let mut cache_hasher = blake3::Hasher::new();
-    cache_hasher.update(b"uc-test-compilation-v7:");
-    cache_hasher.update(UC_SNFORGE_STD_SHIM_SOURCE.as_bytes());
-    cache_hasher.update(native_cairo_lang_compiler_version().as_bytes());
-    cache_hasher.update(manifest_text.as_bytes());
-    cache_hasher.update(resolved_features.join(",").as_bytes());
-    cache_hasher.update(sources_hash.as_bytes());
-    let test_cache_key = cache_hasher.finalize().to_hex().to_string();
-    let test_cache_dir = workspace_root.join(".uc/cache/tests");
-    let test_cache_file = test_cache_dir.join(format!("compiled-{test_cache_key}.json"));
-
-    if !no_cache && test_cache_file.is_file() {
-        if let Ok(bytes) = fs::read(&test_cache_file) {
-            if let Ok(cached_compilation) =
-                serde_json::from_slice::<cairo_lang_test_plugin::TestCompilation<'static>>(&bytes)
-            {
-                let compile_ms = compile_start.elapsed().as_secs_f64() * 1000.0;
-                return Ok((cached_compilation, true, compile_ms));
-            }
-        }
-    }
-
-    let corelib_src = resolve_native_corelib_src(workspace_root)?;
-    let (mut cairo_edition, _) = resolve_manifest_cairo_settings_from_manifest(&manifest);
+    let (mut cairo_edition, _) = resolve_manifest_cairo_settings_from_manifest(manifest);
 
     // Prepare cairo_project.toml for test compilation
     let cairo_project_dir = workspace_root.join(".uc/native-test-project").join(crate_name);
@@ -1872,7 +1860,7 @@ pub(crate) fn compile_or_load_native_tests(
             cairo_edition = ws_edition;
         }
     }
-    let manifest_for_deps = merge_dev_dependencies_into_manifest(&manifest);
+    let manifest_for_deps = merge_dev_dependencies_into_manifest(manifest);
     let workspace_manifest_for_deps = workspace_manifest_fallback
         .as_ref()
         .map(merge_dev_dependencies_into_manifest);
@@ -1964,30 +1952,61 @@ pub(crate) fn compile_or_load_native_tests(
         &[],
     );
     write_text_file_if_changed(&cairo_project_path, &project_toml, "native test cairo project")?;
+    Ok(NativeTestProject {
+        cairo_project_dir,
+        integration_crate_name,
+        has_integration_tests,
+    })
+}
+
+/// Builds the database for a project's tests. `for_proofs` compiles without gas metering, as
+/// Cairo executables do, and adds the wrappers `uc test --prove` turns into executables.
+#[cfg(feature = "native-test-runner")]
+pub(crate) fn build_native_test_db(
+    project: &NativeTestProject,
+    crate_name: &str,
+    resolved_features: &[String],
+    workspace_root: &Path,
+    for_proofs: bool,
+) -> Result<NativeTestDb> {
+    use cairo_lang_filesystem::cfg::{Cfg, CfgSet};
+    use cairo_lang_filesystem::db::init_dev_corelib;
+    use cairo_lang_filesystem::ids::CrateInput;
+
 
     let mut cfg_set = CfgSet::from_iter([Cfg::name("test"), Cfg::kv("target", "test")]);
-    for feat in &resolved_features {
+    for feat in resolved_features {
         cfg_set.insert(Cfg::kv("feature", feat.clone()));
+    }
+    if for_proofs {
+        cfg_set.insert(Cfg::kv("gas", "disabled"));
     }
 
     let mut snforge_attr_suite = cairo_lang_semantic::plugin::PluginSuite::default();
     snforge_attr_suite.add_plugin::<UcSnforgeTestAttrPlugin>();
 
-    let mut db = RootDatabase::builder()
+    let mut builder = RootDatabase::builder();
+    builder
         .with_optimizations(Optimizations::enabled_with_default_movable_functions(
             InliningStrategy::Default,
         ))
         .with_cfg(cfg_set)
         .with_default_plugin_suite(starknet_plugin_suite())
         .with_default_plugin_suite(cairo_lang_test_plugin::test_plugin_suite())
-        .with_default_plugin_suite(snforge_attr_suite)
+        .with_default_plugin_suite(snforge_attr_suite);
+    if for_proofs {
+        builder
+            .skip_auto_withdraw_gas()
+            .with_default_plugin_suite(test_proof_plugin_suite());
+    }
+    let mut db = builder
         .build()
         .context("failed to build Cairo RootDatabase for native test runner")?;
 
     native_set_skip_unused_import_diagnostics(&mut db, true);
-    init_dev_corelib(&mut db, corelib_src.clone());
+    init_dev_corelib(&mut db, resolve_native_corelib_src(workspace_root)?);
 
-    let all_crate_inputs = native_setup_project(&mut db, &cairo_project_dir)
+    let all_crate_inputs = native_setup_project(&mut db, &project.cairo_project_dir)
         .map_err(|e| anyhow!("failed to setup Cairo project for tests: {e}"))?;
 
     // Restrict `#[cfg(test)]` to the root package and integration test crates so external
@@ -1998,14 +2017,17 @@ pub(crate) fn compile_or_load_native_tests(
             .crate_configs(db_ref)
             .clone()
             .unwrap_or_default();
-        let dep_cfg_set = CfgSet::from_iter([
+        let mut dep_cfg_set = CfgSet::from_iter([
             Cfg::kv("target", "test"),
             Cfg::kv("feature", "test_utils"),
         ]);
+        if for_proofs {
+            dep_cfg_set.insert(Cfg::kv("gas", "disabled"));
+        }
         for (input, cfg) in crate_configs.iter_mut() {
             if let CrateInput::Real { name, .. } = input {
                 if name != crate_name
-                    && name != &integration_crate_name
+                    && name != &project.integration_crate_name
                     && name != "core"
                 {
                     cfg.settings.cfg_set = Some(dep_cfg_set.clone());
@@ -2022,11 +2044,70 @@ pub(crate) fn compile_or_load_native_tests(
         .into_iter()
         .filter(|input| match input {
             CrateInput::Real { name, .. } => {
-                name == crate_name || (has_integration_tests && name == &integration_crate_name)
+                name == crate_name || (project.has_integration_tests && name == &project.integration_crate_name)
             }
             _ => false,
         })
         .collect();
+
+    Ok(NativeTestDb { db, test_crate_inputs })
+}
+
+#[cfg(feature = "native-test-runner")]
+pub(crate) fn compile_or_load_native_tests(
+    manifest_path: &Path,
+    workspace_root: &Path,
+    package_name: &str,
+    crate_name: &str,
+    features: &[String],
+    no_cache: bool,
+) -> Result<(cairo_lang_test_plugin::TestCompilation<'static>, bool, f64)> {
+    use cairo_lang_compiler::diagnostics::DiagnosticsReporter;
+    use cairo_lang_defs::ids::NamedLanguageElementId;
+    use cairo_lang_filesystem::db::FilesGroup;
+    use cairo_lang_filesystem::ids::CrateInput;
+
+    let compile_start = Instant::now();
+    let manifest_text = read_text_file_with_limit(manifest_path, MAX_MANIFEST_BYTES, "manifest")?;
+    let manifest = parse_manifest_toml(&manifest_text, manifest_path, "manifest")?;
+    let resolved_features = resolve_manifest_native_features(&manifest, features);
+    let manifest_dir = manifest_path.parent().unwrap_or(workspace_root);
+    let src_dir = manifest_dir.join("src");
+    let tests_dir = manifest_dir.join("tests");
+
+    // Compute source hash for compiled TestCompilation cache (including tests/ if present)
+    let mut tracked_roots = vec![src_dir.clone()];
+    if tests_dir.is_dir() {
+        tracked_roots.push(tests_dir.clone());
+    }
+    let (tracked_sources, _) = native_collect_tracked_sources(workspace_root, &tracked_roots)?;
+    let sources_hash = native_tracked_sources_content_hash(workspace_root, &tracked_sources)?;
+    let mut cache_hasher = blake3::Hasher::new();
+    cache_hasher.update(b"uc-test-compilation-v7:");
+    cache_hasher.update(UC_SNFORGE_STD_SHIM_SOURCE.as_bytes());
+    cache_hasher.update(native_cairo_lang_compiler_version().as_bytes());
+    cache_hasher.update(manifest_text.as_bytes());
+    cache_hasher.update(resolved_features.join(",").as_bytes());
+    cache_hasher.update(sources_hash.as_bytes());
+    let test_cache_key = cache_hasher.finalize().to_hex().to_string();
+    let test_cache_dir = workspace_root.join(".uc/cache/tests");
+    let test_cache_file = test_cache_dir.join(format!("compiled-{test_cache_key}.json"));
+
+    if !no_cache && test_cache_file.is_file() {
+        if let Ok(bytes) = fs::read(&test_cache_file) {
+            if let Ok(cached_compilation) =
+                serde_json::from_slice::<cairo_lang_test_plugin::TestCompilation<'static>>(&bytes)
+            {
+                let compile_ms = compile_start.elapsed().as_secs_f64() * 1000.0;
+                return Ok((cached_compilation, true, compile_ms));
+            }
+        }
+    }
+
+    let project = write_native_test_project(manifest_path, workspace_root, package_name, crate_name, &manifest)?;
+    let NativeTestDb { db, test_crate_inputs } =
+        build_native_test_db(&project, crate_name, &resolved_features, workspace_root, false)?;
+    let integration_crate_name = project.integration_crate_name;
 
     let contract_crate_ids: Vec<_> = db
         .crates()
@@ -2641,6 +2722,18 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
         .unwrap_or("package")
         .to_string();
     let crate_name = normalize_package_name_for_cairo_crate(&package_name);
+
+    #[cfg(feature = "native-test-runner")]
+    if args.verify_proofs {
+        return run_verify_proofs(
+            &args,
+            &effective_manifest_path,
+            &workspace_root,
+            &package_name,
+            &crate_name,
+            &manifest,
+        );
+    }
 
     let uses_external_snforge =
         project_uses_external_snforge_cheatcodes(&effective_manifest_path, &src_dir);
@@ -3478,7 +3571,23 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
             }
         }
 
-        let status = if failed_count == 0 { "passed" } else { "failed" };
+        let proof_bundle = if args.prove && failed_count == 0 {
+            Some(prove_test_results(
+                &args,
+                &effective_manifest_path,
+                &workspace_root,
+                &package_name,
+                &crate_name,
+                &manifest,
+                &results,
+            )?)
+        } else {
+            None
+        };
+        let proof_failures = proof_bundle.as_ref().map_or(0, |(bundle, _)| {
+            bundle.tests.iter().filter(|t| t.status == "failed").count()
+        });
+        let status = if failed_count == 0 && proof_failures == 0 { "passed" } else { "failed" };
         let resource_totals = suite_resource_totals(&results);
         let report = serde_json::json!({
             "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
@@ -3499,6 +3608,7 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
             "coverage": coverage_report,
             "snapshot_regressions": if snapshot_regressions.is_empty() { None } else { Some(&snapshot_regressions) },
             "mutation_testing": mutation_report,
+            "proofs": proof_bundle.as_ref().map(|(bundle, dir)| proof_bundle_report(bundle, dir)),
             "resource_totals": resource_totals,
             "tests": results,
         });
@@ -3609,10 +3719,16 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
                 ignored_count,
                 elapsed_ms
             );
+            if let Some((bundle, dir)) = &proof_bundle {
+                print_proof_bundle(bundle, dir);
+            }
         }
 
         if failed_count > 0 {
             bail!("{failed_count} test(s) failed");
+        }
+        if proof_failures > 0 {
+            bail!("{proof_failures} passing test(s) could not be proved");
         }
         return Ok(());
     }

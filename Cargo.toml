@@ -29,6 +29,10 @@ cairo-lang-test-plugin = "2.18.0"
 cairo-lang-runner = "2.18.0"
 cairo-lang-sierra-to-casm = "2.18.0"
 cairo-lang-sierra-type-size = "2.18.0"
+cairo-lang-casm = "2.18.0"
+cairo-lang-runnable-utils = "2.18.0"
+cairo-lang-sierra-generator = "2.18.0"
+cairo-vm = "3.2.0"
 ureq = { version = "3.2.0", default-features = false, features = ["rustls"] }
 starknet-crypto = "0.8.1"
 clap = { version = "4", features = ["derive"] }

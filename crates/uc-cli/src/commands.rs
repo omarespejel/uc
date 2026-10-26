@@ -15,6 +15,8 @@ mod scarb_parity;
 mod starknet_onchain;
 mod starkscan;
 mod test_runner;
+#[cfg(feature = "native-test-runner")]
+mod test_prove;
 mod tx_hash;
 mod watch;
 
@@ -35,6 +37,8 @@ pub(crate) use scarb_parity::*;
 pub(crate) use starknet_onchain::*;
 pub(crate) use starkscan::*;
 pub(crate) use test_runner::*;
+#[cfg(feature = "native-test-runner")]
+pub(crate) use test_prove::*;
 pub(crate) use tx_hash::*;
 pub(crate) use watch::*;
 
