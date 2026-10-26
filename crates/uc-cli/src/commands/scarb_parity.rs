@@ -2595,10 +2595,43 @@ pub(crate) enum UtilsSubcommand {
     },
     /// Calculate Starknet selector from function/event name (wraps `uc selector`)
     Selector(SelectorArgs),
+    /// SNIP-8 hash of a V3 transaction given as JSON (a file, or `-` for stdin)
+    TxHash {
+        /// Path to the transaction JSON (`type`, `version`, fields as the RPC carries them).
+        #[arg(long)]
+        tx: PathBuf,
+        /// Chain id: `SN_MAIN`, `SN_SEPOLIA`, or a felt (`0x...`).
+        #[arg(long, default_value = "SN_SEPOLIA")]
+        chain_id: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub(crate) fn run_utils(args: UtilsArgs) -> Result<()> {
     match args.command {
+        UtilsSubcommand::TxHash { tx, chain_id, json } => {
+            let text = if tx.as_os_str() == "-" {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                buf
+            } else {
+                fs::read_to_string(&tx).with_context(|| format!("failed to read {}", tx.display()))?
+            };
+            let value: serde_json::Value = serde_json::from_str(&text).context("transaction is not JSON")?;
+            let chain = if chain_id.starts_with("0x") {
+                parse_felt_str(&chain_id)?
+            } else {
+                starknet_types_core::felt::Felt::from_bytes_be_slice(chain_id.as_bytes())
+            };
+            let hash = v3_transaction_hash(&value, chain)?;
+            if json {
+                println!("{}", serde_json::json!({ "transaction_hash": format_felt_hex(&hash), "chain_id": format_felt_hex(&chain) }));
+            } else {
+                println!("{}", format_felt_hex(&hash));
+            }
+            Ok(())
+        }
         UtilsSubcommand::ClassHash(ch_args) => run_class_hash(ch_args),
         UtilsSubcommand::Selector(sel_args) => run_selector(sel_args),
         UtilsSubcommand::Serialize { arguments, json } => {
