@@ -138,11 +138,6 @@ pub(crate) fn sign_transaction_hash(private_key: &Felt, hash: &Felt) -> Result<(
     Ok((sig.r, sig.s))
 }
 
-/// Whether `(r, s)` is a valid signature of `hash` for `public_key`.
-pub(crate) fn verify_transaction_signature(public_key: &Felt, hash: &Felt, r: &Felt, s: &Felt) -> bool {
-    starknet_crypto::verify(public_key, hash, r, s).unwrap_or(false)
-}
-
 /// Signs `tx` in place: computes its SNIP-8 hash for `chain_id`, sets `signature` to `[r, s]`
 /// and returns the hash. With no key the signature is left empty and the hash still returned.
 pub(crate) fn sign_v3_transaction(tx: &mut serde_json::Value, chain_id: Felt, private_key: Option<&Felt>) -> Result<Felt> {
@@ -266,8 +261,9 @@ mod tests {
         let sig = tx["signature"].as_array().unwrap();
         let r = parse_felt_str(sig[0].as_str().unwrap()).unwrap();
         let s = parse_felt_str(sig[1].as_str().unwrap()).unwrap();
-        assert!(verify_transaction_signature(&pubkey, &hash, &r, &s));
-        assert!(!verify_transaction_signature(&pubkey, &(hash + Felt::ONE), &r, &s));
-        assert!(!verify_transaction_signature(&starknet_crypto::get_public_key(&Felt::from(7u64)), &hash, &r, &s));
+        let verify = |key: &Felt, h: &Felt| starknet_crypto::verify(key, h, &r, &s).unwrap_or(false);
+        assert!(verify(&pubkey, &hash));
+        assert!(!verify(&pubkey, &(hash + Felt::ONE)));
+        assert!(!verify(&starknet_crypto::get_public_key(&Felt::from(7u64)), &hash));
     }
 }

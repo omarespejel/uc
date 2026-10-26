@@ -8,14 +8,24 @@ use cairo_lang_runner::{Arg, ClassInfoMap as OrderedHashMap, DevnetExecutionCont
 use cairo_lang_sierra::program::Program;
 use cairo_lang_starknet::contract::ContractInfo;
 use starknet_types_core::felt::Felt;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 
 pub(crate) const DEVNET_STRK_ADDRESS: &str = "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d";
 pub(crate) const DEVNET_ETH_ADDRESS: &str = "0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7";
-pub(crate) const DEVNET_UDC_ADDRESS: &str = "0x041a78e741e5af2fec34b695679bc6891742439f7afb8484ecd7766661ad02bf";
-const DEVNET_SPEC_VERSION: &str = "0.8.1";
+/// The JSON-RPC version the devnet serves (`pre_confirmed` tags, event and transaction indexes).
+const DEVNET_SPEC_VERSION: &str = "0.10.0";
+/// The Starknet version whose rules the devnet follows: fees in L2 gas and blob data gas,
+/// Blake2s compiled class hashes.
+const DEVNET_STARKNET_VERSION: &str = "0.14.1";
 const EXECUTION_GAS_BUDGET: usize = 2_000_000_000;
+/// Price of every gas unit (L1, L1 data, L2) in FRI and WEI, as starknet-devnet starts.
+const DEVNET_GAS_PRICE: u128 = 1_000_000_000;
+/// L1 data gas per felt of state diff (blob data availability).
+const DATA_GAS_PER_FELT: u64 = 32;
+/// L2 gas per byte of declared code, `(Sierra felts + CASM felts) * 32 + ABI bytes`: what
+/// starknet-devnet 0.10.1 (blockifier) charges a DECLARE, within 0.3% on measured classes.
+const GAS_PER_CODE_BYTE: u64 = 1_280;
 
 /// The three system contracts every devnet starts with, as Cairo 2.18 sources.
 const SYSTEM_CONTRACTS_CAIRO: &str = r#"
@@ -34,11 +44,12 @@ pub trait IDevnetAccount<T> {
 
 #[starknet::contract(account)]
 pub mod DevnetAccount {
+    use core::ecdsa::check_ecdsa_signature;
     use core::num::traits::Zero;
     use starknet::account::Call;
     use starknet::storage::{StoragePointerReadAccess, StoragePointerWriteAccess};
     use starknet::syscalls::call_contract_syscall;
-    use starknet::{get_caller_address, get_contract_address};
+    use starknet::{get_caller_address, get_contract_address, get_tx_info};
 
     #[storage]
     struct Storage {
@@ -53,7 +64,7 @@ pub mod DevnetAccount {
     #[abi(embed_v0)]
     impl AccountImpl of super::IDevnetAccount<ContractState> {
         fn __validate__(self: @ContractState, calls: Array<Call>) -> felt252 {
-            starknet::VALIDATED
+            self.validate_transaction()
         }
 
         fn __execute__(ref self: ContractState, calls: Array<Call>) -> Array<Span<felt252>> {
@@ -69,15 +80,19 @@ pub mod DevnetAccount {
         }
 
         fn __validate_declare__(self: @ContractState, class_hash: felt252) -> felt252 {
-            starknet::VALIDATED
+            self.validate_transaction()
         }
 
         fn __validate_deploy__(self: @ContractState, class_hash: felt252, salt: felt252, public_key: felt252) -> felt252 {
-            starknet::VALIDATED
+            self.validate_transaction()
         }
 
         fn is_valid_signature(self: @ContractState, hash: felt252, signature: Array<felt252>) -> felt252 {
-            starknet::VALIDATED
+            if self.is_valid(hash, signature.span()) {
+                starknet::VALIDATED
+            } else {
+                0
+            }
         }
 
         fn get_public_key(self: @ContractState) -> felt252 {
@@ -87,6 +102,20 @@ pub mod DevnetAccount {
         fn set_public_key(ref self: ContractState, new_public_key: felt252) {
             assert(get_caller_address() == get_contract_address(), 'ONLY_SELF');
             self.public_key.write(new_public_key);
+        }
+    }
+
+    #[generate_trait]
+    impl Internal of InternalTrait {
+        fn validate_transaction(self: @ContractState) -> felt252 {
+            let tx_info = get_tx_info().unbox();
+            assert(self.is_valid(tx_info.transaction_hash, tx_info.signature), 'Account: invalid signature');
+            starknet::VALIDATED
+        }
+
+        fn is_valid(self: @ContractState, hash: felt252, signature: Span<felt252>) -> bool {
+            signature.len() == 2
+                && check_ecdsa_signature(hash, self.public_key.read(), *signature.at(0), *signature.at(1))
         }
     }
 }
@@ -306,13 +335,13 @@ pub(crate) struct DevnetSystemClasses {
     pub deployer: serde_json::Value,
 }
 
-/// Compiles the embedded system contracts once per compiler version into uc's cache
-/// (`<cache>/devnet-system-v<cairo version>/`) and loads their class files.
+/// Compiles the embedded system contracts once per compiler version and source revision into
+/// uc's cache (`<cache>/devnet-system-v<cairo version>-<source digest>/`) and loads them.
 pub(crate) fn ensure_devnet_system_classes() -> Result<DevnetSystemClasses> {
     let version = native_cairo_lang_compiler_version();
     let dir = native_global_cache_root_dir()
         .unwrap_or_else(|| std::env::temp_dir().join("uc-global-cache"))
-        .join(format!("devnet-system-v{version}"));
+        .join(format!("devnet-system-v{version}-{}", &blake3::hash(SYSTEM_CONTRACTS_CAIRO.as_bytes()).to_hex()[..12]));
     fs::create_dir_all(dir.join("src"))?;
     let manifest = format!(
         "[package]\nname = \"uc_devnet_system\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n\n[dependencies]\nstarknet = \"{version}\"\n\n[[target.starknet-contract]]\nsierra = true\ncasm = false\n"
@@ -362,7 +391,6 @@ pub(crate) fn ensure_devnet_system_classes() -> Result<DevnetSystemClasses> {
 struct DeclaredClass {
     class_json: serde_json::Value,
     program: Program,
-    declared_in_block: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -412,17 +440,27 @@ const ERR_TX_HASH_NOT_FOUND: i64 = 29;
 const ERR_CONTRACT_ERROR: i64 = 40;
 const ERR_TX_EXECUTION_ERROR: i64 = 41;
 const ERR_INVALID_NONCE: i64 = 52;
+const ERR_INSUFFICIENT_RESOURCES: i64 = 53;
+const ERR_INSUFFICIENT_BALANCE: i64 = 54;
+const ERR_VALIDATION_FAILURE: i64 = 55;
+const ERR_COMPILED_CLASS_HASH_MISMATCH: i64 = 60;
+const ERR_UNSUPPORTED_TX_VERSION: i64 = 61;
 const ERR_CLASS_ALREADY_DECLARED: i64 = 51;
 const ERR_UNSUPPORTED: i64 = -32601;
 const ERR_INVALID_PARAMS: i64 = -32602;
 
 /// Outcome of running one entry point.
 struct ExecutionOutcome {
+    contract: Felt,
+    class_hash: Felt,
+    selector: Felt,
+    calldata: Vec<Felt>,
+    caller: Felt,
+    /// Sierra gas the run consumed, syscalls included: the entry point's L2 gas.
+    l2_gas: u64,
     retdata: Vec<Felt>,
     events: Vec<(Felt, Vec<Felt>, Vec<Felt>)>,
     messages: Vec<(Felt, Felt, Vec<Felt>)>,
-    steps: usize,
-    builtins: BTreeMap<String, usize>,
     panic: Option<Vec<Felt>>,
 }
 
@@ -522,20 +560,21 @@ impl DevnetChain {
             token_class_hash: String::new(),
             deployer_class_hash: String::new(),
         };
-        let account_class = chain.declare(system.account.clone(), 0).map_err(|e| anyhow!("{}", e.message))?;
-        let token_class = chain.declare(system.token.clone(), 0).map_err(|e| anyhow!("{}", e.message))?;
-        let deployer_class = chain.declare(system.deployer.clone(), 0).map_err(|e| anyhow!("{}", e.message))?;
+        let account_class = chain.declare(system.account.clone()).map_err(|e| anyhow!("{}", e.message))?;
+        let token_class = chain.declare(system.token.clone()).map_err(|e| anyhow!("{}", e.message))?;
+        let deployer_class = chain.declare(system.deployer.clone()).map_err(|e| anyhow!("{}", e.message))?;
         chain.account_class_hash = hex(&account_class);
         chain.token_class_hash = hex(&token_class);
         chain.deployer_class_hash = hex(&deployer_class);
 
         let strk = parse_felt_str(DEVNET_STRK_ADDRESS)?;
         let eth = parse_felt_str(DEVNET_ETH_ADDRESS)?;
-        let udc = parse_felt_str(DEVNET_UDC_ADDRESS)?;
+        let udc = parse_felt_str(STARKNET_UDC_ADDRESS)?;
         let short = |s: &str| Felt::from_bytes_be_slice(s.as_bytes());
         chain.deploy_at(strk, token_class, &[short("StarkNet Token"), short("STRK")], Felt::ZERO)?;
         chain.deploy_at(eth, token_class, &[short("Ether"), short("ETH")], Felt::ZERO)?;
         chain.deploy_at(udc, deployer_class, &[], Felt::ZERO)?;
+        chain.deploy_at(parse_felt_str(LEGACY_UDC_ADDRESS)?, deployer_class, &[], Felt::ZERO)?;
         let accounts = chain.accounts.clone();
         for acc in &accounts {
             let address = parse_felt_str(&acc.address)?;
@@ -543,7 +582,7 @@ impl DevnetChain {
             chain.deploy_at(address, account_class, &[public_key], Felt::ZERO)?;
             let (low, high) = u256_parts(&acc.initial_balance).map_err(|e| anyhow!("{}", e.message))?;
             for token in [strk, eth] {
-                let out = chain.execute(token, selector("mint"), vec![address, low, high], Felt::ZERO, &DevnetExecutionContext::default())?;
+                let out = chain.execute(token, selector("mint"), vec![address, low, high], Felt::ZERO, &DevnetExecutionContext::default(), EXECUTION_GAS_BUDGET)?;
                 if let Some(p) = out.panic {
                     bail!("genesis mint failed: {}", cairo_lang_runner::casm_run::format_for_panic(p.into_iter()));
                 }
@@ -558,7 +597,7 @@ impl DevnetChain {
         self.state.register_deployed_contract(address, class_hash);
         let info = self.infos.get(&class_hash).ok_or_else(|| anyhow!("class {} not declared", hex(&class_hash)))?.clone();
         if let Some(ctor) = &info.constructor {
-            let out = self.run_function(class_hash, ctor.clone(), address, calldata.to_vec(), caller, &DevnetExecutionContext::default())?;
+            let out = self.run_function(class_hash, ctor.clone(), selector("constructor"), address, calldata.to_vec(), caller, &DevnetExecutionContext::default(), EXECUTION_GAS_BUDGET)?;
             if let Some(p) = out.panic {
                 self.state.register_deployed_contract(address, Felt::ZERO);
                 bail!("constructor of {} panicked: {}", hex(&address), cairo_lang_runner::casm_run::format_for_panic(p.into_iter()));
@@ -568,7 +607,7 @@ impl DevnetChain {
     }
 
     /// Declares a class from its `.contract_class.json` document. Returns the class hash.
-    fn declare(&mut self, class_json: serde_json::Value, block: u64) -> Result<Felt, RpcError> {
+    fn declare(&mut self, class_json: serde_json::Value) -> Result<Felt, RpcError> {
         let class: ContractClass = serde_json::from_value(normalize_class_json(class_json.clone()))
             .map_err(|e| RpcError::new(ERR_INVALID_PARAMS, format!("not a Sierra contract class: {e}")))?;
         // The class hash commits to the ABI string as declared (a string in DECLARE payloads).
@@ -602,7 +641,7 @@ impl DevnetChain {
         if stored.get("abi").is_some_and(|a| !a.is_string()) {
             stored["abi"] = serde_json::json!(declared_abi_string(&stored));
         }
-        self.classes.insert(class_hash, DeclaredClass { class_json: stored, program, declared_in_block: block });
+        self.classes.insert(class_hash, DeclaredClass { class_json: stored, program });
         self.rebuild_runners().map_err(|e| RpcError::new(ERR_CONTRACT_ERROR, format!("failed to prepare class runners: {e}")))?;
         Ok(class_hash)
     }
@@ -644,14 +683,19 @@ impl DevnetChain {
         }
     }
 
+    /// Runs one entry point with `gas_budget` Sierra gas. A panic leaves the chain state as it
+    /// was; a success commits the run's state.
+    #[allow(clippy::too_many_arguments)]
     fn run_function(
         &mut self,
         class_hash: Felt,
         function: cairo_lang_sierra::ids::FunctionId,
+        selector: Felt,
         contract: Felt,
         calldata: Vec<Felt>,
         caller: Felt,
         tx: &DevnetExecutionContext,
+        gas_budget: usize,
     ) -> Result<ExecutionOutcome> {
         let runner = self.runner_for(&class_hash).ok_or_else(|| anyhow!("no runner for class {}", hex(&class_hash)))?;
         let func = runner
@@ -662,20 +706,13 @@ impl DevnetChain {
         let res = runner
             .run_function_with_starknet_context(
                 func,
-                vec![Arg::Array(calldata.into_iter().map(Arg::Value).collect())],
-                Some(EXECUTION_GAS_BUDGET),
+                vec![Arg::Array(calldata.iter().copied().map(Arg::Value).collect())],
+                Some(gas_budget),
                 state,
             )
             .map_err(|e| anyhow!("runner error: {e}"))?;
-        let steps = res.used_resources.basic_resources.n_steps;
-        let builtins: BTreeMap<String, usize> = res
-            .used_resources
-            .basic_resources
-            .builtin_instance_counter
-            .iter()
-            .filter(|(_, n)| **n > 0)
-            .map(|(k, v)| (k.to_str().to_string(), *v))
-            .collect();
+        let remaining = res.gas_counter.and_then(|g| u64::try_from(g.to_biguint()).ok()).unwrap_or(0);
+        let l2_gas = (gas_budget as u64).saturating_sub(remaining);
         match res.value {
             RunResultValue::Success(value) => {
                 let mut new_state = res.starknet_state;
@@ -686,21 +723,25 @@ impl DevnetChain {
                     Some(data) => data,
                     None => cairo_lang_runner::casm_run::read_array_result_as_vec(&res.memory, &value),
                 };
-                Ok(ExecutionOutcome { retdata, events, messages, steps, builtins, panic: None })
+                Ok(ExecutionOutcome { contract, class_hash, selector, calldata, caller, l2_gas, retdata, events, messages, panic: None })
             }
             RunResultValue::Panic(data) => Ok(ExecutionOutcome {
+                contract,
+                class_hash,
+                selector,
+                calldata,
+                caller,
+                l2_gas,
                 retdata: Vec::new(),
                 events: Vec::new(),
                 messages: Vec::new(),
-                steps,
-                builtins,
                 panic: Some(data),
             }),
         }
     }
 
     /// Runs the external entry point `selector` of the contract at `contract`.
-    fn execute(&mut self, contract: Felt, selector_felt: Felt, calldata: Vec<Felt>, caller: Felt, tx: &DevnetExecutionContext) -> Result<ExecutionOutcome> {
+    fn execute(&mut self, contract: Felt, selector_felt: Felt, calldata: Vec<Felt>, caller: Felt, tx: &DevnetExecutionContext, gas_budget: usize) -> Result<ExecutionOutcome> {
         let class_hash = self.state.class_hash_at(&contract).ok_or_else(|| anyhow!("CONTRACT_NOT_FOUND"))?;
         let info = self.infos.get(&class_hash).ok_or_else(|| anyhow!("class {} not declared", hex(&class_hash)))?;
         let function = info
@@ -709,7 +750,7 @@ impl DevnetChain {
             .or_else(|| info.l1_handlers.get(&selector_felt))
             .cloned()
             .ok_or_else(|| anyhow!("ENTRYPOINT_NOT_FOUND"))?;
-        self.run_function(class_hash, function, contract, calldata, caller, tx)
+        self.run_function(class_hash, function, selector_felt, contract, calldata, caller, tx, gas_budget)
     }
 
     fn next_block_number(&self) -> u64 {
@@ -741,49 +782,16 @@ impl DevnetChain {
         self.blocks.last().unwrap()
     }
 
-    fn record_tx(&mut self, tx_type: &str, tx_hash: Felt, transaction: serde_json::Value, outcome: Option<&ExecutionOutcome>, revert: Option<String>, extra: serde_json::Value) -> String {
+    /// Records a transaction, its receipt and its trace in the pending block.
+    fn record(&mut self, tx_type: &str, tx_hash: Felt, transaction: serde_json::Value, mut receipt: serde_json::Value, trace: serde_json::Value) -> String {
         let hash_hex = hex(&tx_hash);
-        let (events, messages, steps, builtins) = match outcome {
-            Some(o) => (
-                o.events.iter().map(|(from, keys, data)| serde_json::json!({ "from_address": hex(from), "keys": hex_vec(keys), "data": hex_vec(data) })).collect::<Vec<_>>(),
-                o.messages.iter().map(|(from, to, payload)| serde_json::json!({ "from_address": hex(from), "to_address": hex(to), "payload": hex_vec(payload) })).collect::<Vec<_>>(),
-                o.steps,
-                o.builtins.clone(),
-            ),
-            None => (Vec::new(), Vec::new(), 0, BTreeMap::new()),
-        };
-        let mut receipt = serde_json::json!({
-            "type": tx_type,
-            "transaction_hash": hash_hex,
-            "actual_fee": { "amount": "0x0", "unit": "FRI" },
-            "execution_status": if revert.is_some() { "REVERTED" } else { "SUCCEEDED" },
-            "finality_status": "ACCEPTED_ON_L2",
-            "block_number": self.next_block_number(),
-            "block_hash": "0x0",
-            "messages_sent": messages,
-            "events": events,
-            "execution_resources": {
-                "steps": steps,
-                "l1_gas": 0, "l1_data_gas": 0, "l2_gas": steps * 100,
-                "builtins": builtins,
-            },
-        });
-        if let Some(r) = &revert {
-            receipt["revert_reason"] = serde_json::json!(r);
-        }
-        if let serde_json::Value::Object(map) = extra {
-            for (k, v) in map {
-                receipt[k] = v;
-            }
-        }
-        let trace = serde_json::json!({
-            "type": tx_type,
-            "execute_invocation": transaction.get("execute_invocation").cloned().unwrap_or(serde_json::Value::Null),
-            "state_diff": serde_json::Value::Null,
-        });
+        receipt["type"] = serde_json::json!(tx_type);
+        receipt["transaction_hash"] = serde_json::json!(hash_hex);
+        receipt["finality_status"] = serde_json::json!("ACCEPTED_ON_L2");
+        receipt["block_number"] = serde_json::json!(self.next_block_number());
+        receipt["block_hash"] = serde_json::json!("0x0");
         let mut tx_json = transaction;
         if let serde_json::Value::Object(map) = &mut tx_json {
-            map.remove("execute_invocation");
             map.insert("transaction_hash".into(), serde_json::json!(hash_hex));
         }
         let record = DevnetTransaction {
@@ -829,150 +837,347 @@ impl DevnetChain {
         v3_transaction_hash(&normalized, self.chain_id).unwrap_or_else(|_| self.tx_hash_for(kind, sender, nonce, fallback))
     }
 
-    /// Checks a transaction's signature against the account's public key when both exist.
-    /// Empty signatures are accepted (a devnet convenience); a wrong one is refused.
-    fn check_signature(&mut self, tx_hash: &Felt, signature: &[Felt], public_key: Option<Felt>) -> Result<(), RpcError> {
-        if signature.is_empty() {
-            return Ok(());
+    fn strk(&self) -> Felt {
+        parse_felt_str(DEVNET_STRK_ADDRESS).unwrap_or_default()
+    }
+
+    /// The fee token balance of `owner` in FRI, saturating at `u128::MAX`.
+    fn strk_balance(&self, owner: &Felt) -> u128 {
+        let key = balance_key(owner);
+        if self.state.storage_at(&self.strk(), &(key + Felt::ONE)) != Felt::ZERO {
+            return u128::MAX;
         }
-        let Some(public_key) = public_key else { return Ok(()) };
-        if signature.len() != 2 || !verify_transaction_signature(&public_key, tx_hash, &signature[0], &signature[1]) {
-            return Err(RpcError::new(ERR_TX_EXECUTION_ERROR, "invalid signature").with_data(serde_json::json!({
-                "transaction_hash": hex(tx_hash),
-                "public_key": hex(&public_key),
-            })));
+        u128::try_from(self.state.storage_at(&self.strk(), &key).to_biguint()).unwrap_or(u128::MAX)
+    }
+
+    /// Rejects what a sequencer rejects before validation: a gas price under the block's, no L2
+    /// gas at all, or a payer whose balance does not cover the maximum fee.
+    fn check_fee_bounds(&self, payer: &Felt, bounds: &ResourceBounds) -> Result<(), RpcError> {
+        let insufficient = |detail: String| {
+            RpcError::new(ERR_INSUFFICIENT_RESOURCES, "The transaction's resources don't cover validation or the minimal transaction fee")
+                .with_data(serde_json::json!(detail))
+        };
+        for (name, (amount, price)) in [("L2 gas", bounds.l2_gas), ("L1 data gas", bounds.l1_data_gas), ("L1 gas", bounds.l1_gas)] {
+            if amount > 0 && price < DEVNET_GAS_PRICE {
+                return Err(insufficient(format!("Max {name} price ({price}) is lower than the actual gas price: {DEVNET_GAS_PRICE}.")));
+            }
+        }
+        if bounds.l2_gas.0 == 0 {
+            return Err(insufficient("Max L2 gas amount is 0.".to_string()));
+        }
+        let max_fee = bounds.max_fee();
+        let balance = self.strk_balance(payer);
+        if balance < max_fee {
+            return Err(RpcError::new(ERR_INSUFFICIENT_BALANCE, "Account balance is not enough to cover the transaction cost").with_data(serde_json::json!(format!(
+                "The resource bounds allow a fee of up to {max_fee} FRI; {} holds {balance} FRI.",
+                hex(payer)
+            ))));
         }
         Ok(())
     }
 
-    /// The public key the embedded account at `address` reports, if it is one.
-    fn account_public_key(&mut self, address: Felt) -> Option<Felt> {
-        let snapshot = self.state.clone();
-        let out = self.execute(address, selector("get_public_key"), Vec::new(), Felt::ZERO, &DevnetExecutionContext::default()).ok();
-        self.state = snapshot;
-        out.filter(|o| o.panic.is_none()).and_then(|o| o.retdata.first().copied())
+    /// L1 data gas of the state diff since `before`, counted as blockifier counts it for the fee:
+    /// two felts per modified contract (not the fee token, whose updates the block amortizes),
+    /// one per class change, two per storage update (the payer's fee balance included) and two
+    /// per declared class.
+    fn data_gas_for_fee(&self, before: &StarknetState, payer: Felt, declared: bool) -> u64 {
+        let strk = self.strk();
+        let storage = self.state.storage_diff(before);
+        let classes = class_changes(before, &self.state);
+        let mut modified: BTreeSet<Felt> = storage.iter().map(|(c, _, _)| *c).chain(classes.iter().map(|(a, _)| *a)).collect();
+        modified.insert(payer);
+        let payer_key = balance_key(&payer);
+        let mut n_storage = storage.len();
+        if !storage.iter().any(|(c, k, _)| *c == strk && *k == payer_key) {
+            n_storage += 1;
+        }
+        modified.remove(&strk);
+        let felts = 2 * modified.len() + classes.len() + 2 * n_storage + if declared { 2 } else { 0 };
+        DATA_GAS_PER_FELT * felts as u64
     }
 
-    fn add_declare(&mut self, tx: &serde_json::Value) -> Result<serde_json::Value, RpcError> {
-        let sender = felt(tx.get("sender_address").and_then(|v| v.as_str()).unwrap_or("0x1"))?;
-        let nonce = self.check_nonce(&sender, tx.get("nonce"))?;
-        let class_json = tx.get("contract_class").cloned().ok_or_else(|| RpcError::new(ERR_INVALID_PARAMS, "contract_class is required"))?;
-        let block = self.next_block_number();
-        let signature = felts_of_json(tx.get("signature"));
-        let class_hash = self.declare(class_json, block)?;
-        let mut for_hash = tx.clone();
-        for_hash["class_hash"] = serde_json::json!(hex(&class_hash));
-        for_hash.as_object_mut().map(|m| m.remove("contract_class"));
-        let tx_hash = self.v3_hash_or_digest("DECLARE", &sender, nonce, &for_hash, &serde_json::json!({ "class_hash": hex(&class_hash) }));
-        let public_key = self.account_public_key(sender);
-        if let Err(e) = self.check_signature(&tx_hash, &signature, public_key) {
-            self.undeclare(&class_hash);
-            return Err(e);
+    /// The RPC `state_diff` of everything since `before`.
+    fn state_diff_json(&self, before: &StarknetState, nonce: Option<(Felt, u64)>, declared: Option<(Felt, Felt)>) -> serde_json::Value {
+        let mut by_contract: BTreeMap<Felt, Vec<serde_json::Value>> = BTreeMap::new();
+        for (contract, key, value) in self.state.storage_diff(before) {
+            by_contract.entry(contract).or_default().push(serde_json::json!({ "key": hex(&key), "value": hex(&value) }));
         }
-        self.nonces.insert(sender, nonce + 1);
-        let record = serde_json::json!({
-            "type": "DECLARE",
-            "version": tx.get("version").cloned().unwrap_or(serde_json::json!("0x3")),
-            "sender_address": hex(&sender),
-            "class_hash": hex(&class_hash),
-            "compiled_class_hash": tx.get("compiled_class_hash").cloned().unwrap_or(serde_json::json!("0x0")),
-            "nonce": format!("{nonce:#x}"),
-            "signature": tx.get("signature").cloned().unwrap_or(serde_json::json!([])),
-        });
-        let hash_hex = self.record_tx("DECLARE", tx_hash, record, None, None, serde_json::json!({}));
-        Ok(serde_json::json!({ "transaction_hash": hash_hex, "class_hash": hex(&class_hash) }))
+        let (replaced, deployed): (Vec<(Felt, Felt)>, Vec<(Felt, Felt)>) = class_changes(before, &self.state)
+            .into_iter()
+            .partition(|(address, _)| before.class_hash_at(address).is_some_and(|c| c != Felt::ZERO));
+        serde_json::json!({
+            "storage_diffs": by_contract.into_iter().map(|(address, entries)| serde_json::json!({ "address": hex(&address), "storage_entries": entries })).collect::<Vec<_>>(),
+            "deprecated_declared_classes": [],
+            "declared_classes": declared.iter().map(|(h, c)| serde_json::json!({ "class_hash": hex(h), "compiled_class_hash": hex(c) })).collect::<Vec<_>>(),
+            "deployed_contracts": deployed.iter().map(|(a, c)| serde_json::json!({ "address": hex(a), "class_hash": hex(c) })).collect::<Vec<_>>(),
+            "replaced_classes": replaced.iter().map(|(a, c)| serde_json::json!({ "contract_address": hex(a), "class_hash": hex(c) })).collect::<Vec<_>>(),
+            "nonces": nonce.iter().map(|(a, n)| serde_json::json!({ "contract_address": hex(a), "nonce": format!("{n:#x}") })).collect::<Vec<_>>(),
+        })
     }
 
-    fn add_deploy_account(&mut self, tx: &serde_json::Value) -> Result<serde_json::Value, RpcError> {
-        let class_hash = felt(tx.get("class_hash").and_then(|v| v.as_str()).unwrap_or("0x0"))?;
-        let salt = felt(tx.get("contract_address_salt").and_then(|v| v.as_str()).unwrap_or("0x0"))?;
-        let calldata: Vec<Felt> = tx
-            .get("constructor_calldata")
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().and_then(|s| parse_felt_str(s).ok())).collect())
-            .unwrap_or_default();
-        if !self.classes.contains_key(&class_hash) {
-            return Err(RpcError::new(ERR_CLASS_HASH_NOT_FOUND, "Class hash not found"));
+    /// Runs an account's validation entry point; anything but `VALID` rejects the transaction.
+    fn validate_tx(&mut self, account: Felt, entry: &str, calldata: Vec<Felt>, ctx: &DevnetExecutionContext) -> Result<ExecutionOutcome, RpcError> {
+        let failure = |detail: String| RpcError::new(ERR_VALIDATION_FAILURE, "Account validation failed").with_data(serde_json::json!(detail));
+        let out = self
+            .execute(account, selector(entry), calldata, Felt::ZERO, ctx, EXECUTION_GAS_BUDGET)
+            .map_err(|e| failure(format!("The `{entry}` entry point of {} could not run: {e}", hex(&account))))?;
+        if let Some(p) = &out.panic {
+            return Err(failure(format!(
+                "The `{entry}` entry point of {} panicked with: {}",
+                hex(&account),
+                cairo_lang_runner::casm_run::format_for_panic(p.clone().into_iter())
+            )));
         }
-        let address = calculate_contract_address(&salt, &class_hash, &calldata, &Felt::ZERO);
-        if self.state.class_hash_at(&address).is_some_and(|c| c != Felt::ZERO) {
-            return Err(RpcError::new(ERR_TX_EXECUTION_ERROR, format!("contract {} is already deployed", hex(&address))));
+        if out.retdata.first() != Some(&Felt::from_bytes_be_slice(b"VALID")) {
+            return Err(failure(format!("The `{entry}` entry point of {} returned {:?}, not 'VALID'.", hex(&account), hex_vec(&out.retdata))));
         }
-        let nonce = self.check_nonce(&address, tx.get("nonce"))?;
-        let tx_hash = self.v3_hash_or_digest("DEPLOY_ACCOUNT", &address, nonce, tx, &serde_json::json!({ "class_hash": hex(&class_hash), "salt": hex(&salt) }));
-        // The embedded account takes its public key as the first constructor argument.
-        let signature = felts_of_json(tx.get("signature"));
-        let public_key = (class_hash == parse_felt_str(&self.account_class_hash).unwrap_or_default()).then(|| calldata.first().copied()).flatten();
-        self.check_signature(&tx_hash, &signature, public_key)?;
-        let ctx = DevnetExecutionContext { account_contract_address: address, transaction_hash: tx_hash, nonce: Felt::from(nonce), version: Felt::from(3_u64), ..Default::default() };
-        self.state.register_deployed_contract(address, class_hash);
-        let info = self.infos.get(&class_hash).cloned().unwrap();
-        let outcome = match &info.constructor {
-            Some(ctor) => Some(self.run_function(class_hash, ctor.clone(), address, calldata.clone(), Felt::ZERO, &ctx).map_err(|e| RpcError::new(ERR_TX_EXECUTION_ERROR, e.to_string()))?),
-            None => None,
+        Ok(out)
+    }
+
+    /// Rejects, or validates, executes and charges, one account transaction (INVOKE, DECLARE or
+    /// DEPLOY_ACCOUNT) as a Starknet sequencer does. A rejected transaction changes nothing; a
+    /// reverted one keeps its validation, its nonce bump and its fee.
+    fn run_account_tx(&mut self, kind: &'static str, tx: &serde_json::Value, mode: TxMode) -> Result<TxEffects, RpcError> {
+        let before = self.state.clone();
+        let nonces = self.nonces.clone();
+        let mut declared = None;
+        let result = self.run_account_tx_inner(kind, tx, mode, &before, &mut declared);
+        if result.is_err() {
+            if let Some((class_hash, _)) = declared {
+                self.undeclare(&class_hash);
+            }
+            self.state = before;
+            self.nonces = nonces;
+        }
+        result
+    }
+
+    fn run_account_tx_inner(
+        &mut self,
+        kind: &'static str,
+        tx: &serde_json::Value,
+        mode: TxMode,
+        before: &StarknetState,
+        declared: &mut Option<(Felt, Felt)>,
+    ) -> Result<TxEffects, RpcError> {
+        let bounds = ResourceBounds::of(tx);
+        let charge = !mode.skip_fee_charge;
+        let mut deploy: Option<(Felt, Felt)> = None;
+        let mut code_gas = 0_u64;
+        let (sender, calldata) = if kind == "DEPLOY_ACCOUNT" {
+            let class_hash = felt(tx.get("class_hash").and_then(|v| v.as_str()).unwrap_or("0x0"))?;
+            let salt = felt(tx.get("contract_address_salt").and_then(|v| v.as_str()).unwrap_or("0x0"))?;
+            let calldata = felts_of_json(tx.get("constructor_calldata"));
+            if !self.classes.contains_key(&class_hash) {
+                return Err(RpcError::new(ERR_CLASS_HASH_NOT_FOUND, "Class hash not found"));
+            }
+            let address = calculate_contract_address(&salt, &class_hash, &calldata, &Felt::ZERO);
+            if self.state.class_hash_at(&address).is_some_and(|c| c != Felt::ZERO) {
+                return Err(RpcError::new(ERR_TX_EXECUTION_ERROR, format!("contract {} is already deployed", hex(&address))));
+            }
+            deploy = Some((class_hash, salt));
+            (address, calldata)
+        } else {
+            let sender = felt(tx.get("sender_address").and_then(|v| v.as_str()).ok_or_else(|| RpcError::new(ERR_INVALID_PARAMS, "sender_address is required"))?)?;
+            if self.state.class_hash_at(&sender).filter(|c| *c != Felt::ZERO).is_none() {
+                return Err(RpcError::new(ERR_CONTRACT_NOT_FOUND, "Contract not found"));
+            }
+            (sender, felts_of_json(tx.get("calldata")))
         };
-        let revert = outcome.as_ref().and_then(|o| o.panic.as_ref()).map(|p| cairo_lang_runner::casm_run::format_for_panic(p.clone().into_iter()));
-        if revert.is_some() {
-            self.state.register_deployed_contract(address, Felt::ZERO);
+        let nonce = self.check_nonce(&sender, tx.get("nonce"))?;
+        let mut for_hash = tx.clone();
+        if kind == "DECLARE" {
+            let class_json = tx.get("contract_class").cloned().ok_or_else(|| RpcError::new(ERR_INVALID_PARAMS, "contract_class is required"))?;
+            let (compiled, casm_len) = compile_declared_class(&class_json)?;
+            code_gas = declare_code_gas(&class_json, casm_len);
+            let given = tx.get("compiled_class_hash").and_then(|v| v.as_str()).and_then(|s| parse_felt_str(s).ok());
+            if given != Some(compiled) {
+                return Err(RpcError::new(ERR_COMPILED_CLASS_HASH_MISMATCH, "Compiled class hash mismatch").with_data(serde_json::json!(format!(
+                    "The class compiles to compiled class hash {} (Blake2s, required since Starknet 0.14.1); the transaction declares {}.",
+                    hex(&compiled),
+                    given.map(|g| hex(&g)).unwrap_or_else(|| "none".to_string())
+                ))));
+            }
+            let class_hash = self.declare(class_json)?;
+            *declared = Some((class_hash, compiled));
+            for_hash["class_hash"] = serde_json::json!(hex(&class_hash));
+            if let Some(map) = for_hash.as_object_mut() {
+                map.remove("contract_class");
+            }
         }
-        self.nonces.insert(address, nonce + 1);
-        let record = serde_json::json!({
-            "type": "DEPLOY_ACCOUNT",
-            "version": tx.get("version").cloned().unwrap_or(serde_json::json!("0x3")),
-            "class_hash": hex(&class_hash),
-            "contract_address_salt": hex(&salt),
-            "constructor_calldata": hex_vec(&calldata),
-            "nonce": format!("{nonce:#x}"),
-            "signature": tx.get("signature").cloned().unwrap_or(serde_json::json!([])),
-            "execute_invocation": { "contract_address": hex(&address), "entry_point_selector": hex(&selector("constructor")), "calldata": hex_vec(&calldata), "result": [], "calls": [] },
-        });
-        let hash_hex = self.record_tx("DEPLOY_ACCOUNT", tx_hash, record, outcome.as_ref(), revert, serde_json::json!({ "contract_address": hex(&address) }));
-        Ok(serde_json::json!({ "transaction_hash": hash_hex, "contract_address": hex(&address) }))
+        let tx_hash = self.v3_hash_or_digest(kind, &sender, nonce, &for_hash, &serde_json::json!({ "sender": hex(&sender), "calldata": hex_vec(&calldata) }));
+        if charge {
+            self.check_fee_bounds(&sender, &bounds)?;
+        }
+        let ctx = DevnetExecutionContext {
+            account_contract_address: sender,
+            transaction_hash: tx_hash,
+            nonce: Felt::from(nonce),
+            version: Felt::from(3_u64),
+            signature: felts_of_json(tx.get("signature")),
+            ..Default::default()
+        };
+        // DEPLOY_ACCOUNT runs the constructor before validation; a failure of either rejects it.
+        let mut execute = None;
+        if let Some((class_hash, _)) = deploy {
+            self.state.register_deployed_contract(sender, class_hash);
+            let ctor = self.infos.get(&class_hash).and_then(|i| i.constructor.clone());
+            if let Some(ctor) = ctor {
+                let out = self
+                    .run_function(class_hash, ctor, selector("constructor"), sender, calldata.clone(), Felt::ZERO, &ctx, EXECUTION_GAS_BUDGET)
+                    .map_err(|e| RpcError::new(ERR_VALIDATION_FAILURE, "Account validation failed").with_data(serde_json::json!(e.to_string())))?;
+                if let Some(p) = &out.panic {
+                    return Err(RpcError::new(ERR_VALIDATION_FAILURE, "Account validation failed").with_data(serde_json::json!(format!(
+                        "The constructor of {} panicked with: {}",
+                        hex(&sender),
+                        cairo_lang_runner::casm_run::format_for_panic(p.clone().into_iter())
+                    ))));
+                }
+                execute = Some(out);
+            }
+        }
+        let validate = if mode.skip_validate {
+            None
+        } else {
+            let (entry, args) = match (deploy, *declared) {
+                (Some((class_hash, salt)), _) => ("__validate_deploy__", [vec![class_hash, salt], calldata.clone()].concat()),
+                (None, Some((class_hash, _))) => ("__validate_declare__", vec![class_hash]),
+                (None, None) => ("__validate__", calldata.clone()),
+            };
+            Some(self.validate_tx(sender, entry, args, &ctx)?)
+        };
+        let validate_gas = validate.as_ref().map_or(0, |v| v.l2_gas);
+        if charge && u128::from(validate_gas) > bounds.l2_gas.0 {
+            return Err(RpcError::new(ERR_INSUFFICIENT_RESOURCES, "The transaction's resources don't cover validation or the minimal transaction fee").with_data(
+                serde_json::json!(format!("Validation used {validate_gas} L2 gas; the transaction allows {}.", bounds.l2_gas.0)),
+            ));
+        }
+        // INVOKE runs `__execute__` on the L2 gas left: a panic, or running out, reverts it.
+        let after_validate = self.state.clone();
+        let mut revert = None;
+        if kind == "INVOKE" {
+            let budget = if charge {
+                usize::try_from(bounds.l2_gas.0.saturating_sub(u128::from(validate_gas))).unwrap_or(usize::MAX).min(EXECUTION_GAS_BUDGET)
+            } else {
+                EXECUTION_GAS_BUDGET
+            };
+            let out = self
+                .execute(sender, selector("__execute__"), calldata.clone(), Felt::ZERO, &ctx, budget)
+                .map_err(|e| RpcError::new(ERR_TX_EXECUTION_ERROR, e.to_string()))?;
+            if let Some(p) = &out.panic {
+                revert = Some(cairo_lang_runner::casm_run::format_for_panic(p.clone().into_iter()));
+            }
+            execute = Some(out);
+        }
+        let l2_gas = code_gas + validate_gas + execute.as_ref().map_or(0, |e| e.l2_gas);
+        let mut l1_data_gas = self.data_gas_for_fee(before, sender, declared.is_some());
+        if charge && u128::from(l1_data_gas) > bounds.l1_data_gas.0 {
+            if kind != "INVOKE" {
+                return Err(RpcError::new(ERR_INSUFFICIENT_RESOURCES, "The transaction's resources don't cover validation or the minimal transaction fee").with_data(
+                    serde_json::json!(format!("The state diff needs {l1_data_gas} L1 data gas; the transaction allows {}.", bounds.l1_data_gas.0)),
+                ));
+            }
+            if revert.is_none() {
+                revert = Some(format!("Insufficient max L1DataGas: max amount: {}, actual used: {l1_data_gas}.", bounds.l1_data_gas.0));
+                self.state = after_validate;
+                l1_data_gas = self.data_gas_for_fee(before, sender, false);
+            }
+        }
+        let tip = if charge { bounds.tip } else { 0 };
+        let mut fee = u128::from(l2_gas)
+            .saturating_mul(DEVNET_GAS_PRICE.saturating_add(tip))
+            .saturating_add(u128::from(l1_data_gas).saturating_mul(DEVNET_GAS_PRICE));
+        let mut fee_transfer = None;
+        if charge {
+            fee = fee.min(bounds.max_fee());
+            let (strk, sequencer) = (self.strk(), self.sequencer);
+            let out = self
+                .execute(strk, selector("transfer"), vec![sequencer, Felt::from(fee), Felt::ZERO], sender, &ctx, EXECUTION_GAS_BUDGET)
+                .map_err(|e| RpcError::new(ERR_TX_EXECUTION_ERROR, e.to_string()))?;
+            if let Some(p) = &out.panic {
+                return Err(RpcError::new(ERR_INSUFFICIENT_BALANCE, "Account balance is not enough to cover the transaction cost")
+                    .with_data(serde_json::json!(cairo_lang_runner::casm_run::format_for_panic(p.clone().into_iter()))));
+            }
+            fee_transfer = Some(out);
+        }
+        self.nonces.insert(sender, nonce + 1);
+        let state_diff = self.state_diff_json(before, Some((sender, nonce + 1)), *declared);
+        let mut transaction = for_hash;
+        transaction["type"] = serde_json::json!(kind);
+        if transaction.get("version").is_none() {
+            transaction["version"] = serde_json::json!("0x3");
+        }
+        transaction["nonce"] = serde_json::json!(format!("{nonce:#x}"));
+        if kind != "DEPLOY_ACCOUNT" {
+            transaction["sender_address"] = serde_json::json!(hex(&sender));
+        }
+        Ok(TxEffects {
+            tx_type: kind,
+            tx_hash,
+            transaction,
+            validate,
+            execute,
+            fee_transfer,
+            revert,
+            l2_gas,
+            l1_data_gas,
+            fee,
+            state_diff,
+            contract_address: deploy.map(|_| sender),
+            class_hash: declared.map(|(h, _)| h),
+        })
     }
 
-    fn add_invoke(&mut self, tx: &serde_json::Value) -> Result<serde_json::Value, RpcError> {
-        let sender = felt(tx.get("sender_address").and_then(|v| v.as_str()).ok_or_else(|| RpcError::new(ERR_INVALID_PARAMS, "sender_address is required"))?)?;
-        if self.state.class_hash_at(&sender).is_none() {
-            return Err(RpcError::new(ERR_CONTRACT_NOT_FOUND, "Contract not found"));
+    /// Runs an account transaction and records it in a block.
+    fn add_account_tx(&mut self, kind: &'static str, tx: &serde_json::Value) -> Result<serde_json::Value, RpcError> {
+        let query_version = Felt::from_hex(QUERY_VERSION_V3).unwrap_or_default();
+        if tx.get("version").and_then(|v| v.as_str()).and_then(|v| parse_felt_str(v).ok()) == Some(query_version) {
+            return Err(RpcError::new(ERR_UNSUPPORTED_TX_VERSION, "The transaction version is not supported")
+                .with_data(serde_json::json!("Query versions (2^128 + 3) are for estimates and simulations only.")));
         }
-        let nonce = self.check_nonce(&sender, tx.get("nonce"))?;
-        let calldata: Vec<Felt> = tx
-            .get("calldata")
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().and_then(|s| parse_felt_str(s).ok())).collect())
-            .unwrap_or_default();
-        let signature: Vec<Felt> = tx
-            .get("signature")
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().and_then(|s| parse_felt_str(s).ok())).collect())
-            .unwrap_or_default();
-        let tx_hash = self.v3_hash_or_digest("INVOKE", &sender, nonce, tx, &serde_json::json!({ "calldata": hex_vec(&calldata) }));
-        let public_key = self.account_public_key(sender);
-        self.check_signature(&tx_hash, &signature, public_key)?;
-        let ctx = DevnetExecutionContext { account_contract_address: sender, transaction_hash: tx_hash, nonce: Felt::from(nonce), version: Felt::from(3_u64), signature, ..Default::default() };
-        let outcome = self
-            .execute(sender, selector("__execute__"), calldata.clone(), Felt::ZERO, &ctx)
-            .map_err(|e| RpcError::new(ERR_TX_EXECUTION_ERROR, e.to_string()))?;
-        let revert = outcome.panic.as_ref().map(|p| cairo_lang_runner::casm_run::format_for_panic(p.clone().into_iter()));
-        self.nonces.insert(sender, nonce + 1);
-        let record = serde_json::json!({
-            "type": "INVOKE",
-            "version": tx.get("version").cloned().unwrap_or(serde_json::json!("0x3")),
-            "sender_address": hex(&sender),
-            "calldata": hex_vec(&calldata),
-            "nonce": format!("{nonce:#x}"),
-            "signature": tx.get("signature").cloned().unwrap_or(serde_json::json!([])),
-            "execute_invocation": {
-                "contract_address": hex(&sender),
-                "entry_point_selector": hex(&selector("__execute__")),
-                "calldata": hex_vec(&calldata),
-                "result": hex_vec(&outcome.retdata),
-                "revert_reason": revert,
-                "calls": [],
-            },
-        });
-        let hash_hex = self.record_tx("INVOKE", tx_hash, record, Some(&outcome), revert, serde_json::json!({}));
-        Ok(serde_json::json!({ "transaction_hash": hash_hex }))
+        let effects = self.run_account_tx(kind, tx, TxMode::default())?;
+        let hash = self.record(kind, effects.tx_hash, effects.transaction.clone(), effects.receipt(), effects.trace());
+        let mut out = serde_json::json!({ "transaction_hash": hash });
+        if let Some(class_hash) = effects.class_hash {
+            out["class_hash"] = serde_json::json!(hex(&class_hash));
+        }
+        if let Some(address) = effects.contract_address {
+            out["contract_address"] = serde_json::json!(hex(&address));
+        }
+        Ok(out)
+    }
+
+    /// Runs `txs` one after another from the current state, then rolls every change back.
+    fn simulate(&mut self, txs: &[serde_json::Value], mode: TxMode) -> Result<Vec<TxEffects>, RpcError> {
+        let state = self.state.clone();
+        let nonces = self.nonces.clone();
+        let mut effects = Vec::new();
+        let mut failure = None;
+        for (index, tx) in txs.iter().enumerate() {
+            let kind = match tx.get("type").and_then(|v| v.as_str()) {
+                Some("DECLARE") => "DECLARE",
+                Some("DEPLOY_ACCOUNT") => "DEPLOY_ACCOUNT",
+                _ => "INVOKE",
+            };
+            match self.run_account_tx(kind, tx, mode) {
+                Ok(e) => effects.push(e),
+                Err(e) => {
+                    failure = Some(RpcError::new(ERR_TX_EXECUTION_ERROR, "Transaction execution error").with_data(serde_json::json!({
+                        "transaction_index": index,
+                        "execution_error": format!("{} (code {}): {}", e.message, e.code, e.data.map(|d| d.to_string()).unwrap_or_default()),
+                    })));
+                    break;
+                }
+            }
+        }
+        for e in &effects {
+            if let Some(class_hash) = e.class_hash {
+                self.undeclare(&class_hash);
+            }
+        }
+        self.state = state;
+        self.nonces = nonces;
+        failure.map_or(Ok(effects), Err)
     }
 
     fn call(&mut self, request: &serde_json::Value) -> Result<serde_json::Value, RpcError> {
@@ -987,7 +1192,7 @@ impl DevnetChain {
             return Err(RpcError::new(ERR_CONTRACT_NOT_FOUND, "Contract not found"));
         }
         let snapshot = self.state.clone();
-        let result = self.execute(contract, selector_felt, calldata, Felt::ZERO, &DevnetExecutionContext::default());
+        let result = self.execute(contract, selector_felt, calldata, Felt::ZERO, &DevnetExecutionContext::default(), EXECUTION_GAS_BUDGET);
         self.state = snapshot;
         let outcome = result.map_err(|e| RpcError::new(ERR_CONTRACT_ERROR, "Contract error").with_data(serde_json::json!({ "revert_error": e.to_string() })))?;
         if let Some(p) = outcome.panic {
@@ -1020,13 +1225,52 @@ impl DevnetChain {
         Ok(latest)
     }
 
+    fn block_txs<'a>(&'a self, block: &'a DevnetBlock) -> impl Iterator<Item = &'a DevnetTransaction> + 'a {
+        block.transactions.iter().filter_map(|h| self.tx_index.get(h).map(|i| &self.txs[*i]))
+    }
+
+    /// The state diff of a block: its transactions' diffs merged, later writes winning.
+    fn block_state_diff(&self, block: &DevnetBlock) -> serde_json::Value {
+        let mut storage: BTreeMap<String, BTreeMap<String, serde_json::Value>> = BTreeMap::new();
+        let mut nonces: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        let (mut deployed, mut declared, mut replaced) = (Vec::new(), Vec::new(), Vec::new());
+        for t in self.block_txs(block) {
+            let Some(diff) = t.trace.get("state_diff") else { continue };
+            for sd in diff["storage_diffs"].as_array().into_iter().flatten() {
+                let address = sd["address"].as_str().unwrap_or_default().to_string();
+                for e in sd["storage_entries"].as_array().into_iter().flatten() {
+                    storage.entry(address.clone()).or_default().insert(e["key"].as_str().unwrap_or_default().to_string(), e["value"].clone());
+                }
+            }
+            for n in diff["nonces"].as_array().into_iter().flatten() {
+                nonces.insert(n["contract_address"].as_str().unwrap_or_default().to_string(), n["nonce"].clone());
+            }
+            deployed.extend(diff["deployed_contracts"].as_array().cloned().unwrap_or_default());
+            declared.extend(diff["declared_classes"].as_array().cloned().unwrap_or_default());
+            replaced.extend(diff["replaced_classes"].as_array().cloned().unwrap_or_default());
+        }
+        serde_json::json!({
+            "storage_diffs": storage.into_iter().map(|(address, entries)| serde_json::json!({
+                "address": address,
+                "storage_entries": entries.into_iter().map(|(key, value)| serde_json::json!({ "key": key, "value": value })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+            "deprecated_declared_classes": [],
+            "declared_classes": declared,
+            "deployed_contracts": deployed,
+            "replaced_classes": replaced,
+            "nonces": nonces.into_iter().map(|(address, nonce)| serde_json::json!({ "contract_address": address, "nonce": nonce })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// Block header and transactions. Commitments are not computed (`0x0`).
     fn block_json(&self, block: &DevnetBlock, with_txs: bool) -> serde_json::Value {
-        let txs: Vec<serde_json::Value> = block
-            .transactions
+        let records: Vec<&DevnetTransaction> = self.block_txs(block).collect();
+        let txs: Vec<serde_json::Value> = records
             .iter()
-            .filter_map(|h| self.tx_index.get(h).map(|i| &self.txs[*i]))
             .map(|t| if with_txs { t.transaction.clone() } else { serde_json::json!(t.transaction_hash) })
             .collect();
+        let event_count: usize = records.iter().map(|t| t.receipt.get("events").and_then(|e| e.as_array()).map_or(0, Vec::len)).sum();
+        let price = serde_json::json!({ "price_in_fri": format!("{DEVNET_GAS_PRICE:#x}"), "price_in_wei": format!("{DEVNET_GAS_PRICE:#x}") });
         serde_json::json!({
             "status": "ACCEPTED_ON_L2",
             "block_hash": block.block_hash,
@@ -1035,11 +1279,18 @@ impl DevnetChain {
             "new_root": "0x0",
             "timestamp": block.timestamp,
             "sequencer_address": block.sequencer_address,
-            "l1_gas_price": { "price_in_fri": "0x1", "price_in_wei": "0x1" },
-            "l1_data_gas_price": { "price_in_fri": "0x1", "price_in_wei": "0x1" },
-            "l2_gas_price": { "price_in_fri": "0x1", "price_in_wei": "0x1" },
+            "l1_gas_price": price,
+            "l1_data_gas_price": price,
+            "l2_gas_price": price,
             "l1_da_mode": "BLOB",
-            "starknet_version": DEVNET_SPEC_VERSION,
+            "starknet_version": DEVNET_STARKNET_VERSION,
+            "transaction_count": records.len(),
+            "event_count": event_count,
+            "state_diff_length": state_diff_length(&self.block_state_diff(block)),
+            "state_diff_commitment": "0x0",
+            "transaction_commitment": "0x0",
+            "event_commitment": "0x0",
+            "receipt_commitment": "0x0",
             "transactions": txs,
         })
     }
@@ -1068,7 +1319,12 @@ impl DevnetChain {
             if t.block_number < from || t.block_number > to {
                 continue;
             }
-            for ev in t.receipt.get("events").and_then(|e| e.as_array()).into_iter().flatten() {
+            let tx_position = self
+                .blocks
+                .get(t.block_number as usize)
+                .and_then(|b| b.transactions.iter().position(|h| *h == t.transaction_hash))
+                .unwrap_or(0);
+            for (event_index, ev) in t.receipt.get("events").and_then(|e| e.as_array()).into_iter().flatten().enumerate() {
                 let from_addr = ev.get("from_address").and_then(|v| v.as_str()).and_then(|s| parse_felt_str(s).ok());
                 if let Some(a) = address {
                     if from_addr != Some(a) {
@@ -1084,6 +1340,8 @@ impl DevnetChain {
                 e["block_hash"] = serde_json::json!(t.block_hash);
                 e["block_number"] = serde_json::json!(t.block_number);
                 e["transaction_hash"] = serde_json::json!(t.transaction_hash);
+                e["transaction_index"] = serde_json::json!(tx_position);
+                e["event_index"] = serde_json::json!(event_index);
                 all.push(e);
             }
         }
@@ -1101,16 +1359,27 @@ impl DevnetChain {
         let unit = params.get("unit").and_then(|v| v.as_str()).unwrap_or("FRI").to_ascii_uppercase();
         let token = parse_felt_str(if unit == "WEI" { DEVNET_ETH_ADDRESS } else { DEVNET_STRK_ADDRESS }).unwrap();
         let (low, high) = u256_parts(&amount)?;
+        let before = self.state.clone();
         let outcome = self
-            .execute(token, selector("mint"), vec![address, low, high], Felt::ZERO, &DevnetExecutionContext::default())
+            .execute(token, selector("mint"), vec![address, low, high], Felt::ZERO, &DevnetExecutionContext::default(), EXECUTION_GAS_BUDGET)
             .map_err(|e| RpcError::new(ERR_TX_EXECUTION_ERROR, e.to_string()))?;
         if let Some(p) = outcome.panic {
             return Err(RpcError::new(ERR_TX_EXECUTION_ERROR, cairo_lang_runner::casm_run::format_for_panic(p.into_iter())));
         }
         let tx_hash = felt_from_digest("uc-devnet-mint:", &[&address.to_bytes_be(), amount.as_bytes(), &(self.txs.len() as u64).to_le_bytes()]);
-        let hash_hex = self.record_tx("INVOKE", tx_hash, serde_json::json!({ "type": "INVOKE", "version": "0x3", "sender_address": "0x0", "calldata": [], "nonce": "0x0", "signature": [], "devnet_mint": { "address": hex(&address), "amount": amount, "unit": unit } }), Some(&outcome), None, serde_json::json!({}));
+        let resources = serde_json::json!({ "l1_gas": 0, "l1_data_gas": 0, "l2_gas": outcome.l2_gas });
+        let receipt = serde_json::json!({
+            "actual_fee": { "amount": "0x0", "unit": "FRI" },
+            "execution_status": "SUCCEEDED",
+            "messages_sent": [],
+            "events": receipt_events(&[&outcome]),
+            "execution_resources": resources,
+        });
+        let trace = serde_json::json!({ "type": "INVOKE", "execute_invocation": invocation_json(&outcome, "EXTERNAL"), "state_diff": self.state_diff_json(&before, None, None), "execution_resources": resources });
+        let transaction = serde_json::json!({ "type": "INVOKE", "version": "0x3", "sender_address": "0x0", "calldata": [], "nonce": "0x0", "signature": [], "devnet_mint": { "address": hex(&address), "amount": amount, "unit": unit } });
+        let hash_hex = self.record("INVOKE", tx_hash, transaction, receipt, trace);
         let snapshot = self.state.clone();
-        let balance = self.execute(token, selector("balanceOf"), vec![address], Felt::ZERO, &DevnetExecutionContext::default()).ok();
+        let balance = self.execute(token, selector("balanceOf"), vec![address], Felt::ZERO, &DevnetExecutionContext::default(), EXECUTION_GAS_BUDGET).ok();
         self.state = snapshot;
         let new_balance = balance
             .and_then(|o| (o.retdata.len() == 2).then(|| u256_to_decimal(&o.retdata[0], &o.retdata[1])))
@@ -1189,31 +1458,41 @@ impl DevnetChain {
             }
             "starknet_estimateFee" => {
                 let txs = p(0, "request").and_then(|v| v.as_array().cloned()).unwrap_or_default();
-                Ok(serde_json::json!(txs.iter().map(|_| serde_json::json!({
-                    "l1_gas_consumed": "0x0", "l1_gas_price": "0x1",
-                    "l2_gas_consumed": "0x186a0", "l2_gas_price": "0x1",
-                    "l1_data_gas_consumed": "0x0", "l1_data_gas_price": "0x1",
-                    "overall_fee": "0x186a0", "unit": "FRI"
-                })).collect::<Vec<_>>()))
+                let flags = simulation_flags(p(1, "simulation_flags"));
+                let mode = TxMode { skip_validate: flags.iter().any(|f| f == "SKIP_VALIDATE"), skip_fee_charge: true };
+                let effects = self.simulate(&txs, mode)?;
+                if let Some((index, reason)) = effects.iter().enumerate().find_map(|(i, e)| e.revert.clone().map(|r| (i, r))) {
+                    return Err(RpcError::new(ERR_TX_EXECUTION_ERROR, "Transaction execution error")
+                        .with_data(serde_json::json!({ "transaction_index": index, "execution_error": reason })));
+                }
+                Ok(serde_json::json!(effects.iter().map(TxEffects::fee_estimate).collect::<Vec<_>>()))
+            }
+            "starknet_simulateTransactions" => {
+                let txs = p(1, "transactions").and_then(|v| v.as_array().cloned()).unwrap_or_default();
+                let flags = simulation_flags(p(2, "simulation_flags"));
+                let mode = TxMode {
+                    skip_validate: flags.iter().any(|f| f == "SKIP_VALIDATE"),
+                    skip_fee_charge: flags.iter().any(|f| f == "SKIP_FEE_CHARGE"),
+                };
+                let effects = self.simulate(&txs, mode)?;
+                Ok(serde_json::json!(effects
+                    .iter()
+                    .map(|e| serde_json::json!({ "transaction_trace": e.trace(), "fee_estimation": e.fee_estimate() }))
+                    .collect::<Vec<_>>()))
             }
             "starknet_estimateMessageFee" => Ok(serde_json::json!({ "l1_gas_consumed": "0x0", "l1_gas_price": "0x1", "l2_gas_consumed": "0x0", "l2_gas_price": "0x1", "l1_data_gas_consumed": "0x0", "l1_data_gas_price": "0x1", "overall_fee": "0x0", "unit": "FRI" })),
-            "starknet_addDeclareTransaction" => {
-                let tx = first_tx();
-                self.add_declare(&tx)
-            }
-            "starknet_addDeployAccountTransaction" => {
-                let tx = first_tx();
-                self.add_deploy_account(&tx)
-            }
-            "starknet_addInvokeTransaction" => {
-                let tx = first_tx();
-                self.add_invoke(&tx)
-            }
+            "starknet_addDeclareTransaction" => self.add_account_tx("DECLARE", &first_tx()),
+            "starknet_addDeployAccountTransaction" => self.add_account_tx("DEPLOY_ACCOUNT", &first_tx()),
+            "starknet_addInvokeTransaction" => self.add_account_tx("INVOKE", &first_tx()),
             "starknet_getTransactionByHash" => Ok(self.tx_by_hash(p(0, "transaction_hash").as_ref().and_then(|v| v.as_str()).unwrap_or("0x0"))?.transaction.clone()),
             "starknet_getTransactionReceipt" => Ok(self.tx_by_hash(p(0, "transaction_hash").as_ref().and_then(|v| v.as_str()).unwrap_or("0x0"))?.receipt.clone()),
             "starknet_getTransactionStatus" => {
                 let t = self.tx_by_hash(p(0, "transaction_hash").as_ref().and_then(|v| v.as_str()).unwrap_or("0x0"))?;
-                Ok(serde_json::json!({ "finality_status": "ACCEPTED_ON_L2", "execution_status": t.receipt["execution_status"] }))
+                Ok(serde_json::json!({
+                    "finality_status": "ACCEPTED_ON_L2",
+                    "execution_status": t.receipt["execution_status"],
+                    "failure_reason": t.receipt.get("revert_reason").cloned().unwrap_or(serde_json::Value::Null),
+                }))
             }
             "starknet_getTransactionByBlockIdAndIndex" => {
                 let b = self.block_by_id(p(0, "block_id").as_ref())?;
@@ -1227,17 +1506,11 @@ impl DevnetChain {
                 self.get_events(&filter)
             }
             "starknet_getStateUpdate" => {
-                let b = self.block_by_id(p(0, "block_id").as_ref())?;
-                let declared: Vec<serde_json::Value> = self
-                    .classes
-                    .iter()
-                    .filter(|(_, c)| c.declared_in_block == b.block_number && b.block_number > 0)
-                    .map(|(h, _)| serde_json::json!({ "class_hash": hex(h), "compiled_class_hash": "0x0" }))
-                    .collect();
-                Ok(serde_json::json!({ "block_hash": b.block_hash, "new_root": "0x0", "old_root": "0x0", "state_diff": { "storage_diffs": [], "deprecated_declared_classes": [], "declared_classes": declared, "deployed_contracts": [], "replaced_classes": [], "nonces": [] } }))
+                let b = self.block_by_id(p(0, "block_id").as_ref())?.clone();
+                Ok(serde_json::json!({ "block_hash": b.block_hash, "new_root": "0x0", "old_root": "0x0", "state_diff": self.block_state_diff(&b) }))
             }
             "devnet_getPredeployedAccounts" | "devnet_predeployedAccounts" => Ok(self.predeployed_accounts_json()),
-            "devnet_getConfig" => Ok(serde_json::json!({ "chain_id": hex(&self.chain_id), "block_generation_on": if self.block_on_demand { "demand" } else { "transaction" }, "account_class_hash": self.account_class_hash, "strk_fee_token_address": DEVNET_STRK_ADDRESS, "eth_fee_token_address": DEVNET_ETH_ADDRESS, "udc_address": DEVNET_UDC_ADDRESS })),
+            "devnet_getConfig" => Ok(serde_json::json!({ "chain_id": hex(&self.chain_id), "block_generation_on": if self.block_on_demand { "demand" } else { "transaction" }, "account_class_hash": self.account_class_hash, "strk_fee_token_address": DEVNET_STRK_ADDRESS, "eth_fee_token_address": DEVNET_ETH_ADDRESS, "udc_address": STARKNET_UDC_ADDRESS })),
             "devnet_mint" => self.mint(params),
             "devnet_createBlock" => {
                 let b = self.seal_block().clone();
@@ -1254,12 +1527,215 @@ impl DevnetChain {
                 let hash = self.seal_block().block_hash.clone();
                 Ok(serde_json::json!({ "timestamp": self.timestamp, "block_hash": hash }))
             }
-            "starknet_simulateTransactions" | "starknet_traceBlockTransactions" | "starknet_getMessagesStatus" | "starknet_getStorageProof" => {
+            "starknet_traceBlockTransactions" | "starknet_getMessagesStatus" | "starknet_getStorageProof" => {
                 Err(RpcError::new(ERR_UNSUPPORTED, format!("{method} is not implemented by uc devnet")))
             }
             _ => Err(RpcError::new(ERR_UNSUPPORTED, format!("Method not found: {method}"))),
         }
     }
+}
+
+/// How `run_account_tx` treats a transaction: Starknet's simulation flags.
+#[derive(Debug, Clone, Copy, Default)]
+struct TxMode {
+    skip_validate: bool,
+    skip_fee_charge: bool,
+}
+
+/// V3 resource bounds, `(max_amount, max_price_per_unit)` per resource, and the tip.
+#[derive(Debug, Clone, Copy, Default)]
+struct ResourceBounds {
+    l1_gas: (u128, u128),
+    l2_gas: (u128, u128),
+    l1_data_gas: (u128, u128),
+    tip: u128,
+}
+
+impl ResourceBounds {
+    fn of(tx: &serde_json::Value) -> Self {
+        let num = |v: Option<&serde_json::Value>| -> u128 {
+            v.and_then(|x| x.as_str())
+                .and_then(|s| parse_felt_str(s).ok())
+                .and_then(|f| u128::try_from(f.to_biguint()).ok())
+                .unwrap_or(0)
+        };
+        let bound = |name: &str| {
+            let b = tx.get("resource_bounds").and_then(|r| r.get(name));
+            (num(b.and_then(|b| b.get("max_amount"))), num(b.and_then(|b| b.get("max_price_per_unit"))))
+        };
+        Self { l1_gas: bound("l1_gas"), l2_gas: bound("l2_gas"), l1_data_gas: bound("l1_data_gas"), tip: num(tx.get("tip")) }
+    }
+
+    /// The most the transaction can be charged.
+    fn max_fee(&self) -> u128 {
+        self.l1_gas
+            .0
+            .saturating_mul(self.l1_gas.1)
+            .saturating_add(self.l2_gas.0.saturating_mul(self.l2_gas.1.saturating_add(self.tip)))
+            .saturating_add(self.l1_data_gas.0.saturating_mul(self.l1_data_gas.1))
+    }
+}
+
+/// Everything one account transaction did, before it is recorded or rolled back.
+struct TxEffects {
+    tx_type: &'static str,
+    tx_hash: Felt,
+    transaction: serde_json::Value,
+    validate: Option<ExecutionOutcome>,
+    /// `__execute__` for INVOKE, the constructor for DEPLOY_ACCOUNT.
+    execute: Option<ExecutionOutcome>,
+    fee_transfer: Option<ExecutionOutcome>,
+    revert: Option<String>,
+    l2_gas: u64,
+    l1_data_gas: u64,
+    fee: u128,
+    state_diff: serde_json::Value,
+    contract_address: Option<Felt>,
+    class_hash: Option<Felt>,
+}
+
+impl TxEffects {
+    fn execution_resources(&self) -> serde_json::Value {
+        serde_json::json!({ "l1_gas": 0, "l1_data_gas": self.l1_data_gas, "l2_gas": self.l2_gas })
+    }
+
+    fn fee_estimate(&self) -> serde_json::Value {
+        let price = format!("{DEVNET_GAS_PRICE:#x}");
+        serde_json::json!({
+            "l1_gas_consumed": "0x0",
+            "l1_gas_price": price,
+            "l2_gas_consumed": format!("{:#x}", self.l2_gas),
+            "l2_gas_price": price,
+            "l1_data_gas_consumed": format!("{:#x}", self.l1_data_gas),
+            "l1_data_gas_price": price,
+            "overall_fee": format!("{:#x}", self.fee),
+            "unit": "FRI",
+        })
+    }
+
+    /// The receipt body; `record` adds the hash, type, finality and block.
+    fn receipt(&self) -> serde_json::Value {
+        let mut outcomes: Vec<&ExecutionOutcome> = Vec::new();
+        if self.revert.is_none() {
+            outcomes.extend(self.execute.as_ref());
+        }
+        outcomes.extend(self.fee_transfer.as_ref());
+        let mut receipt = serde_json::json!({
+            "actual_fee": { "amount": format!("{:#x}", self.fee), "unit": "FRI" },
+            "execution_status": if self.revert.is_some() { "REVERTED" } else { "SUCCEEDED" },
+            "messages_sent": receipt_messages(&outcomes),
+            "events": receipt_events(&outcomes),
+            "execution_resources": self.execution_resources(),
+        });
+        if let Some(reason) = &self.revert {
+            receipt["revert_reason"] = serde_json::json!(reason);
+        }
+        if let Some(address) = self.contract_address {
+            receipt["contract_address"] = serde_json::json!(hex(&address));
+        }
+        receipt
+    }
+
+    fn trace(&self) -> serde_json::Value {
+        let mut trace = serde_json::json!({ "type": self.tx_type, "state_diff": self.state_diff, "execution_resources": self.execution_resources() });
+        if let Some(v) = &self.validate {
+            trace["validate_invocation"] = invocation_json(v, "EXTERNAL");
+        }
+        if let Some(f) = &self.fee_transfer {
+            trace["fee_transfer_invocation"] = invocation_json(f, "EXTERNAL");
+        }
+        match (self.tx_type, &self.execute, &self.revert) {
+            ("INVOKE", _, Some(reason)) => trace["execute_invocation"] = serde_json::json!({ "revert_reason": reason }),
+            ("INVOKE", Some(e), None) => trace["execute_invocation"] = invocation_json(e, "EXTERNAL"),
+            ("DEPLOY_ACCOUNT", Some(c), _) => trace["constructor_invocation"] = invocation_json(c, "CONSTRUCTOR"),
+            _ => {}
+        }
+        trace
+    }
+}
+
+/// An RPC `FUNCTION_INVOCATION`. Calls made inside the entry point are not broken out: its
+/// events and messages are all listed on it.
+fn invocation_json(o: &ExecutionOutcome, entry_point_type: &str) -> serde_json::Value {
+    serde_json::json!({
+        "contract_address": hex(&o.contract),
+        "entry_point_selector": hex(&o.selector),
+        "calldata": hex_vec(&o.calldata),
+        "caller_address": hex(&o.caller),
+        "class_hash": hex(&o.class_hash),
+        "entry_point_type": entry_point_type,
+        "call_type": "CALL",
+        "result": hex_vec(&o.retdata),
+        "calls": [],
+        "events": o.events.iter().enumerate().map(|(order, (_, keys, data))| serde_json::json!({ "order": order, "keys": hex_vec(keys), "data": hex_vec(data) })).collect::<Vec<_>>(),
+        "messages": o.messages.iter().enumerate().map(|(order, (from, to, payload))| serde_json::json!({ "order": order, "from_address": hex(from), "to_address": hex(to), "payload": hex_vec(payload) })).collect::<Vec<_>>(),
+        "execution_resources": { "l1_gas": 0, "l2_gas": o.l2_gas },
+        "is_reverted": o.panic.is_some(),
+    })
+}
+
+fn receipt_events(outcomes: &[&ExecutionOutcome]) -> Vec<serde_json::Value> {
+    outcomes
+        .iter()
+        .flat_map(|o| o.events.iter())
+        .map(|(from, keys, data)| serde_json::json!({ "from_address": hex(from), "keys": hex_vec(keys), "data": hex_vec(data) }))
+        .collect()
+}
+
+fn receipt_messages(outcomes: &[&ExecutionOutcome]) -> Vec<serde_json::Value> {
+    outcomes
+        .iter()
+        .flat_map(|o| o.messages.iter())
+        .map(|(from, to, payload)| serde_json::json!({ "from_address": hex(from), "to_address": hex(to), "payload": hex_vec(payload) }))
+        .collect()
+}
+
+/// Contracts whose class changed between two states: deployments and replaced classes.
+fn class_changes(before: &StarknetState, after: &StarknetState) -> Vec<(Felt, Felt)> {
+    let mut changes: Vec<(Felt, Felt)> = after
+        .deployed_contracts()
+        .into_iter()
+        .filter(|(address, class)| *class != Felt::ZERO && before.class_hash_at(address) != Some(*class))
+        .collect();
+    changes.sort();
+    changes
+}
+
+/// The storage cell of the low word of `owner`'s balance in the devnet fee token.
+fn balance_key(owner: &Felt) -> Felt {
+    starknet_crypto::pedersen_hash(&selector("balances"), owner)
+}
+
+/// The compiled class hash a sequencer computes for a declared Sierra class (Blake2s), and the
+/// length of its CASM bytecode.
+fn compile_declared_class(class_json: &serde_json::Value) -> Result<(Felt, usize), RpcError> {
+    let class: ContractClass = serde_json::from_value(normalize_class_json(class_json.clone()))
+        .map_err(|e| RpcError::new(ERR_INVALID_PARAMS, format!("not a Sierra contract class: {e}")))?;
+    let casm = compile_native_casm_contract(class, usize::MAX)
+        .map_err(|e| RpcError::new(ERR_INVALID_PARAMS, format!("the class does not compile to CASM: {e:#}")))?;
+    Ok((casm.compiled_class_hash(), casm.bytecode.len()))
+}
+
+/// L2 gas a DECLARE pays for its code.
+fn declare_code_gas(class_json: &serde_json::Value, casm_len: usize) -> u64 {
+    let sierra_len = class_json.get("sierra_program").and_then(|p| p.as_array()).map_or(0, Vec::len);
+    let abi_len = match class_json.get("abi") {
+        Some(serde_json::Value::String(abi)) => abi.len(),
+        Some(abi) => declared_abi_string(&serde_json::json!({ "abi": abi })).len(),
+        None => 0,
+    };
+    GAS_PER_CODE_BYTE * ((sierra_len + casm_len) * 32 + abi_len) as u64
+}
+
+fn simulation_flags(v: Option<serde_json::Value>) -> Vec<String> {
+    v.and_then(|f| f.as_array().cloned()).unwrap_or_default().iter().filter_map(|f| f.as_str().map(str::to_string)).collect()
+}
+
+/// Number of entries in an RPC state diff.
+fn state_diff_length(diff: &serde_json::Value) -> usize {
+    let len = |k: &str| diff[k].as_array().map_or(0, Vec::len);
+    let storage: usize = diff["storage_diffs"].as_array().into_iter().flatten().map(|sd| sd["storage_entries"].as_array().map_or(0, Vec::len)).sum();
+    storage + len("nonces") + len("deployed_contracts") + len("declared_classes") + len("replaced_classes")
 }
 
 fn felts_of_json(v: Option<&serde_json::Value>) -> Vec<Felt> {
@@ -1300,10 +1776,6 @@ mod tests {
         DevnetChain::genesis(&system, accounts, Felt::from_bytes_be_slice(b"SN_SEPOLIA"), 1_700_000_000, false).expect("genesis")
     }
 
-    fn inc_again(deployed: &str) -> Vec<String> {
-        vec!["0x1".to_string(), deployed.to_string(), hex(&selector("increase")), "0x1".to_string(), "0x1".to_string()]
-    }
-
     fn u256_of(retdata: &serde_json::Value) -> String {
         let a = retdata.as_array().unwrap();
         let low = parse_felt_str(a[0].as_str().unwrap()).unwrap();
@@ -1311,49 +1783,149 @@ mod tests {
         u256_to_decimal(&low, &high)
     }
 
+    const L2: u64 = 100_000_000;
+
+    /// Resource bounds at the devnet's gas price.
+    fn bounds(l2_amount: u64) -> serde_json::Value {
+        let price = format!("{DEVNET_GAS_PRICE:#x}");
+        serde_json::json!({
+            "l1_gas": { "max_amount": "0x0", "max_price_per_unit": price },
+            "l2_gas": { "max_amount": format!("{l2_amount:#x}"), "max_price_per_unit": price },
+            "l1_data_gas": { "max_amount": "0x2710", "max_price_per_unit": price },
+        })
+    }
+
+    /// `tx` completed with the V3 fields and signed with `key`.
+    fn signed(chain_id: Felt, mut tx: serde_json::Value, nonce: u64, bounds: serde_json::Value, key: &Felt) -> serde_json::Value {
+        tx["version"] = serde_json::json!("0x3");
+        tx["nonce"] = serde_json::json!(format!("{nonce:#x}"));
+        tx["resource_bounds"] = bounds;
+        for (k, v) in [("tip", serde_json::json!("0x0")), ("paymaster_data", serde_json::json!([])), ("account_deployment_data", serde_json::json!([])), ("nonce_data_availability_mode", serde_json::json!("L1")), ("fee_data_availability_mode", serde_json::json!("L1"))] {
+            tx[k] = v;
+        }
+        sign_v3_transaction(&mut tx, chain_id, Some(key)).unwrap();
+        tx
+    }
+
+    fn signed_invoke(chain_id: Felt, acc: &DevnetPredeployedAccount, calldata: Vec<String>, nonce: u64, bounds: serde_json::Value, key: Option<Felt>) -> serde_json::Value {
+        let key = key.unwrap_or_else(|| parse_felt_str(&acc.private_key).unwrap());
+        signed(chain_id, serde_json::json!({ "type": "INVOKE", "sender_address": acc.address, "calldata": calldata }), nonce, bounds, &key)
+    }
+
+    /// Sends an INVOKE and returns its receipt.
+    fn invoke(chain: &mut DevnetChain, tx: serde_json::Value) -> Result<serde_json::Value, RpcError> {
+        let res = chain.handle_rpc("starknet_addInvokeTransaction", &serde_json::json!({ "invoke_transaction": tx }))?;
+        Ok(chain.handle_rpc("starknet_getTransactionReceipt", &serde_json::json!({ "transaction_hash": res["transaction_hash"] })).unwrap())
+    }
+
+    fn strk_balance_of(chain: &mut DevnetChain, address: &str) -> u128 {
+        let bal = chain.handle_rpc("starknet_call", &serde_json::json!({ "request": { "contract_address": DEVNET_STRK_ADDRESS, "entry_point_selector": hex(&selector("balanceOf")), "calldata": [address] }, "block_id": "latest" })).unwrap();
+        u256_of(&bal).parse().unwrap()
+    }
+
+    fn hex_u128(v: &serde_json::Value) -> u128 {
+        u128::from_str_radix(v.as_str().unwrap().trim_start_matches("0x"), 16).unwrap()
+    }
+
+    fn transfer(to: &str, low: &str, high: &str) -> Vec<String> {
+        vec!["0x1".to_string(), DEVNET_STRK_ADDRESS.to_string(), hex(&selector("transfer")), "0x3".to_string(), to.to_string(), low.to_string(), high.to_string()]
+    }
+
     #[test]
     #[cfg(feature = "native-test-runner")]
-    fn devnet_executes_declare_deploy_invoke_and_call_end_to_end() {
+    fn devnet_validates_charges_fees_and_reverts_like_a_sequencer() {
         let mut chain = test_chain();
+        let id = chain.chain_id;
         let acc = chain.accounts[0].clone();
         let other = chain.accounts[1].clone();
-        let strk = DEVNET_STRK_ADDRESS;
+        let nonce_of = |chain: &mut DevnetChain| chain.handle_rpc("starknet_getNonce", &serde_json::json!({ "block_id": "latest", "contract_address": acc.address })).unwrap();
+        let start = strk_balance_of(&mut chain, &acc.address);
+        assert_eq!(start, 1_000_000_000_000_000_000_000);
 
-        // Genesis funded the accounts.
-        let bal = chain.handle_rpc("starknet_call", &serde_json::json!({ "request": { "contract_address": strk, "entry_point_selector": hex(&selector("balanceOf")), "calldata": [acc.address] }, "block_id": "latest" })).unwrap();
-        assert_eq!(u256_of(&bal), "1000000000000000000000");
-        assert_eq!(chain.handle_rpc("starknet_getNonce", &serde_json::json!({ "block_id": "latest", "contract_address": acc.address })).unwrap(), serde_json::json!("0x0"));
-
-        // Invoke: account __execute__ -> STRK transfer of 5 to the other account.
-        let transfer_calldata = vec![
-            "0x1".to_string(), strk.to_string(), hex(&selector("transfer")), "0x3".to_string(),
-            other.address.clone(), "0x5".to_string(), "0x0".to_string(),
-        ];
-        let res = chain.handle_rpc("starknet_addInvokeTransaction", &serde_json::json!({ "invoke_transaction": { "type": "INVOKE", "version": "0x3", "sender_address": acc.address, "calldata": transfer_calldata, "nonce": "0x0", "signature": [] } })).unwrap();
-        let tx_hash = res["transaction_hash"].as_str().unwrap().to_string();
-        let receipt = chain.handle_rpc("starknet_getTransactionReceipt", &serde_json::json!({ "transaction_hash": tx_hash })).unwrap();
+        // A signed transfer of 5: the fee, in STRK, goes to the sequencer after the call's events.
+        let receipt = invoke(&mut chain, signed_invoke(id, &acc, transfer(&other.address, "0x5", "0x0"), 0, bounds(L2), None)).unwrap();
         assert_eq!(receipt["execution_status"], "SUCCEEDED", "{receipt}");
-        assert_eq!(receipt["block_number"], 1);
+        let l2 = receipt["execution_resources"]["l2_gas"].as_u64().unwrap();
+        let data = receipt["execution_resources"]["l1_data_gas"].as_u64().unwrap();
+        // Data gas: the account's nonce (2 felts) and the two balance cells (4 felts); the fee
+        // token is not counted as a modified contract.
+        assert_eq!(data, 6 * DATA_GAS_PER_FELT, "{receipt}");
+        let fee = hex_u128(&receipt["actual_fee"]["amount"]);
+        assert_eq!(fee, (u128::from(l2) + u128::from(data)) * DEVNET_GAS_PRICE);
+        assert_eq!(strk_balance_of(&mut chain, &acc.address), start - 5 - fee);
         let events = receipt["events"].as_array().unwrap();
-        assert!(events.iter().any(|e| e["from_address"].as_str().map(|s| parse_felt_str(s).unwrap()) == Some(parse_felt_str(strk).unwrap())), "Transfer event expected: {events:?}");
-        let bal_other = chain.handle_rpc("starknet_call", &serde_json::json!({ "request": { "contract_address": strk, "entry_point_selector": hex(&selector("balanceOf")), "calldata": [other.address] }, "block_id": "latest" })).unwrap();
-        assert_eq!(u256_of(&bal_other), "1000000000000000000005");
-        assert_eq!(chain.handle_rpc("starknet_getNonce", &serde_json::json!({ "block_id": "latest", "contract_address": acc.address })).unwrap(), serde_json::json!("0x1"));
+        assert_eq!(events.len(), 2, "the transfer, then the fee transfer: {events:?}");
+        assert_eq!(parse_felt_str(events[1]["keys"][2].as_str().unwrap()).unwrap(), Felt::from(0x1000_u64), "the sequencer gets the fee");
+        let trace = chain.handle_rpc("starknet_traceTransaction", &serde_json::json!({ "transaction_hash": receipt["transaction_hash"] })).unwrap();
+        for key in ["validate_invocation", "execute_invocation", "fee_transfer_invocation", "state_diff"] {
+            assert!(trace.get(key).is_some_and(|v| !v.is_null()), "{key} missing: {trace}");
+        }
+        assert_eq!(trace["validate_invocation"]["result"], serde_json::json!([hex(&Felt::from_bytes_be_slice(b"VALID"))]));
+        let validate_gas = trace["validate_invocation"]["execution_resources"]["l2_gas"].as_u64().unwrap();
+        let update = chain.handle_rpc("starknet_getStateUpdate", &serde_json::json!({ "block_id": "latest" })).unwrap();
+        assert_eq!(update["state_diff"]["nonces"][0]["nonce"], "0x1");
+        assert!(update["state_diff"]["storage_diffs"].as_array().unwrap().iter().any(|d| parse_felt_str(d["address"].as_str().unwrap()).unwrap() == parse_felt_str(DEVNET_STRK_ADDRESS).unwrap()));
+        let block = chain.handle_rpc("starknet_getBlockWithTxHashes", &serde_json::json!({ "block_id": "latest" })).unwrap();
+        assert_eq!((block["transaction_count"].clone(), block["event_count"].clone(), block["starknet_version"].clone()), (serde_json::json!(1), serde_json::json!(2), serde_json::json!(DEVNET_STARKNET_VERSION)));
 
-        // A stale nonce is refused; a reverting call is reported with its reason.
-        let stale = chain.handle_rpc("starknet_addInvokeTransaction", &serde_json::json!({ "invoke_transaction": { "sender_address": acc.address, "calldata": [], "nonce": "0x0" } }));
-        assert_eq!(stale.unwrap_err().code, ERR_INVALID_NONCE);
-        let too_much = vec!["0x1".to_string(), strk.to_string(), hex(&selector("transfer")), "0x3".to_string(), other.address.clone(), "0x0".to_string(), "0x1000".to_string()];
-        let res = chain.handle_rpc("starknet_addInvokeTransaction", &serde_json::json!({ "invoke_transaction": { "sender_address": acc.address, "calldata": too_much, "nonce": "0x1" } })).unwrap();
-        let receipt = chain.handle_rpc("starknet_getTransactionReceipt", &serde_json::json!({ "transaction_hash": res["transaction_hash"] })).unwrap();
+        // Rejected, so no transaction and no nonce bump: a stale nonce, another key, no signature,
+        // a gas price under the block's, a maximum fee above the balance.
+        let pay_one = || transfer(&other.address, "0x1", "0x0");
+        assert_eq!(invoke(&mut chain, signed_invoke(id, &acc, pay_one(), 0, bounds(L2), None)).unwrap_err().code, ERR_INVALID_NONCE);
+        let forged = invoke(&mut chain, signed_invoke(id, &acc, pay_one(), 1, bounds(L2), Some(Felt::from(99_u64)))).unwrap_err();
+        assert_eq!(forged.code, ERR_VALIDATION_FAILURE);
+        assert!(forged.data.unwrap().to_string().contains("invalid signature"));
+        let mut unsigned = signed_invoke(id, &acc, pay_one(), 1, bounds(L2), None);
+        unsigned["signature"] = serde_json::json!([]);
+        assert_eq!(invoke(&mut chain, unsigned).unwrap_err().code, ERR_VALIDATION_FAILURE);
+        let mut cheap = bounds(L2);
+        cheap["l2_gas"]["max_price_per_unit"] = serde_json::json!("0x1");
+        assert_eq!(invoke(&mut chain, signed_invoke(id, &acc, pay_one(), 1, cheap, None)).unwrap_err().code, ERR_INSUFFICIENT_RESOURCES);
+        assert_eq!(invoke(&mut chain, signed_invoke(id, &acc, pay_one(), 1, bounds(1_000_000_000_000_000), None)).unwrap_err().code, ERR_INSUFFICIENT_BALANCE);
+        assert_eq!(nonce_of(&mut chain), serde_json::json!("0x1"));
+
+        // A panicking call reverts: the nonce moves and the fee is charged, the transfer is undone.
+        let other_before = strk_balance_of(&mut chain, &other.address);
+        let receipt = invoke(&mut chain, signed_invoke(id, &acc, transfer(&other.address, "0x0", "0x1000"), 1, bounds(L2), None)).unwrap();
         assert_eq!(receipt["execution_status"], "REVERTED");
         assert!(receipt["revert_reason"].as_str().unwrap().contains("INSUFFICIENT_BALANCE"), "{receipt}");
+        assert!(hex_u128(&receipt["actual_fee"]["amount"]) > 0);
+        assert_eq!(receipt["events"].as_array().unwrap().len(), 1, "only the fee transfer: {receipt}");
+        assert_eq!(strk_balance_of(&mut chain, &other.address), other_before);
+        let status = chain.handle_rpc("starknet_getTransactionStatus", &serde_json::json!({ "transaction_hash": receipt["transaction_hash"] })).unwrap();
+        assert!(status["failure_reason"].as_str().unwrap().contains("INSUFFICIENT_BALANCE"));
 
-        // Declare the token class again under a new name is refused; declaring a fresh class works
-        // and the UDC deploys it with a constructor.
-        let dup = chain.handle_rpc("starknet_addDeclareTransaction", &serde_json::json!({ "declare_transaction": { "sender_address": acc.address, "nonce": "0x2", "contract_class": chain.classes[&parse_felt_str(&chain.token_class_hash).unwrap()].class_json.clone() } }));
-        assert_eq!(dup.unwrap_err().code, ERR_CLASS_ALREADY_DECLARED);
+        // L2 gas for validation and a little more: execution runs out of gas and reverts.
+        let receipt = invoke(&mut chain, signed_invoke(id, &acc, pay_one(), 2, bounds(validate_gas + 5_000), None)).unwrap();
+        assert_eq!(receipt["execution_status"], "REVERTED", "{receipt}");
+        assert!(receipt["revert_reason"].as_str().unwrap().to_ascii_lowercase().contains("out of gas"), "{receipt}");
+        assert_eq!(nonce_of(&mut chain), serde_json::json!("0x3"));
 
+        // estimateFee and simulateTransactions run on a copy of the state, and the estimate is
+        // what the transaction is then charged.
+        let probe = signed_invoke(id, &acc, pay_one(), 3, bounds(L2), None);
+        let estimate = chain.handle_rpc("starknet_estimateFee", &serde_json::json!({ "request": [probe.clone()], "simulation_flags": [], "block_id": "latest" })).unwrap();
+        let skip_validate = chain.handle_rpc("starknet_estimateFee", &serde_json::json!({ "request": [probe.clone()], "simulation_flags": ["SKIP_VALIDATE"], "block_id": "latest" })).unwrap();
+        assert!(hex_u128(&skip_validate[0]["l2_gas_consumed"]) < hex_u128(&estimate[0]["l2_gas_consumed"]));
+        let sim = chain.handle_rpc("starknet_simulateTransactions", &serde_json::json!({ "block_id": "latest", "transactions": [probe.clone()], "simulation_flags": [] })).unwrap();
+        assert_eq!(sim[0]["fee_estimation"], estimate[0]);
+        assert!(sim[0]["transaction_trace"]["fee_transfer_invocation"].is_object());
+        assert_eq!(nonce_of(&mut chain), serde_json::json!("0x3"));
+        let receipt = invoke(&mut chain, probe).unwrap();
+        assert_eq!(u128::from(receipt["execution_resources"]["l2_gas"].as_u64().unwrap()), hex_u128(&estimate[0]["l2_gas_consumed"]));
+        assert_eq!(receipt["actual_fee"]["amount"], estimate[0]["overall_fee"]);
+        let reverting = signed_invoke(id, &acc, transfer(&other.address, "0x0", "0x1000"), 4, bounds(L2), None);
+        let err = chain.handle_rpc("starknet_estimateFee", &serde_json::json!({ "request": [reverting], "simulation_flags": [], "block_id": "latest" })).unwrap_err();
+        assert_eq!(err.code, ERR_TX_EXECUTION_ERROR);
+    }
+
+    #[test]
+    #[cfg(feature = "native-test-runner")]
+    fn devnet_declares_deploys_and_deploys_accounts() {
+        let mut chain = test_chain();
+        let id = chain.chain_id;
+        let acc = chain.accounts[0].clone();
+        let key = parse_felt_str(&acc.private_key).unwrap();
         let root = std::env::temp_dir().join(format!("uc-devnet-counter-{}-{}", std::process::id(), epoch_ms_u64().unwrap_or(1)));
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("Scarb.toml"), "[package]\nname = \"counter\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n\n[dependencies]\nstarknet = \"2.18.0\"\n\n[[target.starknet-contract]]\nsierra = true\ncasm = false\n").unwrap();
@@ -1380,61 +1952,61 @@ pub mod Counter {
         }).expect("build counter");
         let class_json: serde_json::Value = serde_json::from_str(&fs::read_to_string(root.join("target/dev/counter_Counter.contract_class.json")).unwrap()).unwrap();
         let _ = fs::remove_dir_all(&root);
-        let declared = chain.handle_rpc("starknet_addDeclareTransaction", &serde_json::json!({ "declare_transaction": { "sender_address": acc.address, "nonce": "0x2", "contract_class": class_json, "compiled_class_hash": "0x0" } })).unwrap();
-        let class_hash = declared["class_hash"].as_str().unwrap().to_string();
-        let fetched = chain.handle_rpc("starknet_getClass", &serde_json::json!({ "block_id": "latest", "class_hash": class_hash })).unwrap();
-        assert!(fetched.get("sierra_program").is_some());
+        let class_hash = compute_class_hash_from_json(&class_json).unwrap();
+        let compiled = hex(&compile_declared_class(&class_json).unwrap().0);
+        let declare = |nonce: u64, compiled: &str| {
+            let tx = serde_json::json!({ "type": "DECLARE", "sender_address": acc.address, "contract_class": class_json, "class_hash": class_hash, "compiled_class_hash": compiled });
+            serde_json::json!({ "declare_transaction": signed(id, tx, nonce, bounds(L2), &key) })
+        };
 
-        // Deploy through the UDC with constructor(start = 40), then increase by 2 and read 42.
-        let udc_calldata = vec!["0x1".to_string(), DEVNET_UDC_ADDRESS.to_string(), hex(&selector("deployContract")), "0x5".to_string(), class_hash.clone(), "0x7".to_string(), "0x0".to_string(), "0x1".to_string(), "0x28".to_string()];
-        let res = chain.handle_rpc("starknet_addInvokeTransaction", &serde_json::json!({ "invoke_transaction": { "sender_address": acc.address, "calldata": udc_calldata, "nonce": "0x3" } })).unwrap();
-        let receipt = chain.handle_rpc("starknet_getTransactionReceipt", &serde_json::json!({ "transaction_hash": res["transaction_hash"] })).unwrap();
+        // The compiled class hash must be the class's Blake2s hash.
+        let err = chain.handle_rpc("starknet_addDeclareTransaction", &declare(0, "0x1234")).unwrap_err();
+        assert_eq!(err.code, ERR_COMPILED_CLASS_HASH_MISMATCH);
+        assert!(chain.handle_rpc("starknet_getClass", &serde_json::json!({ "block_id": "latest", "class_hash": class_hash })).is_err(), "a rejected declare declares nothing");
+        let declared = chain.handle_rpc("starknet_addDeclareTransaction", &declare(0, &compiled)).unwrap();
+        assert_eq!(parse_felt_str(declared["class_hash"].as_str().unwrap()).unwrap(), parse_felt_str(&class_hash).unwrap());
+        let update = chain.handle_rpc("starknet_getStateUpdate", &serde_json::json!({ "block_id": "latest" })).unwrap();
+        assert_eq!(update["state_diff"]["declared_classes"][0]["compiled_class_hash"], compiled);
+        assert_eq!(chain.handle_rpc("starknet_addDeclareTransaction", &declare(1, &compiled)).unwrap_err().code, ERR_CLASS_ALREADY_DECLARED);
+
+        // The UDC deploys it with constructor(start = 40); increase by 2 and read 42.
+        let udc_calldata = vec!["0x1".to_string(), STARKNET_UDC_ADDRESS.to_string(), hex(&selector("deployContract")), "0x5".to_string(), class_hash.clone(), "0x7".to_string(), "0x0".to_string(), "0x1".to_string(), "0x28".to_string()];
+        let receipt = invoke(&mut chain, signed_invoke(id, &acc, udc_calldata, 1, bounds(L2), None)).unwrap();
         assert_eq!(receipt["execution_status"], "SUCCEEDED", "{receipt}");
         let deployed = receipt["events"].as_array().unwrap().iter()
-            .find(|e| e["from_address"].as_str().map(|s| parse_felt_str(s).unwrap()) == Some(parse_felt_str(DEVNET_UDC_ADDRESS).unwrap()))
+            .find(|e| e["from_address"].as_str().map(|s| parse_felt_str(s).unwrap()) == Some(parse_felt_str(STARKNET_UDC_ADDRESS).unwrap()))
             .and_then(|e| e["data"][0].as_str()).expect("ContractDeployed event").to_string();
         let expected = calculate_contract_address(&Felt::from(7_u64), &parse_felt_str(&class_hash).unwrap(), &[Felt::from(40_u64)], &Felt::ZERO);
         assert_eq!(parse_felt_str(&deployed).unwrap(), expected, "UDC address must follow the Starknet formula for unique = 0");
-        assert_eq!(chain.handle_rpc("starknet_getClassHashAt", &serde_json::json!({ "block_id": "latest", "contract_address": deployed })).unwrap().as_str().map(|s| parse_felt_str(s).unwrap()), parse_felt_str(&class_hash).ok());
-
+        let update = chain.handle_rpc("starknet_getStateUpdate", &serde_json::json!({ "block_id": "latest" })).unwrap();
+        assert!(update["state_diff"]["deployed_contracts"].as_array().unwrap().iter().any(|d| parse_felt_str(d["address"].as_str().unwrap()).unwrap() == expected));
         let inc = vec!["0x1".to_string(), deployed.clone(), hex(&selector("increase")), "0x1".to_string(), "0x2".to_string()];
-        chain.handle_rpc("starknet_addInvokeTransaction", &serde_json::json!({ "invoke_transaction": { "sender_address": acc.address, "calldata": inc, "nonce": "0x4" } })).unwrap();
+        invoke(&mut chain, signed_invoke(id, &acc, inc, 2, bounds(L2), None)).unwrap();
         let got = chain.handle_rpc("starknet_call", &serde_json::json!({ "request": { "contract_address": deployed, "entry_point_selector": hex(&selector("get")), "calldata": [] }, "block_id": "latest" })).unwrap();
         assert_eq!(got, serde_json::json!(["0x2a"]));
-        let slot = hex(&selector("value"));
-        assert_eq!(chain.handle_rpc("starknet_getStorageAt", &serde_json::json!({ "contract_address": deployed, "key": slot, "block_id": "latest" })).unwrap(), serde_json::json!("0x2a"));
+        let events = chain.handle_rpc("starknet_getEvents", &serde_json::json!({ "filter": { "address": DEVNET_STRK_ADDRESS, "chunk_size": 10 } })).unwrap();
+        let first = &events["events"][0];
+        assert!(first.get("transaction_index").is_some() && first.get("event_index").is_some(), "{first}");
 
-        // Blocks: genesis + 4 transactions (the reverted one included).
-        assert_eq!(chain.handle_rpc("starknet_blockNumber", &serde_json::json!([])).unwrap(), serde_json::json!(5));
-        let block = chain.handle_rpc("starknet_getBlockWithTxs", &serde_json::json!({ "block_id": { "block_number": 1 } })).unwrap();
-        assert_eq!(block["transactions"].as_array().unwrap().len(), 1);
-        let events = chain.handle_rpc("starknet_getEvents", &serde_json::json!({ "filter": { "address": strk, "chunk_size": 10 } })).unwrap();
-        assert!(events["events"].as_array().unwrap().len() >= 1);
-
-        // Signatures: a transaction signed with the account's key over its SNIP-8 hash is accepted;
-        // one signed with another key is refused; the node's hash is the SNIP-8 hash.
-        let pk = parse_felt_str(&acc.private_key).unwrap();
-        let mut signed = serde_json::json!({ "type": "INVOKE", "version": "0x3", "sender_address": acc.address, "calldata": inc_again(&deployed), "nonce": "0x5",
-            "resource_bounds": { "l1_gas": { "max_amount": "0x1", "max_price_per_unit": "0x1" }, "l2_gas": { "max_amount": "0x1", "max_price_per_unit": "0x1" }, "l1_data_gas": { "max_amount": "0x1", "max_price_per_unit": "0x1" } },
-            "tip": "0x0", "paymaster_data": [], "account_deployment_data": [], "nonce_data_availability_mode": "L1", "fee_data_availability_mode": "L1" });
-        let expected_hash = sign_v3_transaction(&mut signed, chain.chain_id, Some(&pk)).unwrap();
-        let res = chain.handle_rpc("starknet_addInvokeTransaction", &serde_json::json!({ "invoke_transaction": signed.clone() })).unwrap();
-        assert_eq!(parse_felt_str(res["transaction_hash"].as_str().unwrap()).unwrap(), expected_hash, "the devnet reports the SNIP-8 hash");
-        let mut forged = signed.clone();
-        forged["nonce"] = serde_json::json!("0x6");
-        sign_v3_transaction(&mut forged, chain.chain_id, Some(&Felt::from(99_u64))).unwrap();
-        let err = chain.handle_rpc("starknet_addInvokeTransaction", &serde_json::json!({ "invoke_transaction": forged })).unwrap_err();
-        assert_eq!(err.message, "invalid signature");
-        assert_eq!(chain.handle_rpc("starknet_getNonce", &serde_json::json!({ "block_id": "latest", "contract_address": acc.address })).unwrap(), serde_json::json!("0x6"));
-
-        // Mint and deploy_account.
-        let minted = chain.handle_rpc("devnet_mint", &serde_json::json!({ "address": other.address, "amount": 7, "unit": "FRI" })).unwrap();
-        assert_eq!(minted["new_balance"], "1000000000000000000012");
-        let salt = "0x123";
-        let addr = calculate_contract_address(&parse_felt_str(salt).unwrap(), &parse_felt_str(&chain.account_class_hash).unwrap(), &[Felt::from(9_u64)], &Felt::ZERO);
-        let dep = chain.handle_rpc("starknet_addDeployAccountTransaction", &serde_json::json!({ "deploy_account_transaction": { "class_hash": chain.account_class_hash, "contract_address_salt": salt, "constructor_calldata": ["0x9"], "nonce": "0x0" } })).unwrap();
-        assert_eq!(parse_felt_str(dep["contract_address"].as_str().unwrap()).unwrap(), addr);
-        let pk = chain.handle_rpc("starknet_call", &serde_json::json!({ "request": { "contract_address": hex(&addr), "entry_point_selector": hex(&selector("get_public_key")), "calldata": [] } })).unwrap();
-        assert_eq!(pk, serde_json::json!(["0x9"]));
+        // DEPLOY_ACCOUNT: the new account pays its own fee, from a balance minted beforehand.
+        let new_key = Felt::from(0x1234_u64);
+        let public_key = starknet_crypto::get_public_key(&new_key);
+        let salt = Felt::from(0x123_u64);
+        let address = calculate_contract_address(&salt, &parse_felt_str(&chain.account_class_hash).unwrap(), &[public_key], &Felt::ZERO);
+        let account_class_hash = chain.account_class_hash.clone();
+        let deploy_tx = |key: &Felt| {
+            let tx = serde_json::json!({ "type": "DEPLOY_ACCOUNT", "class_hash": account_class_hash, "contract_address_salt": hex(&salt), "constructor_calldata": [hex(&public_key)] });
+            serde_json::json!({ "deploy_account_transaction": signed(id, tx, 0, bounds(L2), key) })
+        };
+        assert_eq!(chain.handle_rpc("starknet_addDeployAccountTransaction", &deploy_tx(&new_key)).unwrap_err().code, ERR_INSUFFICIENT_BALANCE);
+        chain.handle_rpc("devnet_mint", &serde_json::json!({ "address": hex(&address), "amount": "1000000000000000000", "unit": "FRI" })).unwrap();
+        assert_eq!(chain.handle_rpc("starknet_addDeployAccountTransaction", &deploy_tx(&Felt::from(7_u64))).unwrap_err().code, ERR_VALIDATION_FAILURE);
+        let dep = chain.handle_rpc("starknet_addDeployAccountTransaction", &deploy_tx(&new_key)).unwrap();
+        assert_eq!(parse_felt_str(dep["contract_address"].as_str().unwrap()).unwrap(), address);
+        let receipt = chain.handle_rpc("starknet_getTransactionReceipt", &serde_json::json!({ "transaction_hash": dep["transaction_hash"] })).unwrap();
+        assert_eq!(receipt["execution_status"], "SUCCEEDED");
+        assert!(strk_balance_of(&mut chain, &hex(&address)) < 1_000_000_000_000_000_000);
+        let pk = chain.handle_rpc("starknet_call", &serde_json::json!({ "request": { "contract_address": hex(&address), "entry_point_selector": hex(&selector("get_public_key")), "calldata": [] } })).unwrap();
+        assert_eq!(pk, serde_json::json!([hex(&public_key)]));
     }
 }

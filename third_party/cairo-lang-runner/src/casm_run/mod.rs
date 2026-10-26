@@ -330,6 +330,19 @@ impl StarknetState {
         self.storage.entry(contract).or_default().insert(key, value);
     }
 
+    /// Storage cells whose value differs from `before`, as `(contract, key, value)` sorted by
+    /// contract then key (a write of the value already stored is no change).
+    pub fn storage_diff(&self, before: &StarknetState) -> Vec<(Felt252, Felt252, Felt252)> {
+        let mut out: Vec<(Felt252, Felt252, Felt252)> = self
+            .storage
+            .iter()
+            .flat_map(|(contract, cells)| cells.iter().map(move |(key, value)| (*contract, *key, *value)))
+            .filter(|(contract, key, value)| before.storage_at(contract, key) != *value)
+            .collect();
+        out.sort();
+        out
+    }
+
     /// Takes every event emitted so far as `(emitter, keys, data)`, oldest first.
     pub fn take_events(&mut self) -> Vec<(Felt252, Vec<Felt252>, Vec<Felt252>)> {
         std::mem::take(&mut self.all_events)
