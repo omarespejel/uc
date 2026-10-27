@@ -3676,8 +3676,14 @@ pub(crate) fn run_verify_onchain(args: VerifyOnchainArgs) -> Result<()> {
     let source_tree_merkle_root = merkle_hasher.finalize().to_hex().to_string();
     let manifest_content = fs::read_to_string(&manifest_path).unwrap_or_default();
     let workspace_manifest_content = [
+        Some(workspace_root.join("uc.toml")),
         Some(workspace_root.join("Scarb.toml")),
+        manifest_dir.parent().map(|p| p.join("uc.toml")),
         manifest_dir.parent().map(|p| p.join("Scarb.toml")),
+        manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("uc.toml")),
         manifest_dir
             .parent()
             .and_then(|p| p.parent())
@@ -3692,7 +3698,9 @@ pub(crate) fn run_verify_onchain(args: VerifyOnchainArgs) -> Result<()> {
             None
         }
     });
-    let lock_content = fs::read_to_string(workspace_root.join("Scarb.lock")).ok();
+    let lock_content = fs::read_to_string(workspace_root.join("uc.lock"))
+        .or_else(|_| fs::read_to_string(workspace_root.join("Scarb.lock")))
+        .ok();
     let cairo_project_toml =
         fs::read_to_string(workspace_root.join(".uc/native-project/cairo_project.toml")).ok();
 

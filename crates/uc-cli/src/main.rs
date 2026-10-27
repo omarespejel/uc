@@ -1918,6 +1918,7 @@ struct NativeScarbMetadataPackage {
 #[cfg(feature = "native-compile")]
 struct NativeScarbMetadataCompilationUnit {
     #[serde(default)]
+    #[allow(dead_code)]
     package: String,
     #[serde(default)]
     target: NativeScarbMetadataTarget,
@@ -10953,6 +10954,7 @@ fn run_daemon_start(args: DaemonSocketArgs) -> Result<()> {
             .arg("serve")
             .arg("--socket-path")
             .arg(&socket_path)
+            .current_dir(std::env::temp_dir())
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(log_file_err));
@@ -13638,9 +13640,19 @@ fn collect_native_dependency_table_surface(
     path_roots: &mut BTreeMap<String, PathBuf>,
 ) {
     for (dependency_name, dependency_value) in table {
-        // `starknet` is provided by the compiler/plugin suite directly; every
-        // other dependency must resolve to a supported local path source.
-        if dependency_name == "starknet" {
+        // `starknet` and built-in compiler macro packages are provided by the
+        // compiler/plugin suite directly; every other dependency must resolve
+        // to a supported local or cached path source.
+        if matches!(
+            dependency_name.as_str(),
+            "starknet"
+                | "core"
+                | "assert_macros"
+                | "cairo_execute"
+                | "cairo_test"
+                | "cairo_run"
+                | "snforge_scarb_plugin"
+        ) {
             continue;
         }
         let dependency_label = format!(
@@ -13902,11 +13914,8 @@ fn collect_native_dependency_surface_from_scarb_metadata(
 
     let matching_component =
         |component: &NativeScarbMetadataComponentData,
-         unit: &NativeScarbMetadataCompilationUnit| {
+         _unit: &NativeScarbMetadataCompilationUnit| {
             if normalize_package_name_for_cairo_crate(&component.name) == root_crate_name {
-                return true;
-            }
-            if unit.package == component.id {
                 return true;
             }
             package_by_id
@@ -14096,7 +14105,9 @@ fn collect_native_dependency_surface(
         false,
     );
     let is_uc_toml = manifest_path.file_name().and_then(|s| s.to_str()) == Some("uc.toml");
+    let in_scarb_registry_cache = manifest_dir.to_string_lossy().contains("registry/src");
     let use_dependency_metadata = !is_uc_toml
+        && !in_scarb_registry_cache
         && native_should_use_dependency_metadata_with_flags(
             native_dependency_metadata_enabled(),
             path_roots.len(),
@@ -14529,7 +14540,13 @@ fn build_native_compile_context_uncached_with_features(
     }
 
     let crate_name = normalize_package_name_for_cairo_crate(&package_name);
-    let cairo_project_dir = workspace_root.join(".uc/native-project");
+    let cairo_project_dir = if normalize_fingerprint_path(&manifest_dir)
+        == normalize_fingerprint_path(workspace_root)
+    {
+        workspace_root.join(".uc/native-project")
+    } else {
+        workspace_root.join(".uc/native-project").join(&crate_name)
+    };
     ensure_path_within_root(
         workspace_root,
         &cairo_project_dir,
@@ -14566,9 +14583,21 @@ fn build_native_compile_context_uncached_with_features(
         }
     }
     for cfg in &mut crate_dependency_configs {
-        if !cfg.dependencies.is_empty() && !cfg.dependencies.iter().any(|d| d == &cfg.crate_name) {
+        if !cfg.dependencies.iter().any(|d| d == &cfg.crate_name) {
             cfg.dependencies.push(cfg.crate_name.clone());
             cfg.dependencies.sort();
+        }
+    }
+    for root in &path_dependency_roots {
+        if !crate_dependency_configs
+            .iter()
+            .any(|cfg| cfg.crate_name == root.crate_name)
+        {
+            crate_dependency_configs.push(NativeCrateDependencyConfig {
+                crate_name: root.crate_name.clone(),
+                cairo_edition: cairo_edition.clone(),
+                dependencies: vec![root.crate_name.clone()],
+            });
         }
     }
     if let Some(root_config) = crate_dependency_configs
@@ -14982,6 +15011,7 @@ fn native_cairo_project_toml_with_features(
     content.push_str("edition = \"");
     content.push_str(&escaped_edition);
     content.push_str("\"\n");
+    content.push_str("experimental_features = { negative_impls = true, associated_item_constraints = true, coupons = true, user_defined_inline_macros = true }\n");
     for crate_config in crate_dependency_configs
         .iter()
         .filter(|config| !config.dependencies.is_empty())
@@ -15000,6 +15030,7 @@ fn native_cairo_project_toml_with_features(
         content.push_str("edition = \"");
         content.push_str(&escaped_edition);
         content.push_str("\"\n");
+        content.push_str("experimental_features = { negative_impls = true, associated_item_constraints = true, coupons = true, user_defined_inline_macros = true }\n");
 
         if !enabled_features.is_empty()
             && (root_crate_name.is_empty() || crate_config.crate_name == root_crate_name)
@@ -17222,6 +17253,13 @@ fn persist_native_source_change_journal_best_effort(
     workspace_root: &Path,
     state: &NativeSourceChangeJournal,
 ) {
+    if !workspace_root.is_dir()
+        || (!workspace_root.join("uc.toml").is_file()
+            && !workspace_root.join("Scarb.toml").is_file())
+        || !workspace_root.join(".uc/cache/native-session").is_dir()
+    {
+        return;
+    }
     if let Err(err) = persist_native_source_change_journal(workspace_root, state) {
         tracing::warn!(
             workspace_root = %workspace_root.display(),
@@ -18409,6 +18447,9 @@ fn native_seeded_root_database_with_inlining(
         ))
         .with_default_plugin_suite(starknet_plugin_suite())
         .with_default_plugin_suite({
+            #[cfg(feature = "native-test-runner")]
+            let mut s = crate::commands::uc_unconditional_assert_plugin_suite();
+            #[cfg(not(feature = "native-test-runner"))]
             let mut s = cairo_lang_semantic::plugin::PluginSuite::default();
             #[cfg(feature = "native-test-runner")]
             s.add_plugin::<crate::commands::UcSnforgeTestAttrPlugin>();

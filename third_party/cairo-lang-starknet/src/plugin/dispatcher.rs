@@ -43,6 +43,18 @@ pub fn handle_trait<'db>(
     let Some(interface_attr) = trait_ast.find_attr(db, INTERFACE_ATTR) else {
         return PluginResult::default();
     };
+    if trait_ast.name(db).text(db).long(db).as_str() == "AccountContract"
+        && trait_ast
+            .as_syntax_node()
+            .parent(db)
+            .is_some_and(|p| {
+                p.get_text_without_trivia(db)
+                    .long(db)
+                    .contains("AccountContractDispatcher")
+            })
+    {
+        return PluginResult::default();
+    }
     let body = match trait_ast.body(db) {
         MaybeTraitBody::Some(body) => body,
         MaybeTraitBody::None(empty_body) => {

@@ -51,6 +51,10 @@ pub(crate) struct ProveArgs {
     #[arg(long)]
     pub fail_on_findings: bool,
 
+    /// Fail policy override (`none`, `counterexample`, `findings`, `unproven`).
+    #[arg(long, value_name = "POLICY")]
+    pub fail_on: Option<String>,
+
     /// Force recompilation without reading cached compilation artifacts.
     #[arg(long)]
     pub no_cache: bool,
@@ -2670,7 +2674,16 @@ fn expr_interval(e: &SymExpr, lo: &[i128], hi: &[i128]) -> Option<(i128, i128)> 
         }
         SymExpr::Sub(a, b) => {
             let ((al, ah), (bl, bh)) = (expr_interval(a, lo, hi)?, expr_interval(b, lo, hi)?);
-            (al.checked_sub(bh)?, ah.checked_sub(bl)?)
+            let low = if let SymExpr::Rem(rem_lhs, _) = b.as_ref() {
+                if rem_lhs.as_ref() == a.as_ref() && al >= 0 {
+                    al.checked_sub(bh)?.max(0)
+                } else {
+                    al.checked_sub(bh)?
+                }
+            } else {
+                al.checked_sub(bh)?
+            };
+            (low, ah.checked_sub(bl)?)
         }
         SymExpr::Mul(a, b) => {
             let ((al, ah), (bl, bh)) = (expr_interval(a, lo, hi)?, expr_interval(b, lo, hi)?);
@@ -2715,9 +2728,19 @@ fn interval_refutes(c: &SymConstraint, lo: &[i128], hi: &[i128]) -> bool {
     let (Some((ll, lh)), Some((rl, rh))) = (expr_interval(&c.lhs, lo, hi), expr_interval(&c.rhs, lo, hi)) else {
         return false;
     };
-    let (Some(dl), Some(dh)) = (ll.checked_sub(rh), lh.checked_sub(rl)) else {
+    let (Some(mut dl), Some(mut dh)) = (ll.checked_sub(rh), lh.checked_sub(rl)) else {
         return false;
     };
+    if let SymExpr::Rem(rem_lhs, _) = &c.rhs {
+        if rem_lhs.as_ref() == &c.lhs && ll >= 0 {
+            dl = dl.max(0);
+        }
+    }
+    if let SymExpr::Rem(rem_lhs, _) = &c.lhs {
+        if rem_lhs.as_ref() == &c.rhs && rl >= 0 {
+            dh = dh.min(0);
+        }
+    }
     match c.op {
         CmpOp::Eq => dl > 0 || dh < 0,
         CmpOp::Ne => dl == 0 && dh == 0,
@@ -2984,6 +3007,67 @@ fn solve_path_constraints(
 
     if constraints.iter().any(|c| interval_refutes(c, &lo, &hi)) {
         return SolverOutcome::Unsat;
+    }
+
+    // Subexpression interval tightening: e.g. `(arg_1 % 128)` has initial range `[0, 127]`;
+    // if path constraints require `(arg_1 % 128) > 126` and `(arg_1 % 128) != 127`, its
+    // interval collapses to `[128, 126]`, proving the path unsatisfiable.
+    for (idx_c, c) in constraints.iter().enumerate() {
+        let sub_expr = match (&c.lhs, &c.rhs) {
+            (e, SymExpr::Const(_)) if !matches!(e, SymExpr::Param(..) | SymExpr::Const(_)) => e,
+            (SymExpr::Const(_), e) if !matches!(e, SymExpr::Param(..) | SymExpr::Const(_)) => e,
+            _ => continue,
+        };
+        if constraints[..idx_c]
+            .iter()
+            .any(|prev| &prev.lhs == sub_expr || &prev.rhs == sub_expr)
+        {
+            continue;
+        }
+        let Some((mut elo, mut ehi)) = expr_interval(sub_expr, &lo, &hi) else {
+            continue;
+        };
+        let mut e_excluded = HashSet::new();
+        for other in &constraints[idx_c..] {
+            let (op, val) = if &other.lhs == sub_expr {
+                let SymExpr::Const(v) = &other.rhs else { continue };
+                (other.op, *v)
+            } else if &other.rhs == sub_expr {
+                let SymExpr::Const(v) = &other.lhs else { continue };
+                let mirrored = match other.op {
+                    CmpOp::Lt => CmpOp::Gt,
+                    CmpOp::Le => CmpOp::Ge,
+                    CmpOp::Gt => CmpOp::Lt,
+                    CmpOp::Ge => CmpOp::Le,
+                    op => op,
+                };
+                (mirrored, *v)
+            } else {
+                continue;
+            };
+            match op {
+                CmpOp::Eq => {
+                    elo = elo.max(val);
+                    ehi = ehi.min(val);
+                }
+                CmpOp::Ne => {
+                    e_excluded.insert(val);
+                }
+                CmpOp::Lt => ehi = ehi.min(val.saturating_sub(1)),
+                CmpOp::Le => ehi = ehi.min(val),
+                CmpOp::Gt => elo = elo.max(val.saturating_add(1)),
+                CmpOp::Ge => elo = elo.max(val),
+            }
+        }
+        while elo <= ehi && e_excluded.contains(&elo) {
+            elo += 1;
+        }
+        while ehi >= elo && e_excluded.contains(&ehi) {
+            ehi -= 1;
+        }
+        if elo > ehi {
+            return SolverOutcome::Unsat;
+        }
     }
 
     // Build per-parameter candidate witness sets from solved interval boundaries & algebraic
@@ -3786,13 +3870,17 @@ fn run_symbolic_verification_for_function(
                                     });
                                 let is_precondition_guard = state.guarded_callee
                                     || blocked_by_state
+                                    || ((state_dependent || state.unmodeled_branch)
+                                        && !has_overflow
+                                        && !is_test_or_property)
                                     || (on_params.is_empty()
                                     && (state_dependent || state.unmodeled_branch || meaningful_constraints.is_empty()))
                                     || (!on_params.is_empty()
-                                        && on_params.iter().all(|c| is_raw_test(c))
+                                        && (on_params.iter().all(|c| is_raw_test(c))
+                                            || on_params.last().is_some_and(|c| is_raw_test(c)))
                                         && !has_overflow
                                         && !is_test_or_property)
-                                    || (has_overflow && !params_externally_controlled);
+                                    || (!params_externally_controlled && !is_test_or_property);
 
                                 if !confirmed && !is_precondition_guard {
                                     if debug_paths.as_deref().is_some_and(|f| fname.contains(f)) {
@@ -3802,7 +3890,12 @@ fn run_symbolic_verification_for_function(
                                 } else if is_precondition_guard {
                                     let pre = if state.guarded_callee {
                                         "callee_guard".to_string()
-                                    } else if meaningful_constraints.is_empty() {
+                                    } else if meaningful_constraints.is_empty()
+                                        || state
+                                            .constraints
+                                            .last()
+                                            .is_some_and(|last_c| !meaningful_constraints.contains(last_c))
+                                    {
                                         "caller_auth_or_calldata_guard".to_string()
                                     } else {
                                         meaningful_constraints
@@ -4219,6 +4312,7 @@ fn run_symbolic_verification_for_function(
                             child.depth += 1;
                             let constraints_before = child.constraints.len();
                             let condition_libfunc = gid == "downcast"
+                                || gid == "array_get"
                                 || gid.ends_with("_is_zero")
                                 || gid.ends_with("_eq")
                                 || gid.ends_with("_lt")
@@ -4457,7 +4551,37 @@ fn run_symbolic_verification_for_function(
                                     if let Some(res_var) = branch.results.last() {
                                         child.var_max.insert(res_var.id, max_val);
                                     }
+                                } else {
+                                    let env_expr = opaque_var("v", arg_id);
+                                    child.constraints.push(SymConstraint {
+                                        lhs: env_expr.clone(),
+                                        op: CmpOp::Gt,
+                                        rhs: SymExpr::Const(max_val),
+                                        reason: format!("{gid}({}) branch 1", env_expr.format_human()),
+                                        is_overflow_branch: false,
+                                    });
                                 }
+                            } else if gid == "array_get" && inv.args.len() >= 2 {
+                                let arr_id = inv.args[inv.args.len() - 2].id;
+                                let idx_id = inv.args[inv.args.len() - 1].id;
+                                let idx_expr = state
+                                    .vars
+                                    .get(&idx_id)
+                                    .cloned()
+                                    .unwrap_or_else(|| opaque_var("v", idx_id));
+                                let len_expr = opaque_var("v", arr_id);
+                                let op = if b_idx == 0 { CmpOp::Lt } else { CmpOp::Ge };
+                                child.constraints.push(SymConstraint {
+                                    lhs: idx_expr.clone(),
+                                    op,
+                                    rhs: len_expr.clone(),
+                                    reason: format!(
+                                        "array_get({}, {}) branch {b_idx}",
+                                        idx_expr.format_human(),
+                                        len_expr.format_human()
+                                    ),
+                                    is_overflow_branch: false,
+                                });
                             } else if (gid == "bounded_int_trim_max" || gid == "bounded_int_trim_min")
                                 && !inv.args.is_empty()
                             {
@@ -6098,7 +6222,7 @@ fn prove_single_package(
     use cairo_lang_runner::SierraCasmRunner;
     use cairo_lang_sierra_to_casm::metadata::MetadataComputationConfig;
 
-    let (compilation, _cache_hit, _compile_ms) = compile_or_load_native_tests(
+    let (compilation, _cache_hit, _compile_ms) = compile_or_load_native_tests_for_prove(
         manifest_path,
         workspace_root,
         package_name,
@@ -6269,6 +6393,7 @@ pub(crate) fn run_prove(mut args: ProveArgs) -> Result<()> {
     let start = Instant::now();
     let mut pkg_reports = Vec::new();
     let mut fail_on_unproven = false;
+    let mut fail_on_counterexamples = false;
 
     if let Some(sierra_file) = &args.sierra_file {
         let sierra_str = sierra_file.to_string_lossy();
@@ -6429,7 +6554,12 @@ pub(crate) fn run_prove(mut args: ProveArgs) -> Result<()> {
             vec![effective]
         };
 
+        let multi_target = target_manifests.len() > 1;
         for pkg_manifest in target_manifests {
+            let pkg_dir = pkg_manifest.parent().unwrap_or(&workspace_root);
+            if multi_target && !pkg_dir.join("src/lib.cairo").is_file() {
+                continue;
+            }
             let manifest_text =
                 read_text_file_with_limit(&pkg_manifest, MAX_MANIFEST_BYTES, "manifest")?;
             let manifest = parse_manifest_toml(&manifest_text, &pkg_manifest, "manifest")?;
@@ -6443,7 +6573,6 @@ pub(crate) fn run_prove(mut args: ProveArgs) -> Result<()> {
                 .to_string();
             let crate_name = normalize_package_name_for_cairo_crate(&pkg_name);
             let mut pkg_args = args.clone();
-            let pkg_dir = pkg_manifest.parent().unwrap_or(&workspace_root);
             if let Some(prove_tbl) = manifest
                 .get("prove")
                 .or_else(|| manifest.get("uc").and_then(|u| u.get("prove")))
@@ -6506,18 +6635,27 @@ pub(crate) fn run_prove(mut args: ProveArgs) -> Result<()> {
                         pkg_args.check_equivalence = Some(pkg_dir.join(eq));
                     }
                 }
-                if let Some(fail_policy) = prove_tbl
-                    .get("fail_on")
-                    .or_else(|| prove_tbl.get("fail-on"))
-                    .and_then(TomlValue::as_str)
-                {
-                    match fail_policy.trim() {
-                        "findings" | "counterexample" => pkg_args.fail_on_findings = true,
-                        "unproven" => {
-                            pkg_args.fail_on_findings = true;
-                            fail_on_unproven = true;
+                if args.fail_on.is_none() {
+                    if let Some(fail_policy) = prove_tbl
+                        .get("fail_on")
+                        .or_else(|| prove_tbl.get("fail-on"))
+                        .and_then(TomlValue::as_str)
+                    {
+                        match fail_policy.trim() {
+                            "counterexample" | "counterexamples" => {
+                                fail_on_counterexamples = true;
+                            }
+                            "findings" => {
+                                pkg_args.fail_on_findings = true;
+                                fail_on_counterexamples = true;
+                            }
+                            "unproven" => {
+                                pkg_args.fail_on_findings = true;
+                                fail_on_counterexamples = true;
+                                fail_on_unproven = true;
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
@@ -6760,6 +6898,32 @@ pub(crate) fn run_prove(mut args: ProveArgs) -> Result<()> {
             .is_some_and(|e| e.status == "NON_EQUIVALENT")
     });
 
+    if let Some(ref cli_policy) = args.fail_on {
+        match cli_policy.trim().to_ascii_lowercase().as_str() {
+            "none" | "never" | "off" => {
+                args.fail_on_findings = false;
+                fail_on_counterexamples = false;
+                fail_on_unproven = false;
+            }
+            "counterexample" | "counterexamples" => {
+                args.fail_on_findings = false;
+                fail_on_counterexamples = true;
+                fail_on_unproven = false;
+            }
+            "findings" => {
+                args.fail_on_findings = true;
+                fail_on_counterexamples = true;
+                fail_on_unproven = false;
+            }
+            "unproven" => {
+                args.fail_on_findings = true;
+                fail_on_counterexamples = true;
+                fail_on_unproven = true;
+            }
+            _ => {}
+        }
+    }
+
     let any_unproven = fail_on_unproven
         && report.packages.iter().any(|p| {
             p.symbolic_proofs
@@ -6767,14 +6931,14 @@ pub(crate) fn run_prove(mut args: ProveArgs) -> Result<()> {
                 .any(|s| s.status != "PROVEN_SAFE")
         });
 
-    if (args.fail_on_findings
+    let should_fail_counterexamples = (fail_on_counterexamples || args.fail_on_findings)
         && (total_counterexamples > 0
-            || total_caracal_findings > 0
             || any_invariant_violated
             || any_upgrade_unsafe
-            || any_non_equivalent))
-        || any_unproven
-    {
+            || any_non_equivalent);
+    let should_fail_findings = args.fail_on_findings && total_caracal_findings > 0;
+
+    if should_fail_counterexamples || should_fail_findings || any_unproven {
         std::process::exit(1);
     }
 
@@ -8197,6 +8361,58 @@ pub mod TokenVault {
         assert_eq!(
             write_entry.status, "DIVERGENCE_FOUND",
             "expected storage diff comparison to catch write_val divergence, got: {write_entry:?}"
+        );
+    }
+
+    #[test]
+    fn euclidean_remainder_and_subexpression_interval_tightening_refute_infeasible_branches() {
+        // 1. Euclidean remainder: for x >= 0 and m > 0, x >= x % m, so `x < (x % 8)` is Unsat.
+        let param_bounds_u8 = vec![("arg_0".to_string(), 0i128, 255i128)];
+        let rem_constraint = SymConstraint {
+            lhs: SymExpr::Param(0, "arg_0".to_string()),
+            op: CmpOp::Lt,
+            rhs: SymExpr::Rem(
+                Box::new(SymExpr::Param(0, "arg_0".to_string())),
+                Box::new(SymExpr::Const(8)),
+            ),
+            reason: "underflow".to_string(),
+            is_overflow_branch: true,
+        };
+        assert_eq!(
+            solve_path_constraints(&param_bounds_u8, &[rem_constraint]),
+            SolverOutcome::Unsat,
+            "expected arg_0 < (arg_0 % 8) to be Unsat for arg_0 in [0, 255]"
+        );
+
+        // 2. Subexpression interval tightening: `(arg_1 % 128) > 126 && (arg_1 % 128) != 127`
+        // since `arg_1 % 128` has upper bound 127, `> 126` forces it to [127, 127], which is
+        // refuted by `!= 127`.
+        let param_bounds_u64 = vec![
+            ("arg_0".to_string(), 0i128, 255i128),
+            ("arg_1".to_string(), 0i128, u64::MAX as i128),
+        ];
+        let mod_128 = SymExpr::Rem(
+            Box::new(SymExpr::Param(1, "arg_1".to_string())),
+            Box::new(SymExpr::Const(128)),
+        );
+        let c_gt = SymConstraint {
+            lhs: mod_128.clone(),
+            op: CmpOp::Gt,
+            rhs: SymExpr::Const(126),
+            reason: "shift_gt_126".to_string(),
+            is_overflow_branch: false,
+        };
+        let c_ne = SymConstraint {
+            lhs: mod_128,
+            op: CmpOp::Ne,
+            rhs: SymExpr::Const(127),
+            reason: "shift_ne_127".to_string(),
+            is_overflow_branch: false,
+        };
+        assert_eq!(
+            solve_path_constraints(&param_bounds_u64, &[c_gt, c_ne]),
+            SolverOutcome::Unsat,
+            "expected (arg_1 % 128) > 126 && (arg_1 % 128) != 127 to be Unsat"
         );
     }
 }

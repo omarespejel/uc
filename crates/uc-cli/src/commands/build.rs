@@ -1691,9 +1691,15 @@ fn try_run_native_multi_member_workspace_build(
             .join("src/lib.cairo")
             .is_file()
         {
+            if val.get("cairo-plugin").is_some() {
+                continue;
+            }
             return Ok(false);
         }
         member_targets.push((pkg_name, member_manifest.clone(), member_common));
+    }
+    if member_targets.is_empty() {
+        return Ok(false);
     }
 
     let write_report = report_path.is_some() || emit_json;

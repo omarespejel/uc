@@ -1377,7 +1377,7 @@ pub struct CustomToken {
     pub balances_variable_selector: felt252,
 }
 
-#[derive(Drop, Copy, Clone, Debug, PartialEq)]
+#[derive(Drop, Copy, Debug, PartialEq)]
 pub enum Token {
     STRK,
     ETH,
@@ -2063,14 +2063,14 @@ pub mod trace {
     use core::serde::Serde;
     use starknet::ContractAddress;
 
-    #[derive(Drop, Serde, Clone, PartialEq, Debug, Copy)]
+    #[derive(Drop, Serde, PartialEq, Debug, Copy)]
     pub enum EntryPointType {
         Constructor,
         External,
         L1Handler,
     }
 
-    #[derive(Drop, Serde, Clone, PartialEq, Debug, Copy)]
+    #[derive(Drop, Serde, PartialEq, Debug, Copy)]
     pub enum CallType {
         Call,
         Delegate,
@@ -2571,6 +2571,10 @@ impl cairo_lang_defs::plugin::MacroPlugin for UcSnforgeTestAttrPlugin {
         db: &'db dyn salsa::Database,
     ) -> Vec<cairo_lang_filesystem::ids::SmolStrId<'db>> {
         vec![
+            cairo_lang_filesystem::ids::SmolStrId::from(db, "test"),
+            cairo_lang_filesystem::ids::SmolStrId::from(db, "should_panic"),
+            cairo_lang_filesystem::ids::SmolStrId::from(db, "ignore"),
+            cairo_lang_filesystem::ids::SmolStrId::from(db, "available_gas"),
             cairo_lang_filesystem::ids::SmolStrId::from(db, "fuzzer"),
             cairo_lang_filesystem::ids::SmolStrId::from(db, "fork"),
             cairo_lang_filesystem::ids::SmolStrId::from(db, "disable_predeployed_contracts"),
@@ -2586,6 +2590,40 @@ impl cairo_lang_defs::plugin::MacroPlugin for UcSnforgeTestAttrPlugin {
 }
 
 #[cfg(feature = "native-test-runner")]
+#[derive(Debug)]
+struct UcUnconditionalAssertInlineMacro(
+    std::sync::Arc<dyn cairo_lang_defs::plugin::InlineMacroExprPlugin>,
+);
+
+#[cfg(feature = "native-test-runner")]
+impl cairo_lang_defs::plugin::InlineMacroExprPlugin for UcUnconditionalAssertInlineMacro {
+    fn generate_code<'db>(
+        &self,
+        db: &'db dyn salsa::Database,
+        syntax: &cairo_lang_syntax::node::ast::ExprInlineMacro<'db>,
+        metadata: &cairo_lang_defs::plugin::MacroPluginMetadata<'_>,
+    ) -> cairo_lang_defs::plugin::InlinePluginResult<'db> {
+        let mut res = self.0.generate_code(db, syntax, metadata);
+        res.diagnostics
+            .retain(|d| !d.message.ends_with("macro is only available in test mode."));
+        res
+    }
+}
+
+#[cfg(feature = "native-test-runner")]
+pub(crate) fn uc_unconditional_assert_plugin_suite() -> cairo_lang_semantic::plugin::PluginSuite {
+    let base = cairo_lang_test_plugin::test_assert_suite();
+    let mut suite = cairo_lang_semantic::plugin::PluginSuite::default();
+    for (name, plugin) in base.inline_macro_plugins {
+        suite.inline_macro_plugins.insert(
+            name,
+            std::sync::Arc::new(UcUnconditionalAssertInlineMacro(plugin)),
+        );
+    }
+    suite
+}
+
+#[cfg(feature = "native-test-runner")]
 fn merge_dev_dependencies_into_manifest(manifest: &TomlValue) -> TomlValue {
     let mut cloned = manifest.clone();
     if let Some(root_table) = cloned.as_table_mut() {
@@ -2593,17 +2631,19 @@ fn merge_dev_dependencies_into_manifest(manifest: &TomlValue) -> TomlValue {
             "__uc_include_test_units".to_string(),
             TomlValue::Boolean(true),
         );
-        if let Some(dev_deps) = root_table
-            .get("dev-dependencies")
-            .and_then(TomlValue::as_table)
-            .cloned()
-        {
-            let deps_entry = root_table
-                .entry("dependencies".to_string())
-                .or_insert_with(|| TomlValue::Table(toml::map::Map::new()));
-            if let Some(deps_table) = deps_entry.as_table_mut() {
-                for (k, v) in dev_deps {
-                    deps_table.entry(k).or_insert(v);
+        for dev_key in ["dev-dependencies", "dev_dependencies"] {
+            if let Some(dev_deps) = root_table
+                .get(dev_key)
+                .and_then(TomlValue::as_table)
+                .cloned()
+            {
+                let deps_entry = root_table
+                    .entry("dependencies".to_string())
+                    .or_insert_with(|| TomlValue::Table(toml::map::Map::new()));
+                if let Some(deps_table) = deps_entry.as_table_mut() {
+                    for (k, v) in dev_deps {
+                        deps_table.entry(k).or_insert(v);
+                    }
                 }
             }
         }
@@ -2619,6 +2659,47 @@ pub(crate) fn compile_or_load_native_tests(
     crate_name: &str,
     features: &[String],
     no_cache: bool,
+) -> Result<(cairo_lang_test_plugin::TestCompilation<'static>, bool, f64)> {
+    compile_or_load_native_tests_with_mode(
+        manifest_path,
+        workspace_root,
+        package_name,
+        crate_name,
+        features,
+        no_cache,
+        false,
+    )
+}
+
+#[cfg(feature = "native-test-runner")]
+pub(crate) fn compile_or_load_native_tests_for_prove(
+    manifest_path: &Path,
+    workspace_root: &Path,
+    package_name: &str,
+    crate_name: &str,
+    features: &[String],
+    no_cache: bool,
+) -> Result<(cairo_lang_test_plugin::TestCompilation<'static>, bool, f64)> {
+    compile_or_load_native_tests_with_mode(
+        manifest_path,
+        workspace_root,
+        package_name,
+        crate_name,
+        features,
+        no_cache,
+        true,
+    )
+}
+
+#[cfg(feature = "native-test-runner")]
+fn compile_or_load_native_tests_with_mode(
+    manifest_path: &Path,
+    workspace_root: &Path,
+    package_name: &str,
+    crate_name: &str,
+    features: &[String],
+    no_cache: bool,
+    allow_lib_only_fallback: bool,
 ) -> Result<(cairo_lang_test_plugin::TestCompilation<'static>, bool, f64)> {
     use cairo_lang_compiler::diagnostics::DiagnosticsReporter;
     use cairo_lang_defs::ids::NamedLanguageElementId;
@@ -2750,9 +2831,22 @@ pub(crate) fn compile_or_load_native_tests(
         dependencies: vec!["snforge_std".to_string()],
     });
     for cfg in &mut crate_dependency_configs {
-        if !cfg.dependencies.is_empty() && !cfg.dependencies.iter().any(|d| d == &cfg.crate_name) {
+        if !cfg.dependencies.iter().any(|d| d == &cfg.crate_name) {
             cfg.dependencies.push(cfg.crate_name.clone());
             cfg.dependencies.sort();
+        }
+    }
+    for root in &dep_surface.path_dependency_roots {
+        if root.crate_name != "snforge_std"
+            && !crate_dependency_configs
+                .iter()
+                .any(|cfg| cfg.crate_name == root.crate_name)
+        {
+            crate_dependency_configs.push(NativeCrateDependencyConfig {
+                crate_name: root.crate_name.clone(),
+                cairo_edition: cairo_edition.clone(),
+                dependencies: vec![root.crate_name.clone()],
+            });
         }
     }
     let mut root_deps = vec![crate_name.to_string(), "snforge_std".to_string()];
@@ -2799,187 +2893,243 @@ pub(crate) fn compile_or_load_native_tests(
     );
     write_text_file_if_changed(&cairo_project_path, &project_toml, "native test cairo project")?;
 
-    let mut cfg_set = CfgSet::from_iter([Cfg::name("test"), Cfg::kv("target", "test")]);
-    for feat in &resolved_features {
-        cfg_set.insert(Cfg::kv("feature", feat.clone()));
-    }
+    let attempt_compile = |inlining: InliningStrategy,
+                           include_test_cfg: bool|
+     -> std::thread::Result<Result<cairo_lang_test_plugin::TestCompilation<'static>>> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut cfg_set = if include_test_cfg {
+                CfgSet::from_iter([Cfg::name("test"), Cfg::kv("target", "test")])
+            } else {
+                CfgSet::from_iter([Cfg::kv("target", "lib")])
+            };
+            for feat in &resolved_features {
+                cfg_set.insert(Cfg::kv("feature", feat.clone()));
+            }
 
-    let mut snforge_attr_suite = cairo_lang_semantic::plugin::PluginSuite::default();
-    snforge_attr_suite.add_plugin::<UcSnforgeTestAttrPlugin>();
+            let mut snforge_attr_suite = uc_unconditional_assert_plugin_suite();
+            snforge_attr_suite.add_plugin::<UcSnforgeTestAttrPlugin>();
 
-    let mut db = RootDatabase::builder()
-        .with_optimizations(Optimizations::enabled_with_default_movable_functions(
-            InliningStrategy::Default,
-        ))
-        .with_cfg(cfg_set)
-        .with_default_plugin_suite(starknet_plugin_suite())
-        .with_default_plugin_suite(cairo_lang_test_plugin::test_plugin_suite())
-        .with_default_plugin_suite(snforge_attr_suite)
-        .build()
-        .context("failed to build Cairo RootDatabase for native test runner")?;
+            let mut db = RootDatabase::builder()
+                .with_optimizations(Optimizations::enabled_with_default_movable_functions(
+                    inlining,
+                ))
+                .with_cfg(cfg_set)
+                .with_default_plugin_suite(starknet_plugin_suite())
+                .with_default_plugin_suite(cairo_lang_test_plugin::test_plugin_suite())
+                .with_default_plugin_suite(snforge_attr_suite)
+                .build()
+                .context("failed to build Cairo RootDatabase for native test runner")?;
 
-    native_set_skip_unused_import_diagnostics(&mut db, true);
-    init_dev_corelib(&mut db, corelib_src.clone());
+            native_set_skip_unused_import_diagnostics(&mut db, true);
+            init_dev_corelib(&mut db, corelib_src.clone());
 
-    let all_crate_inputs = native_setup_project(&mut db, &cairo_project_dir)
-        .map_err(|e| anyhow!("failed to setup Cairo project for tests: {e}"))?;
+            let all_crate_inputs = native_setup_project(&mut db, &cairo_project_dir)
+                .map_err(|e| anyhow!("failed to setup Cairo project for tests: {e}"))?;
 
-    // Restrict `#[cfg(test)]` to the root package and integration test crates so external
-    // dependency crates (e.g. `openzeppelin_access`) do not compile their internal dev-only tests.
-    {
-        let db_ref: &dyn salsa::Database = &db;
-        let mut crate_configs = files_group_input(db_ref)
-            .crate_configs(db_ref)
-            .clone()
-            .unwrap_or_default();
-        let dep_cfg_set = CfgSet::from_iter([
-            Cfg::kv("target", "test"),
-            Cfg::kv("feature", "test_utils"),
-        ]);
-        for (input, cfg) in crate_configs.iter_mut() {
-            if let CrateInput::Real { name, .. } = input {
-                if name != crate_name
-                    && name != &integration_crate_name
-                    && name != "core"
-                {
-                    cfg.settings.cfg_set = Some(dep_cfg_set.clone());
+            // Restrict `#[cfg(test)]` to the root package and integration test crates so external
+            // dependency crates (e.g. `openzeppelin_access`) do not compile their internal dev-only tests.
+            {
+                let db_ref: &dyn salsa::Database = &db;
+                let mut crate_configs = files_group_input(db_ref)
+                    .crate_configs(db_ref)
+                    .clone()
+                    .unwrap_or_default();
+                let dep_cfg_set = CfgSet::from_iter([
+                    Cfg::kv("target", "test"),
+                    Cfg::kv("feature", "test_utils"),
+                ]);
+                for (input, cfg) in crate_configs.iter_mut() {
+                    if let CrateInput::Real { name, .. } = input {
+                        if name != crate_name
+                            && name != &integration_crate_name
+                            && name != "core"
+                        {
+                            cfg.settings.cfg_set = Some(dep_cfg_set.clone());
+                        }
+                    }
                 }
+                #[cfg(not(feature = "helper-cairo-214"))]
+                set_crate_configs_input(&mut db, crate_configs);
+                #[cfg(feature = "helper-cairo-214")]
+                set_crate_configs_input(&mut db, Some(crate_configs));
             }
-        }
-        #[cfg(not(feature = "helper-cairo-214"))]
-        set_crate_configs_input(&mut db, crate_configs);
-        #[cfg(feature = "helper-cairo-214")]
-        set_crate_configs_input(&mut db, Some(crate_configs));
-    }
 
-    let test_crate_inputs: Vec<CrateInput> = all_crate_inputs
-        .into_iter()
-        .filter(|input| match input {
-            CrateInput::Real { name, .. } => {
-                name == crate_name || (has_integration_tests && name == &integration_crate_name)
-            }
-            _ => false,
-        })
-        .collect();
+            let test_crate_inputs: Vec<CrateInput> = all_crate_inputs
+                .into_iter()
+                .filter(|input| match input {
+                    CrateInput::Real { name, .. } => {
+                        name == crate_name
+                            || (include_test_cfg
+                                && has_integration_tests
+                                && name == &integration_crate_name)
+                    }
+                    _ => false,
+                })
+                .collect();
 
-    let contract_crate_ids: Vec<_> = db
-        .crates()
-        .iter()
-        .copied()
-        .filter(|cid| {
-            let cname = cid.long(&db).name().long(&db).as_str();
-            !cname.starts_with("openzeppelin")
-                && cname != "garaga"
-                && cname != "core"
-                && cname != "snforge_std"
-        })
-        .collect();
-    let discovered_contracts =
-        cairo_lang_starknet::contract::find_contracts(&db, &contract_crate_ids);
+            let contract_crate_ids: Vec<_> = db
+                .crates()
+                .iter()
+                .copied()
+                .filter(|cid| {
+                    let cname = cid.long(&db).name().long(&db).as_str();
+                    !cname.starts_with("openzeppelin")
+                        && cname != "garaga"
+                        && cname != "core"
+                        && cname != "snforge_std"
+                        && (include_test_cfg || cname != integration_crate_name)
+                })
+                .collect();
+            let discovered_contracts =
+                cairo_lang_starknet::contract::find_contracts(&db, &contract_crate_ids);
 
-    let mut diag_string = String::new();
-    let compiled = cairo_lang_test_plugin::compile_test_prepared_db(
-        &db,
-        cairo_lang_test_plugin::TestsCompilationConfig {
-            starknet: true,
-            contract_declarations: Some(discovered_contracts.clone()),
-            contract_crate_ids: None,
-            executable_crate_ids: None,
-            add_statements_functions: false,
-            add_statements_code_locations: false,
-            add_functions_debug_info: false,
-            replace_ids: true,
-        },
-        test_crate_inputs.clone(),
-        DiagnosticsReporter::write_to_string(&mut diag_string)
-            .with_crates(&test_crate_inputs)
-            .allow_warnings(),
-    )
-    .map_err(|err| {
-        if diag_string.trim().is_empty() {
-            let _ = DiagnosticsReporter::write_to_string(&mut diag_string)
-                .allow_warnings()
-                .check(&db);
-        }
-        if diag_string.trim().is_empty() {
-            anyhow!("Cairo test compilation failed: {err}")
-        } else {
-            anyhow!("Cairo test compilation failed:\n{}", diag_string.trim())
-        }
-    })?;
-
-    // Register `snforge_std::declare("<ContractName>")` class_hash aliases in `contracts_info`
-    // Insert dependency contracts first and root/integration crate contracts second so root
-    // contracts take priority on name collisions.
-    let mut contracts_info = compiled.metadata.contracts_info;
-    let existing_infos: Vec<cairo_lang_starknet::contract::ContractInfo> =
-        contracts_info.values().cloned().collect();
-    for pass_root in [false, true] {
-        for (idx, contract_decl) in discovered_contracts.iter().enumerate() {
-            if let Some(info) = existing_infos.get(idx) {
-                let is_root = info
-                    .externals
-                    .values()
-                    .chain(info.constructor.iter())
-                    .next()
-                    .and_then(|f| f.debug_name.as_ref())
-                    .is_some_and(|dn| {
-                        let s = dn.as_str();
-                        s.starts_with(&format!("{crate_name}::"))
-                            || s.starts_with(&format!("{integration_crate_name}::"))
-                    });
-                if is_root != pass_root {
-                    continue;
-                }
-                let contract_name = contract_decl.submodule_id.name(&db).long(&db).as_str();
-                let declare_hash = uc_snforge_declare_class_hash(contract_name);
-                contracts_info.insert(declare_hash, info.clone());
-            }
-        }
-    }
-
-    let mut final_sierra_program = compiled.sierra_program;
-    let function_set_costs = compiled.metadata.function_set_costs;
-    let named_tests = compiled.metadata.named_tests;
-    let has_main_fn = final_sierra_program.program.funcs.iter().any(|f| {
-        f.id.debug_name
-            .as_ref()
-            .is_some_and(|dn| dn.as_str() == format!("{crate_name}::main") || dn.as_str().ends_with("::main"))
-    });
-    // Without tests or a `main`, the test compiler emits nothing: compile the whole crate so
-    // `uc prove` and `uc test --coverage` see every function. (A 32 KB source cap used to skip
-    // this and left larger libraries silently unanalysed.)
-    let _total_src_bytes: u64 = tracked_sources.values().map(|s| s.size_bytes).sum();
-    if final_sierra_program.program.funcs.is_empty() || (named_tests.is_empty() && !has_main_fn) {
-        #[cfg(not(feature = "helper-cairo-214"))]
-        {
-            let exec_crate_ids = CrateInput::into_crate_ids(&db, test_crate_inputs.clone());
-            if let Ok(artifact) = compile_prepared_db_program_artifact(
+            let mut diag_string = String::new();
+            let compiled = cairo_lang_test_plugin::compile_test_prepared_db(
                 &db,
-                exec_crate_ids,
-                CompilerConfig {
+                cairo_lang_test_plugin::TestsCompilationConfig {
+                    starknet: true,
+                    contract_declarations: Some(discovered_contracts.clone()),
+                    contract_crate_ids: None,
+                    executable_crate_ids: None,
+                    add_statements_functions: false,
+                    add_statements_code_locations: false,
+                    add_functions_debug_info: false,
                     replace_ids: true,
-                    diagnostics_reporter: DiagnosticsReporter::ignoring()
-                        .with_crates(&test_crate_inputs)
-                        .allow_warnings(),
-                    ..CompilerConfig::default()
                 },
-            ) {
-                if !artifact.program.funcs.is_empty() {
-                    final_sierra_program = artifact;
+                test_crate_inputs.clone(),
+                DiagnosticsReporter::write_to_string(&mut diag_string)
+                    .with_crates(&test_crate_inputs)
+                    .allow_warnings(),
+            )
+            .map_err(|err| {
+                if diag_string.trim().is_empty() {
+                    let _ = DiagnosticsReporter::write_to_string(&mut diag_string)
+                        .allow_warnings()
+                        .check(&db);
+                }
+                if diag_string.trim().is_empty() {
+                    anyhow!("Cairo test compilation failed: {err}")
+                } else {
+                    anyhow!("Cairo test compilation failed:\n{}", diag_string.trim())
+                }
+            })?;
+
+            // Register `snforge_std::declare("<ContractName>")` class_hash aliases in `contracts_info`
+            // Insert dependency contracts first and root/integration crate contracts second so root
+            // contracts take priority on name collisions.
+            let mut contracts_info = compiled.metadata.contracts_info;
+            let existing_infos: Vec<cairo_lang_starknet::contract::ContractInfo> =
+                contracts_info.values().cloned().collect();
+            for pass_root in [false, true] {
+                for (idx, contract_decl) in discovered_contracts.iter().enumerate() {
+                    if let Some(info) = existing_infos.get(idx) {
+                        let is_root = info
+                            .externals
+                            .values()
+                            .chain(info.constructor.iter())
+                            .next()
+                            .and_then(|f| f.debug_name.as_ref())
+                            .is_some_and(|dn| {
+                                let s = dn.as_str();
+                                s.starts_with(&format!("{crate_name}::"))
+                                    || s.starts_with(&format!("{integration_crate_name}::"))
+                            });
+                        if is_root != pass_root {
+                            continue;
+                        }
+                        let contract_name =
+                            contract_decl.submodule_id.name(&db).long(&db).as_str();
+                        let declare_hash = uc_snforge_declare_class_hash(contract_name);
+                        contracts_info.insert(declare_hash, info.clone());
+                    }
                 }
             }
-        }
-    }
 
-    let owned_compilation = cairo_lang_test_plugin::TestCompilation {
-        sierra_program: final_sierra_program,
-        metadata: cairo_lang_test_plugin::TestCompilationMetadata {
-            contracts_info,
-            function_set_costs,
-            named_tests,
-            statements_locations: None,
+            let mut final_sierra_program = compiled.sierra_program;
+            let function_set_costs = compiled.metadata.function_set_costs;
+            let named_tests = compiled.metadata.named_tests;
+            let has_main_fn = final_sierra_program.program.funcs.iter().any(|f| {
+                f.id.debug_name.as_ref().is_some_and(|dn| {
+                    dn.as_str() == format!("{crate_name}::main") || dn.as_str().ends_with("::main")
+                })
+            });
+            // Without tests or a `main`, the test compiler emits nothing: compile the whole crate so
+            // `uc prove` and `uc test --coverage` see every function. (A 32 KB source cap used to skip
+            // this and left larger libraries silently unanalysed.)
+            let _total_src_bytes: u64 = tracked_sources.values().map(|s| s.size_bytes).sum();
+            if final_sierra_program.program.funcs.is_empty()
+                || (named_tests.is_empty() && !has_main_fn)
+            {
+                #[cfg(not(feature = "helper-cairo-214"))]
+                {
+                    let mut all_clean_diag = String::new();
+                    let db_has_errors = DiagnosticsReporter::write_to_string(&mut all_clean_diag)
+                        .allow_warnings()
+                        .check(&db);
+                    if !db_has_errors {
+                        let exec_crate_ids =
+                            CrateInput::into_crate_ids(&db, test_crate_inputs.clone());
+                        if let Ok(Ok(artifact)) = std::panic::catch_unwind(
+                            std::panic::AssertUnwindSafe(|| {
+                                compile_prepared_db_program_artifact(
+                                    &db,
+                                    exec_crate_ids,
+                                    CompilerConfig {
+                                        replace_ids: true,
+                                        diagnostics_reporter: DiagnosticsReporter::ignoring()
+                                            .with_crates(&test_crate_inputs)
+                                            .allow_warnings(),
+                                        ..CompilerConfig::default()
+                                    },
+                                )
+                            }),
+                        ) {
+                            if !artifact.program.funcs.is_empty() {
+                                final_sierra_program = artifact;
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(cairo_lang_test_plugin::TestCompilation {
+                sierra_program: final_sierra_program,
+                metadata: cairo_lang_test_plugin::TestCompilationMetadata {
+                    contracts_info,
+                    function_set_costs,
+                    named_tests,
+                    statements_locations: None,
+                },
+            })
+        }))
+    };
+
+    let primary_res = match attempt_compile(InliningStrategy::Default, true) {
+        Ok(res) => res,
+        Err(_) => match attempt_compile(InliningStrategy::Avoid, true) {
+            Ok(res) => res,
+            Err(_) => Err(anyhow!(
+                "Cairo compiler panicked during test specialization even with InliningStrategy::Avoid"
+            )),
         },
+    };
+
+    let owned_compilation = match primary_res {
+        Ok(comp) => comp,
+        Err(primary_err) if allow_lib_only_fallback => {
+            let fallback_res = match attempt_compile(InliningStrategy::Default, false) {
+                Ok(res) => res,
+                Err(_) => match attempt_compile(InliningStrategy::Avoid, false) {
+                    Ok(res) => res,
+                    Err(_) => return Err(primary_err),
+                },
+            };
+            match fallback_res {
+                Ok(comp) => comp,
+                Err(_) => return Err(primary_err),
+            }
+        }
+        Err(err) => return Err(err),
     };
 
     if fs::create_dir_all(&test_cache_dir).is_ok() {
@@ -3458,6 +3608,14 @@ pub(crate) fn run_test(mut args: TestArgs) -> Result<()> {
                 "test-ws"
             };
             for (idx, member_manifest) in member_manifests.into_iter().enumerate() {
+                if !member_manifest
+                    .parent()
+                    .unwrap_or(&workspace_root)
+                    .join("src/lib.cairo")
+                    .is_file()
+                {
+                    continue;
+                }
                 let temp_report = workspace_root.join(".uc/cache").join(format!(
                     "{ws_report_prefix}-{}-{idx}.json",
                     epoch_ms_u64().unwrap_or_default()

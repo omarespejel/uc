@@ -1329,6 +1329,15 @@ pub(crate) fn run_check(args: CheckArgs) -> Result<()> {
 
         let mut package_results = Vec::with_capacity(manifests.len());
         for mpath in &manifests {
+            if manifests.len() > 1
+                && !mpath
+                    .parent()
+                    .unwrap_or(&workspace_root)
+                    .join("src/lib.cairo")
+                    .is_file()
+            {
+                continue;
+            }
             let pkg_filter = if manifests.len() == 1 {
                 args.package.as_deref()
             } else {
@@ -1800,7 +1809,11 @@ pub(crate) fn run_add(args: AddArgs) -> Result<()> {
         .as_table_mut()
         .context("Scarb.toml root must be a TOML table")?;
     let section_key = if args.dev {
-        "dev-dependencies"
+        if root_table.contains_key("dev_dependencies") && !root_table.contains_key("dev-dependencies") {
+            "dev_dependencies"
+        } else {
+            "dev-dependencies"
+        }
     } else {
         "dependencies"
     };
@@ -1908,7 +1921,11 @@ pub(crate) fn run_remove(args: RemoveArgs) -> Result<()> {
         .as_table_mut()
         .context("Scarb.toml root must be a TOML table")?;
     let section_key = if args.dev {
-        "dev-dependencies"
+        if root_table.contains_key("dev_dependencies") && !root_table.contains_key("dev-dependencies") {
+            "dev_dependencies"
+        } else {
+            "dev-dependencies"
+        }
     } else {
         "dependencies"
     };
@@ -1996,9 +2013,27 @@ fn build_tree_node_for_manifest(
         .and_then(TomlValue::as_str)
         .unwrap_or("workspace")
         .to_string();
+    let ws_manifest_opt = {
+        let ws_file = manifest_file_in_dir(workspace_root);
+        if ws_file.is_file() {
+            fs::read_to_string(&ws_file)
+                .ok()
+                .and_then(|t| parse_manifest_toml(&t, &ws_file, "workspace manifest").ok())
+        } else {
+            None
+        }
+    };
     let pkg_version = pkg_table
         .and_then(|t| t.get("version"))
         .and_then(TomlValue::as_str)
+        .or_else(|| {
+            ws_manifest_opt
+                .as_ref()
+                .and_then(|w| w.get("workspace"))
+                .and_then(|w| w.get("package").or_else(|| w.get("project")))
+                .and_then(|p| p.get("version"))
+                .and_then(TomlValue::as_str)
+        })
         .map(str::to_string);
     let manifest_dir = manifest_path.parent().unwrap_or(workspace_root);
 
@@ -2023,19 +2058,38 @@ fn build_tree_node_for_manifest(
         let Some(table) = manifest.get(section).and_then(TomlValue::as_table) else {
             continue;
         };
-        for (dep_name, dep_val) in table {
+        for (dep_name, raw_dep_val) in table {
             if prune_set.contains(dep_name) {
                 continue;
             }
             let already_seen = !seen_packages.insert(dep_name.clone());
             let deduped = !no_dedupe && already_seen;
+            let is_ws_dep = raw_dep_val
+                .as_table()
+                .and_then(|t| t.get("workspace"))
+                .and_then(TomlValue::as_bool)
+                == Some(true);
+            let dep_val = if is_ws_dep {
+                ws_manifest_opt
+                    .as_ref()
+                    .and_then(|w| w.get("workspace"))
+                    .and_then(|w| w.get("dependencies"))
+                    .and_then(|d| d.get(dep_name))
+                    .unwrap_or(raw_dep_val)
+            } else {
+                raw_dep_val
+            };
 
             let dep_path_opt = dep_val
                 .as_table()
                 .and_then(|t| t.get("path"))
                 .and_then(TomlValue::as_str)
                 .map(|p| {
-                    let base = manifest_dir.join(p);
+                    let base = if is_ws_dep && raw_dep_val.as_table().and_then(|t| t.get("path")).is_none() {
+                        workspace_root.join(p)
+                    } else {
+                        manifest_dir.join(p)
+                    };
                     let scarb = base.join("Scarb.toml");
                     if scarb.is_file() {
                         scarb
@@ -2258,8 +2312,12 @@ pub(crate) fn run_expand(args: ExpandArgs) -> Result<()> {
     #[cfg(feature = "native-compile")]
     {
         let started = Instant::now();
-        let manifest_path = resolve_manifest_path(&args.manifest_path)?;
-        let workspace_root = metadata_cache_workspace_root(&manifest_path)?;
+        let base_manifest_path = resolve_manifest_path(&args.manifest_path)?;
+        let workspace_root = metadata_cache_workspace_root(&base_manifest_path)?;
+        let manifest_path = resolve_all_workspace_member_manifests(&base_manifest_path, &workspace_root)
+            .ok()
+            .and_then(|mut v| v.drain(..).next())
+            .unwrap_or(base_manifest_path);
         let common = BuildCommonArgs {
             manifest_path: Some(manifest_path.clone()),
             package: None,
@@ -2269,7 +2327,9 @@ pub(crate) fn run_expand(args: ExpandArgs) -> Result<()> {
             release: false,
             profile: Some("dev".to_string()),
         };
-        let context = build_native_compile_context(&common, &manifest_path, &workspace_root)?;
+        let context = with_native_compat_toolchain_fallback(|| {
+            build_native_compile_context(&common, &manifest_path, &workspace_root)
+        })?;
         let signature = native_compile_session_signature(&manifest_path, &context);
 
         let modules = with_native_compile_session(
@@ -2627,18 +2687,29 @@ pub(crate) fn run_lint(args: LintArgs) -> Result<()> {
     #[cfg(feature = "native-compile")]
     {
         let started = Instant::now();
-        let manifest_path = resolve_manifest_path(&args.manifest_path)?;
-        let workspace_root = metadata_cache_workspace_root(&manifest_path)?;
+        let base_manifest_path = resolve_manifest_path(&args.manifest_path)?;
+        let workspace_root = metadata_cache_workspace_root(&base_manifest_path)?;
+        let manifest_path = if let Some(pkg) = args.package.as_deref() {
+            resolve_native_effective_manifest_path(&base_manifest_path, &workspace_root, Some(pkg))
+                .unwrap_or(base_manifest_path)
+        } else {
+            resolve_all_workspace_member_manifests(&base_manifest_path, &workspace_root)
+                .ok()
+                .and_then(|mut v| v.drain(..).next())
+                .unwrap_or(base_manifest_path)
+        };
         let common = BuildCommonArgs {
             manifest_path: Some(manifest_path.clone()),
             package: args.package.clone(),
-            workspace: args.workspace,
+            workspace: false,
             features: Vec::new(),
             offline: false,
             release: false,
             profile: Some("dev".to_string()),
         };
-        let context = build_native_compile_context(&common, &manifest_path, &workspace_root)?;
+        let context = with_native_compat_toolchain_fallback(|| {
+            build_native_compile_context(&common, &manifest_path, &workspace_root)
+        })?;
         let mut findings = Vec::new();
 
         // 1. Run full compiler diagnostics with unused-import warnings enabled!

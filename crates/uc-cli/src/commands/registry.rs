@@ -315,10 +315,23 @@ fn manifest_registry_requirements_with_workspace(
     manifest: &TomlValue,
     workspace_manifest: Option<&TomlValue>,
 ) -> Vec<(String, String)> {
+    manifest_registry_requirements_inner(manifest, workspace_manifest, true)
+}
+
+fn manifest_registry_requirements_inner(
+    manifest: &TomlValue,
+    workspace_manifest: Option<&TomlValue>,
+    include_dev_dependencies: bool,
+) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut tables: Vec<&toml::map::Map<String, TomlValue>> = Vec::new();
-    for section in ["dependencies", "dev-dependencies"] {
-        if let Some(table) = manifest.get(section).and_then(TomlValue::as_table) {
+    let sections: &[&str] = if include_dev_dependencies {
+        &["dependencies", "dev-dependencies", "dev_dependencies"]
+    } else {
+        &["dependencies"]
+    };
+    for section in sections {
+        if let Some(table) = manifest.get(*section).and_then(TomlValue::as_table) {
             tables.push(table);
         }
     }
@@ -371,10 +384,24 @@ fn manifest_git_requirements_with_workspace(
     workspace_manifest: Option<&TomlValue>,
     locked_revs: &BTreeMap<String, String>,
 ) -> Vec<GitDependencySpec> {
+    manifest_git_requirements_inner(manifest, workspace_manifest, locked_revs, true)
+}
+
+fn manifest_git_requirements_inner(
+    manifest: &TomlValue,
+    workspace_manifest: Option<&TomlValue>,
+    locked_revs: &BTreeMap<String, String>,
+    include_dev_dependencies: bool,
+) -> Vec<GitDependencySpec> {
     let mut out = Vec::new();
     let mut tables: Vec<&toml::map::Map<String, TomlValue>> = Vec::new();
-    for section in ["dependencies", "dev-dependencies"] {
-        if let Some(table) = manifest.get(section).and_then(TomlValue::as_table) {
+    let sections: &[&str] = if include_dev_dependencies {
+        &["dependencies", "dev-dependencies", "dev_dependencies"]
+    } else {
+        &["dependencies"]
+    };
+    for section in sections {
+        if let Some(table) = manifest.get(*section).and_then(TomlValue::as_table) {
             tables.push(table);
         }
     }
@@ -626,7 +653,7 @@ fn find_package_in_checkout_dir(
         .and_then(|t| toml::from_str::<TomlValue>(&t).ok())
         .and_then(|v| {
             v.get("workspace")
-                .and_then(|w| w.get("package"))
+                .and_then(|w| w.get("package").or_else(|| w.get("project")))
                 .and_then(|p| p.get("version"))
                 .and_then(TomlValue::as_str)
                 .map(str::to_string)
@@ -899,7 +926,7 @@ pub(crate) fn ensure_registry_dependencies(manifest_path: &Path) -> Result<Regis
         if !visited_git_specs.insert(git_spec.clone()) {
             continue;
         }
-        let (_pkg_dir, version, pkg_manifest) =
+        let (pkg_dir, version, pkg_manifest) =
             if let Some(found) = find_cached_git_dependency(&git_checkouts_root, &git_spec) {
                 report.cached.push(RegistryPackageSpec {
                     name: git_spec.name.clone(),
@@ -931,8 +958,9 @@ pub(crate) fn ensure_registry_dependencies(manifest_path: &Path) -> Result<Regis
                 found
             };
         let _ = version;
+        let pkg_ws_manifest = find_workspace_manifest(&pkg_dir, &pkg_manifest);
         for (trans_name, trans_req) in
-            manifest_registry_requirements_with_workspace(&pkg_manifest, None)
+            manifest_registry_requirements_inner(&pkg_manifest, pkg_ws_manifest.as_ref(), false)
         {
             if !direct_requirements
                 .iter()
@@ -941,9 +969,12 @@ pub(crate) fn ensure_registry_dependencies(manifest_path: &Path) -> Result<Regis
                 direct_requirements.push((trans_name, trans_req));
             }
         }
-        for trans_git in
-            manifest_git_requirements_with_workspace(&pkg_manifest, None, &locked_revs)
-        {
+        for trans_git in manifest_git_requirements_inner(
+            &pkg_manifest,
+            pkg_ws_manifest.as_ref(),
+            &locked_revs,
+            false,
+        ) {
             if !visited_git_specs.contains(&trans_git) {
                 git_queue.push(trans_git);
             }
@@ -1016,36 +1047,84 @@ pub(crate) fn ensure_registry_dependencies(manifest_path: &Path) -> Result<Regis
                 };
                 (version.clone(), checksum, deps)
             } else {
-                if !index_cache.contains_key(&name) {
-                    index_cache.insert(name.clone(), fetch_index(&name)?);
-                }
-                let entries = &index_cache[&name];
                 let all_reqs = requirements.get(&name).cloned().unwrap_or_default();
-                let Some(entry) = pick_version(entries, &all_reqs) else {
-                    let available: Vec<&str> = entries.iter().map(|e| e.v.as_str()).collect();
-                    bail!(
-                        "no version of `{name}` satisfies {} in the registry (available: {})",
-                        all_reqs.join(" and "),
-                        available.join(", ")
-                    );
+                let exact_cached_candidate = if std::env::var_os("UC_REGISTRY_INDEX_URL").is_none() {
+                    all_reqs
+                        .iter()
+                        .find_map(|r| {
+                            let base = r.trim().trim_start_matches(['^', '~', '=', ' ', '>']);
+                            let ver = semver::Version::parse(base).ok()?;
+                            let satisfies_all = all_reqs.iter().all(|req_str| {
+                                semver::VersionReq::parse(req_str.trim())
+                                    .map(|vr| vr.matches(&ver))
+                                    .unwrap_or(true)
+                            });
+                            if !satisfies_all {
+                                return None;
+                            }
+                            let dir = src_dir.join(format!("{name}-{ver}"));
+                            if package_dir_ready(&dir) {
+                                Some((ver.to_string(), dir))
+                            } else {
+                                None
+                            }
+                        })
+                } else {
+                    None
                 };
-                let deps: Vec<(String, String)> = entry
-                    .deps
-                    .iter()
-                    .filter(|d| d.kind.as_deref().unwrap_or("normal") == "normal")
-                    .map(|d| (d.name.clone(), d.req.clone()))
-                    .collect();
-                let mut dep_names: Vec<String> = deps
-                    .iter()
-                    .map(|(n, _)| n.clone())
-                    .filter(|n| !BUILTIN_PACKAGES.contains(&n.as_str()))
-                    .collect();
-                dep_names.sort();
-                resolved_entries.insert(
-                    name.clone(),
-                    (entry.v.clone(), Some(entry.cksum.clone()), dep_names),
-                );
-                (entry.v.clone(), Some(entry.cksum.clone()), deps)
+                if let Some((cached_ver, cached_dir)) = exact_cached_candidate {
+                    let cached_manifest_path = if cached_dir.join("Scarb.toml").is_file() {
+                        cached_dir.join("Scarb.toml")
+                    } else {
+                        cached_dir.join("uc.toml")
+                    };
+                    let deps = fs::read_to_string(&cached_manifest_path)
+                        .ok()
+                        .and_then(|raw| raw.parse::<TomlValue>().ok())
+                        .map(|doc| manifest_registry_requirements_inner(&doc, None, false))
+                        .unwrap_or_default();
+                    let mut dep_names: Vec<String> = deps
+                        .iter()
+                        .map(|(n, _)| n.clone())
+                        .filter(|n| !BUILTIN_PACKAGES.contains(&n.as_str()))
+                        .collect();
+                    dep_names.sort();
+                    resolved_entries.insert(
+                        name.clone(),
+                        (cached_ver.clone(), None, dep_names),
+                    );
+                    (cached_ver, None, deps)
+                } else {
+                    if !index_cache.contains_key(&name) {
+                        index_cache.insert(name.clone(), fetch_index(&name)?);
+                    }
+                    let entries = &index_cache[&name];
+                    let Some(entry) = pick_version(entries, &all_reqs) else {
+                        let available: Vec<&str> = entries.iter().map(|e| e.v.as_str()).collect();
+                        bail!(
+                            "no version of `{name}` satisfies {} in the registry (available: {})",
+                            all_reqs.join(" and "),
+                            available.join(", ")
+                        );
+                    };
+                    let deps: Vec<(String, String)> = entry
+                        .deps
+                        .iter()
+                        .filter(|d| d.kind.as_deref().unwrap_or("normal") == "normal")
+                        .map(|d| (d.name.clone(), d.req.clone()))
+                        .collect();
+                    let mut dep_names: Vec<String> = deps
+                        .iter()
+                        .map(|(n, _)| n.clone())
+                        .filter(|n| !BUILTIN_PACKAGES.contains(&n.as_str()))
+                        .collect();
+                    dep_names.sort();
+                    resolved_entries.insert(
+                        name.clone(),
+                        (entry.v.clone(), Some(entry.cksum.clone()), dep_names),
+                    );
+                    (entry.v.clone(), Some(entry.cksum.clone()), deps)
+                }
             };
         queue.extend(deps);
         let spec = RegistryPackageSpec { name: name.clone(), version: version.clone(), checksum };
@@ -1057,7 +1136,9 @@ pub(crate) fn ensure_registry_dependencies(manifest_path: &Path) -> Result<Regis
             report.fetched.push(spec);
         }
     }
-    if !lock_existed && !resolved_entries.is_empty() {
+    let in_scarb_cache = scarb_cache_root()
+        .is_ok_and(|cache_root| manifest_dir.starts_with(cache_root));
+    if !lock_existed && !resolved_entries.is_empty() && !in_scarb_cache {
         if let Some(lock_path) = write_lockfile(
             manifest_dir,
             &manifest,
@@ -1095,6 +1176,13 @@ fn write_lockfile(
     let version = package
         .get("version")
         .and_then(TomlValue::as_str)
+        .or_else(|| {
+            manifest
+                .get("workspace")
+                .and_then(|w| w.get("package").or_else(|| w.get("project")))
+                .and_then(|p| p.get("version"))
+                .and_then(TomlValue::as_str)
+        })
         .unwrap_or("0.1.0");
     let mut root_deps: Vec<String> = direct_requirements.iter().map(|(n, _)| n.clone()).collect();
     root_deps.sort();
