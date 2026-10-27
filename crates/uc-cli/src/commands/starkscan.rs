@@ -139,6 +139,9 @@ impl StarkscanLabels {
             return l.clone();
         }
         let mut label = StarkscanLabel { address: key.clone(), ..Default::default() };
+        if starkscan_api_key().is_none() {
+            return label;
+        }
         self.requests += 1;
         if let Ok(Some(meta)) = starkscan_request("GET", &format!("/v1/{}/contract/{key}", self.chain), None) {
             label.alias = meta.get("alias").and_then(|v| v.as_str()).map(str::to_string);
@@ -146,15 +149,15 @@ impl StarkscanLabels {
             label.is_token = meta.get("isToken").and_then(|v| v.as_bool());
             label.token_kind = meta.get("tokenKind").and_then(|v| v.as_str()).map(str::to_string);
             label.class_hash = meta.get("classHash").and_then(|v| v.as_str()).map(str::to_string);
-        }
-        if label.is_token == Some(true) {
-            self.requests += 1;
-            if let Ok(Some(token)) = starkscan_request("GET", &format!("/v1/{}/token/{key}", self.chain), None) {
-                label.token_symbol = token.get("symbol").and_then(|v| v.as_str()).map(str::to_string);
-                label.token_name = token.get("name").and_then(|v| v.as_str()).map(str::to_string);
+            if label.is_token == Some(true) {
+                self.requests += 1;
+                if let Ok(Some(token)) = starkscan_request("GET", &format!("/v1/{}/token/{key}", self.chain), None) {
+                    label.token_symbol = token.get("symbol").and_then(|v| v.as_str()).map(str::to_string);
+                    label.token_name = token.get("name").and_then(|v| v.as_str()).map(str::to_string);
+                }
             }
+            self.cache.insert(key, label.clone());
         }
-        self.cache.insert(key, label.clone());
         label
     }
 }

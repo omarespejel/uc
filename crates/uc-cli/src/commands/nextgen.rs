@@ -886,7 +886,16 @@ pub(crate) fn run_fmt(args: FmtArgs) -> Result<()> {
             }
         } else if let Some(manifest_path) = &manifest_opt {
             let root = manifest_path.parent().unwrap_or_else(|| Path::new("."));
-            collect_cairo_files_under(root, &mut files);
+            if let Some(pkg) = args.package.as_deref() {
+                if let Ok(eff) = resolve_native_effective_manifest_path(manifest_path, root, Some(pkg)) {
+                    let pkg_root = eff.parent().unwrap_or(root);
+                    collect_cairo_files_under(pkg_root, &mut files);
+                } else {
+                    collect_cairo_files_under(root, &mut files);
+                }
+            } else {
+                collect_cairo_files_under(root, &mut files);
+            }
         } else {
             let cwd = std::env::current_dir()?;
             collect_cairo_files_under(&cwd, &mut files);
@@ -1053,11 +1062,14 @@ fn compute_fast_package_source_digest(manifest_path: &Path) -> Result<String> {
     let manifest_bytes = fs::read(manifest_path)?;
     hasher.update(&manifest_bytes);
     let pkg_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
-    if let Ok(lock) = fs::read(pkg_dir.join("Scarb.lock")) {
-        hasher.update(b"lock");
-        hasher.update(&lock);
+    for lock_name in ["Scarb.lock", "uc.lock"] {
+        if let Ok(lock) = fs::read(pkg_dir.join(lock_name)) {
+            hasher.update(b"lock");
+            hasher.update(&lock);
+        }
     }
     hash_cairo_tree(&mut hasher, pkg_dir, &pkg_dir.join("src"))?;
+    hash_cairo_tree(&mut hasher, pkg_dir, &pkg_dir.join("tests"))?;
 
     if let Ok(manifest) = toml::from_str::<TomlValue>(&String::from_utf8_lossy(&manifest_bytes)) {
         for section in ["dependencies", "dev-dependencies"] {
@@ -1083,7 +1095,9 @@ fn compute_fast_package_source_digest(manifest_path: &Path) -> Result<String> {
                     Some(src_dir) if src_dir.is_dir() => {
                         hasher.update(src_dir.to_string_lossy().as_bytes());
                         let root = src_dir.parent().unwrap_or(&src_dir).to_path_buf();
-                        if let Ok(dep_manifest) = fs::read(root.join("Scarb.toml")) {
+                        if let Ok(dep_manifest) = fs::read(root.join("Scarb.toml"))
+                            .or_else(|_| fs::read(root.join("uc.toml")))
+                        {
                             hasher.update(&dep_manifest);
                         }
                         hash_cairo_tree(&mut hasher, &root, &src_dir)?;
@@ -1123,9 +1137,10 @@ pub(crate) fn check_single_manifest_native(
     )
     .unwrap_or_else(|_| manifest_path.to_path_buf());
     let fast_digest = compute_fast_package_source_digest(&effective_manifest).ok();
+    let pkg_cache_id = short_hash(&effective_manifest.display().to_string());
     let check_cache_path = workspace_root
         .join(".uc")
-        .join(format!("check-cache-v1-{profile}.json"));
+        .join(format!("check-cache-v1-{profile}-{pkg_cache_id}.json"));
 
     if let Some(ref digest) = fast_digest {
         if let Ok(raw) = fs::read(&check_cache_path) {
@@ -1394,8 +1409,6 @@ pub(crate) fn run_clean(args: CleanArgs) -> Result<()> {
         candidate_dirs.push(workspace_root.join(".uc/cache"));
         candidate_dirs.push(workspace_root.join(".uc/receipts"));
         candidate_dirs.push(workspace_root.join(".uc/native-project"));
-    }
-    if args.all || args.uc_cache {
         // `uc check` result cache lives next to the other `.uc` caches.
         if let Ok(entries) = fs::read_dir(workspace_root.join(".uc")) {
             for entry in entries.flatten() {
@@ -1507,10 +1520,13 @@ fn scaffold_package_at(
         .unwrap_or_else(|_| root_dir.to_path_buf());
     let manifest_filename = if legacy_scarb { "Scarb.toml" } else { "uc.toml" };
     let manifest_path = canonical_root.join(manifest_filename);
-    if manifest_path.exists() {
+    if manifest_path.exists()
+        || canonical_root.join("Scarb.toml").exists()
+        || canonical_root.join("uc.toml").exists()
+    {
         bail!(
-            "`{manifest_filename}` already exists at `{}`",
-            manifest_path.display()
+            "a Cairo manifest (`Scarb.toml` or `uc.toml`) already exists in `{}`",
+            canonical_root.display()
         );
     }
 
@@ -1951,7 +1967,10 @@ fn build_tree_node_for_manifest(
 ) -> Result<TreeNodeReport> {
     let text = read_text_file_with_limit(manifest_path, MAX_MANIFEST_BYTES, "manifest")?;
     let manifest: TomlValue = parse_manifest_toml(&text, manifest_path, "failed to parse manifest")?;
-    let pkg_table = manifest.get("package").and_then(TomlValue::as_table);
+    let pkg_table = manifest
+        .get("package")
+        .or_else(|| manifest.get("project"))
+        .and_then(TomlValue::as_table);
     let pkg_name = pkg_table
         .and_then(|t| t.get("name"))
         .and_then(TomlValue::as_str)
@@ -1995,7 +2014,15 @@ fn build_tree_node_for_manifest(
                 .as_table()
                 .and_then(|t| t.get("path"))
                 .and_then(TomlValue::as_str)
-                .map(|p| manifest_dir.join(p).join("Scarb.toml"));
+                .map(|p| {
+                    let base = manifest_dir.join(p);
+                    let scarb = base.join("Scarb.toml");
+                    if scarb.is_file() {
+                        scarb
+                    } else {
+                        base.join("uc.toml")
+                    }
+                });
 
             if let Some(child_manifest) = dep_path_opt.filter(|p| p.is_file()) {
                 if deduped {
@@ -2003,7 +2030,8 @@ fn build_tree_node_for_manifest(
                     let child_ver = toml::from_str::<TomlValue>(&child_text)
                         .ok()
                         .and_then(|v| {
-                            v.get("package")?
+                            v.get("package")
+                                .or_else(|| v.get("project"))?
                                 .get("version")?
                                 .as_str()
                                 .map(str::to_string)
@@ -2231,8 +2259,27 @@ pub(crate) fn run_expand(args: ExpandArgs) -> Result<()> {
             false,
             |session| -> Result<Vec<ExpandedModuleReport>> {
                 let db = &session.db;
-                let crate_ids =
-                    CrateInput::into_crate_ids(db, session.main_crate_inputs.clone());
+                let root_crate_inputs: Vec<CrateInput> = if args.module.is_none() {
+                    session
+                        .main_crate_inputs
+                        .iter()
+                        .filter(|input| match input {
+                            CrateInput::Real { name, .. } => name == &context.crate_name,
+                            _ => false,
+                        })
+                        .cloned()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let crate_ids = CrateInput::into_crate_ids(
+                    db,
+                    if root_crate_inputs.is_empty() {
+                        session.main_crate_inputs.clone()
+                    } else {
+                        root_crate_inputs
+                    },
+                );
                 let all_modules: Vec<ModuleId<'_>> = crate_ids
                     .iter()
                     .flat_map(|cid| db.crate_modules(*cid).iter().copied())
@@ -2371,14 +2418,33 @@ fn scan_cairo_file_for_starknet_lints(
             pending_event_derive = true;
         }
 
-        // Check function declarations
-        if let Some(fn_pos) = trimmed.find("fn ") {
-            let after_fn = &trimmed[fn_pos + 3..];
+        // Check function declarations (ignoring inline comments and string literals)
+        let code_no_comment = trimmed.split("//").next().unwrap_or(trimmed).trim();
+        let after_vis = code_no_comment
+            .strip_prefix("pub(crate) ")
+            .or_else(|| code_no_comment.strip_prefix("pub "))
+            .or_else(|| code_no_comment.strip_prefix("extern "))
+            .or_else(|| code_no_comment.strip_prefix("const "))
+            .unwrap_or(code_no_comment)
+            .trim_start();
+        if let Some(after_fn) = after_vis.strip_prefix("fn ") {
+            let fn_pos = raw_line.find("fn ").unwrap_or(0);
             let fn_name: String = after_fn
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
                 .collect();
             if !fn_name.is_empty() && fn_name.chars().any(|c| c.is_ascii_uppercase()) {
+                let mut snake = String::with_capacity(fn_name.len() + 4);
+                for (ch_idx, ch) in fn_name.chars().enumerate() {
+                    if ch.is_ascii_uppercase() {
+                        if ch_idx > 0 && !snake.ends_with('_') {
+                            snake.push('_');
+                        }
+                        snake.push(ch.to_ascii_lowercase());
+                    } else {
+                        snake.push(ch);
+                    }
+                }
                 findings.push(LintFinding {
                     rule_id: "CAIRO_NAMING_CONVENTION".to_string(),
                     severity: "warning".to_string(),
@@ -2387,10 +2453,7 @@ fn scan_cairo_file_for_starknet_lints(
                     line: line_no,
                     column: fn_pos + 1,
                     message: format!("Function `{fn_name}` should use `snake_case` naming."),
-                    suggestion: format!(
-                        "Rename `{fn_name}` to `{}`.",
-                        fn_name.to_ascii_lowercase()
-                    ),
+                    suggestion: format!("Rename `{fn_name}` to `{snake}`."),
                 });
             }
             if !trimmed.ends_with(';') && current_fn_brace_start.is_none() {
@@ -3702,63 +3765,67 @@ pub(crate) fn run_abi(args: AbiArgs) -> Result<()> {
                     }
                     AbiOutputFormat::Cairo => {
                         let mut trait_fns = Vec::new();
+                        let mut push_cairo_fn = |fn_item: &serde_json::Value| {
+                            if fn_item.get("type").and_then(|v| v.as_str()) == Some("function") {
+                                let fn_name = fn_item
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("func");
+                                let mutability = fn_item
+                                    .get("state_mutability")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("external");
+                                let self_param = if mutability == "view" {
+                                    "self: @TContractState"
+                                } else {
+                                    "ref self: TContractState"
+                                };
+                                let mut params = vec![self_param.to_string()];
+                                if let Some(inputs) =
+                                    fn_item.get("inputs").and_then(|v| v.as_array())
+                                {
+                                    for inp in inputs {
+                                        let in_name = inp
+                                            .get("name")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("arg");
+                                        let in_ty = inp
+                                            .get("type")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("felt252");
+                                        params.push(format!("{in_name}: {in_ty}"));
+                                    }
+                                }
+                                let ret_str = fn_item
+                                    .get("outputs")
+                                    .and_then(|v| v.as_array())
+                                    .and_then(|o| o.first())
+                                    .and_then(|o| o.get("type"))
+                                    .and_then(|v| v.as_str())
+                                    .map(|ty| format!(" -> {ty}"))
+                                    .unwrap_or_default();
+                                trait_fns.push(format!(
+                                    "    fn {}({}){};",
+                                    fn_name,
+                                    params.join(", "),
+                                    ret_str
+                                ));
+                            }
+                        };
                         if let Some(arr) = abi_val.as_array() {
                             for item in arr {
-                                if item.get("type").and_then(|v| v.as_str()) == Some("interface") {
-                                    if let Some(items) =
-                                        item.get("items").and_then(|v| v.as_array())
-                                    {
-                                        for fn_item in items {
-                                            if fn_item.get("type").and_then(|v| v.as_str())
-                                                == Some("function")
-                                            {
-                                                let fn_name = fn_item
-                                                    .get("name")
-                                                    .and_then(|v| v.as_str())
-                                                    .unwrap_or("func");
-                                                let mutability = fn_item
-                                                    .get("state_mutability")
-                                                    .and_then(|v| v.as_str())
-                                                    .unwrap_or("external");
-                                                let self_param = if mutability == "view" {
-                                                    "self: @TContractState"
-                                                } else {
-                                                    "ref self: TContractState"
-                                                };
-                                                let mut params = vec![self_param.to_string()];
-                                                if let Some(inputs) = fn_item
-                                                    .get("inputs")
-                                                    .and_then(|v| v.as_array())
-                                                {
-                                                    for inp in inputs {
-                                                        let in_name = inp
-                                                            .get("name")
-                                                            .and_then(|v| v.as_str())
-                                                            .unwrap_or("arg");
-                                                        let in_ty = inp
-                                                            .get("type")
-                                                            .and_then(|v| v.as_str())
-                                                            .unwrap_or("felt252");
-                                                        params.push(format!("{in_name}: {in_ty}"));
-                                                    }
-                                                }
-                                                let ret_str = fn_item
-                                                    .get("outputs")
-                                                    .and_then(|v| v.as_array())
-                                                    .and_then(|o| o.first())
-                                                    .and_then(|o| o.get("type"))
-                                                    .and_then(|v| v.as_str())
-                                                    .map(|ty| format!(" -> {ty}"))
-                                                    .unwrap_or_default();
-                                                trait_fns.push(format!(
-                                                    "    fn {}({}){};",
-                                                    fn_name,
-                                                    params.join(", "),
-                                                    ret_str
-                                                ));
+                                match item.get("type").and_then(|v| v.as_str()) {
+                                    Some("interface") => {
+                                        if let Some(items) =
+                                            item.get("items").and_then(|v| v.as_array())
+                                        {
+                                            for fn_item in items {
+                                                push_cairo_fn(fn_item);
                                             }
                                         }
                                     }
+                                    Some("function") => push_cairo_fn(item),
+                                    _ => {}
                                 }
                             }
                         }
@@ -3771,15 +3838,20 @@ pub(crate) fn run_abi(args: AbiArgs) -> Result<()> {
                         rendered_chunks.push(cairo_stub);
                     }
                     AbiOutputFormat::Rust => {
+                        let sel_names = abi_selector_names(&abi_val);
                         let mut consts = Vec::new();
                         consts.push(format!(
                             "    pub const CLASS_HASH: &str = \"{}\";",
                             class_hash
                         ));
                         for (idx, ep) in cc.entry_points_by_type.external.iter().enumerate() {
+                            let sel_hex = format!("0x{:x}", ep.selector);
+                            let const_name = sel_names
+                                .get(&sel_hex)
+                                .map(|n| format!("SELECTOR_{}", n.to_ascii_uppercase()))
+                                .unwrap_or_else(|| format!("EXTERNAL_SELECTOR_{idx}"));
                             consts.push(format!(
-                                "    pub const EXTERNAL_SELECTOR_{}: &str = \"0x{:x}\";",
-                                idx, ep.selector
+                                "    pub const {const_name}: &str = \"{sel_hex}\";",
                             ));
                         }
                         let rs = format!(
@@ -3937,6 +4009,32 @@ pub(crate) fn run_completions(args: CompletionsArgs) -> Result<()> {
         "compare-build",
         "migrate",
         "replay",
+        "prove",
+        "decompile",
+        "audit",
+        "watch",
+        "doctor",
+        "devnet",
+        "ledger",
+        "execute",
+        "doc",
+        "package",
+        "publish",
+        "list",
+        "update",
+        "commands",
+        "optimize-inlining",
+        "clean-cache",
+        "check-requirements",
+        "declare-from",
+        "multicall",
+        "get",
+        "balance",
+        "show-config",
+        "script",
+        "utils",
+        "trace",
+        "lsp",
     ];
     let list = subcommands.join(" ");
     match args.shell {

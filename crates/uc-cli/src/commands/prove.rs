@@ -2388,7 +2388,9 @@ fn concrete_panic_confirms_witness(predicted_reason: &str, panic_message: &str) 
         return false;
     }
     let predicted = predicted_reason.to_ascii_lowercase();
-    if predicted.contains("overflow") || predicted.contains("underflow") {
+    if (predicted.contains("overflow") || predicted.contains("underflow"))
+        && !predicted.contains("inequality")
+    {
         if predicted.contains("downcast") || predicted.contains("try_from_felt252") {
             return panic_message.contains("Overflow")
                 || panic_message.contains("overflow")
@@ -2831,15 +2833,15 @@ fn solve_path_constraints(
                         CmpOp::Ne => {
                             excluded[*idx].insert(*val);
                             if lo[*idx] == *val {
-                                lo[*idx] += 1;
+                                lo[*idx] = lo[*idx].saturating_add(1);
                             }
                             if hi[*idx] == *val {
-                                hi[*idx] -= 1;
+                                hi[*idx] = hi[*idx].saturating_sub(1);
                             }
                         }
-                        CmpOp::Lt => hi[*idx] = hi[*idx].min(*val - 1),
+                        CmpOp::Lt => hi[*idx] = hi[*idx].min(val.saturating_sub(1)),
                         CmpOp::Le => hi[*idx] = hi[*idx].min(*val),
-                        CmpOp::Gt => lo[*idx] = lo[*idx].max(*val + 1),
+                        CmpOp::Gt => lo[*idx] = lo[*idx].max(val.saturating_add(1)),
                         CmpOp::Ge => lo[*idx] = lo[*idx].max(*val),
                     }
                 }
@@ -2853,9 +2855,9 @@ fn solve_path_constraints(
                         CmpOp::Ne => {
                             excluded[*idx].insert(*val);
                         }
-                        CmpOp::Lt => lo[*idx] = lo[*idx].max(*val + 1),
+                        CmpOp::Lt => lo[*idx] = lo[*idx].max(val.saturating_add(1)),
                         CmpOp::Le => lo[*idx] = lo[*idx].max(*val),
-                        CmpOp::Gt => hi[*idx] = hi[*idx].min(*val - 1),
+                        CmpOp::Gt => hi[*idx] = hi[*idx].min(val.saturating_sub(1)),
                         CmpOp::Ge => hi[*idx] = hi[*idx].min(*val),
                     }
                 }
@@ -2920,14 +2922,14 @@ fn solve_path_constraints(
                     if let (SymExpr::Param(i, _), SymExpr::Param(j, _)) = (a.as_ref(), b.as_ref()) {
                         match op {
                             CmpOp::Eq => {
-                                lo[*i] = lo[*i].max(*target - hi[*j]);
-                                hi[*i] = hi[*i].min(*target - lo[*j]);
-                                lo[*j] = lo[*j].max(*target - hi[*i]);
-                                hi[*j] = hi[*j].min(*target - lo[*i]);
+                                lo[*i] = lo[*i].max(target.saturating_sub(hi[*j]));
+                                hi[*i] = hi[*i].min(target.saturating_sub(lo[*j]));
+                                lo[*j] = lo[*j].max(target.saturating_sub(hi[*i]));
+                                hi[*j] = hi[*j].min(target.saturating_sub(lo[*i]));
                             }
                             CmpOp::Gt => {
-                                lo[*i] = lo[*i].max((*target + 1).saturating_sub(hi[*j]));
-                                lo[*j] = lo[*j].max((*target + 1).saturating_sub(hi[*i]));
+                                lo[*i] = lo[*i].max(target.saturating_add(1).saturating_sub(hi[*j]));
+                                lo[*j] = lo[*j].max(target.saturating_add(1).saturating_sub(hi[*i]));
                             }
                             _ => {}
                         }
@@ -2936,7 +2938,11 @@ fn solve_path_constraints(
                         (a.as_ref(), b.as_ref())
                     {
                         let needed = target.saturating_sub(*k);
-                        candidate_constants.extend([needed - 1, needed, needed + 1]);
+                        candidate_constants.extend([
+                            needed.saturating_sub(1),
+                            needed,
+                            needed.saturating_add(1),
+                        ]);
                         match op {
                             CmpOp::Eq => {
                                 lo[*i] = lo[*i].max(needed);
@@ -2946,13 +2952,13 @@ fn solve_path_constraints(
                                 lo[*i] = lo[*i].max(needed);
                             }
                             CmpOp::Gt => {
-                                lo[*i] = lo[*i].max(needed + 1);
+                                lo[*i] = lo[*i].max(needed.saturating_add(1));
                             }
                             CmpOp::Le => {
                                 hi[*i] = hi[*i].min(needed);
                             }
                             CmpOp::Lt => {
-                                hi[*i] = hi[*i].min(needed - 1);
+                                hi[*i] = hi[*i].min(needed.saturating_sub(1));
                             }
                             CmpOp::Ne => {
                                 excluded[*i].insert(needed);
@@ -4976,8 +4982,10 @@ fn verify_counterexamples_concretely(
             seeded_state(),
         ) {
             if let RunResultValue::Panic(felts) = run_res.value {
-                proof.concrete_verified = Some(true);
-                proof.concrete_panic_data = Some(format_for_panic(felts.into_iter()));
+                let msg = format_for_panic(felts.into_iter());
+                proof.concrete_verified =
+                    Some(concrete_panic_confirms_witness(reason_comment, &msg));
+                proof.concrete_panic_data = Some(msg);
             } else {
                 proof.concrete_verified = Some(false);
             }
@@ -5458,7 +5466,12 @@ fn check_upgrade_safety_against_baseline(
     no_cache: bool,
 ) -> Result<UpgradeSafetyReport> {
     let base_manifest = if baseline_manifest_arg.is_dir() {
-        baseline_manifest_arg.join("Scarb.toml")
+        let uc_manifest = baseline_manifest_arg.join("uc.toml");
+        if uc_manifest.is_file() {
+            uc_manifest
+        } else {
+            baseline_manifest_arg.join("Scarb.toml")
+        }
     } else {
         baseline_manifest_arg.to_path_buf()
     };
@@ -5467,6 +5480,7 @@ fn check_upgrade_safety_against_baseline(
     let base_toml = parse_manifest_toml(&base_text, &base_manifest, "manifest")?;
     let base_pkg = base_toml
         .get("package")
+        .or_else(|| base_toml.get("project"))
         .and_then(TomlValue::as_table)
         .and_then(|p| p.get("name"))
         .and_then(TomlValue::as_str)
@@ -5600,7 +5614,12 @@ fn check_functional_equivalence_against_baseline(
     use starknet_types_core::felt::Felt as Felt252;
 
     let base_manifest = if baseline_manifest_arg.is_dir() {
-        baseline_manifest_arg.join("Scarb.toml")
+        let uc_manifest = baseline_manifest_arg.join("uc.toml");
+        if uc_manifest.is_file() {
+            uc_manifest
+        } else {
+            baseline_manifest_arg.join("Scarb.toml")
+        }
     } else {
         baseline_manifest_arg.to_path_buf()
     };
@@ -5609,6 +5628,7 @@ fn check_functional_equivalence_against_baseline(
     let base_toml = parse_manifest_toml(&base_text, &base_manifest, "manifest")?;
     let base_pkg = base_toml
         .get("package")
+        .or_else(|| base_toml.get("project"))
         .and_then(TomlValue::as_table)
         .and_then(|p| p.get("name"))
         .and_then(TomlValue::as_str)
@@ -6253,8 +6273,11 @@ pub(crate) fn run_prove(mut args: ProveArgs) -> Result<()> {
     if let Some(sierra_file) = &args.sierra_file {
         let sierra_str = sierra_file.to_string_lossy();
         let mut text = if !sierra_file.is_file() && sierra_str.starts_with("0x") {
-            let rpc = resolve_read_rpc_url(None, Some("mainnet"))
-                .with_context(|| format!("unable to resolve RPC URL for `{sierra_str}`"))?;
+            let rpc = resolve_read_rpc_url(
+                args.url.as_deref(),
+                args.network.as_deref().or(Some("mainnet")),
+            )
+            .with_context(|| format!("unable to resolve RPC URL for `{sierra_str}`"))?;
             let class_val = starknet_rpc_request(
                 &rpc,
                 "starknet_getClassAt",
@@ -6381,7 +6404,11 @@ pub(crate) fn run_prove(mut args: ProveArgs) -> Result<()> {
             read_text_file_with_limit(&manifest_path, MAX_MANIFEST_BYTES, "manifest")
                 .ok()
                 .and_then(|txt| parse_manifest_toml(&txt, &manifest_path, "manifest").ok())
-                .is_some_and(|m| m.get("package").is_none() && m.get("workspace").is_some());
+                .is_some_and(|m| {
+                    m.get("package").is_none()
+                        && m.get("project").is_none()
+                        && m.get("workspace").is_some()
+                });
 
         let target_manifests: Vec<PathBuf> = if (args.workspace || is_virtual_workspace)
             && args.package.is_none()
@@ -6408,6 +6435,7 @@ pub(crate) fn run_prove(mut args: ProveArgs) -> Result<()> {
             let manifest = parse_manifest_toml(&manifest_text, &pkg_manifest, "manifest")?;
             let pkg_name = manifest
                 .get("package")
+                .or_else(|| manifest.get("project"))
                 .and_then(TomlValue::as_table)
                 .and_then(|p| p.get("name"))
                 .and_then(TomlValue::as_str)
@@ -6427,7 +6455,7 @@ pub(crate) fn run_prove(mut args: ProveArgs) -> Result<()> {
                     .and_then(TomlValue::as_integer)
                     .and_then(|v| usize::try_from(v).ok())
                 {
-                    if pkg_args.max_depth == 48 {
+                    if pkg_args.max_depth == 1024 {
                         pkg_args.max_depth = d;
                     }
                 }
@@ -6437,7 +6465,7 @@ pub(crate) fn run_prove(mut args: ProveArgs) -> Result<()> {
                     .and_then(TomlValue::as_integer)
                     .and_then(|v| usize::try_from(v).ok())
                 {
-                    if pkg_args.max_paths == 64 {
+                    if pkg_args.max_paths == 1024 {
                         pkg_args.max_paths = p;
                     }
                 }

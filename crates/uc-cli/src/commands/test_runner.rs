@@ -589,61 +589,67 @@ pub(crate) fn discover_source_test_locations(
     src_dir: &Path,
 ) -> BTreeMap<String, (String, usize, bool)> {
     let mut map = BTreeMap::new();
-    if !src_dir.is_dir() {
-        return map;
+    let mut dirs = vec![src_dir.to_path_buf()];
+    if let Some(parent) = src_dir.parent() {
+        dirs.push(parent.join("tests"));
     }
-    for entry in WalkDir::new(src_dir).follow_links(false).into_iter().flatten() {
-        if !entry.file_type().is_file() {
+    for check_dir in dirs {
+        if !check_dir.is_dir() {
             continue;
         }
-        let path = entry.path();
-        if !path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("cairo"))
-        {
-            continue;
-        }
-        let Ok(source) = fs::read_to_string(path) else {
-            continue;
-        };
-        let rel_path = path
-            .strip_prefix(workspace_root)
-            .unwrap_or(path)
-            .display()
-            .to_string();
-        let mut pending_test_attr = false;
-        let mut should_panic = false;
-        for (idx, raw_line) in source.lines().enumerate() {
-            let line = raw_line
-                .split_once("//")
-                .map(|(h, _)| h)
-                .unwrap_or(raw_line)
-                .trim();
-            if line.is_empty() {
+        for entry in WalkDir::new(check_dir).follow_links(false).into_iter().flatten() {
+            if !entry.file_type().is_file() {
                 continue;
             }
-            if line.contains("#[test]") || line.starts_with("#[test(") {
-                pending_test_attr = true;
+            let path = entry.path();
+            if !path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("cairo"))
+            {
+                continue;
             }
-            if line.contains("#[should_panic") {
-                should_panic = true;
-            }
-            if pending_test_attr {
-                let trimmed = line.strip_prefix("pub ").unwrap_or(line).trim_start();
-                if let Some(rest) = trimmed.strip_prefix("fn ") {
-                    let fn_name: String = rest
-                        .chars()
-                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                        .collect();
-                    if !fn_name.is_empty() {
-                        map.insert(fn_name, (rel_path.clone(), idx + 1, should_panic));
+            let Ok(source) = fs::read_to_string(path) else {
+                continue;
+            };
+            let rel_path = path
+                .strip_prefix(workspace_root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            let mut pending_test_attr = false;
+            let mut should_panic = false;
+            for (idx, raw_line) in source.lines().enumerate() {
+                let line = raw_line
+                    .split_once("//")
+                    .map(|(h, _)| h)
+                    .unwrap_or(raw_line)
+                    .trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if line.contains("#[test]") || line.starts_with("#[test(") {
+                    pending_test_attr = true;
+                }
+                if line.contains("#[should_panic") {
+                    should_panic = true;
+                }
+                if pending_test_attr {
+                    let trimmed = line.strip_prefix("pub ").unwrap_or(line).trim_start();
+                    if let Some(rest) = trimmed.strip_prefix("fn ") {
+                        let fn_name: String = rest
+                            .chars()
+                            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                            .collect();
+                        if !fn_name.is_empty() {
+                            map.insert(fn_name, (rel_path.clone(), idx + 1, should_panic));
+                            pending_test_attr = false;
+                            should_panic = false;
+                        }
+                    } else if !line.starts_with("#[") {
                         pending_test_attr = false;
                         should_panic = false;
                     }
-                } else if !line.starts_with("#[") {
-                    pending_test_attr = false;
-                    should_panic = false;
                 }
             }
         }
@@ -972,6 +978,12 @@ impl ContractClassImpl of ContractClassTrait {
         let out = starknet::testing::cheatcode::<'precalculate_address'>(inputs.span());
         (*out.at(0)).try_into().unwrap()
     }
+}
+
+pub fn precalculate_address(
+    self: @ContractClass, constructor_calldata: @Array<felt252>
+) -> ContractAddress {
+    ContractClassTrait::precalculate_address(self, constructor_calldata)
 }
 
 #[derive(Copy, Drop, Serde, PartialEq, Debug)]
@@ -1846,9 +1858,7 @@ pub fn cheat_block_hash(
 }
 
 pub fn start_cheat_paymaster_data(contract_address: ContractAddress, paymaster_data: Span<felt252>) {
-    let mut inputs: Array<felt252> = array![contract_address.into()];
-    inputs.append_span(paymaster_data);
-    let _ = starknet::testing::cheatcode::<'cheat_paymaster_data'>(inputs.span());
+    cheat_paymaster_data(contract_address, paymaster_data, CheatSpan::Indefinite);
 }
 
 pub fn stop_cheat_paymaster_data(contract_address: ContractAddress) {
@@ -1876,9 +1886,9 @@ pub fn cheat_paymaster_data(
 pub fn start_cheat_account_deployment_data(
     contract_address: ContractAddress, account_deployment_data: Span<felt252>,
 ) {
-    let mut inputs: Array<felt252> = array![contract_address.into()];
-    inputs.append_span(account_deployment_data);
-    let _ = starknet::testing::cheatcode::<'cheat_acct_deploy_data'>(inputs.span());
+    cheat_account_deployment_data(
+        contract_address, account_deployment_data, CheatSpan::Indefinite
+    );
 }
 
 pub fn stop_cheat_account_deployment_data(contract_address: ContractAddress) {
@@ -2103,21 +2113,128 @@ pub mod trace {
 
 pub use trace::get_call_trace;
 
+pub fn generate_random_felt() -> felt252 {
+    let out = starknet::testing::cheatcode::<'next_keypair_secret'>(array![].span());
+    *out.at(0)
+}
+
 pub mod fuzzable {
     use core::array::{ArrayTrait, SpanTrait};
-    use core::serde::Serde;
+    use core::option::OptionTrait;
+    use core::traits::{Into, TryInto};
+    use starknet::{ClassHash, ContractAddress};
+    use super::generate_random_felt;
 
     pub trait Fuzzable<T> {
         fn blank() -> T;
         fn generate() -> T;
     }
 
-    pub fn generate_arg<T, +Fuzzable<T>>() -> T {
-        Fuzzable::<T>::generate()
+    pub fn generate_arg<T, +Drop<T>>(min: T, _max: T) -> T {
+        min
+    }
+
+    pub impl FuzzableFelt252 of Fuzzable<felt252> {
+        fn blank() -> felt252 { 0 }
+        fn generate() -> felt252 { generate_random_felt() }
+    }
+
+    pub impl FuzzableBool of Fuzzable<bool> {
+        fn blank() -> bool { false }
+        fn generate() -> bool {
+            let v: u256 = generate_random_felt().into();
+            (v.low & 1) == 1
+        }
+    }
+
+    pub impl FuzzableU8 of Fuzzable<u8> {
+        fn blank() -> u8 { 0 }
+        fn generate() -> u8 {
+            let v: u256 = generate_random_felt().into();
+            (v.low & 0xff).try_into().unwrap()
+        }
+    }
+
+    pub impl FuzzableU16 of Fuzzable<u16> {
+        fn blank() -> u16 { 0 }
+        fn generate() -> u16 {
+            let v: u256 = generate_random_felt().into();
+            (v.low & 0xffff).try_into().unwrap()
+        }
+    }
+
+    pub impl FuzzableU32 of Fuzzable<u32> {
+        fn blank() -> u32 { 0 }
+        fn generate() -> u32 {
+            let v: u256 = generate_random_felt().into();
+            (v.low & 0xffffffff).try_into().unwrap()
+        }
+    }
+
+    pub impl FuzzableU64 of Fuzzable<u64> {
+        fn blank() -> u64 { 0 }
+        fn generate() -> u64 {
+            let v: u256 = generate_random_felt().into();
+            (v.low & 0xffffffffffffffff).try_into().unwrap()
+        }
+    }
+
+    pub impl FuzzableU128 of Fuzzable<u128> {
+        fn blank() -> u128 { 0 }
+        fn generate() -> u128 {
+            let v: u256 = generate_random_felt().into();
+            v.low
+        }
+    }
+
+    pub impl FuzzableU256 of Fuzzable<u256> {
+        fn blank() -> u256 { 0 }
+        fn generate() -> u256 {
+            generate_random_felt().into()
+        }
+    }
+
+    pub impl FuzzableI8 of Fuzzable<i8> {
+        fn blank() -> i8 { 0 }
+        fn generate() -> i8 { 0 }
+    }
+
+    pub impl FuzzableI16 of Fuzzable<i16> {
+        fn blank() -> i16 { 0 }
+        fn generate() -> i16 { 0 }
+    }
+
+    pub impl FuzzableI32 of Fuzzable<i32> {
+        fn blank() -> i32 { 0 }
+        fn generate() -> i32 { 0 }
+    }
+
+    pub impl FuzzableI64 of Fuzzable<i64> {
+        fn blank() -> i64 { 0 }
+        fn generate() -> i64 { 0 }
+    }
+
+    pub impl FuzzableI128 of Fuzzable<i128> {
+        fn blank() -> i128 { 0 }
+        fn generate() -> i128 { 0 }
+    }
+
+    pub impl FuzzableContractAddress of Fuzzable<ContractAddress> {
+        fn blank() -> ContractAddress { 0.try_into().unwrap() }
+        fn generate() -> ContractAddress {
+            generate_random_felt().try_into().unwrap()
+        }
+    }
+
+    pub impl FuzzableClassHash of Fuzzable<ClassHash> {
+        fn blank() -> ClassHash { 0.try_into().unwrap() }
+        fn generate() -> ClassHash {
+            generate_random_felt().try_into().unwrap()
+        }
     }
 }
 
-pub use fuzzable::Fuzzable;
+pub use fuzzable::{Fuzzable, generate_arg};
 
 pub mod cheatcodes {
     pub mod events {
@@ -2153,20 +2270,33 @@ pub fn get_class_hash(contract_address: ContractAddress) -> ClassHash {
     starknet::syscalls::get_class_hash_at_syscall(contract_address).unwrap()
 }
 
-pub fn replace_bytecode(contract: ContractAddress, new_class: ClassHash) {
-    let prev = starknet::get_contract_address();
-    starknet::testing::set_contract_address(contract);
-    let _ = starknet::syscalls::replace_class_syscall(new_class);
-    starknet::testing::set_contract_address(prev);
+pub trait IntoClassHash<T> {
+    fn into_class_hash(self: T) -> ClassHash;
 }
 
-pub fn generate_random_felt() -> felt252 {
-    let out = starknet::testing::cheatcode::<'next_keypair_secret'>(array![].span());
-    *out.at(0)
+pub impl ContractClassIntoClassHash of IntoClassHash<ContractClass> {
+    fn into_class_hash(self: ContractClass) -> ClassHash {
+        self.class_hash
+    }
 }
 
-pub mod fuzzable {
-    pub use super::generate_random_felt;
+pub impl SnapContractClassIntoClassHash of IntoClassHash<@ContractClass> {
+    fn into_class_hash(self: @ContractClass) -> ClassHash {
+        *self.class_hash
+    }
+}
+
+pub impl ClassHashIntoClassHash of IntoClassHash<ClassHash> {
+    fn into_class_hash(self: ClassHash) -> ClassHash {
+        self
+    }
+}
+
+pub fn replace_bytecode<T, +IntoClassHash<T>, +Drop<T>>(contract: ContractAddress, new_class: T) {
+    let ch: ClassHash = IntoClassHash::<T>::into_class_hash(new_class);
+    let _ = starknet::testing::cheatcode::<'replace_bytecode'>(
+        array![contract.into(), ch.into()].span()
+    );
 }
 
 pub fn interact_with_state<F, +Drop<F>, impl func: core::ops::FnOnce<F, ()>, +Drop<func::Output>>(
@@ -2928,6 +3058,32 @@ impl SplitMix64 {
     }
 }
 
+fn fuzz_words_to_vm_args(
+    param_specs: &[(String, usize)],
+    words: &[u128],
+) -> Vec<cairo_lang_runner::Arg> {
+    let mut args = Vec::with_capacity(words.len());
+    let mut flat_idx = 0usize;
+    for (ty_name, word_size) in param_specs {
+        let is_signed = matches!(ty_name.as_str(), "i8" | "i16" | "i32" | "i64" | "i128");
+        for _ in 0..*word_size {
+            let w = words.get(flat_idx).copied().unwrap_or(0);
+            flat_idx += 1;
+            let felt = if is_signed && w > 0 && (w & 1) == 1 {
+                let mag = (w >> 1).max(1);
+                starknet_types_core::felt::Felt::ZERO
+                    - starknet_types_core::felt::Felt::from(mag)
+            } else if is_signed {
+                starknet_types_core::felt::Felt::from(w >> 1)
+            } else {
+                starknet_types_core::felt::Felt::from(w)
+            };
+            args.push(cairo_lang_runner::Arg::Value(felt));
+        }
+    }
+    args
+}
+
 fn clamp_fuzz_word_for_type(ty_name: &str, word_idx: usize, val: u128) -> u128 {
     if word_idx > 0 {
         // High word of u256 or multi-word struct: keep small to avoid overflow noise unless testing u256
@@ -3279,7 +3435,11 @@ pub(crate) fn run_test(mut args: TestArgs) -> Result<()> {
     let is_virtual_workspace = read_text_file_with_limit(&manifest_path, MAX_MANIFEST_BYTES, "manifest")
         .ok()
         .and_then(|txt| parse_manifest_toml(&txt, &manifest_path, "manifest").ok())
-        .is_some_and(|m| m.get("package").is_none() && m.get("workspace").is_some());
+        .is_some_and(|m| {
+            m.get("package").is_none()
+                && m.get("project").is_none()
+                && m.get("workspace").is_some()
+        });
 
     // Multi-package workspace support (`uc test --workspace` or virtual workspace root)
     if (args.workspace || is_virtual_workspace) && args.package.is_none() {
@@ -3361,6 +3521,7 @@ pub(crate) fn run_test(mut args: TestArgs) -> Result<()> {
     let manifest = parse_manifest_toml(&manifest_text, &effective_manifest_path, "manifest")?;
     let package_name = manifest
         .get("package")
+        .or_else(|| manifest.get("project"))
         .and_then(TomlValue::as_table)
         .and_then(|p| p.get("name"))
         .and_then(TomlValue::as_str)
@@ -3759,15 +3920,7 @@ pub(crate) fn run_test(mut args: TestArgs) -> Result<()> {
                     for run_idx in 0..total_runs {
                         let cov_before = runner.covered_statement_count();
                         let words = generate_fuzz_words(&param_specs, run_idx, &mut rng, &corpus);
-                        let vm_args: Vec<cairo_lang_runner::Arg> = words
-                            .iter()
-                            .copied()
-                            .map(|w| {
-                                cairo_lang_runner::Arg::Value(
-                                    starknet_types_core::felt::Felt::from(w),
-                                )
-                            })
-                            .collect();
+                        let vm_args = fuzz_words_to_vm_args(&param_specs, &words);
                         let run_res = runner.run_function_with_starknet_context_sliced(
                             func,
                             vm_args,
@@ -3802,15 +3955,8 @@ pub(crate) fn run_test(mut args: TestArgs) -> Result<()> {
                                     let mut shrunk = words.clone();
                                     let mut shrunk_msg = fail_msg.unwrap_or_default();
                                     let test_fails_with = |candidate: &[u128]| -> Option<String> {
-                                        let cand_args: Vec<cairo_lang_runner::Arg> = candidate
-                                            .iter()
-                                            .copied()
-                                            .map(|w| {
-                                                cairo_lang_runner::Arg::Value(
-                                                    starknet_types_core::felt::Felt::from(w),
-                                                )
-                                            })
-                                            .collect();
+                                        let cand_args =
+                                            fuzz_words_to_vm_args(&param_specs, candidate);
                                         match runner.run_function_with_starknet_context_sliced(
                                             func,
                                             cand_args,
@@ -4072,7 +4218,9 @@ pub(crate) fn run_test(mut args: TestArgs) -> Result<()> {
                     .filter(|(fn_name, _, total)| {
                         *total > 0
                             && (fn_name.starts_with(&format!("{crate_name}::"))
-                                || !fn_name.starts_with("core::"))
+                                || (!fn_name.starts_with("core::")
+                                    && !fn_name.starts_with("snforge_std::")
+                                    && !fn_name.starts_with("starknet::")))
                     })
                     .map(|(fn_name, cov, tot)| FunctionCoverageEntry {
                         function: fn_name.clone(),
@@ -4209,9 +4357,20 @@ pub(crate) fn run_test(mut args: TestArgs) -> Result<()> {
                                     was_killed = true;
                                     break;
                                 };
+                                let param_specs = mut_runner.user_param_types_and_sizes(f);
+                                let default_args: Vec<cairo_lang_runner::Arg> = param_specs
+                                    .iter()
+                                    .flat_map(|(_, sz)| {
+                                        (0..*sz).map(|_| {
+                                            cairo_lang_runner::Arg::Value(
+                                                starknet_types_core::felt::Felt::ZERO,
+                                            )
+                                        })
+                                    })
+                                    .collect();
                                 match mut_runner.run_function_with_starknet_context_sliced(
                                     f,
-                                    vec![],
+                                    default_args,
                                     t_cfg.available_gas,
                                     StarknetState::default()
                                         .with_snforge_defaults(predeployed_erc20_class_hash),

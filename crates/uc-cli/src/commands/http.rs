@@ -168,15 +168,24 @@ fn native_agent(ipv4_only: bool) -> &'static ureq::Agent {
 fn send_native(method: &str, url: &str, body: Option<&[u8]>, headers: &[(&str, &str)], ipv4_only: bool) -> Exchange {
     let agent = native_agent(ipv4_only);
     let sent = match method {
-        "GET" | "DELETE" => {
-            let mut req = if method == "GET" { agent.get(url) } else { agent.delete(url) };
+        "GET" | "DELETE" | "HEAD" | "OPTIONS" => {
+            let mut req = match method {
+                "DELETE" => agent.delete(url),
+                "HEAD" => agent.head(url),
+                "OPTIONS" => agent.options(url),
+                _ => agent.get(url),
+            };
             for (k, v) in headers {
                 req = req.header(*k, *v);
             }
             req.call()
         }
         _ => {
-            let mut req = if method == "PUT" { agent.put(url) } else { agent.post(url) };
+            let mut req = match method {
+                "PUT" => agent.put(url),
+                "PATCH" => agent.patch(url),
+                _ => agent.post(url),
+            };
             for (k, v) in headers {
                 req = req.header(*k, *v);
             }

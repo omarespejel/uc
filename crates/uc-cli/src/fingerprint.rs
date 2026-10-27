@@ -219,9 +219,12 @@ pub(super) fn collect_external_path_dependency_roots(
             if canonical_dir.starts_with(canonical_workspace_root) {
                 continue;
             }
-            let dep_manifest = canonical_dir.join("Scarb.toml");
-            if dep_manifest.is_file() {
-                pending.push(dep_manifest);
+            for candidate_name in ["Scarb.toml", "uc.toml", "Uc.toml"] {
+                let dep_manifest = canonical_dir.join(candidate_name);
+                if dep_manifest.is_file() {
+                    pending.push(dep_manifest);
+                    break;
+                }
             }
             if accepted.iter().any(|root| canonical_dir.starts_with(root)) {
                 continue;
@@ -822,7 +825,12 @@ pub(super) fn compute_build_fingerprint_with_scarb_version(
     )?;
     let mut seed_manifests: Vec<PathBuf> = files
         .iter()
-        .filter(|(path, _)| path.file_name().and_then(|name| name.to_str()) == Some("Scarb.toml"))
+        .filter(|(path, _)| {
+            matches!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some("Scarb.toml" | "uc.toml" | "Uc.toml")
+            )
+        })
         .map(|(path, _)| path.clone())
         .collect();
     seed_manifests.push(canonical_manifest.clone());
@@ -958,7 +966,10 @@ pub(super) fn should_include_fingerprint_file(path: &Path) -> bool {
         return false;
     };
 
-    if matches!(name, "Scarb.toml" | "Scarb.lock" | "Uc.toml") {
+    if matches!(
+        name,
+        "Scarb.toml" | "Scarb.lock" | "uc.toml" | "Uc.toml" | "uc.lock" | "Uc.lock"
+    ) {
         return true;
     }
 

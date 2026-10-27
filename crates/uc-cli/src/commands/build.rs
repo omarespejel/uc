@@ -1629,7 +1629,11 @@ fn try_run_native_multi_member_workspace_build(
     if !has_workspace {
         return Ok(false);
     }
-    let has_root_package = manifest.get("package").and_then(TomlValue::as_table).is_some();
+    let has_root_package = manifest
+        .get("package")
+        .or_else(|| manifest.get("project"))
+        .and_then(TomlValue::as_table)
+        .is_some();
     if !common.workspace && has_root_package {
         return Ok(false);
     }
@@ -1652,6 +1656,7 @@ fn try_run_native_multi_member_workspace_build(
         };
         let Some(pkg_name) = val
             .get("package")
+            .or_else(|| val.get("project"))
             .and_then(TomlValue::as_table)
             .and_then(|p| p.get("name"))
             .and_then(TomlValue::as_str)

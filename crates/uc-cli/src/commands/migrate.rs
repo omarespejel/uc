@@ -29,10 +29,18 @@ pub(crate) fn convert_scarb_and_snfoundry_to_uc_toml(
             .get_mut("dependencies")
             .and_then(TomlValue::as_table_mut)
         {
-            ws_deps.remove("starknet");
-            ws_deps.remove("snforge_std");
-            ws_deps.remove("assert_macros");
-            ws_deps.remove("cairo_test");
+            for builtin in [
+                "starknet",
+                "snforge_std",
+                "sncast_std",
+                "assert_macros",
+                "cairo_test",
+                "cairo_execute",
+                "cairo_run",
+                "snforge_scarb_plugin",
+            ] {
+                ws_deps.remove(builtin);
+            }
         }
         root.insert("workspace".to_string(), TomlValue::Table(clean_ws));
     }
@@ -43,7 +51,14 @@ pub(crate) fn convert_scarb_and_snfoundry_to_uc_toml(
             for (k, v) in deps {
                 if matches!(
                     k.as_str(),
-                    "starknet" | "snforge_std" | "assert_macros" | "cairo_test" | "snforge_scarb_plugin"
+                    "starknet"
+                        | "snforge_std"
+                        | "sncast_std"
+                        | "assert_macros"
+                        | "cairo_test"
+                        | "cairo_execute"
+                        | "cairo_run"
+                        | "snforge_scarb_plugin"
                 ) {
                     continue;
                 }
@@ -78,12 +93,20 @@ pub(crate) fn convert_scarb_and_snfoundry_to_uc_toml(
         .and_then(TomlValue::as_table)
         .cloned()
         .unwrap_or_default();
-    if let Some(snf) = snfoundry_doc {
-        if let Some(snforge_tbl) = snf
-            .get("snforge")
-            .and_then(TomlValue::as_table)
-            .and_then(|t| t.get("default").or_else(|| t.values().next()))
-            .and_then(TomlValue::as_table)
+    for snforge_source in [
+        scarb_doc.get("tool").and_then(|t| t.get("snforge")),
+        snfoundry_doc.and_then(|s| s.get("snforge")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(snforge_tbl) = snforge_source
+            .as_table()
+            .and_then(|t| {
+                t.get("default")
+                    .and_then(TomlValue::as_table)
+                    .or_else(|| Some(t))
+            })
         {
             if let Some(runs) = snforge_tbl.get("fuzzer_runs").or_else(|| snforge_tbl.get("fuzzer-runs")) {
                 test_tbl.insert("fuzzer-runs".to_string(), runs.clone());
@@ -104,15 +127,29 @@ pub(crate) fn convert_scarb_and_snfoundry_to_uc_toml(
         .and_then(TomlValue::as_table)
         .cloned()
         .unwrap_or_default();
-    if let Some(snf) = snfoundry_doc {
-        if let Some(sncast_tbl) = snf.get("sncast").and_then(TomlValue::as_table) {
-            for (prof_name, prof_val) in sncast_tbl {
-                if let Some(prof_map) = prof_val.as_table() {
-                    let mut clean_prof = prof_map.clone();
-                    if let Some(url_val) = clean_prof.remove("url") {
-                        clean_prof.entry("rpc".to_string()).or_insert(url_val);
+    for sncast_source in [
+        scarb_doc.get("tool").and_then(|t| t.get("sncast")),
+        snfoundry_doc.and_then(|s| s.get("sncast")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(sncast_tbl) = sncast_source.as_table() {
+            if sncast_tbl.contains_key("url") || sncast_tbl.contains_key("account") {
+                let mut clean_prof = sncast_tbl.clone();
+                if let Some(url_val) = clean_prof.remove("url") {
+                    clean_prof.entry("rpc".to_string()).or_insert(url_val);
+                }
+                networks_tbl.insert("default".to_string(), TomlValue::Table(clean_prof));
+            } else {
+                for (prof_name, prof_val) in sncast_tbl {
+                    if let Some(prof_map) = prof_val.as_table() {
+                        let mut clean_prof = prof_map.clone();
+                        if let Some(url_val) = clean_prof.remove("url") {
+                            clean_prof.entry("rpc".to_string()).or_insert(url_val);
+                        }
+                        networks_tbl.insert(prof_name.clone(), TomlValue::Table(clean_prof));
                     }
-                    networks_tbl.insert(prof_name.clone(), TomlValue::Table(clean_prof));
                 }
             }
         }

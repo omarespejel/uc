@@ -464,9 +464,25 @@ pub(crate) fn extract_tar_strip_root(tar: &[u8], dest: &Path) -> Result<usize> {
                 }
                 continue;
             }
-            b'g' | b'L' | b'K' => continue,
+            b'L' => {
+                // GNU LongLink extended filename for the next entry.
+                let long_name = String::from_utf8_lossy(data)
+                    .trim_end_matches('\0')
+                    .trim_end_matches('\n')
+                    .to_string();
+                if !long_name.is_empty() {
+                    pax_path = Some(long_name);
+                }
+                continue;
+            }
+            b'g' | b'K' => continue,
             b'0' | 0 => {}
-            _ => continue, // directories, symlinks, devices
+            _ => {
+                // Consume any PAX/LongLink path attached to a non-file entry (such as a directory)
+                // so it never leaks onto the next regular file entry.
+                let _ = pax_path.take();
+                continue;
+            }
         }
         let full_name = pax_path.take().unwrap_or_else(|| {
             if prefix_raw.is_empty() {

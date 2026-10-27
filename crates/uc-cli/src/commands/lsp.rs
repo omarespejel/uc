@@ -61,11 +61,25 @@ fn path_to_file_uri(path: &Path) -> String {
 }
 
 fn file_uri_to_path(uri: &str) -> PathBuf {
-    if let Some(rest) = uri.strip_prefix("file://") {
-        PathBuf::from(rest)
-    } else {
-        PathBuf::from(uri)
+    let raw = uri.strip_prefix("file://").unwrap_or(uri);
+    let mut decoded = Vec::with_capacity(raw.len());
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                decoded.push(((h << 4) | l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[i]);
+        i += 1;
     }
+    PathBuf::from(String::from_utf8_lossy(&decoded).into_owned())
 }
 
 fn compute_starknet_keccak_hex(name: &str) -> String {
@@ -91,9 +105,20 @@ pub(crate) fn index_cairo_source_symbols(
     let mut pending_contract = false;
     let mut pending_interface = false;
     let mut pending_test = false;
+    let mut attr_bracket_depth = 0usize;
 
     for (idx, raw_line) in lines.iter().enumerate() {
         let trimmed = raw_line.trim();
+        if attr_bracket_depth > 0 {
+            for ch in trimmed.chars() {
+                if ch == '[' {
+                    attr_bracket_depth += 1;
+                } else if ch == ']' {
+                    attr_bracket_depth = attr_bracket_depth.saturating_sub(1);
+                }
+            }
+            continue;
+        }
         if let Some(doc) = trimmed.strip_prefix("///") {
             doc_buf.push(doc.trim().to_string());
             continue;
@@ -105,19 +130,21 @@ pub(crate) fn index_cairo_source_symbols(
             doc_buf.clear();
             continue;
         }
-        if trimmed.starts_with("#[starknet::contract") {
-            pending_contract = true;
-            continue;
-        }
-        if trimmed.starts_with("#[starknet::interface") {
-            pending_interface = true;
-            continue;
-        }
-        if trimmed.starts_with("#[test") {
-            pending_test = true;
-            continue;
-        }
         if trimmed.starts_with("#[") {
+            if trimmed.starts_with("#[starknet::contract") {
+                pending_contract = true;
+            } else if trimmed.starts_with("#[starknet::interface") {
+                pending_interface = true;
+            } else if trimmed.starts_with("#[test") {
+                pending_test = true;
+            }
+            for ch in trimmed.chars() {
+                if ch == '[' {
+                    attr_bracket_depth += 1;
+                } else if ch == ']' {
+                    attr_bracket_depth = attr_bracket_depth.saturating_sub(1);
+                }
+            }
             continue;
         }
 
@@ -133,6 +160,12 @@ pub(crate) fn index_cairo_source_symbols(
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
                 .collect()
         };
+        let col_after_kw = |kw: &str| -> usize {
+            raw_line
+                .find(kw)
+                .map(|pos| pos + kw.len())
+                .unwrap_or(0)
+        };
 
         let doc_comment = if doc_buf.is_empty() {
             None
@@ -143,7 +176,7 @@ pub(crate) fn index_cairo_source_symbols(
         if let Some(rest) = after_vis.strip_prefix("fn ") {
             let name = take_ident(rest);
             if !name.is_empty() {
-                let col = raw_line.find(&name).unwrap_or(0);
+                let col = col_after_kw("fn ");
                 let sig = code.trim_end_matches('{').trim().to_string();
                 let kind = if pending_test {
                     "test_function"
@@ -174,7 +207,7 @@ pub(crate) fn index_cairo_source_symbols(
         } else if let Some(rest) = after_vis.strip_prefix("mod ") {
             let name = take_ident(rest);
             if !name.is_empty() {
-                let col = raw_line.find(&name).unwrap_or(0);
+                let col = col_after_kw("mod ");
                 let kind = if pending_contract {
                     "starknet_contract"
                 } else {
@@ -199,7 +232,7 @@ pub(crate) fn index_cairo_source_symbols(
         } else if let Some(rest) = after_vis.strip_prefix("trait ") {
             let name = take_ident(rest);
             if !name.is_empty() {
-                let col = raw_line.find(&name).unwrap_or(0);
+                let col = col_after_kw("trait ");
                 let kind = if pending_interface {
                     "starknet_interface"
                 } else {
@@ -224,7 +257,7 @@ pub(crate) fn index_cairo_source_symbols(
         } else if let Some(rest) = after_vis.strip_prefix("struct ") {
             let name = take_ident(rest);
             if !name.is_empty() {
-                let col = raw_line.find(&name).unwrap_or(0);
+                let col = col_after_kw("struct ");
                 symbols.push(CairoIndexedSymbol {
                     name,
                     kind: "struct".to_string(),
@@ -243,7 +276,7 @@ pub(crate) fn index_cairo_source_symbols(
         } else if let Some(rest) = after_vis.strip_prefix("enum ") {
             let name = take_ident(rest);
             if !name.is_empty() {
-                let col = raw_line.find(&name).unwrap_or(0);
+                let col = col_after_kw("enum ");
                 symbols.push(CairoIndexedSymbol {
                     name,
                     kind: "enum".to_string(),
@@ -262,7 +295,7 @@ pub(crate) fn index_cairo_source_symbols(
         } else if let Some(rest) = after_vis.strip_prefix("const ") {
             let name = take_ident(rest);
             if !name.is_empty() {
-                let col = raw_line.find(&name).unwrap_or(0);
+                let col = col_after_kw("const ");
                 symbols.push(CairoIndexedSymbol {
                     name,
                     kind: "const".to_string(),
@@ -291,23 +324,39 @@ pub(crate) fn index_cairo_source_symbols(
 pub(crate) fn compute_cairo_lsp_diagnostics(source: &str) -> Vec<CairoLspDiagnostic> {
     let mut diags = Vec::new();
 
-    // 1. In-process Cairo parser syntax diagnostics via CairoFormatter
+    // 1. In-process Cairo parser syntax diagnostics via SimpleParserDatabase
     #[cfg(feature = "native-compile")]
     {
-        use cairo_lang_formatter::{CairoFormatter, FormatterConfig};
-        let formatter = CairoFormatter::new(FormatterConfig::default());
-        if let Err(err) = formatter.format_to_string(&source.to_string()) {
-            let err_str = err.to_string();
-            for chunk in err_str.lines() {
+        use cairo_lang_parser::utils::SimpleParserDatabase;
+        let db = SimpleParserDatabase::default();
+        if let Err(parser_diags) = db.parse_virtual(source) {
+            let formatted = parser_diags.format(&db);
+            let lines: Vec<&str> = formatted.lines().collect();
+            for (i, chunk) in lines.iter().enumerate() {
                 let trimmed = chunk.trim();
-                if trimmed.starts_with("error:") {
+                if trimmed.starts_with("error:") || trimmed.starts_with("error[") {
+                    let mut diag_line = 0usize;
+                    let mut diag_col = 0usize;
+                    if let Some(next_line) = lines.get(i + 1).map(|l| l.trim()) {
+                        if let Some(loc) = next_line.strip_prefix("-->") {
+                            let parts: Vec<&str> = loc.trim().rsplitn(3, ':').collect();
+                            if parts.len() >= 2 {
+                                if let Ok(c) = parts[0].trim().parse::<usize>() {
+                                    diag_col = c.saturating_sub(1);
+                                }
+                                if let Ok(l) = parts[1].trim().parse::<usize>() {
+                                    diag_line = l.saturating_sub(1);
+                                }
+                            }
+                        }
+                    }
                     diags.push(CairoLspDiagnostic {
                         code: "CAIRO-SYNTAX".to_string(),
                         severity: 1, // Error
                         message: trimmed.to_string(),
-                        line: 0,
-                        character: 0,
-                        end_character: 80,
+                        line: diag_line,
+                        character: diag_col,
+                        end_character: diag_col + 1,
                     });
                 }
             }
@@ -886,18 +935,17 @@ pub(crate) fn serve_lsp_stream<R: BufRead, W: Write>(
                 if let Some(doc_text) = state.open_documents.get(uri) {
                     #[cfg(feature = "native-compile")]
                     {
-                        use cairo_lang_formatter::{CairoFormatter, FormatOutcome, FormatterConfig};
-                        let formatter = CairoFormatter::new(FormatterConfig::default());
-                        if let Ok(FormatOutcome::DiffFound(diff)) =
-                            formatter.format_to_string(doc_text)
-                        {
+                        use cairo_lang_parser::utils::SimpleParserDatabase;
+                        let db = SimpleParserDatabase::default();
+                        let formatted = cairo_lang_formatter::format_string(&db, doc_text.clone());
+                        if &formatted != doc_text {
                             let line_count = doc_text.lines().count() + 1;
                             edits.push(serde_json::json!({
                                 "range": {
                                     "start": { "line": 0, "character": 0 },
                                     "end": { "line": line_count, "character": 0 }
                                 },
-                                "newText": diff.formatted
+                                "newText": formatted
                             }));
                         }
                     }
@@ -1220,5 +1268,37 @@ pub mod Vault {
         assert_eq!(lens_resp["result"].as_array().unwrap().len(), 2);
 
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn lsp_uri_percent_decoding_multiline_test_attrs_and_in_memory_syntax_diagnostics() {
+        let decoded = file_uri_to_path("file:///tmp/my%20cairo%20project/src/lib.cairo");
+        assert_eq!(decoded, PathBuf::from("/tmp/my cairo project/src/lib.cairo"));
+
+        let src = r#"#[test]
+#[should_panic(
+    expected: ('bad',)
+)]
+fn f() {
+    assert(1 == 2, 'bad');
+}
+"#;
+        let syms = index_cairo_source_symbols("file:///tmp/lib.cairo", "src/lib.cairo", src);
+        assert_eq!(syms.len(), 1);
+        assert_eq!(syms[0].name, "f");
+        assert_eq!(
+            syms[0].kind, "test_function",
+            "multi-line #[should_panic(...)] must not clear pending_test"
+        );
+        assert_eq!(
+            syms[0].character, 3,
+            "fn f() column must point to identifier `f`, not `fn`"
+        );
+
+        let broken_diags = compute_cairo_lsp_diagnostics("pub fn broken( { }");
+        assert!(
+            broken_diags.iter().any(|d| d.code == "CAIRO-SYNTAX"),
+            "in-memory SimpleParserDatabase must report syntax errors: {broken_diags:?}"
+        );
     }
 }

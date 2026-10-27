@@ -295,7 +295,12 @@ pub(crate) fn audit_deployed_class(
 }
 
 fn default_state_path(address: &str) -> PathBuf {
-    PathBuf::from(".uc").join("watch").join(format!("{}.json", address.trim_start_matches("0x")))
+    let norm = parse_felt_str(address)
+        .map(|f| format_felt_hex(&f))
+        .unwrap_or_else(|_| address.to_string());
+    PathBuf::from(".uc")
+        .join("watch")
+        .join(format!("{}.json", norm.trim_start_matches("0x")))
 }
 
 pub(crate) fn load_watch_state(path: &Path) -> WatchState {
@@ -418,8 +423,11 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
                 "starknet_getClassHashAt",
                 serde_json::json!({ "block_id": "latest", "contract_address": args.address }),
             )
-            .ok()
-            .and_then(|v| v.as_str().map(|s| format_felt_hex(&parse_felt_str(s).unwrap_or_default())));
+                .ok()
+                .and_then(|v| {
+                    v.as_str()
+                        .and_then(|s| parse_felt_str(s).ok().map(|f| format_felt_hex(&f)))
+                });
             let block_number = starknet_rpc_request(&rpc, "starknet_blockNumber", serde_json::json!([]))
                 .ok()
                 .and_then(|v| v.as_u64());

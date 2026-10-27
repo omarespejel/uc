@@ -16621,3 +16621,62 @@ fn native_build_targets_follow_the_manifest_like_scarb() {
     assert_eq!(resolve_manifest_native_build_targets(&parse(&format!("{pkg}[executable]\n"))).unwrap(), (None, false));
     assert!(resolve_manifest_native_build_targets(&parse(&format!("{pkg}[lib]\ncasm = \"yes\"\n"))).is_err());
 }
+
+#[test]
+fn uc_toml_and_uc_lock_parity_across_lockfile_summary_cleanup_and_account_contracts() {
+    let root = unique_test_dir("uc-toml-lock-parity");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("target/dev")).unwrap();
+    let manifest_path = root.join("uc.toml");
+    let lock_path = root.join("uc.lock");
+    fs::write(
+        &manifest_path,
+        r#"[project]
+name = "acct_pkg"
+
+[workspace.project]
+edition = "2024_07"
+"#,
+    )
+    .unwrap();
+    fs::write(&lock_path, "version = 1\n[[package]]\nname = \"acct_pkg\"\nversion = \"0.1.0\"\n")
+        .unwrap();
+    fs::write(
+        root.join("src/lib.cairo"),
+        "#[starknet::contract(account)]\npub mod MyAccount {}\n",
+    )
+    .unwrap();
+
+    assert_eq!(lockfile_in_dir(&root), lock_path);
+    let mut diags = Vec::new();
+    let summary = project_lockfile_summary(&root, &mut diags).unwrap();
+    assert!(summary.present);
+    assert!(summary.valid);
+    assert_eq!(summary.packages.len(), 1);
+    assert_eq!(summary.packages[0].name, "acct_pkg");
+
+    let (_, _, lock_hash_1) = daemon_lock_state(&manifest_path).unwrap();
+    assert!(lock_hash_1.starts_with("lock-blake3:"));
+
+    let parsed = parse_manifest_toml(
+        &fs::read_to_string(&manifest_path).unwrap(),
+        &manifest_path,
+        "test",
+    )
+    .unwrap();
+    assert!(
+        parsed.get("target").is_some(),
+        "#[starknet::contract(account)] in src/ must auto-infer [[target.starknet-contract]]"
+    );
+    assert!(
+        parsed
+            .get("workspace")
+            .and_then(|w| w.get("package"))
+            .is_some(),
+        "[workspace.project] must normalize to [workspace.package]"
+    );
+
+    remove_build_outputs(&root).expect("remove_build_outputs must accept uc.toml + uc.lock");
+    assert!(!root.join("target").exists());
+    let _ = fs::remove_dir_all(&root);
+}

@@ -5851,7 +5851,7 @@ fn project_lockfile_summary(
     workspace_root: &Path,
     diagnostics: &mut Vec<NativeDiagnostic>,
 ) -> Result<ProjectLockfileSummary> {
-    let lock_path = workspace_root.join("Scarb.lock");
+    let lock_path = lockfile_in_dir(workspace_root);
     let metadata = match fs::metadata(&lock_path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -8083,7 +8083,7 @@ fn write_failure_bundle(path: &Path, args: &BuildArgs, error: &str) -> Result<()
             .map(|hash| format!("blake3:{hash}"))
     });
     let lockfile_hash = workspace_root.as_ref().and_then(|root| {
-        let lockfile = root.join("Scarb.lock");
+        let lockfile = lockfile_in_dir(root);
         if lockfile.is_file() {
             hash_file_blake3(&lockfile)
                 .ok()
@@ -8974,7 +8974,7 @@ fn resolve_native_toolchain_requirement(
             == Some(true)
     {
         if let Ok(ws_root) = metadata_cache_workspace_root(manifest_path) {
-            let ws_manifest_path = ws_root.join("Scarb.toml");
+            let ws_manifest_path = manifest_file_in_dir(&ws_root);
             if ws_manifest_path != manifest_path && ws_manifest_path.is_file() {
                 if let Ok(ws_text) =
                     read_text_file_with_limit(&ws_manifest_path, MAX_MANIFEST_BYTES, "workspace manifest")
@@ -21721,15 +21721,17 @@ fn remove_build_outputs(workspace_root: &Path) -> Result<()> {
             canonical_root.display()
         );
     }
-    if !canonical_root.join("Scarb.toml").is_file() {
+    if !canonical_root.join("Scarb.toml").is_file() && !canonical_root.join("uc.toml").is_file() {
         bail!(
-            "workspace root {} has no Scarb.toml marker; refusing cleanup",
+            "workspace root {} has no Scarb.toml or uc.toml marker; refusing cleanup",
             canonical_root.display()
         );
     }
     if !canonical_root.join("Scarb.lock").exists()
+        && !canonical_root.join("uc.lock").exists()
         && !canonical_root.join("src").is_dir()
         && !canonical_root.join("crates").is_dir()
+        && !canonical_root.join("packages").is_dir()
     {
         bail!(
             "workspace root {} is missing expected project markers; refusing cleanup",
@@ -21945,6 +21947,21 @@ fn resolve_manifest_path(manifest_path: &Option<PathBuf>) -> Result<PathBuf> {
     }
 
     Ok(resolved)
+}
+
+pub(crate) fn lockfile_in_dir(dir: &Path) -> PathBuf {
+    let uc_lock = dir.join("uc.lock");
+    let scarb_lock = dir.join("Scarb.lock");
+    if uc_lock.is_file() {
+        return uc_lock;
+    }
+    if scarb_lock.is_file() {
+        return scarb_lock;
+    }
+    if dir.join("uc.toml").is_file() && !dir.join("Scarb.toml").is_file() {
+        return uc_lock;
+    }
+    scarb_lock
 }
 
 #[cfg(test)]
@@ -22402,7 +22419,7 @@ fn metadata_workspace_manifests_hash(workspace_root: &Path) -> Result<String> {
         if !entry.file_type().is_file() {
             continue;
         }
-        if entry.file_name() == "Scarb.toml" {
+        if entry.file_name() == "Scarb.toml" || entry.file_name() == "uc.toml" {
             manifests.push(entry.into_path());
         }
     }
@@ -22493,10 +22510,11 @@ fn daemon_build_plan_cache_key(
 }
 
 fn daemon_lock_state(manifest_path: &Path) -> Result<(Option<u64>, Option<u64>, String)> {
-    let lock_path = manifest_path
-        .parent()
-        .context("manifest path has no parent")?
-        .join("Scarb.lock");
+    let lock_path = lockfile_in_dir(
+        manifest_path
+            .parent()
+            .context("manifest path has no parent")?,
+    );
     let metadata = match fs::metadata(&lock_path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -22565,10 +22583,11 @@ fn daemon_lock_state(manifest_path: &Path) -> Result<(Option<u64>, Option<u64>, 
 }
 
 fn daemon_lock_metadata_state(manifest_path: &Path) -> Result<(Option<u64>, Option<u64>, String)> {
-    let lock_path = manifest_path
-        .parent()
-        .context("manifest path has no parent")?
-        .join("Scarb.lock");
+    let lock_path = lockfile_in_dir(
+        manifest_path
+            .parent()
+            .context("manifest path has no parent")?,
+    );
     let metadata = match fs::metadata(&lock_path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -23064,6 +23083,7 @@ fn resolve_manifest_cairo_settings_from_manifest(
 ) -> (Option<String>, Option<String>) {
     let edition_from_manifest = manifest
         .get("package")
+        .or_else(|| manifest.get("project"))
         .and_then(TomlValue::as_table)
         .and_then(|tbl| tbl.get("edition"))
         .and_then(TomlValue::as_str)
@@ -23071,7 +23091,7 @@ fn resolve_manifest_cairo_settings_from_manifest(
             manifest
                 .get("workspace")
                 .and_then(TomlValue::as_table)
-                .and_then(|ws| ws.get("package"))
+                .and_then(|ws| ws.get("package").or_else(|| ws.get("project")))
                 .and_then(TomlValue::as_table)
                 .and_then(|tbl| tbl.get("edition"))
                 .and_then(TomlValue::as_str)
@@ -23206,7 +23226,7 @@ fn dir_contains_starknet_contract(src_dir: &Path, depth: usize) -> bool {
             }
         } else if p.extension().and_then(|s| s.to_str()) == Some("cairo") {
             if let Ok(text) = fs::read_to_string(&p) {
-                if text.contains("#[starknet::contract]") {
+                if text.contains("#[starknet::contract") {
                     return true;
                 }
             }
@@ -23231,6 +23251,14 @@ fn normalize_uc_manifest_toml(doc: &mut TomlValue, manifest_path: &Path) {
     if has_project && !root.contains_key("package") {
         if let Some(proj) = root.get("project").cloned() {
             root.insert("package".to_string(), proj);
+        }
+    }
+    if let Some(ws) = root.get_mut("workspace").and_then(TomlValue::as_table_mut) {
+        if ws.get("project").and_then(TomlValue::as_table).is_some() && !ws.contains_key("package")
+        {
+            if let Some(ws_proj) = ws.get("project").cloned() {
+                ws.insert("package".to_string(), ws_proj);
+            }
         }
     }
     if !(is_uc_toml || has_project) {
@@ -23639,7 +23667,7 @@ fn workspace_root() -> Result<PathBuf> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     for candidate in cwd.ancestors() {
         let root = candidate.to_path_buf();
-        if root.join("Scarb.toml").is_file() {
+        if root.join("Scarb.toml").is_file() || root.join("uc.toml").is_file() {
             return Ok(root);
         }
     }

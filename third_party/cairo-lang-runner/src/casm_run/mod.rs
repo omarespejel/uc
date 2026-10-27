@@ -2550,22 +2550,90 @@ impl CairoHintProcessor<'_> {
                     self.starknet_state.block_hash.remove(&block_num);
                 }
             }
-            "cheat_paymaster_data"
-            | "uncheat_paymaster_data"
-            | "cheat_paymaster_glob"
-            | "uncheat_paymaster_glob"
-            | "cheat_acct_deploy_data"
-            | "uncheat_acct_deploy_data"
-            | "cheat_acct_deploy_glob"
-            | "uncheat_acct_deploy_glob"
-            | "cheat_nonce_da_mode"
-            | "uncheat_nonce_da_mode"
-            | "cheat_nonce_da_glob"
-            | "uncheat_nonce_da_glob"
-            | "cheat_fee_da_mode"
-            | "uncheat_fee_da_mode"
-            | "cheat_fee_da_glob"
-            | "uncheat_fee_da_glob" => {}
+            "get_contract_address" => {
+                res_segment.write(self.starknet_state.exec_info.contract_address)?;
+            }
+            "replace_bytecode" => {
+                if inputs.len() >= 2 {
+                    self.starknet_state
+                        .deployed_contracts
+                        .insert(inputs[0], inputs[1]);
+                }
+            }
+            "cheat_paymaster_data" => {
+                let data = inputs.get(2..).unwrap_or(&[]).to_vec();
+                self.starknet_state.exec_info.tx_info.paymaster_data = data;
+            }
+            "uncheat_paymaster_data" | "uncheat_paymaster_glob" => {
+                self.starknet_state.exec_info.tx_info.paymaster_data.clear();
+            }
+            "cheat_paymaster_glob" => {
+                self.starknet_state.exec_info.tx_info.paymaster_data = inputs.clone();
+            }
+            "cheat_acct_deploy_data" => {
+                let data = inputs.get(2..).unwrap_or(&[]).to_vec();
+                self.starknet_state
+                    .exec_info
+                    .tx_info
+                    .account_deployment_data = data;
+            }
+            "uncheat_acct_deploy_data" | "uncheat_acct_deploy_glob" => {
+                self.starknet_state
+                    .exec_info
+                    .tx_info
+                    .account_deployment_data
+                    .clear();
+            }
+            "cheat_acct_deploy_glob" => {
+                self.starknet_state
+                    .exec_info
+                    .tx_info
+                    .account_deployment_data = inputs.clone();
+            }
+            "cheat_nonce_da_mode" => {
+                if let Some(&mode) = inputs.get(1) {
+                    self.starknet_state
+                        .exec_info
+                        .tx_info
+                        .nonce_data_availability_mode = mode;
+                }
+            }
+            "uncheat_nonce_da_mode" | "uncheat_nonce_da_glob" => {
+                self.starknet_state
+                    .exec_info
+                    .tx_info
+                    .nonce_data_availability_mode = Felt252::zero();
+            }
+            "cheat_nonce_da_glob" => {
+                if let Some(&mode) = inputs.first() {
+                    self.starknet_state
+                        .exec_info
+                        .tx_info
+                        .nonce_data_availability_mode = mode;
+                }
+            }
+            "cheat_fee_da_mode" => {
+                if let Some(&mode) = inputs.get(1) {
+                    self.starknet_state
+                        .exec_info
+                        .tx_info
+                        .fee_data_availability_mode = mode;
+                }
+            }
+            "uncheat_fee_da_mode" | "uncheat_fee_da_glob" => {
+                self.starknet_state
+                    .exec_info
+                    .tx_info
+                    .fee_data_availability_mode = Felt252::zero();
+            }
+            "cheat_fee_da_glob" => {
+                if let Some(&mode) = inputs.first() {
+                    self.starknet_state
+                        .exec_info
+                        .tx_info
+                        .fee_data_availability_mode = mode;
+                }
+            }
             _ => Err(HintError::CustomHint(Box::from(format!(
                 "Unknown cheatcode selector: {selector}"
             ))))?,
