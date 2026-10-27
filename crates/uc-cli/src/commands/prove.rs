@@ -6228,6 +6228,14 @@ fn prove_single_package(
 }
 
 pub(crate) fn run_prove(mut args: ProveArgs) -> Result<()> {
+    if args.sierra_file.is_none() {
+        if let Some(ref f) = args.filter {
+            if f.ends_with(".json") && Path::new(f).is_file() {
+                args.sierra_file = Some(PathBuf::from(f));
+                args.filter = None;
+            }
+        }
+    }
     if args.manifest_path.is_none() {
         if let Some(ref f) = args.filter {
             if f.ends_with(".cairo") && Path::new(f).is_file() {

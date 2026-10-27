@@ -120,7 +120,7 @@ use commands::{
     ListVersionsArgs, LspArgs, ManifestPathArgs, MulticallArgs, NewArgs, OptimizeInliningArgs,
     PackageCmdArgs, ProcMacroServerArgs, ProfileArgs, ProveArgs, PublishArgs, RemoveArgs,
     RunScriptArgs, ScriptCmdArgs, SelectorArgs, ShowConfigArgs, TestArgs, TraceTxArgs, TreeArgs,
-    TxStatusArgs, UpdateArgs, UtilsArgs, VerifyOnchainArgs, WatchArgs, DoctorArgs, run_abi, run_account, run_add,
+    TxStatusArgs, UpdateArgs, UtilsArgs, VerifyOnchainArgs, WatchArgs, DoctorArgs, LedgerArgs, run_abi, run_account, run_add,
     run_audit, run_balance, run_build, run_call, run_check, run_check_requirements, run_class_hash,
     run_clean, run_clean_cache, run_commands_list, run_compare_build, run_completions, run_declare,
     run_declare_from, run_decompile, run_deploy, run_devnet, run_diff, run_doc, run_execute,
@@ -128,7 +128,7 @@ use commands::{
     run_manifest_path, run_metadata, run_migrate, run_multicall, run_new, run_optimize_inlining,
     run_package, run_proc_macro_server, run_profile, run_prove, run_publish, run_remove,
     run_script, run_script_cmd, run_selector, run_show_config, run_test, run_trace_tx, run_tree,
-    run_tx_status, run_update, run_utils, run_verify_onchain, run_watch, run_doctor,
+    run_tx_status, run_update, run_utils, run_verify_onchain, run_watch, run_doctor, run_ledger,
 };
 #[allow(unused_imports)]
 use daemon::*;
@@ -442,6 +442,8 @@ enum Commands {
     Script(ScriptCmdArgs),
     /// Starknet utility commands (`serialize`, `class-hash`, `contract-address`, `selector`)
     Utils(UtilsArgs),
+    /// Interact with a Ledger hardware wallet (`get-public-key`, `sign-hash`, `app-version`) (`sncast ledger`)
+    Ledger(LedgerArgs),
     /// Start a local Starknet Devnet node (`0xSpaceShard/starknet-devnet-rs` compatible + native in-process RPC)
     #[command(visible_alias = "node", alias = "starknet-devnet")]
     Devnet(DevnetArgs),
@@ -3095,6 +3097,7 @@ fn main() -> Result<()> {
         Commands::ShowConfig(args) => run_show_config(args),
         Commands::Script(args) => run_script_cmd(args),
         Commands::Utils(args) => run_utils(args),
+        Commands::Ledger(args) => run_ledger(args),
         Commands::Devnet(args) => run_devnet(args),
         Commands::Audit(args) => run_audit(args),
         Commands::Watch(args) => run_watch(args),
@@ -16465,9 +16468,19 @@ fn compile_native_casm_contract_with_hints(
     max_casm_bytecode_size: usize,
 ) -> Result<CasmContractClass> {
     #[cfg(not(feature = "helper-cairo-214"))]
-    let extracted_program = contract_class
+    let mut extracted_program = contract_class
         .extract_sierra_program(false)
         .context("failed to extract native Sierra program for CASM emission")?;
+    #[cfg(not(feature = "helper-cairo-214"))]
+    {
+        let current_sierra_version =
+            cairo_lang_starknet_classes::compiler_version::current_sierra_version_id();
+        if extracted_program.sierra_version.major == current_sierra_version.major
+            && extracted_program.sierra_version.minor > current_sierra_version.minor
+        {
+            extracted_program.sierra_version = current_sierra_version;
+        }
+    }
     #[cfg(not(feature = "helper-cairo-214"))]
     let casm = CasmContractClass::from_contract_class(
         contract_class,

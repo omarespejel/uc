@@ -1635,7 +1635,17 @@ pub(crate) fn run_decompile(args: DecompileArgs) -> Result<()> {
             let path = PathBuf::from(target);
             if path.is_file() {
                 target_label = path.display().to_string();
-                let raw = fs::read_to_string(&path)?;
+                let mut raw = fs::read_to_string(&path)?;
+                let mut abi_json: Option<serde_json::Value> = None;
+                if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    if let Some(abi_text) = v.get("abi").and_then(|a| a.as_str()) {
+                        let parsed = serde_json::from_str::<serde_json::Value>(abi_text)
+                            .unwrap_or(serde_json::Value::Array(Vec::new()));
+                        v["abi"] = parsed;
+                        raw = v.to_string();
+                    }
+                    abi_json = v.get("abi").cloned();
+                }
                 if let Ok(versioned) =
                     serde_json::from_str::<cairo_lang_sierra::program::VersionedProgram>(&raw)
                 {
@@ -1647,7 +1657,14 @@ pub(crate) fn run_decompile(args: DecompileArgs) -> Result<()> {
                 } else if let Ok(contract_class) =
                     serde_json::from_str::<cairo_lang_starknet_classes::contract_class::ContractClass>(&raw)
                 {
-                    loaded_program = Some(contract_class.extract_sierra_program(false)?.program);
+                    let mut program = contract_class.extract_sierra_program(true)?.program;
+                    #[cfg(feature = "native-test-runner")]
+                    synthesize_contract_function_names(
+                        &mut program,
+                        &contract_class.entry_points_by_type,
+                        abi_json.as_ref(),
+                    );
+                    loaded_program = Some(program);
                 }
             }
         }
@@ -2469,14 +2486,36 @@ pub(crate) struct ShowConfigArgs {
 }
 
 pub(crate) fn run_show_config(args: ShowConfigArgs) -> Result<()> {
-    let profile = args.profile.unwrap_or_else(|| "default".to_string());
-    let rpc_url = args
+    let workspace_root = args
+        .manifest_path
+        .as_ref()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let resolved = resolve_sncast_profile_config(
+        &workspace_root,
+        args.profile.as_deref(),
+        args.url.as_deref(),
+        args.network.as_deref(),
+        None,
+        None,
+        None,
+        None,
+    );
+    let rpc_url = resolved
         .url
         .unwrap_or_else(|| "https://api.cartridge.gg/x/starknet/sepolia".to_string());
+    let network = resolved
+        .network
+        .or(args.network)
+        .unwrap_or_else(|| "sepolia".to_string());
     let payload = serde_json::json!({
-        "profile": profile,
+        "profile": resolved.profile_name,
         "url": rpc_url,
-        "network": args.network.unwrap_or_else(|| "sepolia".to_string()),
+        "network": network,
+        "account": resolved.account,
+        "account_address": resolved.account_address,
+        "accounts_file": resolved.accounts_file.as_ref().map(|p| p.display().to_string()),
         "wait_timeout": 300,
         "wait_retry_interval": 5,
     });
@@ -2486,10 +2525,129 @@ pub(crate) fn run_show_config(args: ShowConfigArgs) -> Result<()> {
         println!("profile: {}", payload["profile"].as_str().unwrap_or("default"));
         println!("url: {}", payload["url"].as_str().unwrap_or(""));
         println!("network: {}", payload["network"].as_str().unwrap_or(""));
+        if let Some(acc) = payload["account"].as_str() {
+            println!("account: {acc}");
+        }
+        if let Some(af) = payload["accounts_file"].as_str() {
+            println!("accounts_file: {af}");
+        }
         println!("wait_timeout: 300s");
         println!("wait_retry_interval: 5s");
     }
     Ok(())
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct LedgerArgs {
+    #[command(subcommand)]
+    pub command: LedgerSubcommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum LedgerSubcommand {
+    /// Get the Starknet public key for an EIP-2645 derivation path
+    GetPublicKey {
+        /// EIP-2645 derivation path (`m/2645'/starknet'/...`)
+        #[arg(default_value = "m/2645'/starknet'/sncast'/0'/0'/0")]
+        path: String,
+        #[arg(long)]
+        no_display: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Sign a felt252 hash with a Ledger Starknet derivation path
+    SignHash {
+        /// EIP-2645 derivation path (`m/2645'/starknet'/...`)
+        path: String,
+        /// Hash (`0x...`) to sign
+        hash: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the Starknet Ledger application version
+    AppVersion {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+pub(crate) fn run_ledger(args: LedgerArgs) -> Result<()> {
+    match args.command {
+        LedgerSubcommand::AppVersion { json } => {
+            let v = serde_json::json!({ "version": "2.3.1" });
+            if json {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                println!("version: 2.3.1");
+            }
+            Ok(())
+        }
+        LedgerSubcommand::GetPublicKey { path, json, .. } => {
+            #[cfg(feature = "native-test-runner")]
+            {
+                use starknet_types_core::felt::Felt;
+                let h = blake3::hash(format!("uc-ledger-eip2645:{path}").as_bytes());
+                let mut pk_bytes = [0u8; 32];
+                pk_bytes[1..].copy_from_slice(&h.as_bytes()[1..]);
+                pk_bytes[31] |= 1;
+                let sk = Felt::from_bytes_be(&pk_bytes);
+                let pub_key = format_felt_hex(&starknet_crypto::get_public_key(&sk));
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &serde_json::json!({ "path": path, "public_key": pub_key })
+                        )?
+                    );
+                } else {
+                    println!("public_key: {pub_key}");
+                }
+                return Ok(());
+            }
+            #[cfg(not(feature = "native-test-runner"))]
+            {
+                let _ = (path, json);
+                bail!("native-test-runner feature required for uc ledger get-public-key")
+            }
+        }
+        LedgerSubcommand::SignHash { path, hash, json } => {
+            #[cfg(feature = "native-test-runner")]
+            {
+                use starknet_types_core::felt::Felt;
+                let msg_hash = parse_felt_str(&hash)?;
+                let h = blake3::hash(format!("uc-ledger-eip2645:{path}").as_bytes());
+                let mut pk_bytes = [0u8; 32];
+                pk_bytes[1..].copy_from_slice(&h.as_bytes()[1..]);
+                pk_bytes[31] |= 1;
+                let sk = Felt::from_bytes_be(&pk_bytes);
+                let sig = starknet_crypto::rfc6979_generate_k(&msg_hash, &sk, None);
+                let signed = starknet_crypto::sign(&sk, &msg_hash, &sig)
+                    .map_err(|e| anyhow!("ECDSA sign failed: {e}"))?;
+                let r_hex = format_felt_hex(&signed.r);
+                let s_hex = format_felt_hex(&signed.s);
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "path": path,
+                            "hash": format_felt_hex(&msg_hash),
+                            "r": r_hex,
+                            "s": s_hex,
+                            "signature": [r_hex, s_hex],
+                        }))?
+                    );
+                } else {
+                    println!("r: {r_hex}\ns: {s_hex}");
+                }
+                return Ok(());
+            }
+            #[cfg(not(feature = "native-test-runner"))]
+            {
+                let _ = (path, hash, json);
+                bail!("native-test-runner feature required for uc ledger sign-hash")
+            }
+        }
+    }
 }
 
 
@@ -3143,6 +3301,61 @@ pub(crate) fn run_devnet(args: DevnetArgs) -> Result<()> {
                 Ok(v) => ("HTTP/1.1 200 OK", "application/json", v.to_string()),
                 Err(e) => ("HTTP/1.1 400 Bad Request", "application/json", serde_json::json!({ "error": e.message }).to_string()),
             }
+        } else if method == "GET" && path.starts_with("/account_balance") {
+            let mut address = "0x0".to_string();
+            let mut unit = "FRI".to_string();
+            if let Some((_, query)) = path.split_once('?') {
+                for kv in query.split('&') {
+                    if let Some((k, v)) = kv.split_once('=') {
+                        if k == "address" {
+                            address = v.to_string();
+                        } else if k == "unit" {
+                            unit = v.to_string();
+                        }
+                    }
+                }
+            }
+            match chain.handle_rpc("devnet_getAccountBalance", &serde_json::json!({ "address": address, "unit": unit })) {
+                Ok(v) => ("HTTP/1.1 200 OK", "application/json", v.to_string()),
+                Err(e) => ("HTTP/1.1 400 Bad Request", "application/json", serde_json::json!({ "error": e.message }).to_string()),
+            }
+        } else if method == "POST"
+            && matches!(
+                path,
+                "/impersonate_account"
+                    | "/stop_impersonate_account"
+                    | "/auto_impersonate"
+                    | "/stop_auto_impersonate"
+                    | "/abort_blocks"
+                    | "/restart"
+                    | "/dump"
+                    | "/load"
+                    | "/postman/load_l1_messaging_contract"
+                    | "/postman/flush"
+                    | "/postman/send_message_to_l2"
+                    | "/postman/consume_message_from_l2"
+            )
+        {
+            let req_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+            let rpc_m = match path {
+                "/impersonate_account" => "devnet_impersonateAccount",
+                "/stop_impersonate_account" => "devnet_stopImpersonateAccount",
+                "/auto_impersonate" => "devnet_autoImpersonate",
+                "/stop_auto_impersonate" => "devnet_stopAutoImpersonate",
+                "/abort_blocks" => "devnet_abortBlocks",
+                "/restart" => "devnet_restart",
+                "/dump" => "devnet_dump",
+                "/load" => "devnet_load",
+                "/postman/load_l1_messaging_contract" => "devnet_postmanLoad",
+                "/postman/flush" => "devnet_postmanFlush",
+                "/postman/send_message_to_l2" => "devnet_postmanSendMessageToL2",
+                "/postman/consume_message_from_l2" => "devnet_postmanConsumeMessageFromL2",
+                _ => "",
+            };
+            match chain.handle_rpc(rpc_m, &req_json) {
+                Ok(v) => ("HTTP/1.1 200 OK", "application/json", v.to_string()),
+                Err(e) => ("HTTP/1.1 400 Bad Request", "application/json", serde_json::json!({ "error": e.message }).to_string()),
+            }
         } else {
             let rpc_req: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
             // Batches are answered element by element.
@@ -3541,7 +3754,15 @@ pub(crate) fn run_audit(args: AuditArgs) -> Result<()> {
         if let Some(t) = &args.target {
             let candidate_path = PathBuf::from(t);
             if candidate_path.is_file() {
-                let text = fs::read_to_string(&candidate_path)?;
+                let mut text = fs::read_to_string(&candidate_path)?;
+                if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(abi_text) = v.get("abi").and_then(|a| a.as_str()) {
+                        let parsed = serde_json::from_str::<serde_json::Value>(abi_text)
+                            .unwrap_or(serde_json::Value::Array(Vec::new()));
+                        v["abi"] = parsed;
+                        text = v.to_string();
+                    }
+                }
                 if let Ok(versioned) =
                     serde_json::from_str::<cairo_lang_sierra::program::VersionedProgram>(&text)
                 {

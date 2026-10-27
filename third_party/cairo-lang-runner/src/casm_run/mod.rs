@@ -2471,6 +2471,101 @@ impl CairoHintProcessor<'_> {
                 insert_value_to_cellref!(vm, output_end, res_segment_end)?;
                 return Ok(());
             }
+            "var" => {
+                let name = decode_cairo_byte_array(&inputs);
+                let raw = std::env::var(&name).unwrap_or_default();
+                let felts = parse_text_tokens_to_felts(&raw);
+                res_segment.write_data(felts.iter())?;
+            }
+            "read_txt" => {
+                let rel_path = decode_cairo_byte_array(&inputs);
+                let content = std::fs::read_to_string(&rel_path).map_err(|e| {
+                    HintError::CustomHint(Box::from(format!(
+                        "Failed to read_txt `{rel_path}`: {e}"
+                    )))
+                })?;
+                let felts = parse_text_tokens_to_felts(&content);
+                res_segment.write_data(felts.iter())?;
+            }
+            "read_json" => {
+                let rel_path = decode_cairo_byte_array(&inputs);
+                let content = std::fs::read_to_string(&rel_path).map_err(|e| {
+                    HintError::CustomHint(Box::from(format!(
+                        "Failed to read_json `{rel_path}`: {e}"
+                    )))
+                })?;
+                let felts = parse_json_text_to_felts(&content);
+                res_segment.write_data(felts.iter())?;
+            }
+            "get_call_trace" => {
+                // Serializes the call trace tree recorded during test execution.
+                let root_trace = if let Some(last) = self.starknet_state.recorded_calls.last() {
+                    let mut root = last.clone();
+                    if root.calls.is_empty() && !self.starknet_state.recorded_calls.is_empty() {
+                        root.calls = self.starknet_state.recorded_calls.clone();
+                    }
+                    root
+                } else {
+                    RecordedCall {
+                        contract_address: self.starknet_state.exec_info.contract_address,
+                        caller_address: self.starknet_state.exec_info.caller_address,
+                        class_hash: Felt252::zero(),
+                        entry_point_selector: Felt252::zero(),
+                        entry_point_type: "EXTERNAL",
+                        call_type: "CALL",
+                        calldata: Vec::new(),
+                        result: Vec::new(),
+                        events: Vec::new(),
+                        messages: Vec::new(),
+                        calls: Vec::new(),
+                        l2_gas: 0,
+                    }
+                };
+                let mut felts = Vec::new();
+                serialize_recorded_call_trace(&root_trace, &mut felts);
+                res_segment.write_data(felts.iter())?;
+            }
+            "cheat_block_hash" => {
+                // inputs: [target, block_number, block_hash, span]
+                if inputs.len() >= 3 {
+                    let block_num = inputs[1].to_u64().unwrap_or(0);
+                    self.starknet_state.block_hash.insert(block_num, inputs[2]);
+                }
+            }
+            "uncheat_block_hash" => {
+                if inputs.len() >= 2 {
+                    let block_num = inputs[1].to_u64().unwrap_or(0);
+                    self.starknet_state.block_hash.remove(&block_num);
+                }
+            }
+            "cheat_block_hash_glob" => {
+                if inputs.len() >= 2 {
+                    let block_num = inputs[0].to_u64().unwrap_or(0);
+                    self.starknet_state.block_hash.insert(block_num, inputs[1]);
+                }
+            }
+            "uncheat_block_hash_glob" => {
+                if !inputs.is_empty() {
+                    let block_num = inputs[0].to_u64().unwrap_or(0);
+                    self.starknet_state.block_hash.remove(&block_num);
+                }
+            }
+            "cheat_paymaster_data"
+            | "uncheat_paymaster_data"
+            | "cheat_paymaster_glob"
+            | "uncheat_paymaster_glob"
+            | "cheat_acct_deploy_data"
+            | "uncheat_acct_deploy_data"
+            | "cheat_acct_deploy_glob"
+            | "uncheat_acct_deploy_glob"
+            | "cheat_nonce_da_mode"
+            | "uncheat_nonce_da_mode"
+            | "cheat_nonce_da_glob"
+            | "uncheat_nonce_da_glob"
+            | "cheat_fee_da_mode"
+            | "uncheat_fee_da_mode"
+            | "cheat_fee_da_glob"
+            | "uncheat_fee_da_glob" => {}
             _ => Err(HintError::CustomHint(Box::from(format!(
                 "Unknown cheatcode selector: {selector}"
             ))))?,
@@ -3752,4 +3847,251 @@ where
     *values = cloned_values_iter;
 
     Some(format!("{full_words_string}{pending_word_string}"))
+}
+
+fn decode_cairo_byte_array(inputs: &[Felt252]) -> String {
+    let mut iter = inputs.iter().cloned();
+    if let Some(s) = try_format_string(&mut iter) {
+        return s;
+    }
+    if inputs.len() >= 2 {
+        let mut iter2 = inputs[1..].iter().cloned();
+        if let Some(s) = try_format_string(&mut iter2) {
+            return s;
+        }
+    }
+    if let Some(first) = inputs.first()
+        && let Some(s) = as_cairo_short_string(first)
+    {
+        return s;
+    }
+    String::new()
+}
+
+fn encode_cairo_byte_array_to_felts(s: &str, out: &mut Vec<Felt252>) {
+    let bytes = s.as_bytes();
+    let full_chunks = bytes.chunks_exact(BYTES_IN_WORD);
+    let rem = full_chunks.remainder();
+    out.push(Felt252::from(full_chunks.len()));
+    for chunk in full_chunks {
+        out.push(Felt252::from_bytes_be_slice(chunk));
+    }
+    out.push(Felt252::from_bytes_be_slice(rem));
+    out.push(Felt252::from(rem.len()));
+}
+
+fn parse_single_token_to_felts(token: &str, out: &mut Vec<Felt252>) {
+    let t = token.trim();
+    if t.is_empty() {
+        return;
+    }
+    if t.starts_with('"') && t.ends_with('"') && t.len() >= 2 {
+        let inner = &t[1..t.len() - 1];
+        encode_cairo_byte_array_to_felts(inner, out);
+        return;
+    }
+    if t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2 {
+        let inner = &t[1..t.len() - 1];
+        out.push(Felt252::from_bytes_be_slice(inner.as_bytes()));
+        return;
+    }
+    if t.eq_ignore_ascii_case("true") {
+        out.push(Felt252::from(1_u64));
+        return;
+    }
+    if t.eq_ignore_ascii_case("false") {
+        out.push(Felt252::zero());
+        return;
+    }
+    if let Some(hex_str) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X"))
+        && let Ok(v) = Felt252::from_hex(t)
+    {
+        let _ = hex_str;
+        out.push(v);
+        return;
+    }
+    if let Ok(v) = Felt252::from_dec_str(t) {
+        out.push(v);
+        return;
+    }
+    if t.len() <= BYTES_IN_WORD {
+        out.push(Felt252::from_bytes_be_slice(t.as_bytes()));
+    } else {
+        encode_cairo_byte_array_to_felts(t, out);
+    }
+}
+
+fn parse_text_tokens_to_felts(raw: &str) -> Vec<Felt252> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote: Option<char> = None;
+    for ch in raw.chars() {
+        if let Some(q) = in_quote {
+            cur.push(ch);
+            if ch == q {
+                in_quote = None;
+                parse_single_token_to_felts(&cur, &mut out);
+                cur.clear();
+            }
+        } else if ch == '"' || ch == '\'' {
+            if !cur.trim().is_empty() {
+                parse_single_token_to_felts(&cur, &mut out);
+                cur.clear();
+            }
+            cur.push(ch);
+            in_quote = Some(ch);
+        } else if ch.is_whitespace() || ch == ',' {
+            if !cur.trim().is_empty() {
+                parse_single_token_to_felts(&cur, &mut out);
+                cur.clear();
+            }
+        } else {
+            cur.push(ch);
+        }
+    }
+    if !cur.trim().is_empty() {
+        parse_single_token_to_felts(&cur, &mut out);
+    }
+    out
+}
+
+fn parse_json_text_to_felts(raw: &str) -> Vec<Felt252> {
+    fn skip_ws(chars: &[char], idx: &mut usize) {
+        while *idx < chars.len() && chars[*idx].is_whitespace() {
+            *idx += 1;
+        }
+    }
+    fn parse_string(chars: &[char], idx: &mut usize) -> String {
+        *idx += 1; // skip opening quote
+        let mut s = String::new();
+        while *idx < chars.len() {
+            let c = chars[*idx];
+            *idx += 1;
+            if c == '"' {
+                break;
+            }
+            if c == '\\' && *idx < chars.len() {
+                s.push(chars[*idx]);
+                *idx += 1;
+            } else {
+                s.push(c);
+            }
+        }
+        s
+    }
+    fn parse_value(chars: &[char], idx: &mut usize, out: &mut Vec<Felt252>) {
+        skip_ws(chars, idx);
+        if *idx >= chars.len() {
+            return;
+        }
+        match chars[*idx] {
+            '{' => {
+                *idx += 1;
+                loop {
+                    skip_ws(chars, idx);
+                    if *idx >= chars.len() {
+                        break;
+                    }
+                    if chars[*idx] == '}' {
+                        *idx += 1;
+                        break;
+                    }
+                    if chars[*idx] == '"' {
+                        let _key = parse_string(chars, idx);
+                    }
+                    skip_ws(chars, idx);
+                    if *idx < chars.len() && chars[*idx] == ':' {
+                        *idx += 1;
+                    }
+                    parse_value(chars, idx, out);
+                    skip_ws(chars, idx);
+                    if *idx < chars.len() && chars[*idx] == ',' {
+                        *idx += 1;
+                    }
+                }
+            }
+            '[' => {
+                *idx += 1;
+                let mut items: Vec<Vec<Felt252>> = Vec::new();
+                loop {
+                    skip_ws(chars, idx);
+                    if *idx >= chars.len() {
+                        break;
+                    }
+                    if chars[*idx] == ']' {
+                        *idx += 1;
+                        break;
+                    }
+                    let mut item_felts = Vec::new();
+                    parse_value(chars, idx, &mut item_felts);
+                    items.push(item_felts);
+                    skip_ws(chars, idx);
+                    if *idx < chars.len() && chars[*idx] == ',' {
+                        *idx += 1;
+                    }
+                }
+                out.push(Felt252::from(items.len()));
+                for item in items {
+                    out.extend(item);
+                }
+            }
+            '"' => {
+                let s = parse_string(chars, idx);
+                parse_single_token_to_felts(&s, out);
+            }
+            _ => {
+                let start = *idx;
+                while *idx < chars.len()
+                    && !chars[*idx].is_whitespace()
+                    && !matches!(chars[*idx], ',' | ']' | '}')
+                {
+                    *idx += 1;
+                }
+                let token: String = chars[start..*idx].iter().collect();
+                parse_single_token_to_felts(&token, out);
+            }
+        }
+    }
+    let chars: Vec<char> = raw.chars().collect();
+    let mut idx = 0;
+    let mut out = Vec::new();
+    parse_value(&chars, &mut idx, &mut out);
+    out
+}
+
+fn serialize_recorded_call_trace(call: &RecordedCall, out: &mut Vec<Felt252>) {
+    // CallEntryPoint:
+    // 1. entry_point_type: 0 = Constructor, 1 = External, 2 = L1Handler
+    let ep_type = match call.entry_point_type {
+        "CONSTRUCTOR" => 0_u64,
+        "L1_HANDLER" => 2_u64,
+        _ => 1_u64,
+    };
+    out.push(Felt252::from(ep_type));
+    // 2. entry_point_selector
+    out.push(call.entry_point_selector);
+    // 3. calldata: Array<felt252>
+    out.push(Felt252::from(call.calldata.len()));
+    out.extend(call.calldata.iter().copied());
+    // 4. contract_address
+    out.push(call.contract_address);
+    // 5. caller_address
+    out.push(call.caller_address);
+    // 6. call_type: 0 = Call, 1 = Delegate
+    let c_type = match call.call_type {
+        "DELEGATE" | "LIBRARY_CALL" => 1_u64,
+        _ => 0_u64,
+    };
+    out.push(Felt252::from(c_type));
+
+    // nested_calls: Array<CallTrace>
+    out.push(Felt252::from(call.calls.len()));
+    for child in &call.calls {
+        serialize_recorded_call_trace(child, out);
+    }
+
+    // result: CallResult::Success(Array<felt252>) -> variant 0, len, data
+    out.push(Felt252::zero());
+    out.push(Felt252::from(call.result.len()));
+    out.extend(call.result.iter().copied());
 }

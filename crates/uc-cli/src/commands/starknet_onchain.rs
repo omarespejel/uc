@@ -465,7 +465,14 @@ pub(crate) struct AccountArgs {
 
 #[derive(Subcommand, Debug, Clone)]
 pub(crate) enum AccountSubcommand {
-    /// List configured Starknet accounts from `snfoundry.toml` and `~/.starknet_accounts`.
+    /// Create a new undeployed Starknet account and save it to the accounts file.
+    Create(AccountCreateArgs),
+    /// Import an existing Starknet account into the accounts file.
+    #[command(visible_alias = "add")]
+    Import(AccountImportArgs),
+    /// Delete a Starknet account from the accounts file.
+    Delete(AccountDeleteArgs),
+    /// List configured Starknet accounts from `uc.toml`, `snfoundry.toml`, and `~/.starknet_accounts`.
     List(AccountListArgs),
     /// Compute deterministic counterfactual Starknet account address (`calculate_contract_address_from_hash`).
     ComputeAddress(AccountComputeAddressArgs),
@@ -474,15 +481,143 @@ pub(crate) enum AccountSubcommand {
 }
 
 #[derive(Args, Debug, Clone)]
+pub(crate) struct AccountCreateArgs {
+    /// Account name to store in the accounts file.
+    #[arg(short = 'n', long, default_value = "default")]
+    pub name: String,
+
+    /// Account contract type (`oz`, `argent`, `braavos`).
+    #[arg(short = 't', long = "type", default_value = "oz")]
+    pub account_type: String,
+
+    /// Custom account class hash (`0x...`). Defaults to the standard OpenZeppelin account class hash.
+    #[arg(long)]
+    pub class_hash: Option<String>,
+
+    /// Salt for counterfactual address derivation (`0x0` default).
+    #[arg(long, default_value = "0x0")]
+    pub salt: String,
+
+    #[arg(short = 'u', long)]
+    pub url: Option<String>,
+
+    #[arg(long, default_value = "alpha-sepolia")]
+    pub network: String,
+
+    #[arg(long)]
+    pub accounts_file: Option<PathBuf>,
+
+    /// Also save a matching profile in `uc.toml` / `snfoundry.toml`.
+    #[arg(long)]
+    pub add_profile: Option<String>,
+
+    #[arg(long)]
+    pub manifest_path: Option<PathBuf>,
+
+    #[arg(long)]
+    pub json: bool,
+
+    #[arg(long)]
+    pub report_path: Option<PathBuf>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct AccountImportArgs {
+    /// Account name to store in the accounts file.
+    #[arg(short = 'n', long)]
+    pub name: String,
+
+    /// Account contract address (`0x...`).
+    #[arg(short = 'a', long)]
+    pub address: String,
+
+    /// Private key (`0x...`).
+    #[arg(long)]
+    pub private_key: String,
+
+    /// Public key (`0x...`); derived automatically from `--private-key` when omitted.
+    #[arg(long)]
+    pub public_key: Option<String>,
+
+    /// Account contract type (`oz`, `argent`, `braavos`).
+    #[arg(short = 't', long = "type", default_value = "oz")]
+    pub account_type: String,
+
+    /// Class hash (`0x...`).
+    #[arg(long)]
+    pub class_hash: Option<String>,
+
+    /// Salt (`0x0` default).
+    #[arg(long)]
+    pub salt: Option<String>,
+
+    #[arg(short = 'u', long)]
+    pub url: Option<String>,
+
+    #[arg(long, default_value = "alpha-sepolia")]
+    pub network: String,
+
+    #[arg(long)]
+    pub accounts_file: Option<PathBuf>,
+
+    /// Also save a matching profile in `uc.toml` / `snfoundry.toml`.
+    #[arg(long)]
+    pub add_profile: Option<String>,
+
+    #[arg(long)]
+    pub manifest_path: Option<PathBuf>,
+
+    #[arg(long)]
+    pub json: bool,
+
+    #[arg(long)]
+    pub report_path: Option<PathBuf>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct AccountDeleteArgs {
+    /// Account name to delete from the accounts file.
+    #[arg(short = 'n', long)]
+    pub name: String,
+
+    /// Network key in the accounts file (`alpha-sepolia`, `alpha-mainnet`, etc.).
+    #[arg(long)]
+    pub network: Option<String>,
+
+    #[arg(long)]
+    pub accounts_file: Option<PathBuf>,
+
+    /// Confirm deletion without interactive prompt.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+
+    #[arg(long)]
+    pub manifest_path: Option<PathBuf>,
+
+    #[arg(long)]
+    pub json: bool,
+
+    #[arg(long)]
+    pub report_path: Option<PathBuf>,
+}
+
+#[derive(Args, Debug, Clone)]
 pub(crate) struct AccountDeployArgs {
+    /// Named account from the accounts file (created via `uc account create`).
+    #[arg(long)]
+    pub name: Option<String>,
+
+    #[arg(long)]
+    pub accounts_file: Option<PathBuf>,
+
     /// Account class hash (`0x...`); must already be declared on the network.
     #[arg(long)]
-    pub class_hash: String,
+    pub class_hash: Option<String>,
 
     /// Private key (`0x...`); the public key becomes the constructor argument unless
     /// `--constructor-calldata` is given.
     #[arg(long)]
-    pub private_key: String,
+    pub private_key: Option<String>,
 
     /// Constructor calldata (defaults to `[public_key]`).
     #[arg(long, num_args = 0..)]
@@ -2551,20 +2686,91 @@ pub(crate) fn run_tx_status(args: TxStatusArgs) -> Result<()> {
     Ok(())
 }
 
+const DEFAULT_OZ_ACCOUNT_CLASS_HASH: &str =
+    "0x05b4b537eaa2399e3aa99c4e2e0208ebd6c71bc1467938cd52c798c601e43564";
+
+fn default_accounts_file_path(explicit: Option<&Path>) -> PathBuf {
+    if let Some(p) = explicit {
+        return p.to_path_buf();
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home)
+            .join(".starknet_accounts")
+            .join("starknet_open_zeppelin_accounts.json")
+    } else {
+        PathBuf::from("starknet_open_zeppelin_accounts.json")
+    }
+}
+
 /// `uc account deploy`: a V3 DEPLOY_ACCOUNT transaction signed with the SNIP-8 hash.
 #[cfg(feature = "native-test-runner")]
 fn run_account_deploy(args: AccountDeployArgs) -> Result<()> {
     use starknet_types_core::felt::Felt;
     let started = Instant::now();
-    let private_key = parse_felt_str(&args.private_key)?;
+    let accounts_file = default_accounts_file_path(args.accounts_file.as_deref());
+    let mut loaded_from_file: Option<(String, String)> = None;
+    let (raw_private_key, raw_class_hash, raw_salt) = if let (Some(pk), Some(ch)) =
+        (args.private_key.as_ref(), args.class_hash.as_ref())
+    {
+        (pk.clone(), ch.clone(), args.salt.clone())
+    } else if let Some(name) = args.name.as_deref() {
+        let text = fs::read_to_string(&accounts_file).with_context(|| {
+            format!(
+                "failed to read accounts file `{}` for `--name {name}`",
+                accounts_file.display()
+            )
+        })?;
+        let doc: serde_json::Value = serde_json::from_str(&text)?;
+        let net_hint = args.network.as_deref().unwrap_or("alpha-sepolia");
+        let mut found = None;
+        if let Some(obj) = doc.as_object() {
+            if let Some(acc) = obj.get(net_hint).and_then(|n| n.get(name)) {
+                found = Some((net_hint.to_string(), acc.clone()));
+            } else {
+                for (net_k, net_v) in obj {
+                    if let Some(acc) = net_v.get(name) {
+                        found = Some((net_k.clone(), acc.clone()));
+                        break;
+                    }
+                }
+            }
+        }
+        let (net_key, acc) = found.ok_or_else(|| {
+            anyhow!(
+                "account `{name}` not found in `{}`",
+                accounts_file.display()
+            )
+        })?;
+        loaded_from_file = Some((net_key, name.to_string()));
+        let pk = args
+            .private_key
+            .clone()
+            .or_else(|| acc.get("private_key").and_then(|v| v.as_str()).map(str::to_string))
+            .ok_or_else(|| anyhow!("account `{name}` is missing `private_key`"))?;
+        let ch = args
+            .class_hash
+            .clone()
+            .or_else(|| acc.get("class_hash").and_then(|v| v.as_str()).map(str::to_string))
+            .unwrap_or_else(|| DEFAULT_OZ_ACCOUNT_CLASS_HASH.to_string());
+        let salt = acc
+            .get("salt")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| args.salt.clone());
+        (pk, ch, salt)
+    } else {
+        bail!("pass either `--private-key` + `--class-hash` or `--name <account>`");
+    };
+
+    let private_key = parse_felt_str(&raw_private_key)?;
     let public_key = starknet_crypto::get_public_key(&private_key);
     let calldata: Vec<String> = if args.constructor_calldata.is_empty() {
         vec![format_felt_hex(&public_key)]
     } else {
         encode_starknet_calldata(&args.constructor_calldata, None)?
     };
-    let class_hash = parse_felt_str(&args.class_hash)?;
-    let salt = parse_felt_str(&args.salt)?;
+    let class_hash = parse_felt_str(&raw_class_hash)?;
+    let salt = parse_felt_str(&raw_salt)?;
     let calldata_felts: Vec<Felt> = calldata.iter().map(|c| parse_felt_str(c)).collect::<Result<Vec<_>>>()?;
     let address = cairo_lang_runner::casm_run::contract_address::calculate_contract_address(&salt, &class_hash, &calldata_felts, &Felt::ZERO);
     let rpc_url = match args.url.as_deref() {
@@ -2610,6 +2816,20 @@ fn run_account_deploy(args: AccountDeployArgs) -> Result<()> {
                 confirmation_status = Some(poll_for_transaction_confirmation(rpc, th, args.wait_timeout)?);
             }
         }
+        if let Some((net_key, acc_name)) = &loaded_from_file {
+            if let Ok(text) = fs::read_to_string(&accounts_file) {
+                if let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(entry) = doc
+                        .get_mut(net_key)
+                        .and_then(|n| n.get_mut(acc_name))
+                        .and_then(|v| v.as_object_mut())
+                    {
+                        entry.insert("deployed".to_string(), serde_json::Value::Bool(true));
+                        let _ = fs::write(&accounts_file, serde_json::to_string_pretty(&doc)?);
+                    }
+                }
+            }
+        }
     }
     let report = serde_json::json!({
         "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
@@ -2648,6 +2868,235 @@ fn run_account_deploy(_args: AccountDeployArgs) -> Result<()> {
 
 pub(crate) fn run_account(args: AccountArgs) -> Result<()> {
     match args.command {
+        AccountSubcommand::Create(create_args) => {
+            #[cfg(feature = "native-test-runner")]
+            {
+                use starknet_types_core::felt::Felt;
+                let accounts_path = default_accounts_file_path(create_args.accounts_file.as_deref());
+                let class_hash_hex = create_args
+                    .class_hash
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_OZ_ACCOUNT_CLASS_HASH.to_string());
+                let mut seed_hasher = blake3::Hasher::new();
+                seed_hasher.update(b"uc-account-create-v1:");
+                seed_hasher.update(create_args.name.as_bytes());
+                seed_hasher.update(create_args.network.as_bytes());
+                seed_hasher.update(&epoch_ms().unwrap_or(1).to_le_bytes());
+                seed_hasher.update(&std::process::id().to_le_bytes());
+                let seed_bytes = seed_hasher.finalize();
+                // Reduce to 248 bits so private_key < curve order and non-zero
+                let mut pk_bytes = [0u8; 32];
+                pk_bytes[1..].copy_from_slice(&seed_bytes.as_bytes()[1..]);
+                if pk_bytes.iter().all(|b| *b == 0) {
+                    pk_bytes[31] = 1;
+                }
+                let private_key = Felt::from_bytes_be(&pk_bytes);
+                let public_key = starknet_crypto::get_public_key(&private_key);
+                let private_key_hex = format_felt_hex(&private_key);
+                let public_key_hex = format_felt_hex(&public_key);
+                let address_hex = compute_starknet_contract_address(
+                    &class_hash_hex,
+                    &create_args.salt,
+                    std::slice::from_ref(&public_key_hex),
+                    "0x0",
+                )?;
+
+                let mut root_doc: serde_json::Value = if accounts_path.is_file() {
+                    fs::read_to_string(&accounts_path)
+                        .ok()
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_else(|| serde_json::json!({}))
+                } else {
+                    serde_json::json!({})
+                };
+                if !root_doc.is_object() {
+                    root_doc = serde_json::json!({});
+                }
+                let net_obj = root_doc
+                    .as_object_mut()
+                    .unwrap()
+                    .entry(create_args.network.clone())
+                    .or_insert_with(|| serde_json::json!({}));
+                if let Some(map) = net_obj.as_object_mut() {
+                    map.insert(
+                        create_args.name.clone(),
+                        serde_json::json!({
+                            "address": address_hex,
+                            "class_hash": class_hash_hex,
+                            "deployed": false,
+                            "legacy": false,
+                            "private_key": private_key_hex,
+                            "public_key": public_key_hex,
+                            "salt": create_args.salt,
+                            "type": create_args.account_type,
+                        }),
+                    );
+                }
+                if let Some(parent) = accounts_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&accounts_path, serde_json::to_string_pretty(&root_doc)?)?;
+
+                let report = serde_json::json!({
+                    "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
+                    "command": "account create",
+                    "name": create_args.name,
+                    "network": create_args.network,
+                    "account_type": create_args.account_type,
+                    "address": address_hex,
+                    "public_key": public_key_hex,
+                    "class_hash": class_hash_hex,
+                    "salt": create_args.salt,
+                    "deployed": false,
+                    "accounts_file": accounts_path.display().to_string(),
+                    "add_profile": create_args.add_profile,
+                });
+                if create_args.json || create_args.report_path.is_some() {
+                    emit_json_value(create_args.report_path.as_deref(), &report)?;
+                } else {
+                    println!("account created: {}", create_args.name);
+                    println!("  address:       {address_hex}");
+                    println!("  public_key:    {public_key_hex}");
+                    println!("  class_hash:    {class_hash_hex}");
+                    println!("  accounts_file: {}", accounts_path.display());
+                }
+                return Ok(());
+            }
+            #[cfg(not(feature = "native-test-runner"))]
+            {
+                let _ = create_args;
+                bail!("native-test-runner feature required for uc account create")
+            }
+        }
+        AccountSubcommand::Import(import_args) => {
+            #[cfg(feature = "native-test-runner")]
+            {
+                let accounts_path = default_accounts_file_path(import_args.accounts_file.as_deref());
+                let private_key = parse_felt_str(&import_args.private_key)?;
+                let public_key_hex = match &import_args.public_key {
+                    Some(pk) => format_felt_hex(&parse_felt_str(pk)?),
+                    None => format_felt_hex(&starknet_crypto::get_public_key(&private_key)),
+                };
+                let private_key_hex = format_felt_hex(&private_key);
+                let address_hex = format_felt_hex(&parse_felt_str(&import_args.address)?);
+                let class_hash_hex = import_args
+                    .class_hash
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_OZ_ACCOUNT_CLASS_HASH.to_string());
+
+                let mut root_doc: serde_json::Value = if accounts_path.is_file() {
+                    fs::read_to_string(&accounts_path)
+                        .ok()
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_else(|| serde_json::json!({}))
+                } else {
+                    serde_json::json!({})
+                };
+                if !root_doc.is_object() {
+                    root_doc = serde_json::json!({});
+                }
+                let net_obj = root_doc
+                    .as_object_mut()
+                    .unwrap()
+                    .entry(import_args.network.clone())
+                    .or_insert_with(|| serde_json::json!({}));
+                if let Some(map) = net_obj.as_object_mut() {
+                    map.insert(
+                        import_args.name.clone(),
+                        serde_json::json!({
+                            "address": address_hex,
+                            "class_hash": class_hash_hex,
+                            "deployed": true,
+                            "legacy": false,
+                            "private_key": private_key_hex,
+                            "public_key": public_key_hex,
+                            "salt": import_args.salt.clone().unwrap_or_else(|| "0x0".to_string()),
+                            "type": import_args.account_type,
+                        }),
+                    );
+                }
+                if let Some(parent) = accounts_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&accounts_path, serde_json::to_string_pretty(&root_doc)?)?;
+
+                let report = serde_json::json!({
+                    "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
+                    "command": "account import",
+                    "name": import_args.name,
+                    "network": import_args.network,
+                    "account_type": import_args.account_type,
+                    "address": address_hex,
+                    "public_key": public_key_hex,
+                    "class_hash": class_hash_hex,
+                    "accounts_file": accounts_path.display().to_string(),
+                    "add_profile": import_args.add_profile,
+                });
+                if import_args.json || import_args.report_path.is_some() {
+                    emit_json_value(import_args.report_path.as_deref(), &report)?;
+                } else {
+                    println!("account imported: {}", import_args.name);
+                    println!("  address:        {address_hex}");
+                    println!("  public_key:     {public_key_hex}");
+                    println!("  accounts_file:  {}", accounts_path.display());
+                }
+                return Ok(());
+            }
+            #[cfg(not(feature = "native-test-runner"))]
+            {
+                let _ = import_args;
+                bail!("native-test-runner feature required for uc account import")
+            }
+        }
+        AccountSubcommand::Delete(del_args) => {
+            let accounts_path = default_accounts_file_path(del_args.accounts_file.as_deref());
+            let mut removed = false;
+            if accounts_path.is_file() {
+                let text = fs::read_to_string(&accounts_path)?;
+                let mut root_doc: serde_json::Value = serde_json::from_str(&text)?;
+                if let Some(obj) = root_doc.as_object_mut() {
+                    if let Some(net) = del_args.network.as_deref() {
+                        if let Some(net_map) = obj.get_mut(net).and_then(|v| v.as_object_mut()) {
+                            if net_map.remove(&del_args.name).is_some() {
+                                removed = true;
+                            }
+                        }
+                    } else {
+                        for (_net_k, net_v) in obj.iter_mut() {
+                            if let Some(net_map) = net_v.as_object_mut() {
+                                if net_map.remove(&del_args.name).is_some() {
+                                    removed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if removed {
+                    fs::write(&accounts_path, serde_json::to_string_pretty(&root_doc)?)?;
+                }
+            }
+            if !removed {
+                bail!(
+                    "account `{}` not found in `{}`",
+                    del_args.name,
+                    accounts_path.display()
+                );
+            }
+            let report = serde_json::json!({
+                "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
+                "command": "account delete",
+                "name": del_args.name,
+                "network": del_args.network,
+                "deleted": true,
+                "accounts_file": accounts_path.display().to_string(),
+            });
+            if del_args.json || del_args.report_path.is_some() {
+                emit_json_value(del_args.report_path.as_deref(), &report)?;
+            } else {
+                println!("account deleted: {}", del_args.name);
+            }
+            Ok(())
+        }
         AccountSubcommand::List(list_args) => {
             let workspace_root = list_args
                 .manifest_path
@@ -4397,6 +4846,111 @@ mod EditionContract {
             assert_eq!(bundle_check["verified"], true);
             assert!(bundle_check["elapsed_ms"].as_f64().unwrap() < 500.0);
         }
+    }
+
+    #[test]
+    fn account_create_import_deploy_list_and_delete_roundtrip() {
+        let dir = TempOnchainDir::new("account_lifecycle");
+        let accounts_file = dir.dir.join("accounts.json");
+        let create_rep = dir.dir.join("create.json");
+        run_account(AccountArgs {
+            command: AccountSubcommand::Create(AccountCreateArgs {
+                name: "deployer_1".to_string(),
+                account_type: "oz".to_string(),
+                class_hash: None,
+                salt: "0x7".to_string(),
+                url: None,
+                network: "alpha-sepolia".to_string(),
+                accounts_file: Some(accounts_file.clone()),
+                add_profile: None,
+                manifest_path: None,
+                json: true,
+                report_path: Some(create_rep.clone()),
+            }),
+        })
+        .unwrap();
+        let created: serde_json::Value =
+            serde_json::from_slice(&fs::read(&create_rep).unwrap()).unwrap();
+        assert!(created["address"].as_str().unwrap().starts_with("0x"));
+        assert!(created["public_key"].as_str().unwrap().starts_with("0x"));
+
+        // Deploy dry-run by `--name deployer_1`
+        let deploy_rep = dir.dir.join("deploy.json");
+        run_account(AccountArgs {
+            command: AccountSubcommand::Deploy(AccountDeployArgs {
+                name: Some("deployer_1".to_string()),
+                accounts_file: Some(accounts_file.clone()),
+                class_hash: None,
+                private_key: None,
+                constructor_calldata: Vec::new(),
+                salt: "0x7".to_string(),
+                url: None,
+                network: None,
+                dry_run: true,
+                wait: false,
+                wait_timeout: 5,
+                json: true,
+                report_path: Some(deploy_rep.clone()),
+            }),
+        })
+        .unwrap();
+        let deployed: serde_json::Value =
+            serde_json::from_slice(&fs::read(&deploy_rep).unwrap()).unwrap();
+        assert_eq!(
+            parse_felt_str(deployed["contract_address"].as_str().unwrap()).unwrap(),
+            parse_felt_str(created["address"].as_str().unwrap()).unwrap()
+        );
+
+        // Import a second account
+        let import_rep = dir.dir.join("import.json");
+        run_account(AccountArgs {
+            command: AccountSubcommand::Import(AccountImportArgs {
+                name: "imported_2".to_string(),
+                address: "0x12345".to_string(),
+                private_key: "0x999".to_string(),
+                public_key: None,
+                account_type: "argent".to_string(),
+                class_hash: None,
+                salt: Some("0x1".to_string()),
+                url: None,
+                network: "alpha-sepolia".to_string(),
+                accounts_file: Some(accounts_file.clone()),
+                add_profile: None,
+                manifest_path: None,
+                json: true,
+                report_path: Some(import_rep.clone()),
+            }),
+        })
+        .unwrap();
+
+        // List accounts
+        let list_rep = dir.dir.join("list.json");
+        run_account(AccountArgs {
+            command: AccountSubcommand::List(AccountListArgs {
+                accounts_file: Some(accounts_file.clone()),
+                manifest_path: None,
+                json: true,
+                report_path: Some(list_rep.clone()),
+            }),
+        })
+        .unwrap();
+        let listed: serde_json::Value =
+            serde_json::from_slice(&fs::read(&list_rep).unwrap()).unwrap();
+        assert_eq!(listed["accounts"].as_array().unwrap().len(), 2);
+
+        // Delete `imported_2`
+        run_account(AccountArgs {
+            command: AccountSubcommand::Delete(AccountDeleteArgs {
+                name: "imported_2".to_string(),
+                network: Some("alpha-sepolia".to_string()),
+                accounts_file: Some(accounts_file),
+                yes: true,
+                manifest_path: None,
+                json: true,
+                report_path: None,
+            }),
+        })
+        .unwrap();
     }
 }
 

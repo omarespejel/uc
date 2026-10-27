@@ -1800,6 +1800,325 @@ impl EventTraitImpl of starknet::Event<Event> {
     }
 }
 
+pub fn test_selector(selector: felt252) -> felt252 {
+    selector
+}
+
+#[derive(Drop, Copy, Serde, PartialEq, Debug)]
+pub enum ReplaceBytecodeError {
+    ContractNotDeployed,
+    UndeclaredClassHash,
+}
+
+pub fn start_cheat_block_hash(
+    contract_address: ContractAddress, block_number: u64, block_hash: felt252,
+) {
+    let _ = starknet::testing::cheatcode::<'cheat_block_hash'>(
+        array![contract_address.into(), block_number.into(), block_hash].span(),
+    );
+}
+
+pub fn stop_cheat_block_hash(contract_address: ContractAddress, block_number: u64) {
+    let _ = starknet::testing::cheatcode::<'uncheat_block_hash'>(
+        array![contract_address.into(), block_number.into()].span(),
+    );
+}
+
+pub fn start_cheat_block_hash_global(block_number: u64, block_hash: felt252) {
+    let _ = starknet::testing::cheatcode::<'cheat_block_hash_glob'>(
+        array![block_number.into(), block_hash].span(),
+    );
+}
+
+pub fn stop_cheat_block_hash_global(block_number: u64) {
+    let _ = starknet::testing::cheatcode::<'uncheat_block_hash_glob'>(
+        array![block_number.into()].span(),
+    );
+}
+
+pub fn cheat_block_hash(
+    contract_address: ContractAddress, block_number: u64, block_hash: felt252, span: CheatSpan,
+) {
+    let _ = starknet::testing::cheatcode::<'cheat_block_hash'>(
+        array![contract_address.into(), block_number.into(), block_hash, cheat_span_calls(span)]
+            .span(),
+    );
+}
+
+pub fn start_cheat_paymaster_data(contract_address: ContractAddress, paymaster_data: Span<felt252>) {
+    let mut inputs: Array<felt252> = array![contract_address.into()];
+    inputs.append_span(paymaster_data);
+    let _ = starknet::testing::cheatcode::<'cheat_paymaster_data'>(inputs.span());
+}
+
+pub fn stop_cheat_paymaster_data(contract_address: ContractAddress) {
+    let _ = starknet::testing::cheatcode::<'uncheat_paymaster_data'>(
+        array![contract_address.into()].span(),
+    );
+}
+
+pub fn start_cheat_paymaster_data_global(paymaster_data: Span<felt252>) {
+    let _ = starknet::testing::cheatcode::<'cheat_paymaster_glob'>(paymaster_data);
+}
+
+pub fn stop_cheat_paymaster_data_global() {
+    let _ = starknet::testing::cheatcode::<'uncheat_paymaster_glob'>(array![].span());
+}
+
+pub fn cheat_paymaster_data(
+    contract_address: ContractAddress, paymaster_data: Span<felt252>, span: CheatSpan,
+) {
+    let mut inputs: Array<felt252> = array![contract_address.into(), cheat_span_calls(span)];
+    inputs.append_span(paymaster_data);
+    let _ = starknet::testing::cheatcode::<'cheat_paymaster_data'>(inputs.span());
+}
+
+pub fn start_cheat_account_deployment_data(
+    contract_address: ContractAddress, account_deployment_data: Span<felt252>,
+) {
+    let mut inputs: Array<felt252> = array![contract_address.into()];
+    inputs.append_span(account_deployment_data);
+    let _ = starknet::testing::cheatcode::<'cheat_acct_deploy_data'>(inputs.span());
+}
+
+pub fn stop_cheat_account_deployment_data(contract_address: ContractAddress) {
+    let _ = starknet::testing::cheatcode::<'uncheat_acct_deploy_data'>(
+        array![contract_address.into()].span(),
+    );
+}
+
+pub fn start_cheat_account_deployment_data_global(account_deployment_data: Span<felt252>) {
+    let _ = starknet::testing::cheatcode::<'cheat_acct_deploy_glob'>(account_deployment_data);
+}
+
+pub fn stop_cheat_account_deployment_data_global() {
+    let _ = starknet::testing::cheatcode::<'uncheat_acct_deploy_glob'>(array![].span());
+}
+
+pub fn cheat_account_deployment_data(
+    contract_address: ContractAddress, account_deployment_data: Span<felt252>, span: CheatSpan,
+) {
+    let mut inputs: Array<felt252> = array![contract_address.into(), cheat_span_calls(span)];
+    inputs.append_span(account_deployment_data);
+    let _ = starknet::testing::cheatcode::<'cheat_acct_deploy_data'>(inputs.span());
+}
+
+pub fn start_cheat_nonce_data_availability_mode(
+    contract_address: ContractAddress, mode: u32,
+) {
+    let _ = starknet::testing::cheatcode::<'cheat_nonce_da_mode'>(
+        array![contract_address.into(), mode.into()].span(),
+    );
+}
+
+pub fn stop_cheat_nonce_data_availability_mode(contract_address: ContractAddress) {
+    let _ = starknet::testing::cheatcode::<'uncheat_nonce_da_mode'>(
+        array![contract_address.into()].span(),
+    );
+}
+
+pub fn start_cheat_nonce_data_availability_mode_global(mode: u32) {
+    let _ = starknet::testing::cheatcode::<'cheat_nonce_da_glob'>(array![mode.into()].span());
+}
+
+pub fn stop_cheat_nonce_data_availability_mode_global() {
+    let _ = starknet::testing::cheatcode::<'uncheat_nonce_da_glob'>(array![].span());
+}
+
+pub fn cheat_nonce_data_availability_mode(
+    contract_address: ContractAddress, mode: u32, span: CheatSpan,
+) {
+    let _ = starknet::testing::cheatcode::<'cheat_nonce_da_mode'>(
+        array![contract_address.into(), mode.into(), cheat_span_calls(span)].span(),
+    );
+}
+
+pub fn start_cheat_fee_data_availability_mode(
+    contract_address: ContractAddress, mode: u32,
+) {
+    let _ = starknet::testing::cheatcode::<'cheat_fee_da_mode'>(
+        array![contract_address.into(), mode.into()].span(),
+    );
+}
+
+pub fn stop_cheat_fee_data_availability_mode(contract_address: ContractAddress) {
+    let _ = starknet::testing::cheatcode::<'uncheat_fee_da_mode'>(
+        array![contract_address.into()].span(),
+    );
+}
+
+pub fn start_cheat_fee_data_availability_mode_global(mode: u32) {
+    let _ = starknet::testing::cheatcode::<'cheat_fee_da_glob'>(array![mode.into()].span());
+}
+
+pub fn stop_cheat_fee_data_availability_mode_global() {
+    let _ = starknet::testing::cheatcode::<'uncheat_fee_da_glob'>(array![].span());
+}
+
+pub fn cheat_fee_data_availability_mode(
+    contract_address: ContractAddress, mode: u32, span: CheatSpan,
+) {
+    let _ = starknet::testing::cheatcode::<'cheat_fee_da_mode'>(
+        array![contract_address.into(), mode.into(), cheat_span_calls(span)].span(),
+    );
+}
+
+pub mod env {
+    use core::array::{ArrayTrait, SpanTrait};
+    use core::serde::Serde;
+
+    pub fn var(name: ByteArray) -> Array<felt252> {
+        let mut inputs = array![];
+        name.serialize(ref inputs);
+        let out = starknet::testing::cheatcode::<'var'>(inputs.span());
+        let mut res = array![];
+        for item in out {
+            res.append(*item);
+        };
+        res
+    }
+}
+
+pub mod fs {
+    use core::array::{ArrayTrait, SpanTrait};
+    use core::serde::Serde;
+
+    #[derive(Drop, Clone)]
+    pub struct File {
+        pub path: ByteArray,
+    }
+
+    pub trait FileTrait {
+        fn new(path: ByteArray) -> File;
+    }
+
+    pub impl FileTraitImpl of FileTrait {
+        fn new(path: ByteArray) -> File {
+            File { path }
+        }
+    }
+
+    pub fn read_txt(file: @File) -> Array<felt252> {
+        let mut inputs = array![];
+        file.path.serialize(ref inputs);
+        let out = starknet::testing::cheatcode::<'read_txt'>(inputs.span());
+        let mut res = array![];
+        for item in out {
+            res.append(*item);
+        };
+        res
+    }
+
+    pub fn read_json(file: @File) -> Array<felt252> {
+        let mut inputs = array![];
+        file.path.serialize(ref inputs);
+        let out = starknet::testing::cheatcode::<'read_json'>(inputs.span());
+        let mut res = array![];
+        for item in out {
+            res.append(*item);
+        };
+        res
+    }
+
+    pub trait FileParser<T, +Serde<T>> {
+        fn parse_txt(file: @File) -> Option<T>;
+        fn parse_json(file: @File) -> Option<T>;
+    }
+
+    pub impl FileParserImpl<T, +Serde<T>> of FileParser<T> {
+        fn parse_txt(file: @File) -> Option<T> {
+            let content = read_txt(file);
+            let mut span = content.span();
+            Serde::<T>::deserialize(ref span)
+        }
+
+        fn parse_json(file: @File) -> Option<T> {
+            let content = read_json(file);
+            let mut span = content.span();
+            Serde::<T>::deserialize(ref span)
+        }
+    }
+
+    pub fn parse_txt<T, +Serde<T>>(file: @File) -> Option<T> {
+        FileParser::<T>::parse_txt(file)
+    }
+
+    pub fn parse_json<T, +Serde<T>>(file: @File) -> Option<T> {
+        FileParser::<T>::parse_json(file)
+    }
+}
+
+pub mod trace {
+    use core::array::{ArrayTrait, SpanTrait};
+    use core::serde::Serde;
+    use starknet::ContractAddress;
+
+    #[derive(Drop, Serde, Clone, PartialEq, Debug, Copy)]
+    pub enum EntryPointType {
+        Constructor,
+        External,
+        L1Handler,
+    }
+
+    #[derive(Drop, Serde, Clone, PartialEq, Debug, Copy)]
+    pub enum CallType {
+        Call,
+        Delegate,
+    }
+
+    #[derive(Drop, Serde, Clone, PartialEq, Debug)]
+    pub enum CallFailure {
+        Panic: Array<felt252>,
+        Error: ByteArray,
+    }
+
+    #[derive(Drop, Serde, Clone, PartialEq, Debug)]
+    pub enum CallResult {
+        Success: Array<felt252>,
+        Failure: CallFailure,
+    }
+
+    #[derive(Drop, Serde, Clone, PartialEq, Debug)]
+    pub struct CallEntryPoint {
+        pub entry_point_type: EntryPointType,
+        pub entry_point_selector: felt252,
+        pub calldata: Array<felt252>,
+        pub contract_address: ContractAddress,
+        pub caller_address: ContractAddress,
+        pub call_type: CallType,
+    }
+
+    #[derive(Drop, Serde, Clone, PartialEq, Debug)]
+    pub struct CallTrace {
+        pub entry_point: CallEntryPoint,
+        pub nested_calls: Array<CallTrace>,
+        pub result: CallResult,
+    }
+
+    pub fn get_call_trace() -> CallTrace {
+        let mut out = starknet::testing::cheatcode::<'get_call_trace'>(array![].span());
+        Serde::<CallTrace>::deserialize(ref out).unwrap()
+    }
+}
+
+pub use trace::get_call_trace;
+
+pub mod fuzzable {
+    use core::array::{ArrayTrait, SpanTrait};
+    use core::serde::Serde;
+
+    pub trait Fuzzable<T> {
+        fn blank() -> T;
+        fn generate() -> T;
+    }
+
+    pub fn generate_arg<T, +Fuzzable<T>>() -> T {
+        Fuzzable::<T>::generate()
+    }
+}
+
+pub use fuzzable::Fuzzable;
+
 pub mod cheatcodes {
     pub mod events {
         pub use super::super::{
@@ -1821,6 +2140,12 @@ pub mod cheatcodes {
     }
     pub mod l1_handler {
         pub use super::super::{L1Handler, L1HandlerImpl, L1HandlerTrait};
+    }
+    pub mod contract_class {
+        pub use super::super::{
+            ContractClass, ContractClassTrait, DeclareResult, DeclareResultTrait,
+            ReplaceBytecodeError, declare, get_class_hash, precalculate_address, replace_bytecode,
+        };
     }
 }
 
@@ -5588,6 +5913,126 @@ mod tests {
         let srep: serde_json::Value =
             serde_json::from_slice(&fs::read(&single_rep).unwrap()).unwrap();
         assert_eq!(srep["passed_count"], 1, "{srep}");
+    }
+
+    #[test]
+    fn snforge_std_env_fs_trace_and_block_hash_cheatcodes_work() {
+        let _env = crate::test_env_shared();
+        let proj = TempTestProject::new("snforge_full_surface");
+        let txt_path = proj.dir.join("sample.txt");
+        let json_path = proj.dir.join("sample.json");
+        fs::write(&txt_path, "42 0x64 'hello'").unwrap();
+        fs::write(&json_path, r#"{"a": 7, "b": [10, 20]}"#).unwrap();
+        unsafe {
+            std::env::set_var("UC_SNFORGE_TEST_ENV_VAR", "123 456");
+        }
+
+        let uc_toml = proj.dir.join("uc.toml");
+        fs::write(
+            &uc_toml,
+            r#"[project]
+name = "snforge_full_surface"
+version = "0.1.0"
+edition = "2024_07"
+"#,
+        )
+        .unwrap();
+
+        fs::write(
+            proj.dir.join("src/lib.cairo"),
+            format!(
+                r#"#[starknet::interface]
+pub trait IPing<T> {{
+    fn ping(ref self: T, x: felt252) -> felt252;
+}}
+
+#[starknet::contract]
+pub mod PingContract {{
+    use starknet::syscalls::get_block_hash_syscall;
+    use starknet::SyscallResultTrait;
+
+    #[storage]
+    struct Storage {{}}
+
+    #[abi(embed_v0)]
+    impl PingImpl of super::IPing<ContractState> {{
+        fn ping(ref self: ContractState, x: felt252) -> felt252 {{
+            let bh = get_block_hash_syscall(10).unwrap_syscall();
+            x + bh
+        }}
+    }}
+}}
+
+#[cfg(test)]
+mod tests {{
+    use super::{{IPingDispatcher, IPingDispatcherTrait}};
+    use snforge_std::{{
+        ContractClassTrait, DeclareResultTrait, declare, get_call_trace,
+        start_cheat_block_hash_global, stop_cheat_block_hash_global,
+        start_cheat_paymaster_data_global, stop_cheat_paymaster_data_global,
+    }};
+    use snforge_std::env::var;
+    use snforge_std::fs::{{FileTrait, read_txt, read_json}};
+    use snforge_std::trace::CallResult;
+
+    #[test]
+    fn test_env_fs_trace_and_block_hash() {{
+        let env_vals = var("UC_SNFORGE_TEST_ENV_VAR");
+        assert(*env_vals.at(0) == 123, 'env_0');
+        assert(*env_vals.at(1) == 456, 'env_1');
+
+        let f_txt = FileTrait::new("{}");
+        let txt_vals = read_txt(@f_txt);
+        assert(*txt_vals.at(0) == 42, 'txt_0');
+        assert(*txt_vals.at(1) == 100, 'txt_1');
+        assert(*txt_vals.at(2) == 'hello', 'txt_2');
+
+        let f_json = FileTrait::new("{}");
+        let json_vals = read_json(@f_json);
+        assert(*json_vals.at(0) == 7, 'json_a');
+        assert(*json_vals.at(1) == 2, 'json_b_len');
+        assert(*json_vals.at(2) == 10, 'json_b0');
+        assert(*json_vals.at(3) == 20, 'json_b1');
+
+        start_cheat_block_hash_global(10, 0x99);
+        start_cheat_paymaster_data_global(array![1, 2].span());
+        let contract = declare("PingContract").unwrap().contract_class();
+        let (addr, _) = contract.deploy(@array![]).unwrap();
+        let disp = IPingDispatcher {{ contract_address: addr }};
+        let out = disp.ping(5);
+        assert(out == 5 + 0x99, 'ping_bh');
+        stop_cheat_block_hash_global(10);
+        stop_cheat_paymaster_data_global();
+
+        let trace = get_call_trace();
+        assert(trace.entry_point.contract_address == addr, 'trace_addr');
+        match trace.result {{
+            CallResult::Success(res) => {{
+                assert(*res.at(0) == 5 + 0x99, 'trace_res');
+            }},
+            CallResult::Failure(_) => panic!("expected success"),
+        }}
+    }}
+}}
+"#,
+                txt_path.display(),
+                json_path.display()
+            ),
+        )
+        .unwrap();
+
+        let rep_path = proj.dir.join("rep.json");
+        run_test(TestArgs {
+            manifest_path: Some(uc_toml),
+            json: true,
+            report_path: Some(rep_path.clone()),
+            ..Default::default()
+        })
+        .expect("snforge_std env/fs/trace/block_hash test should pass");
+        let rep: serde_json::Value =
+            serde_json::from_slice(&fs::read(&rep_path).unwrap()).unwrap();
+        assert_eq!(rep["passed_count"], 1, "{rep}");
+        assert_eq!(rep["failed_count"], 0, "{rep}");
     }
 }
 

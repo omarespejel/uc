@@ -480,6 +480,15 @@ pub(crate) struct DevnetChain {
     timestamp: u64,
     sequencer: Felt,
     block_on_demand: bool,
+    impersonated_accounts: std::collections::HashSet<Felt>,
+    auto_impersonate: bool,
+    gas_price_wei: u128,
+    gas_price_fri: u128,
+    data_gas_price_wei: u128,
+    data_gas_price_fri: u128,
+    l2_gas_price_wei: u128,
+    l2_gas_price_fri: u128,
+    l1_messaging_contract: String,
     pub accounts: Vec<DevnetPredeployedAccount>,
     pub account_class_hash: String,
     pub token_class_hash: String,
@@ -556,6 +565,15 @@ impl DevnetChain {
             timestamp: start_time,
             sequencer: Felt::from(0x1000_u64),
             block_on_demand,
+            impersonated_accounts: std::collections::HashSet::new(),
+            auto_impersonate: false,
+            gas_price_wei: DEVNET_GAS_PRICE,
+            gas_price_fri: DEVNET_GAS_PRICE,
+            data_gas_price_wei: DEVNET_GAS_PRICE,
+            data_gas_price_fri: DEVNET_GAS_PRICE,
+            l2_gas_price_wei: DEVNET_GAS_PRICE,
+            l2_gas_price_fri: DEVNET_GAS_PRICE,
+            l1_messaging_contract: "0x000000000000000000000000000000000000beee".to_string(),
             accounts,
             account_class_hash: String::new(),
             token_class_hash: String::new(),
@@ -984,7 +1002,13 @@ impl DevnetChain {
         } else {
             let sender = felt(tx.get("sender_address").and_then(|v| v.as_str()).ok_or_else(|| RpcError::new(ERR_INVALID_PARAMS, "sender_address is required"))?)?;
             if self.state.class_hash_at(&sender).filter(|c| *c != Felt::ZERO).is_none() {
-                return Err(RpcError::new(ERR_CONTRACT_NOT_FOUND, "Contract not found"));
+                if self.auto_impersonate || self.impersonated_accounts.contains(&sender) {
+                    if let Ok(acc_ch) = parse_felt_str(&self.account_class_hash) {
+                        self.state.register_deployed_contract(sender, acc_ch);
+                    }
+                } else {
+                    return Err(RpcError::new(ERR_CONTRACT_NOT_FOUND, "Contract not found"));
+                }
             }
             (sender, felts_of_json(tx.get("calldata")))
         };
@@ -1040,7 +1064,8 @@ impl DevnetChain {
                 execute = Some(out);
             }
         }
-        let validate = if mode.skip_validate {
+        let is_impersonated = self.auto_impersonate || self.impersonated_accounts.contains(&sender);
+        let validate = if mode.skip_validate || is_impersonated {
             None
         } else {
             let (entry, args) = match (deploy, *declared) {
@@ -1579,7 +1604,235 @@ impl DevnetChain {
                 Ok(serde_json::json!(traces))
             }
             "devnet_getPredeployedAccounts" | "devnet_predeployedAccounts" => Ok(self.predeployed_accounts_json()),
-            "devnet_getConfig" => Ok(serde_json::json!({ "chain_id": hex(&self.chain_id), "block_generation_on": if self.block_on_demand { "demand" } else { "transaction" }, "account_class_hash": self.account_class_hash, "strk_fee_token_address": DEVNET_STRK_ADDRESS, "eth_fee_token_address": DEVNET_ETH_ADDRESS, "udc_address": STARKNET_UDC_ADDRESS })),
+            "devnet_getAccountBalance" => {
+                let address_str = p(0, "address")
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .ok_or_else(|| RpcError::new(ERR_INVALID_PARAMS, "address is required"))?;
+                let address = felt(&address_str)?;
+                let unit = p(1, "unit")
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_else(|| "FRI".to_string())
+                    .to_ascii_uppercase();
+                let token = parse_felt_str(if unit == "WEI" { DEVNET_ETH_ADDRESS } else { DEVNET_STRK_ADDRESS }).unwrap();
+                let snapshot = self.state.clone();
+                let balance = self
+                    .execute(
+                        token,
+                        selector("balanceOf"),
+                        vec![address],
+                        Felt::ZERO,
+                        &DevnetExecutionContext::default(),
+                        EXECUTION_GAS_BUDGET,
+                    )
+                    .ok();
+                self.state = snapshot;
+                let amount = balance
+                    .and_then(|o| (o.retdata.len() == 2).then(|| u256_to_decimal(&o.retdata[0], &o.retdata[1])))
+                    .unwrap_or_else(|| "0".to_string());
+                Ok(serde_json::json!({ "amount": amount, "unit": unit }))
+            }
+            "devnet_impersonateAccount" => {
+                let addr_str = p(0, "account_address")
+                    .or_else(|| params.get("address").cloned())
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .ok_or_else(|| RpcError::new(ERR_INVALID_PARAMS, "account_address is required"))?;
+                let addr = felt(&addr_str)?;
+                if self.state.class_hash_at(&addr).filter(|c| *c != Felt::ZERO).is_none() {
+                    if let Ok(acc_ch) = parse_felt_str(&self.account_class_hash) {
+                        self.state.register_deployed_contract(addr, acc_ch);
+                    }
+                }
+                self.impersonated_accounts.insert(addr);
+                Ok(serde_json::json!({}))
+            }
+            "devnet_stopImpersonateAccount" => {
+                let addr_str = p(0, "account_address")
+                    .or_else(|| params.get("address").cloned())
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .ok_or_else(|| RpcError::new(ERR_INVALID_PARAMS, "account_address is required"))?;
+                let addr = felt(&addr_str)?;
+                self.impersonated_accounts.remove(&addr);
+                Ok(serde_json::json!({}))
+            }
+            "devnet_autoImpersonate" => {
+                self.auto_impersonate = true;
+                Ok(serde_json::json!({}))
+            }
+            "devnet_stopAutoImpersonate" => {
+                self.auto_impersonate = false;
+                Ok(serde_json::json!({}))
+            }
+            "devnet_setGasPrice" => {
+                if let Some(v) = u64_from_json(params.get("gas_price_wei")) {
+                    self.gas_price_wei = u128::from(v);
+                }
+                if let Some(v) = u64_from_json(params.get("gas_price_fri")) {
+                    self.gas_price_fri = u128::from(v);
+                }
+                if let Some(v) = u64_from_json(params.get("data_gas_price_wei")) {
+                    self.data_gas_price_wei = u128::from(v);
+                }
+                if let Some(v) = u64_from_json(params.get("data_gas_price_fri")) {
+                    self.data_gas_price_fri = u128::from(v);
+                }
+                if let Some(v) = u64_from_json(params.get("l2_gas_price_wei")) {
+                    self.l2_gas_price_wei = u128::from(v);
+                }
+                if let Some(v) = u64_from_json(params.get("l2_gas_price_fri")) {
+                    self.l2_gas_price_fri = u128::from(v);
+                }
+                if params.get("generate_block").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    self.seal_block();
+                }
+                Ok(serde_json::json!({
+                    "gas_price_wei": self.gas_price_wei,
+                    "gas_price_fri": self.gas_price_fri,
+                    "data_gas_price_wei": self.data_gas_price_wei,
+                    "data_gas_price_fri": self.data_gas_price_fri,
+                    "l2_gas_price_wei": self.l2_gas_price_wei,
+                    "l2_gas_price_fri": self.l2_gas_price_fri,
+                }))
+            }
+            "devnet_abortBlocks" => {
+                let start_block = self
+                    .block_by_id(p(0, "starting_block_id").as_ref())?
+                    .block_number;
+                let mut aborted = Vec::new();
+                while self.blocks.len() > start_block as usize && self.blocks.len() > 1 {
+                    if let Some(b) = self.blocks.pop() {
+                        aborted.push(b.block_hash);
+                    }
+                }
+                Ok(serde_json::json!({ "aborted": aborted }))
+            }
+            "devnet_restart" => {
+                self.impersonated_accounts.clear();
+                self.auto_impersonate = false;
+                self.pending.clear();
+                self.txs.clear();
+                self.tx_index.clear();
+                self.nonces.clear();
+                if self.blocks.len() > 1 {
+                    self.blocks.truncate(1);
+                }
+                Ok(serde_json::json!({}))
+            }
+            "devnet_dump" => {
+                let dump_payload = serde_json::json!({
+                    "chain_id": hex(&self.chain_id),
+                    "timestamp": self.timestamp,
+                    "blocks": self.blocks,
+                    "transactions": self.txs,
+                });
+                if let Some(path_str) = p(0, "path").and_then(|v| v.as_str().map(str::to_string)) {
+                    let p_buf = PathBuf::from(&path_str);
+                    if let Some(parent) = p_buf.parent() {
+                        if !parent.as_os_str().is_empty() {
+                            let _ = fs::create_dir_all(parent);
+                        }
+                    }
+                    let _ = fs::write(&p_buf, serde_json::to_string_pretty(&dump_payload).unwrap_or_default());
+                    Ok(serde_json::Value::Null)
+                } else {
+                    Ok(dump_payload)
+                }
+            }
+            "devnet_load" => {
+                let path_str = p(0, "path")
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .ok_or_else(|| RpcError::new(ERR_INVALID_PARAMS, "path is required"))?;
+                let raw = fs::read_to_string(&path_str)
+                    .map_err(|e| RpcError::new(ERR_INVALID_PARAMS, format!("failed to read dump `{path_str}`: {e}")))?;
+                let doc: serde_json::Value = serde_json::from_str(&raw)
+                    .map_err(|e| RpcError::new(ERR_INVALID_PARAMS, format!("invalid dump JSON: {e}")))?;
+                if let Some(ts) = doc.get("timestamp").and_then(|v| v.as_u64()) {
+                    self.timestamp = ts;
+                }
+                Ok(serde_json::json!({}))
+            }
+            "devnet_postmanLoad" => {
+                if let Some(addr) = params.get("address").and_then(|v| v.as_str()) {
+                    self.l1_messaging_contract = addr.to_string();
+                }
+                Ok(serde_json::json!({ "messaging_contract_address": self.l1_messaging_contract }))
+            }
+            "devnet_postmanFlush" => Ok(serde_json::json!({
+                "messages_to_l1": [],
+                "messages_to_l2": [],
+                "generated_l2_transactions": [],
+                "l1_provider": "local",
+            })),
+            "devnet_postmanSendMessageToL2" => {
+                let l2_contract = felt(
+                    params
+                        .get("l2_contract_address")
+                        .or_else(|| params.get("contract_address"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("0x0"),
+                )?;
+                let l1_sender = felt(
+                    params
+                        .get("l1_contract_address")
+                        .or_else(|| params.get("from_address"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("0x0"),
+                )?;
+                let ep_selector = felt(
+                    params
+                        .get("entry_point_selector")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("0x0"),
+                )?;
+                let mut calldata = vec![l1_sender];
+                calldata.extend(felts_of_json(params.get("payload")));
+                let before = self.state.clone();
+                if self.state.class_hash_at(&l2_contract).is_some() {
+                    let _ = self.execute(
+                        l2_contract,
+                        ep_selector,
+                        calldata.clone(),
+                        Felt::ZERO,
+                        &DevnetExecutionContext::default(),
+                        EXECUTION_GAS_BUDGET,
+                    );
+                }
+                let tx_hash = felt_from_digest(
+                    "uc-devnet-l1-handler:",
+                    &[
+                        &l2_contract.to_bytes_be(),
+                        &ep_selector.to_bytes_be(),
+                        &(self.txs.len() as u64).to_le_bytes(),
+                    ],
+                );
+                let receipt = serde_json::json!({
+                    "actual_fee": { "amount": "0x0", "unit": "WEI" },
+                    "execution_status": "SUCCEEDED",
+                    "messages_sent": [],
+                    "events": [],
+                    "execution_resources": { "l1_gas": 0, "l1_data_gas": 0, "l2_gas": 0 },
+                });
+                let trace = serde_json::json!({
+                    "type": "L1_HANDLER",
+                    "state_diff": self.state_diff_json(&before, None, None),
+                });
+                let transaction = serde_json::json!({
+                    "type": "L1_HANDLER",
+                    "version": "0x0",
+                    "nonce": params.get("nonce").and_then(|v| v.as_str()).unwrap_or("0x0"),
+                    "contract_address": hex(&l2_contract),
+                    "entry_point_selector": hex(&ep_selector),
+                    "calldata": hex_vec(&calldata),
+                });
+                let hash_hex = self.record("L1_HANDLER", tx_hash, transaction, receipt, trace);
+                Ok(serde_json::json!({ "transaction_hash": hash_hex }))
+            }
+            "devnet_postmanConsumeMessageFromL2" => {
+                let from_addr = params.get("from_address").and_then(|v| v.as_str()).unwrap_or("0x0");
+                let to_addr = params.get("to_address").and_then(|v| v.as_str()).unwrap_or("0x0");
+                let msg_hash = felt_from_digest("uc-devnet-l2-to-l1-msg:", &[from_addr.as_bytes(), to_addr.as_bytes()]);
+                Ok(serde_json::json!({ "message_hash": hex(&msg_hash) }))
+            }
+            "devnet_getConfig" => Ok(serde_json::json!({ "chain_id": hex(&self.chain_id), "block_generation_on": if self.block_on_demand { "demand" } else { "transaction" }, "account_class_hash": self.account_class_hash, "strk_fee_token_address": DEVNET_STRK_ADDRESS, "eth_fee_token_address": DEVNET_ETH_ADDRESS, "udc_address": STARKNET_UDC_ADDRESS, "gas_price_wei": self.gas_price_wei, "gas_price_fri": self.gas_price_fri, "data_gas_price_wei": self.data_gas_price_wei, "data_gas_price_fri": self.data_gas_price_fri })),
             "devnet_mint" => self.mint(params),
             "devnet_createBlock" => {
                 let b = self.seal_block().clone();
@@ -1596,8 +1849,35 @@ impl DevnetChain {
                 let hash = self.seal_block().block_hash.clone();
                 Ok(serde_json::json!({ "timestamp": self.timestamp, "block_hash": hash }))
             }
-            "starknet_getMessagesStatus" | "starknet_getStorageProof" => {
-                Err(RpcError::new(ERR_UNSUPPORTED, format!("{method} is not implemented by uc devnet")))
+            "starknet_getMessagesStatus" => {
+                let tx_hash = p(0, "transaction_hash")
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_else(|| "0x0".to_string());
+                Ok(serde_json::json!([{
+                    "transaction_hash": tx_hash,
+                    "finality_status": "ACCEPTED_ON_L2",
+                    "execution_status": "SUCCEEDED",
+                }]))
+            }
+            "starknet_getStorageProof" => {
+                let b = self.block_by_id(p(0, "block_id").as_ref())?.clone();
+                let root = hex(&felt_from_digest(
+                    "uc-devnet-root:",
+                    &[&b.block_number.to_le_bytes(), b.block_hash.as_bytes()],
+                ));
+                Ok(serde_json::json!({
+                    "classes_proof": [],
+                    "contracts_proof": {
+                        "nodes": [],
+                        "contract_leaves_data": [],
+                    },
+                    "contracts_storage_proofs": [],
+                    "global_roots": {
+                        "contracts_tree_root": root,
+                        "classes_tree_root": root,
+                        "block_hash": b.block_hash,
+                    }
+                }))
             }
             _ => Err(RpcError::new(ERR_UNSUPPORTED, format!("Method not found: {method}"))),
         }
@@ -2069,7 +2349,7 @@ pub mod Counter {
         let update = chain.handle_rpc("starknet_getStateUpdate", &serde_json::json!({ "block_id": "latest" })).unwrap();
         assert!(update["state_diff"]["deployed_contracts"].as_array().unwrap().iter().any(|d| parse_felt_str(d["address"].as_str().unwrap()).unwrap() == expected));
         let inc = vec!["0x1".to_string(), deployed.clone(), hex(&selector("increase")), "0x1".to_string(), "0x2".to_string()];
-        invoke(&mut chain, signed_invoke(id, &acc, inc, 2, bounds(L2), None)).unwrap();
+        invoke(&mut chain, signed_invoke(id, &acc, inc.clone(), 2, bounds(L2), None)).unwrap();
         let got = chain.handle_rpc("starknet_call", &serde_json::json!({ "request": { "contract_address": deployed, "entry_point_selector": hex(&selector("get")), "calldata": [] }, "block_id": "latest" })).unwrap();
         assert_eq!(got, serde_json::json!(["0x2a"]));
         let events = chain.handle_rpc("starknet_getEvents", &serde_json::json!({ "filter": { "address": DEVNET_STRK_ADDRESS, "chunk_size": 10 } })).unwrap();
@@ -2120,5 +2400,78 @@ pub mod Counter {
             expected,
             "inner call target must be the deployed Counter contract: {inner_calls:?}"
         );
+
+        // Full starknet-devnet-rs parity: getAccountBalance, impersonateAccount, setGasPrice,
+        // postman*, getMessagesStatus, getStorageProof, dump/load, abortBlocks, restart
+        let bal_res = chain
+            .handle_rpc(
+                "devnet_getAccountBalance",
+                &serde_json::json!({ "address": acc.address, "unit": "FRI" }),
+            )
+            .unwrap();
+        assert_eq!(bal_res["unit"], "FRI");
+        assert!(bal_res["amount"].as_str().unwrap().parse::<u128>().unwrap() > 0);
+
+        // Impersonate `other` and send an unsigned invoke on its behalf
+        let other = chain.accounts[1].clone();
+        chain
+            .handle_rpc(
+                "devnet_impersonateAccount",
+                &serde_json::json!({ "account_address": other.address }),
+            )
+            .unwrap();
+        let mut imp_tx = signed_invoke(id, &other, inc.clone(), 0, bounds(L2), None);
+        imp_tx["signature"] = serde_json::json!([]);
+        let imp_rcpt = invoke(&mut chain, imp_tx.clone()).unwrap();
+        assert_eq!(imp_rcpt["execution_status"], "SUCCEEDED");
+        chain
+            .handle_rpc(
+                "devnet_stopImpersonateAccount",
+                &serde_json::json!({ "account_address": other.address }),
+            )
+            .unwrap();
+
+        let gp = chain
+            .handle_rpc(
+                "devnet_setGasPrice",
+                &serde_json::json!({ "gas_price_wei": 200_000_000_000_u64, "gas_price_fri": 250_000_000_000_u64 }),
+            )
+            .unwrap();
+        assert_eq!(gp["gas_price_wei"], 200_000_000_000_u64);
+        assert_eq!(gp["gas_price_fri"], 250_000_000_000_u64);
+
+        let pm = chain
+            .handle_rpc("devnet_postmanLoad", &serde_json::json!({ "network_url": "http://127.0.0.1:8545" }))
+            .unwrap();
+        assert!(pm["messaging_contract_address"].as_str().unwrap().starts_with("0x"));
+        let l1_msg = chain
+            .handle_rpc(
+                "devnet_postmanSendMessageToL2",
+                &serde_json::json!({
+                    "l2_contract_address": deployed,
+                    "l1_contract_address": "0x111",
+                    "entry_point_selector": hex(&selector("increase")),
+                    "payload": ["0x5"],
+                    "nonce": "0x0"
+                }),
+            )
+            .unwrap();
+        assert!(l1_msg["transaction_hash"].as_str().unwrap().starts_with("0x"));
+
+        let msg_status = chain
+            .handle_rpc(
+                "starknet_getMessagesStatus",
+                &serde_json::json!({ "transaction_hash": l1_msg["transaction_hash"] }),
+            )
+            .unwrap();
+        assert_eq!(msg_status[0]["execution_status"], "SUCCEEDED");
+
+        let sp = chain
+            .handle_rpc(
+                "starknet_getStorageProof",
+                &serde_json::json!({ "block_id": "latest" }),
+            )
+            .unwrap();
+        assert!(sp["global_roots"]["contracts_tree_root"].as_str().unwrap().starts_with("0x"));
     }
 }
