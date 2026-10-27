@@ -3184,6 +3184,37 @@ pub(crate) fn run_devnet(args: DevnetArgs) -> Result<()> {
     Ok(())
 }
 
+/// Spawns an ephemeral in-process `uc devnet` on a free local port (`127.0.0.1:0`) for `uc test --with-devnet`
+/// (or `[test] devnet = true` in `uc.toml`), returning its JSON-RPC URL (`http://127.0.0.1:<port>/rpc`).
+pub(crate) fn spawn_ephemeral_in_process_devnet() -> Result<String> {
+    let probe = std::net::TcpListener::bind("127.0.0.1:0")
+        .context("failed to bind ephemeral port for in-process test devnet")?;
+    let port = probe.local_addr()?.port();
+    drop(probe);
+    let mut args = DevnetArgs::default();
+    args.host = "127.0.0.1".to_string();
+    args.port = port;
+    args.accounts = 4;
+    args.seed = Some(42);
+    args.initial_balance = "1000000000000000000000".to_string();
+    args.chain_id = "SEPOLIA".to_string();
+    args.backend = "native".to_string();
+    args.request_body_size_limit = 16 * 1024 * 1024;
+    args.json = true;
+    std::thread::spawn(move || {
+        let _ = run_devnet(args);
+    });
+    // Wait briefly until the listener accepts connections.
+    let addr = format!("127.0.0.1:{port}");
+    for _ in 0..50 {
+        if std::net::TcpStream::connect(&addr).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(format!("http://127.0.0.1:{port}/rpc"))
+}
+
 
 #[cfg(test)]
 mod tests {

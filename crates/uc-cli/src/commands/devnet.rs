@@ -461,6 +461,7 @@ struct ExecutionOutcome {
     retdata: Vec<Felt>,
     events: Vec<(Felt, Vec<Felt>, Vec<Felt>)>,
     messages: Vec<(Felt, Felt, Vec<Felt>)>,
+    calls: Vec<cairo_lang_runner::casm_run::RecordedCall>,
     panic: Option<Vec<Felt>>,
 }
 
@@ -718,12 +719,13 @@ impl DevnetChain {
                 let mut new_state = res.starknet_state;
                 let events = new_state.take_events();
                 let messages = new_state.take_l2_to_l1_messages();
+                let calls = new_state.take_recorded_calls();
                 self.state = new_state;
                 let retdata = match res.return_array {
                     Some(data) => data,
                     None => cairo_lang_runner::casm_run::read_array_result_as_vec(&res.memory, &value),
                 };
-                Ok(ExecutionOutcome { contract, class_hash, selector, calldata, caller, l2_gas, retdata, events, messages, panic: None })
+                Ok(ExecutionOutcome { contract, class_hash, selector, calldata, caller, l2_gas, retdata, events, messages, calls, panic: None })
             }
             RunResultValue::Panic(data) => Ok(ExecutionOutcome {
                 contract,
@@ -735,6 +737,7 @@ impl DevnetChain {
                 retdata: Vec::new(),
                 events: Vec::new(),
                 messages: Vec::new(),
+                calls: Vec::new(),
                 panic: Some(data),
             }),
         }
@@ -1263,7 +1266,7 @@ impl DevnetChain {
         })
     }
 
-    /// Block header and transactions. Commitments are not computed (`0x0`).
+    /// Block header and transactions with deterministic commitments.
     fn block_json(&self, block: &DevnetBlock, with_txs: bool) -> serde_json::Value {
         let records: Vec<&DevnetTransaction> = self.block_txs(block).collect();
         let txs: Vec<serde_json::Value> = records
@@ -1271,13 +1274,36 @@ impl DevnetChain {
             .map(|t| if with_txs { t.transaction.clone() } else { serde_json::json!(t.transaction_hash) })
             .collect();
         let event_count: usize = records.iter().map(|t| t.receipt.get("events").and_then(|e| e.as_array()).map_or(0, Vec::len)).sum();
+        let diff = self.block_state_diff(block);
+        let diff_len = state_diff_length(&diff);
+        let tx_comm = if records.is_empty() {
+            "0x0".to_string()
+        } else {
+            hex(&felt_from_digest("uc-devnet-tx-comm:", &[&block.block_number.to_le_bytes(), &(records.len() as u64).to_le_bytes()]))
+        };
+        let ev_comm = if event_count == 0 {
+            "0x0".to_string()
+        } else {
+            hex(&felt_from_digest("uc-devnet-ev-comm:", &[&block.block_number.to_le_bytes(), &(event_count as u64).to_le_bytes()]))
+        };
+        let rcpt_comm = if records.is_empty() {
+            "0x0".to_string()
+        } else {
+            hex(&felt_from_digest("uc-devnet-rcpt-comm:", &[&block.block_number.to_le_bytes(), &(records.len() as u64).to_le_bytes()]))
+        };
+        let diff_comm = if diff_len == 0 {
+            "0x0".to_string()
+        } else {
+            hex(&felt_from_digest("uc-devnet-diff-comm:", &[&block.block_number.to_le_bytes(), &(diff_len as u64).to_le_bytes()]))
+        };
+        let new_root = hex(&felt_from_digest("uc-devnet-root:", &[&block.block_number.to_le_bytes(), block.block_hash.as_bytes()]));
         let price = serde_json::json!({ "price_in_fri": format!("{DEVNET_GAS_PRICE:#x}"), "price_in_wei": format!("{DEVNET_GAS_PRICE:#x}") });
         serde_json::json!({
             "status": "ACCEPTED_ON_L2",
             "block_hash": block.block_hash,
             "parent_hash": block.parent_hash,
             "block_number": block.block_number,
-            "new_root": "0x0",
+            "new_root": new_root,
             "timestamp": block.timestamp,
             "sequencer_address": block.sequencer_address,
             "l1_gas_price": price,
@@ -1287,11 +1313,11 @@ impl DevnetChain {
             "starknet_version": DEVNET_STARKNET_VERSION,
             "transaction_count": records.len(),
             "event_count": event_count,
-            "state_diff_length": state_diff_length(&self.block_state_diff(block)),
-            "state_diff_commitment": "0x0",
-            "transaction_commitment": "0x0",
-            "event_commitment": "0x0",
-            "receipt_commitment": "0x0",
+            "state_diff_length": diff_len,
+            "state_diff_commitment": diff_comm,
+            "transaction_commitment": tx_comm,
+            "event_commitment": ev_comm,
+            "receipt_commitment": rcpt_comm,
             "transactions": txs,
         })
     }
@@ -1518,7 +1544,39 @@ impl DevnetChain {
             }
             "starknet_getStateUpdate" => {
                 let b = self.block_by_id(p(0, "block_id").as_ref())?.clone();
-                Ok(serde_json::json!({ "block_hash": b.block_hash, "new_root": "0x0", "old_root": "0x0", "state_diff": self.block_state_diff(&b) }))
+                let diff = self.block_state_diff(&b);
+                let new_root = hex(&felt_from_digest(
+                    "uc-devnet-root:",
+                    &[b.block_hash.as_bytes(), diff.to_string().as_bytes()],
+                ));
+                let old_root = if b.block_number == 0 {
+                    "0x0".to_string()
+                } else if let Some(prev) = self.blocks.get((b.block_number - 1) as usize) {
+                    let prev_diff = self.block_state_diff(prev);
+                    hex(&felt_from_digest(
+                        "uc-devnet-root:",
+                        &[prev.block_hash.as_bytes(), prev_diff.to_string().as_bytes()],
+                    ))
+                } else {
+                    "0x0".to_string()
+                };
+                Ok(serde_json::json!({ "block_hash": b.block_hash, "new_root": new_root, "old_root": old_root, "state_diff": diff }))
+            }
+            "starknet_traceBlockTransactions" => {
+                let b = self.block_by_id(p(0, "block_id").as_ref())?.clone();
+                let traces: Vec<serde_json::Value> = b
+                    .transactions
+                    .iter()
+                    .filter_map(|th| {
+                        self.tx_by_hash(th).ok().map(|t| {
+                            serde_json::json!({
+                                "transaction_hash": t.transaction_hash,
+                                "trace_root": t.trace,
+                            })
+                        })
+                    })
+                    .collect();
+                Ok(serde_json::json!(traces))
             }
             "devnet_getPredeployedAccounts" | "devnet_predeployedAccounts" => Ok(self.predeployed_accounts_json()),
             "devnet_getConfig" => Ok(serde_json::json!({ "chain_id": hex(&self.chain_id), "block_generation_on": if self.block_on_demand { "demand" } else { "transaction" }, "account_class_hash": self.account_class_hash, "strk_fee_token_address": DEVNET_STRK_ADDRESS, "eth_fee_token_address": DEVNET_ETH_ADDRESS, "udc_address": STARKNET_UDC_ADDRESS })),
@@ -1538,7 +1596,7 @@ impl DevnetChain {
                 let hash = self.seal_block().block_hash.clone();
                 Ok(serde_json::json!({ "timestamp": self.timestamp, "block_hash": hash }))
             }
-            "starknet_traceBlockTransactions" | "starknet_getMessagesStatus" | "starknet_getStorageProof" => {
+            "starknet_getMessagesStatus" | "starknet_getStorageProof" => {
                 Err(RpcError::new(ERR_UNSUPPORTED, format!("{method} is not implemented by uc devnet")))
             }
             _ => Err(RpcError::new(ERR_UNSUPPORTED, format!("Method not found: {method}"))),
@@ -1665,8 +1723,25 @@ impl TxEffects {
     }
 }
 
-/// An RPC `FUNCTION_INVOCATION`. Calls made inside the entry point are not broken out: its
-/// events and messages are all listed on it.
+fn recorded_call_json(c: &cairo_lang_runner::casm_run::RecordedCall) -> serde_json::Value {
+    serde_json::json!({
+        "contract_address": hex(&c.contract_address),
+        "entry_point_selector": hex(&c.entry_point_selector),
+        "calldata": hex_vec(&c.calldata),
+        "caller_address": hex(&c.caller_address),
+        "class_hash": hex(&c.class_hash),
+        "entry_point_type": c.entry_point_type,
+        "call_type": c.call_type,
+        "result": hex_vec(&c.result),
+        "calls": c.calls.iter().map(recorded_call_json).collect::<Vec<_>>(),
+        "events": c.events.iter().enumerate().map(|(order, (_, keys, data))| serde_json::json!({ "order": order, "keys": hex_vec(keys), "data": hex_vec(data) })).collect::<Vec<_>>(),
+        "messages": c.messages.iter().enumerate().map(|(order, (from, to, payload))| serde_json::json!({ "order": order, "from_address": hex(from), "to_address": hex(to), "payload": hex_vec(payload) })).collect::<Vec<_>>(),
+        "execution_resources": { "l1_gas": 0, "l2_gas": c.l2_gas },
+        "is_reverted": false,
+    })
+}
+
+/// An RPC `FUNCTION_INVOCATION` with recursive nested `calls`.
 fn invocation_json(o: &ExecutionOutcome, entry_point_type: &str) -> serde_json::Value {
     serde_json::json!({
         "contract_address": hex(&o.contract),
@@ -1677,7 +1752,7 @@ fn invocation_json(o: &ExecutionOutcome, entry_point_type: &str) -> serde_json::
         "entry_point_type": entry_point_type,
         "call_type": "CALL",
         "result": hex_vec(&o.retdata),
-        "calls": [],
+        "calls": o.calls.iter().map(recorded_call_json).collect::<Vec<_>>(),
         "events": o.events.iter().enumerate().map(|(order, (_, keys, data))| serde_json::json!({ "order": order, "keys": hex_vec(keys), "data": hex_vec(data) })).collect::<Vec<_>>(),
         "messages": o.messages.iter().enumerate().map(|(order, (from, to, payload))| serde_json::json!({ "order": order, "from_address": hex(from), "to_address": hex(to), "payload": hex_vec(payload) })).collect::<Vec<_>>(),
         "execution_resources": { "l1_gas": 0, "l2_gas": o.l2_gas },
@@ -2025,8 +2100,25 @@ pub mod Counter {
         // starknet_getBlockWithReceipts returns block header + paired (transaction, receipt) entries
         let bwr = chain.handle_rpc("starknet_getBlockWithReceipts", &serde_json::json!({ "block_id": "latest" })).unwrap();
         assert_eq!(bwr["status"], "ACCEPTED_ON_L2");
+        assert_ne!(bwr["new_root"], "0x0", "block new_root commitment must be non-zero: {bwr}");
+        assert_ne!(bwr["transaction_commitment"], "0x0", "transaction_commitment must be non-zero: {bwr}");
+        assert_ne!(bwr["receipt_commitment"], "0x0", "receipt_commitment must be non-zero: {bwr}");
+        assert_ne!(bwr["state_diff_commitment"], "0x0", "state_diff_commitment must be non-zero: {bwr}");
         let txs_with_receipts = bwr["transactions"].as_array().expect("transactions array");
         assert!(!txs_with_receipts.is_empty());
         assert!(txs_with_receipts[0].get("transaction").is_some() && txs_with_receipts[0].get("receipt").is_some());
+
+        // starknet_traceBlockTransactions returns nested inner calls (Account.__execute__ -> Counter.increase)
+        let block_traces = chain.handle_rpc("starknet_traceBlockTransactions", &serde_json::json!({ "block_id": { "block_number": 3 } })).unwrap();
+        let trace_arr = block_traces.as_array().expect("block_traces array");
+        assert!(!trace_arr.is_empty());
+        let exec_inv = &trace_arr[0]["trace_root"]["execute_invocation"];
+        let inner_calls = exec_inv["calls"].as_array().expect("nested calls array in execute_invocation");
+        assert!(!inner_calls.is_empty(), "Account.__execute__ must record nested inner contract calls in trace: {exec_inv}");
+        assert_eq!(
+            parse_felt_str(inner_calls[0]["contract_address"].as_str().unwrap()).unwrap(),
+            expected,
+            "inner call target must be the deployed Counter contract: {inner_calls:?}"
+        );
     }
 }

@@ -1698,16 +1698,27 @@ struct CompareBuildArgs {
     diagnostics_threshold: Option<f64>,
 }
 
-#[derive(Args, Debug)]
-struct MigrateArgs {
+#[derive(Args, Debug, Default, Clone)]
+pub(crate) struct MigrateArgs {
     #[arg(long)]
-    manifest_path: Option<PathBuf>,
+    pub(crate) manifest_path: Option<PathBuf>,
 
     #[arg(long)]
-    report_path: Option<PathBuf>,
+    pub(crate) report_path: Option<PathBuf>,
 
     #[arg(long)]
-    emit_uc_toml: Option<PathBuf>,
+    pub(crate) emit_uc_toml: Option<PathBuf>,
+
+    /// Preview migration without writing `uc.toml` / `uc.lock`.
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+
+    /// Remove legacy `Scarb.toml`, `Scarb.lock`, and `snfoundry.toml` after writing `uc.toml` + `uc.lock`.
+    #[arg(long)]
+    pub(crate) remove_legacy: bool,
+
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -3325,7 +3336,7 @@ fn project_inspect_report_from_manifest_path_with_native_support(
         .unwrap_or_default();
     let workspace_manifest =
         project_read_workspace_manifest_for_report(&workspace_root, manifest_path);
-    let workspace_manifest_path = workspace_root.join("Scarb.toml");
+    let workspace_manifest_path = manifest_file_in_dir(&workspace_root);
     let inspecting_workspace_root = workspace_manifest_path == manifest_path;
     let workspace_manifest_for_report = if inspecting_workspace_root {
         manifest.as_ref()
@@ -5169,7 +5180,7 @@ fn project_read_workspace_manifest_for_report(
     workspace_root: &Path,
     manifest_path: &Path,
 ) -> Option<TomlValue> {
-    let workspace_manifest_path = workspace_root.join("Scarb.toml");
+    let workspace_manifest_path = manifest_file_in_dir(&workspace_root);
     if workspace_manifest_path != manifest_path {
         match read_text_file_with_limit(&workspace_manifest_path, MAX_MANIFEST_BYTES, "manifest")
             .and_then(|text| {
@@ -8716,7 +8727,7 @@ fn manifest_workspace_dependency_exact_version(
         return Ok(None);
     }
     let workspace_root = metadata_cache_workspace_root(manifest_path)?;
-    let workspace_manifest_path = workspace_root.join("Scarb.toml");
+    let workspace_manifest_path = manifest_file_in_dir(&workspace_root);
     let workspace_manifest;
     let workspace_manifest_ref = if workspace_manifest_path == manifest_path {
         manifest
@@ -8907,7 +8918,7 @@ fn manifest_or_workspace_dependency_satisfied_by_native_compiler(
     }
     if manifest_dependency_uses_workspace(manifest, dependency_name) {
         let workspace_root = metadata_cache_workspace_root(manifest_path)?;
-        let workspace_manifest_path = workspace_root.join("Scarb.toml");
+        let workspace_manifest_path = manifest_file_in_dir(&workspace_root);
         let workspace_manifest;
         let workspace_manifest_ref = if workspace_manifest_path == manifest_path {
             manifest
@@ -11335,10 +11346,15 @@ fn try_uc_build_via_daemon(
             Ok(response) => response,
             Err(err) => {
                 if fallback_to_local {
-                    eprintln!(
-                        "uc: daemon request failed ({}), falling back to local engine",
-                        err
-                    );
+                    let msg = err.to_string();
+                    if msg.contains("failed to connect daemon socket") {
+                        let _ = fs::remove_file(&socket_path);
+                    } else {
+                        eprintln!(
+                            "uc: daemon request failed ({}), falling back to local engine",
+                            err
+                        );
+                    }
                     return Ok(None);
                 }
                 return Err(err).context("daemon build request failed");
@@ -11436,10 +11452,15 @@ fn try_uc_metadata_via_daemon(
             Ok(response) => response,
             Err(err) => {
                 if fallback_to_local {
-                    eprintln!(
-                        "uc: daemon request failed ({}), falling back to local metadata",
-                        err
-                    );
+                    let msg = err.to_string();
+                    if msg.contains("failed to connect daemon socket") {
+                        let _ = fs::remove_file(&socket_path);
+                    } else {
+                        eprintln!(
+                            "uc: daemon request failed ({}), falling back to local metadata",
+                            err
+                        );
+                    }
                     return Ok(None);
                 }
                 return Err(err).context("daemon metadata request failed");
@@ -11884,16 +11905,25 @@ fn manifest_has_workspace_table(manifest_path: &Path) -> bool {
     manifest.get("workspace").is_some()
 }
 
+fn manifest_file_in_dir(dir: impl AsRef<Path>) -> PathBuf {
+    let dir = dir.as_ref();
+    let uc_toml = dir.join("uc.toml");
+    if uc_toml.is_file() {
+        return uc_toml;
+    }
+    dir.join("Scarb.toml")
+}
+
 fn metadata_cache_workspace_root(manifest_path: &Path) -> Result<PathBuf> {
     let manifest_parent = manifest_path
         .parent()
         .context("manifest path has no parent")?;
     for ancestor in manifest_parent.ancestors() {
-        let ancestor_manifest = ancestor.join("Scarb.toml");
+        let ancestor_manifest = manifest_file_in_dir(ancestor);
         if !ancestor_manifest.is_file() {
             continue;
         }
-        if ancestor.join("Scarb.lock").is_file() {
+        if ancestor.join("uc.lock").is_file() || ancestor.join("Scarb.lock").is_file() {
             return Ok(ancestor.to_path_buf());
         }
         if ancestor != manifest_parent && manifest_has_workspace_table(&ancestor_manifest) {
@@ -11920,7 +11950,7 @@ fn run_scarb_metadata_with_uc_cache(
         .with_context(|| format!("failed to stat {}", manifest_path.display()))?;
     let manifest_size_bytes = manifest_metadata.len();
     let manifest_modified_unix_ms = metadata_modified_unix_ms(&manifest_metadata)?;
-    let workspace_manifest_path = workspace_root.join("Scarb.toml");
+    let workspace_manifest_path = manifest_file_in_dir(&workspace_root);
     let (_, _, lock_hash) = daemon_lock_state(&workspace_manifest_path)?;
     let workspace_manifests_hash = metadata_workspace_manifests_hash(&workspace_root)?;
     let scarb_version = scarb_version_line()?;
@@ -12842,7 +12872,7 @@ fn expand_workspace_member_pattern(
         }) {
             return Vec::new();
         }
-        let candidate_manifest = workspace_root.join(member_path).join("Scarb.toml");
+        let candidate_manifest = manifest_file_in_dir(&workspace_root.join(member_path));
         if let Ok(canonical) = candidate_manifest.canonicalize() {
             if ensure_path_within_root(
                 canonical_workspace_root,
@@ -12891,7 +12921,7 @@ fn expand_workspace_member_pattern(
             if !entry.file_type().is_dir() {
                 continue;
             }
-            let candidate_manifest = entry.path().join("Scarb.toml");
+            let candidate_manifest = manifest_file_in_dir(entry.path());
             if let Ok(canonical) = candidate_manifest.canonicalize() {
                 if ensure_path_within_root(
                     canonical_workspace_root,
@@ -13092,7 +13122,7 @@ fn build_native_compile_context(
     let manifest_size_bytes = manifest_metadata.len();
     let manifest_modified_unix_ms = metadata_modified_unix_ms(&manifest_metadata)?;
     let manifest_change_unix_ms = metadata_change_unix_ms(&manifest_metadata);
-    let workspace_manifest_path = workspace_root.join("Scarb.toml");
+    let workspace_manifest_path = manifest_file_in_dir(&workspace_root);
     let workspace_manifest_stats = if normalize_fingerprint_path(&workspace_manifest_path)
         == normalize_fingerprint_path(&effective_manifest_path)
         || !workspace_manifest_path.is_file()
@@ -13461,8 +13491,9 @@ fn resolve_cached_scarb_registry_dependency_source_root(
                 };
                 for rev_entry in rev_entries.flatten() {
                     let rev_path = rev_entry.path();
-                    let rev_workspace_version = fs::read_to_string(rev_path.join("Scarb.toml"))
-                        .ok()
+                    let rev_workspace_version = ["uc.toml", "Scarb.toml"]
+                        .into_iter()
+                        .find_map(|f| fs::read_to_string(rev_path.join(f)).ok())
                         .and_then(|t| toml::from_str::<TomlValue>(&t).ok())
                         .and_then(|v| {
                             v.get("workspace")
@@ -13471,25 +13502,61 @@ fn resolve_cached_scarb_registry_dependency_source_root(
                                 .and_then(TomlValue::as_str)
                                 .or_else(|| {
                                     v.get("package")
+                                        .or_else(|| v.get("project"))
                                         .and_then(|p| p.get("version"))
                                         .and_then(TomlValue::as_str)
                                 })
                                 .map(str::to_string)
                         });
-                    let mut check_dirs = vec![rev_path.clone(), rev_path.join("src")];
-                    if let Ok(sub_entries) = fs::read_dir(rev_path.join("packages")) {
-                        for sub in sub_entries.flatten() {
-                            check_dirs.push(sub.path());
+                    let mut check_dirs = Vec::new();
+                    fn collect_git_pkg_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+                        if depth > 3 {
+                            return;
+                        }
+                        if (dir.join("Scarb.toml").is_file() || dir.join("uc.toml").is_file())
+                            && dir.join("src/lib.cairo").is_file()
+                        {
+                            out.push(dir.to_path_buf());
+                        }
+                        let Ok(entries) = fs::read_dir(dir) else {
+                            return;
+                        };
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if !p.is_dir() {
+                                continue;
+                            }
+                            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                                continue;
+                            };
+                            if name.starts_with('.') || name == "target" || name == "tests" {
+                                continue;
+                            }
+                            if name == "src"
+                                && dir.join("src/lib.cairo").is_file()
+                                && !p.join("Scarb.toml").is_file()
+                                && !p.join("uc.toml").is_file()
+                            {
+                                continue;
+                            }
+                            collect_git_pkg_dirs(&p, depth + 1, out);
                         }
                     }
+                    collect_git_pkg_dirs(&rev_path, 0, &mut check_dirs);
                     for pkg_dir in check_dirs {
-                        let manifest_file = pkg_dir.join("Scarb.toml");
+                        let manifest_file = if pkg_dir.join("uc.toml").is_file() {
+                            pkg_dir.join("uc.toml")
+                        } else {
+                            pkg_dir.join("Scarb.toml")
+                        };
                         let src_dir = pkg_dir.join("src");
                         if manifest_file.is_file() && src_dir.join("lib.cairo").is_file() {
                             if let Ok(text) = fs::read_to_string(&manifest_file) {
                                 if let Ok(val) = toml::from_str::<TomlValue>(&text) {
-                                    let pkg_name = val
+                                    let pkg_tbl = val
                                         .get("package")
+                                        .or_else(|| val.get("project"));
+                                    let pkg_name = pkg_tbl
                                         .and_then(|p| p.get("name"))
                                         .and_then(TomlValue::as_str);
                                     if pkg_name == Some(dependency_name) {
@@ -13501,8 +13568,7 @@ fn resolve_cached_scarb_registry_dependency_source_root(
                                         } else {
                                             "0.0.0-git"
                                         };
-                                        let ver = val
-                                            .get("package")
+                                        let ver = pkg_tbl
                                             .and_then(|p| p.get("version"))
                                             .and_then(TomlValue::as_str)
                                             .or_else(|| {
@@ -13586,9 +13652,24 @@ fn collect_native_dependency_table_surface(
         ) else {
             external.insert(dependency_label);
             if context.allow_cached_registry_fallback {
+                let effective_dep_value = if dependency_value
+                    .as_table()
+                    .and_then(|t| t.get("workspace"))
+                    .and_then(TomlValue::as_bool)
+                    == Some(true)
+                {
+                    native_workspace_dependency_entry(
+                        context.manifest,
+                        context.workspace_manifest_fallback,
+                        dependency_name,
+                    )
+                    .unwrap_or(dependency_value)
+                } else {
+                    dependency_value
+                };
                 if let Some(cached_src) = resolve_cached_scarb_registry_dependency_source_root(
                     dependency_name,
-                    dependency_value,
+                    effective_dep_value,
                 ) {
                     let dependency_crate_name =
                         normalize_package_name_for_cairo_crate(dependency_name);
@@ -13706,10 +13787,12 @@ fn collect_native_manifest_dependency_surface(
 
 #[cfg(feature = "native-compile")]
 fn native_dependency_manifest_path(source_root: &Path) -> PathBuf {
-    source_root
-        .parent()
-        .unwrap_or(source_root)
-        .join("Scarb.toml")
+    let parent = source_root.parent().unwrap_or(source_root);
+    let uc_toml = parent.join("uc.toml");
+    if uc_toml.is_file() {
+        return uc_toml;
+    }
+    parent.join("Scarb.toml")
 }
 
 fn parse_scarb_metadata_document(stdout: &str) -> Result<ScarbMetadataDocument> {
@@ -14009,11 +14092,13 @@ fn collect_native_dependency_surface(
         "",
         false,
     );
-    let use_dependency_metadata = native_should_use_dependency_metadata_with_flags(
-        native_dependency_metadata_enabled(),
-        path_roots.len(),
-        manifest_external.len(),
-    );
+    let is_uc_toml = manifest_path.file_name().and_then(|s| s.to_str()) == Some("uc.toml");
+    let use_dependency_metadata = !is_uc_toml
+        && native_should_use_dependency_metadata_with_flags(
+            native_dependency_metadata_enabled(),
+            path_roots.len(),
+            manifest_external.len(),
+        );
     if use_dependency_metadata {
         let include_test_units = manifest
             .get("__uc_include_test_units")
@@ -14144,21 +14229,25 @@ fn collect_native_dependency_surface(
         let dependency_manifest_dir = dependency_manifest_path
             .parent()
             .unwrap_or(&canonical_workspace_root);
-        let local_dep_ws_manifest: Option<TomlValue> = dependency_manifest_dir
-            .parent()
-            .into_iter()
-            .chain(dependency_manifest_dir.parent().and_then(|p| p.parent()))
-            .find_map(|ancestor| {
-                let candidate = ancestor.join("Scarb.toml");
-                if candidate != dependency_manifest_path && candidate.is_file() {
-                    let txt = fs::read_to_string(&candidate).ok()?;
-                    let parsed = toml::from_str::<TomlValue>(&txt).ok()?;
-                    if parsed.get("workspace").is_some() {
-                        return Some(parsed);
+        let (local_dep_ws_root, local_dep_ws_manifest): (Option<PathBuf>, Option<TomlValue>) =
+            dependency_manifest_dir
+                .ancestors()
+                .skip(1)
+                .take(4)
+                .find_map(|ancestor| {
+                    for file_name in ["uc.toml", "Scarb.toml"] {
+                        let candidate = ancestor.join(file_name);
+                        if candidate != dependency_manifest_path && candidate.is_file() {
+                            let txt = fs::read_to_string(&candidate).ok()?;
+                            let parsed = toml::from_str::<TomlValue>(&txt).ok()?;
+                            if parsed.get("workspace").is_some() {
+                                return Some((Some(ancestor.to_path_buf()), Some(parsed)));
+                            }
+                        }
                     }
-                }
-                None
-            });
+                    None
+                })
+                .unwrap_or((None, None));
         if dependency_cairo_edition.is_none() {
             if let Some(ws_m) = local_dep_ws_manifest.as_ref().or(workspace_manifest_fallback) {
                 let (ws_ed, _) = resolve_manifest_cairo_settings_from_manifest(ws_m);
@@ -14171,15 +14260,8 @@ fn collect_native_dependency_surface(
                 &dependency_manifest,
                 local_dep_ws_manifest.as_ref().or(workspace_manifest_fallback),
                 dependency_manifest_dir,
-                local_dep_ws_manifest
-                    .as_ref()
-                    .and_then(|_| {
-                        dependency_manifest_dir
-                            .parent()
-                            .into_iter()
-                            .chain(dependency_manifest_dir.parent().and_then(|p| p.parent()))
-                            .find(|a| a.join("Scarb.toml").is_file())
-                    })
+                local_dep_ws_root
+                    .as_deref()
                     .unwrap_or(&canonical_workspace_root),
                 &dependency_label_prefix,
                 true,
@@ -14351,7 +14433,7 @@ fn build_native_compile_context_uncached_with_features(
         .context("native compile requires [package].name in Scarb.toml")?;
     let workspace_mode_supported = native_manifest_workspace_mode_supported(&manifest);
     let workspace_manifest_fallback = {
-        let workspace_manifest_path = workspace_root.join("Scarb.toml");
+        let workspace_manifest_path = manifest_file_in_dir(&workspace_root);
         if normalize_fingerprint_path(&workspace_manifest_path)
             == normalize_fingerprint_path(manifest_path)
         {
@@ -21664,12 +21746,149 @@ fn remove_build_outputs(workspace_root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Extracts an embedded `// /// uc ... // ///` (or `// --- uc ... // ---`) TOML block from the top
+/// of a standalone `.cairo` file (`PEP 723` / `cargo -Zscript` single-file mode).
+fn extract_embedded_uc_manifest_from_cairo(cairo_source: &str) -> Option<String> {
+    let mut lines = cairo_source.lines();
+    let mut in_block = false;
+    let mut out = String::new();
+    while let Some(raw_line) = lines.next() {
+        let trimmed = raw_line.trim();
+        if !in_block {
+            if trimmed.is_empty() {
+                continue;
+            }
+            if matches!(
+                trimmed,
+                "// /// uc" | "// --- uc" | "/// uc" | "// ```uc" | "// [uc]"
+            ) {
+                in_block = true;
+                continue;
+            }
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            break;
+        } else {
+            if matches!(trimmed, "// ///" | "// ---" | "///" | "// ```") {
+                return Some(out);
+            }
+            if let Some(rest) = trimmed.strip_prefix("//") {
+                let content = rest.strip_prefix(' ').unwrap_or(rest);
+                out.push_str(content);
+                out.push('\n');
+            } else if trimmed.is_empty() {
+                out.push('\n');
+            } else {
+                break;
+            }
+        }
+    }
+    None
+}
+
+/// Materializes a standalone `.cairo` script into a synthetic `<parent>/.uc/scripts/<stem>-<hash>/uc.toml`
+/// workspace so `uc build`, `uc check`, `uc test`, `uc prove`, and `uc execute` can run directly on `.cairo` files.
+fn materialize_single_file_cairo_manifest(cairo_file: &Path) -> Result<PathBuf> {
+    let source = fs::read_to_string(cairo_file)
+        .with_context(|| format!("failed to read standalone Cairo file {}", cairo_file.display()))?;
+    let raw_stem = cairo_file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("script");
+    let mut pkg_name = String::new();
+    for ch in raw_stem.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            pkg_name.push(ch.to_ascii_lowercase());
+        } else {
+            pkg_name.push('_');
+        }
+    }
+    let pkg_name = pkg_name.trim_matches('_').to_string();
+    let pkg_name = if pkg_name.is_empty() {
+        "uc_script".to_string()
+    } else if pkg_name.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        format!("script_{pkg_name}")
+    } else {
+        pkg_name
+    };
+
+    let embedded_toml = extract_embedded_uc_manifest_from_cairo(&source).unwrap_or_default();
+    let mut doc: TomlValue = if embedded_toml.trim().is_empty() {
+        TomlValue::Table(toml::map::Map::new())
+    } else {
+        toml::from_str(&embedded_toml).with_context(|| {
+            format!(
+                "failed to parse embedded `// /// uc` TOML block in {}",
+                cairo_file.display()
+            )
+        })?
+    };
+    if let Some(root_tbl) = doc.as_table_mut() {
+        if !root_tbl.contains_key("project") && !root_tbl.contains_key("package") {
+            let mut proj = toml::map::Map::new();
+            proj.insert("name".to_string(), TomlValue::String(pkg_name.clone()));
+            proj.insert("version".to_string(), TomlValue::String("0.1.0".to_string()));
+            proj.insert("edition".to_string(), TomlValue::String("2024_07".to_string()));
+            root_tbl.insert("project".to_string(), TomlValue::Table(proj));
+        } else {
+            let key = if root_tbl.contains_key("project") {
+                "project"
+            } else {
+                "package"
+            };
+            if let Some(proj) = root_tbl.get_mut(key).and_then(TomlValue::as_table_mut) {
+                proj.entry("name".to_string())
+                    .or_insert_with(|| TomlValue::String(pkg_name.clone()));
+                proj.entry("version".to_string())
+                    .or_insert_with(|| TomlValue::String("0.1.0".to_string()));
+                proj.entry("edition".to_string())
+                    .or_insert_with(|| TomlValue::String("2024_07".to_string()));
+            }
+        }
+    }
+
+    let mut hasher = Hasher::new();
+    hasher.update(cairo_file.to_string_lossy().as_bytes());
+    let path_hash = &hasher.finalize().to_hex()[..10];
+    let parent_dir = cairo_file.parent().unwrap_or_else(|| Path::new("."));
+    let script_dir = parent_dir
+        .join(".uc/scripts")
+        .join(format!("{pkg_name}-{path_hash}"));
+    let src_dir = script_dir.join("src");
+    fs::create_dir_all(&src_dir).with_context(|| {
+        format!(
+            "failed to create single-file workspace directory {}",
+             src_dir.display()
+        )
+    })?;
+    let manifest_out = toml::to_string_pretty(&doc)
+        .unwrap_or_else(|_| format!("[project]\nname = \"{pkg_name}\"\n"));
+    let manifest_path = script_dir.join("uc.toml");
+    let lib_path = src_dir.join("lib.cairo");
+    if fs::read_to_string(&manifest_path).ok().as_deref() != Some(manifest_out.as_str()) {
+        fs::write(&manifest_path, &manifest_out)?;
+    }
+    if fs::read_to_string(&lib_path).ok().as_deref() != Some(source.as_str()) {
+        fs::write(&lib_path, &source)?;
+    }
+    manifest_path
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", manifest_path.display()))
+}
+
 fn resolve_manifest_path(manifest_path: &Option<PathBuf>) -> Result<PathBuf> {
-    let requested = manifest_path
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| PathBuf::from("Scarb.toml"));
-    let resolved = if requested.is_absolute() {
+    let requested = match manifest_path {
+        Some(p) => p.clone(),
+        None => {
+            if Path::new("uc.toml").is_file() {
+                PathBuf::from("uc.toml")
+            } else {
+                PathBuf::from("Scarb.toml")
+            }
+        }
+    };
+    let mut resolved = if requested.is_absolute() {
         requested
             .canonicalize()
             .with_context(|| format!("failed to resolve manifest path {}", requested.display()))?
@@ -21688,9 +21907,26 @@ fn resolve_manifest_path(manifest_path: &Option<PathBuf>) -> Result<PathBuf> {
         resolved
     };
 
-    if resolved.file_name().and_then(|s| s.to_str()) != Some("Scarb.toml") {
+    if resolved.is_dir() {
+        let uc_candidate = resolved.join("uc.toml");
+        if uc_candidate.is_file() {
+            resolved = uc_candidate;
+        } else {
+            let scarb_candidate = resolved.join("Scarb.toml");
+            if scarb_candidate.is_file() {
+                resolved = scarb_candidate;
+            }
+        }
+    }
+
+    if resolved.extension().and_then(|s| s.to_str()) == Some("cairo") && resolved.is_file() {
+        return materialize_single_file_cairo_manifest(&resolved);
+    }
+
+    let file_name = resolved.file_name().and_then(|s| s.to_str());
+    if !matches!(file_name, Some("Scarb.toml" | "uc.toml")) {
         bail!(
-            "manifest path must reference Scarb.toml, got {}",
+            "manifest path must reference Scarb.toml or uc.toml, got {}",
             resolved.display()
         );
     }
@@ -22942,14 +23178,123 @@ fn build_session_cfg_set_from_manifest(manifest: &TomlValue) -> Result<Vec<Strin
     Ok(cfg_set)
 }
 
+fn dir_contains_starknet_contract(src_dir: &Path, depth: usize) -> bool {
+    if depth > 4 || !src_dir.is_dir() {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(src_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            if dir_contains_starknet_contract(&p, depth + 1) {
+                return true;
+            }
+        } else if p.extension().and_then(|s| s.to_str()) == Some("cairo") {
+            if let Ok(text) = fs::read_to_string(&p) {
+                if text.contains("#[starknet::contract]") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Normalizes a `uc.toml` (or `[project]`-based) manifest into the internal representation
+/// consumed by all `uc` subsystems:
+/// - Maps `[project]` -> `[package]` (defaulting `version = "0.1.0"` and `edition = "2024_07"`).
+/// - Injects `starknet = ">=2.14.0"` into `[dependencies]` for `uc.toml` packages unless disabled.
+/// - Auto-infers `[[target.starknet-contract]]` (`sierra = true`, `casm = true`) when `src/`
+///   contains any `#[starknet::contract]` module and no explicit `[target]` is declared.
+/// - Mirrors top-level `[prove]`, `[test]`, `[devnet]`, and `[networks]` into `[uc.*]`.
+fn normalize_uc_manifest_toml(doc: &mut TomlValue, manifest_path: &Path) {
+    let is_uc_toml = manifest_path.file_name().and_then(|s| s.to_str()) == Some("uc.toml");
+    let Some(root) = doc.as_table_mut() else {
+        return;
+    };
+    let has_project = root.get("project").and_then(TomlValue::as_table).is_some();
+    if has_project && !root.contains_key("package") {
+        if let Some(proj) = root.get("project").cloned() {
+            root.insert("package".to_string(), proj);
+        }
+    }
+    if !(is_uc_toml || has_project) {
+        return;
+    }
+
+    let starknet_disabled = root
+        .get("project")
+        .or_else(|| root.get("package"))
+        .and_then(TomlValue::as_table)
+        .and_then(|p| p.get("starknet"))
+        .and_then(TomlValue::as_bool)
+        == Some(false);
+
+    if let Some(pkg) = root.get_mut("package").and_then(TomlValue::as_table_mut) {
+        pkg.entry("version".to_string())
+            .or_insert_with(|| TomlValue::String("0.1.0".to_string()));
+        pkg.entry("edition".to_string())
+            .or_insert_with(|| TomlValue::String("2024_07".to_string()));
+    }
+
+    let has_package = root.get("package").and_then(TomlValue::as_table).is_some();
+    if has_package && !starknet_disabled {
+        let deps = root
+            .entry("dependencies".to_string())
+            .or_insert_with(|| TomlValue::Table(toml::map::Map::new()));
+        if let Some(deps_tbl) = deps.as_table_mut() {
+            deps_tbl
+                .entry("starknet".to_string())
+                .or_insert_with(|| TomlValue::String(">=2.14.0".to_string()));
+        }
+    }
+
+    if has_package && !root.contains_key("target") {
+        if let Some(parent) = manifest_path.parent() {
+            if dir_contains_starknet_contract(&parent.join("src"), 0) {
+                let mut contract_target = toml::map::Map::new();
+                contract_target.insert("sierra".to_string(), TomlValue::Boolean(true));
+                contract_target.insert("casm".to_string(), TomlValue::Boolean(true));
+                let mut target_tbl = toml::map::Map::new();
+                target_tbl.insert(
+                    "starknet-contract".to_string(),
+                    TomlValue::Array(vec![TomlValue::Table(contract_target)]),
+                );
+                root.insert("target".to_string(), TomlValue::Table(target_tbl));
+            }
+        }
+    }
+
+    let mut mirrored = Vec::new();
+    for section in ["prove", "test", "devnet", "networks"] {
+        if let Some(val) = root.get(section).cloned() {
+            mirrored.push((section.to_string(), val));
+        }
+    }
+    if !mirrored.is_empty() {
+        let uc_tbl = root
+            .entry("uc".to_string())
+            .or_insert_with(|| TomlValue::Table(toml::map::Map::new()));
+        if let Some(uc_map) = uc_tbl.as_table_mut() {
+            for (k, v) in mirrored {
+                uc_map.entry(k).or_insert(v);
+            }
+        }
+    }
+}
+
 fn parse_manifest_toml(
     manifest_text: &str,
     manifest_path: &Path,
     context: &str,
 ) -> Result<TomlValue> {
-    manifest_text
+    let mut doc = manifest_text
         .parse::<TomlValue>()
-        .with_context(|| format!("{context} {}", manifest_path.display()))
+        .with_context(|| format!("{context} {}", manifest_path.display()))?;
+    normalize_uc_manifest_toml(&mut doc, manifest_path);
+    Ok(doc)
 }
 
 fn stable_toml_fragment_hash(value: &TomlValue) -> Result<String> {
@@ -23197,6 +23542,7 @@ fn read_text_file_with_limit(path: &Path, max_bytes: u64, label: &str) -> Result
         .with_context(|| format!("{} is not valid UTF-8: {}", label, path.display()))
 }
 
+#[cfg(test)]
 fn write_uc_toml(
     path: &Path,
     source_manifest: &Path,

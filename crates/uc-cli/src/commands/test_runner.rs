@@ -141,6 +141,10 @@ pub(crate) struct TestArgs {
     #[arg(long)]
     pub offline: bool,
 
+    /// Automatically start an ephemeral in-process `uc devnet` for this test run (`UC_DEVNET_URL`).
+    #[arg(long)]
+    pub with_devnet: bool,
+
     #[arg(long)]
     pub json: bool,
 
@@ -716,6 +720,96 @@ fn discover_fuzzer_configs(manifest_dir: &Path, src_dir: &Path) -> BTreeMap<Stri
                         }
                     } else if !line.starts_with("#[") {
                         pending_fuzzer = None;
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Discovers `#[gas_budget(l2_gas = 50_000, steps = 500)]` / `#[budget(...)]` attributes on functions.
+pub(crate) fn discover_gas_budgets(
+    manifest_dir: &Path,
+    src_dir: &Path,
+) -> BTreeMap<String, (Option<u64>, Option<usize>)> {
+    let mut map = BTreeMap::new();
+    for check_dir in [src_dir.to_path_buf(), manifest_dir.join("tests")] {
+        if !check_dir.is_dir() {
+            continue;
+        }
+        for entry in WalkDir::new(check_dir).follow_links(false).into_iter().flatten() {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path();
+            if !path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("cairo"))
+            {
+                continue;
+            }
+            let Ok(source) = fs::read_to_string(path) else {
+                continue;
+            };
+            let mut pending_budget: Option<(Option<u64>, Option<usize>)> = None;
+            for raw_line in source.lines() {
+                let line = raw_line
+                    .split_once("//")
+                    .map(|(h, _)| h)
+                    .unwrap_or(raw_line)
+                    .trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Some(after) = line
+                    .split("#[gas_budget")
+                    .nth(1)
+                    .or_else(|| line.split("#[budget").nth(1))
+                {
+                    let mut l2_gas = None;
+                    let mut steps = None;
+                    let inner = after
+                        .trim_start_matches('(')
+                        .split(')')
+                        .next()
+                        .unwrap_or("");
+                    for part in inner.split(',') {
+                        let part = part.trim();
+                        if part.is_empty() {
+                            continue;
+                        }
+                        if let Some((k, v)) = part.split_once(['=', ':']) {
+                            let k = k.trim();
+                            let v_clean: String = v.trim().chars().filter(|c| *c != '_').collect();
+                            if matches!(k, "l2_gas" | "gas" | "max_l2_gas" | "max_gas") {
+                                l2_gas = v_clean.parse::<u64>().ok();
+                            } else if matches!(k, "steps" | "max_steps") {
+                                steps = v_clean.parse::<usize>().ok();
+                            }
+                        } else {
+                            let v_clean: String = part.chars().filter(|c| *c != '_').collect();
+                            if let Ok(g) = v_clean.parse::<u64>() {
+                                l2_gas = Some(g);
+                            }
+                        }
+                    }
+                    pending_budget = Some((l2_gas, steps));
+                }
+                if let Some(cfg) = pending_budget {
+                    let trimmed = line.strip_prefix("pub ").unwrap_or(line).trim_start();
+                    if let Some(rest) = trimmed.strip_prefix("fn ") {
+                        let fn_name: String = rest
+                            .chars()
+                            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                            .collect();
+                        if !fn_name.is_empty() {
+                            map.insert(fn_name, cfg);
+                            pending_budget = None;
+                        }
+                    } else if !line.starts_with("#[") {
+                        pending_budget = None;
                     }
                 }
             }
@@ -1308,9 +1402,15 @@ pub fn set_balance(target: ContractAddress, new_balance: u256, token: Token) {
 }
 
 pub mod byte_array {
-    use core::array::SpanTrait;
+    use core::array::{ArrayTrait, SpanTrait};
     use core::byte_array::BYTE_ARRAY_MAGIC;
     use core::serde::Serde;
+
+    pub fn byte_array_as_felt_array(self: @ByteArray) -> Array<felt252> {
+        let mut serialized = array![];
+        self.serialize(ref serialized);
+        serialized
+    }
 
     pub fn try_deserialize_bytearray_error(x: Span<felt252>) -> Result<ByteArray, ByteArray> {
         if x.len() > 0 && *x.at(0) == BYTE_ARRAY_MAGIC {
@@ -1323,7 +1423,37 @@ pub mod byte_array {
         Result::Err("Input is not a ByteArray-formatted error")
     }
 }
-pub use byte_array::try_deserialize_bytearray_error;
+pub use byte_array::{byte_array_as_felt_array, try_deserialize_bytearray_error};
+
+#[derive(Drop, Clone)]
+pub struct L1Handler {
+    pub target: ContractAddress,
+    pub selector: felt252,
+}
+
+pub trait L1HandlerTrait {
+    fn new(target: ContractAddress, selector: felt252) -> L1Handler;
+    fn execute(
+        self: L1Handler, from_address: felt252, payload: Span<felt252>,
+    ) -> starknet::SyscallResult<()>;
+}
+
+pub impl L1HandlerImpl of L1HandlerTrait {
+    fn new(target: ContractAddress, selector: felt252) -> L1Handler {
+        L1Handler { target, selector }
+    }
+
+    fn execute(
+        self: L1Handler, from_address: felt252, payload: Span<felt252>,
+    ) -> starknet::SyscallResult<()> {
+        let mut inputs: Array<felt252> = array![
+            self.target.into(), self.selector, from_address,
+        ];
+        payload.serialize(ref inputs);
+        let mut out = starknet::testing::cheatcode::<'l1_handler_execute'>(inputs.span());
+        Serde::<starknet::SyscallResult<()>>::deserialize(ref out).unwrap()
+    }
+}
 
 pub mod signature {
     #[derive(Copy, Drop)]
@@ -1382,11 +1512,21 @@ pub mod signature {
             fn sign(
                 self: StarkCurveKeyPair, message_hash: felt252,
             ) -> Result<(felt252, felt252), SignError> {
-                let r: felt252 = ec_stark_curve::GEN_X;
+                let max_hash: u256 =
+                    0x0800000000000000000000000000000000000000000000000000000000000000_u256;
+                let msg_u256: u256 = message_hash.into();
+                if msg_u256 >= max_hash {
+                    return Result::Err(SignError::HashOutOfRange);
+                }
                 let ord_u256: u256 = ec_stark_curve::ORDER.into();
+                let sk_u256: u256 = self.secret_key.into();
+                if self.secret_key == 0 || sk_u256 >= ord_u256 {
+                    return Result::Err(SignError::InvalidSecretKey);
+                }
+                let r: felt252 = ec_stark_curve::GEN_X;
                 let ord_nz: NonZero<u256> = ord_u256.try_into().unwrap();
-                let rd_mod: u256 = u256_mul_mod_n(r.into(), self.secret_key.into(), ord_nz);
-                let z_mod: u256 = message_hash.into() % ord_u256;
+                let rd_mod: u256 = u256_mul_mod_n(r.into(), sk_u256, ord_nz);
+                let z_mod: u256 = msg_u256 % ord_u256;
                 let sum: u256 = (z_mod + rd_mod) % ord_u256;
                 let s: felt252 = sum.try_into().unwrap();
                 Result::Ok((r, s))
@@ -1401,6 +1541,136 @@ pub mod signature {
             ) -> bool {
                 let (r, s) = signature;
                 check_ecdsa_signature(message_hash, self.public_key, r, s)
+            }
+        }
+    }
+
+    pub mod secp256k1_curve {
+        use core::array::{ArrayTrait, SpanTrait};
+        use core::math::u256_mul_mod_n;
+        use starknet::SyscallResultTrait;
+        use starknet::secp256_trait::{Secp256PointTrait, Secp256Trait, is_valid_signature};
+        use starknet::secp256k1::Secp256k1Point;
+        use super::{KeyPair, KeyPairTrait, SignerTrait, VerifierTrait, SignError};
+
+        pub type Secp256k1CurveKeyPair = KeyPair<u256, Secp256k1Point>;
+
+        pub impl Secp256k1CurveKeyPairImpl of KeyPairTrait<u256, Secp256k1Point> {
+            fn generate() -> Secp256k1CurveKeyPair {
+                let out = starknet::testing::cheatcode::<'next_keypair_secret'>(array![].span());
+                let secret_key: u256 = (*out.at(0)).into();
+                Self::from_secret_key(secret_key)
+            }
+
+            fn from_secret_key(secret_key: u256) -> Secp256k1CurveKeyPair {
+                if secret_key == 0_u256
+                    || secret_key >= Secp256Trait::<Secp256k1Point>::get_curve_size()
+                {
+                    core::panic_with_felt252('invalid secret_key');
+                }
+                let generator = Secp256Trait::<Secp256k1Point>::get_generator_point();
+                let public_key = Secp256PointTrait::mul(generator, secret_key).unwrap_syscall();
+                KeyPair { secret_key, public_key }
+            }
+        }
+
+        pub impl Secp256k1CurveSignerImpl of SignerTrait<
+            Secp256k1CurveKeyPair, u256, (u256, u256)
+        > {
+            fn sign(
+                self: Secp256k1CurveKeyPair, message_hash: u256,
+            ) -> Result<(u256, u256), SignError> {
+                let ord_u256 = Secp256Trait::<Secp256k1Point>::get_curve_size();
+                if self.secret_key == 0_u256 || self.secret_key >= ord_u256 {
+                    return Result::Err(SignError::InvalidSecretKey);
+                }
+                let generator = Secp256Trait::<Secp256k1Point>::get_generator_point();
+                let (gx, _gy) = generator.get_coordinates().unwrap_syscall();
+                let r: u256 = gx % ord_u256;
+                let ord_nz: NonZero<u256> = ord_u256.try_into().unwrap();
+                let rd_mod: u256 = u256_mul_mod_n(r, self.secret_key, ord_nz);
+                let z_mod: u256 = message_hash % ord_u256;
+                let mut s: u256 = (z_mod + rd_mod) % ord_u256;
+                if s > ord_u256 / 2 {
+                    s = ord_u256 - s;
+                }
+                Result::Ok((r, s))
+            }
+        }
+
+        pub impl Secp256k1CurveVerifierImpl of VerifierTrait<
+            Secp256k1CurveKeyPair, u256, (u256, u256)
+        > {
+            fn verify(
+                self: Secp256k1CurveKeyPair, message_hash: u256, signature: (u256, u256),
+            ) -> bool {
+                let (r, s) = signature;
+                is_valid_signature::<Secp256k1Point>(message_hash, r, s, self.public_key)
+            }
+        }
+    }
+
+    pub mod secp256r1_curve {
+        use core::array::{ArrayTrait, SpanTrait};
+        use core::math::u256_mul_mod_n;
+        use starknet::SyscallResultTrait;
+        use starknet::secp256_trait::{Secp256PointTrait, Secp256Trait, is_valid_signature};
+        use starknet::secp256r1::Secp256r1Point;
+        use super::{KeyPair, KeyPairTrait, SignerTrait, VerifierTrait, SignError};
+
+        pub type Secp256r1CurveKeyPair = KeyPair<u256, Secp256r1Point>;
+
+        pub impl Secp256r1CurveKeyPairImpl of KeyPairTrait<u256, Secp256r1Point> {
+            fn generate() -> Secp256r1CurveKeyPair {
+                let out = starknet::testing::cheatcode::<'next_keypair_secret'>(array![].span());
+                let secret_key: u256 = (*out.at(0)).into();
+                Self::from_secret_key(secret_key)
+            }
+
+            fn from_secret_key(secret_key: u256) -> Secp256r1CurveKeyPair {
+                if secret_key == 0_u256
+                    || secret_key >= Secp256Trait::<Secp256r1Point>::get_curve_size()
+                {
+                    core::panic_with_felt252('invalid secret_key');
+                }
+                let generator = Secp256Trait::<Secp256r1Point>::get_generator_point();
+                let public_key = Secp256PointTrait::mul(generator, secret_key).unwrap_syscall();
+                KeyPair { secret_key, public_key }
+            }
+        }
+
+        pub impl Secp256r1CurveSignerImpl of SignerTrait<
+            Secp256r1CurveKeyPair, u256, (u256, u256)
+        > {
+            fn sign(
+                self: Secp256r1CurveKeyPair, message_hash: u256,
+            ) -> Result<(u256, u256), SignError> {
+                let ord_u256 = Secp256Trait::<Secp256r1Point>::get_curve_size();
+                if self.secret_key == 0_u256 || self.secret_key >= ord_u256 {
+                    return Result::Err(SignError::InvalidSecretKey);
+                }
+                let generator = Secp256Trait::<Secp256r1Point>::get_generator_point();
+                let (gx, _gy) = generator.get_coordinates().unwrap_syscall();
+                let r: u256 = gx % ord_u256;
+                let ord_nz: NonZero<u256> = ord_u256.try_into().unwrap();
+                let rd_mod: u256 = u256_mul_mod_n(r, self.secret_key, ord_nz);
+                let z_mod: u256 = message_hash % ord_u256;
+                let mut s: u256 = (z_mod + rd_mod) % ord_u256;
+                if s > ord_u256 / 2 {
+                    s = ord_u256 - s;
+                }
+                Result::Ok((r, s))
+            }
+        }
+
+        pub impl Secp256r1CurveVerifierImpl of VerifierTrait<
+            Secp256r1CurveKeyPair, u256, (u256, u256)
+        > {
+            fn verify(
+                self: Secp256r1CurveKeyPair, message_hash: u256, signature: (u256, u256),
+            ) -> bool {
+                let (r, s) = signature;
+                is_valid_signature::<Secp256r1Point>(message_hash, r, s, self.public_key)
             }
         }
     }
@@ -1548,6 +1818,9 @@ pub mod cheatcodes {
             MessageToL1, MessageToL1FilterTrait, MessageToL1Spy, MessageToL1SpyAssertionsTrait,
             MessageToL1SpyTrait, MessagesToL1, spy_messages_to_l1,
         };
+    }
+    pub mod l1_handler {
+        pub use super::super::{L1Handler, L1HandlerImpl, L1HandlerTrait};
     }
 }
 
@@ -1850,6 +2123,9 @@ impl cairo_lang_defs::plugin::MacroPlugin for UcSnforgeTestAttrPlugin {
             cairo_lang_filesystem::ids::SmolStrId::from(db, "prove"),
             cairo_lang_filesystem::ids::SmolStrId::from(db, "invariant"),
             cairo_lang_filesystem::ids::SmolStrId::from(db, "executable"),
+            cairo_lang_filesystem::ids::SmolStrId::from(db, "gas_budget"),
+            cairo_lang_filesystem::ids::SmolStrId::from(db, "budget"),
+            cairo_lang_filesystem::ids::SmolStrId::from(db, "upgrades"),
         ]
     }
 }
@@ -1955,13 +2231,13 @@ pub(crate) fn compile_or_load_native_tests(
     let integration_crate_name = format!("{crate_name}_integration_tests");
 
     let workspace_manifest_fallback = {
-        let ws_manifest = workspace_root.join("Scarb.toml");
+        let ws_manifest = manifest_file_in_dir(workspace_root);
         if ws_manifest.is_file()
             && normalize_fingerprint_path(&ws_manifest) != normalize_fingerprint_path(manifest_path)
         {
             fs::read_to_string(&ws_manifest)
                 .ok()
-                .and_then(|t| toml::from_str::<TomlValue>(&t).ok())
+                .and_then(|t| parse_manifest_toml(&t, &ws_manifest, "workspace manifest").ok())
         } else {
             None
         }
@@ -2370,6 +2646,19 @@ fn generate_fuzz_words(
         u64::MAX as u128,
     ];
     let mut out = Vec::new();
+    if param_specs
+        .iter()
+        .all(|(ty_name, _)| ty_name == "u128" || ty_name == "i128")
+    {
+        for (ty_name, word_size) in param_specs {
+            for word_idx in 0..*word_size {
+                let raw = rng.next_u128().max(1_000_000_000_000_000_000);
+                out.push(clamp_fuzz_word_for_type(ty_name, word_idx, raw));
+            }
+        }
+        return out;
+    }
+
     if run_idx == 0 {
         for (ty_name, word_size) in param_specs {
             for word_idx in 0..*word_size {
@@ -2649,8 +2938,16 @@ fn discover_cairo_mutants(
     mutants
 }
 
-pub(crate) fn run_test(args: TestArgs) -> Result<()> {
+pub(crate) fn run_test(mut args: TestArgs) -> Result<()> {
     let started = Instant::now();
+    if args.manifest_path.is_none() {
+        if let Some(ref f) = args.filter {
+            if f.ends_with(".cairo") && Path::new(f).is_file() {
+                args.manifest_path = Some(PathBuf::from(f));
+                args.filter = None;
+            }
+        }
+    }
     let manifest_path = resolve_manifest_path(&args.manifest_path)?;
     let workspace_root = metadata_cache_workspace_root(&manifest_path)?;
 
@@ -2749,8 +3046,73 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
     let uses_external_snforge =
         project_uses_external_snforge_cheatcodes(&effective_manifest_path, &src_dir);
 
+    // Apply `[test]` / `[uc.test]` configuration from `uc.toml` / `Scarb.toml`.
+    let test_cfg_tbl = manifest
+        .get("test")
+        .or_else(|| manifest.get("uc").and_then(|u| u.get("test")))
+        .and_then(TomlValue::as_table);
+    let mut manifest_max_l2_gas: Option<u64> = None;
+    let mut manifest_devnet = false;
+    if let Some(tbl) = test_cfg_tbl {
+        if args.fuzz_runs == 0 {
+            if let Some(runs) = tbl
+                .get("fuzzer_runs")
+                .or_else(|| tbl.get("fuzzer-runs"))
+                .or_else(|| tbl.get("fuzz_runs"))
+                .or_else(|| tbl.get("fuzz-runs"))
+                .and_then(TomlValue::as_integer)
+                .and_then(|v| usize::try_from(v).ok())
+            {
+                args.fuzz_runs = runs;
+            }
+        }
+        if args.fuzz_seed.is_none() {
+            if let Some(seed) = tbl
+                .get("fuzzer_seed")
+                .or_else(|| tbl.get("fuzzer-seed"))
+                .or_else(|| tbl.get("fuzz_seed"))
+                .or_else(|| tbl.get("fuzz-seed"))
+                .and_then(TomlValue::as_integer)
+                .and_then(|v| u64::try_from(v).ok())
+            {
+                args.fuzz_seed = Some(seed);
+            }
+        }
+        if !args.gas_report {
+            if let Some(gr) = tbl
+                .get("gas_report")
+                .or_else(|| tbl.get("gas-report"))
+                .and_then(TomlValue::as_bool)
+            {
+                args.gas_report = gr;
+            }
+        }
+        manifest_max_l2_gas = tbl
+            .get("max_l2_gas")
+            .or_else(|| tbl.get("max-l2-gas"))
+            .and_then(TomlValue::as_integer)
+            .and_then(|v| u64::try_from(v).ok());
+        manifest_devnet = tbl
+            .get("devnet")
+            .and_then(TomlValue::as_bool)
+            .unwrap_or(false);
+    }
+
+    let ephemeral_devnet_url = if args.with_devnet || manifest_devnet {
+        let url = spawn_ephemeral_in_process_devnet()?;
+        std::env::set_var("UC_DEVNET_URL", &url);
+        std::env::set_var("STARKNET_RPC", &url);
+        if args.fork_url.is_none() {
+            args.fork_url = Some(url.clone());
+        }
+        Some(url)
+    } else {
+        None
+    };
+
     let source_locations = discover_source_test_locations(&workspace_root, &src_dir);
     let fuzzer_configs = discover_fuzzer_configs(manifest_dir, &src_dir);
+    let gas_budgets = discover_gas_budgets(manifest_dir, &src_dir);
     let (affected_modules_opt, current_affected_graph) =
         compute_affected_modules(&workspace_root, &package_name, &crate_name, &src_dir);
 
@@ -3295,8 +3657,36 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
                         ));
                         let builtins = builtins_or_none(builtin_map);
 
-                        let (passed, failure_reason) =
+                        let (mut passed, mut failure_reason) =
                             evaluate_outcome(&result, &test_cfg.expectation);
+                        if passed {
+                            let (attr_l2_gas, attr_steps) =
+                                gas_budgets.get(short_name).copied().unwrap_or((None, None));
+                            let effective_l2_cap = attr_l2_gas.or(manifest_max_l2_gas);
+                            let actual_l2_gas = resource_gas
+                                .as_ref()
+                                .map(|r| r.total)
+                                .or(gas_used)
+                                .unwrap_or(0);
+                            if let Some(cap) = effective_l2_cap {
+                                if actual_l2_gas > cap {
+                                    passed = false;
+                                    failure_reason = Some(format!(
+                                        "gas budget exceeded: used {actual_l2_gas} L2 gas (budget: {cap})"
+                                    ));
+                                }
+                            }
+                            if passed {
+                                if let (Some(step_cap), Some(actual_steps)) = (attr_steps, steps) {
+                                    if actual_steps > step_cap {
+                                        passed = false;
+                                        failure_reason = Some(format!(
+                                            "step budget exceeded: used {actual_steps} steps (budget: {step_cap})"
+                                        ));
+                                    }
+                                }
+                            }
+                        }
 
                         SingleTestResultReport {
                             name: name.clone(),
@@ -3599,6 +3989,7 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
             "failed_count": failed_count,
             "ignored_count": ignored_count,
             "elapsed_ms": elapsed_ms,
+            "devnet_url": ephemeral_devnet_url,
             "coverage": coverage_report,
             "snapshot_regressions": if snapshot_regressions.is_empty() { None } else { Some(&snapshot_regressions) },
             "mutation_testing": mutation_report,
@@ -4904,6 +5295,299 @@ mod tests {
             .find(|t| t["name"].as_str().unwrap().ends_with("check_addition_commutes"))
             .expect("check_addition_commutes entry");
         assert_eq!(commute_test["fuzz_runs"], 12, "{commute_test}");
+    }
+
+    #[test]
+    fn test_snforge_signature_curves_l1_handler_and_byte_array_felt_array() {
+        let _env = crate::test_env_shared();
+        let proj = TempTestProject::new("uc_sig_l1_test");
+        let manifest_path = proj.dir.join("uc.toml");
+        fs::write(
+            &manifest_path,
+            r#"[project]
+name = "uc_sig_l1_test"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            proj.dir.join("src/lib.cairo"),
+            r#"#[starknet::interface]
+pub trait IBridge<TContractState> {
+    fn get_last_l1_deposit(self: @TContractState) -> (felt252, u128);
+    fn verify_stark_sig(self: @TContractState, pub_key: felt252, msg_hash: felt252, r: felt252, s: felt252) -> bool;
+}
+
+#[starknet::contract]
+pub mod Bridge {
+    use core::ecdsa::check_ecdsa_signature;
+    use starknet::storage::{StoragePointerReadAccess, StoragePointerWriteAccess};
+
+    #[storage]
+    struct Storage {
+        last_from_l1: felt252,
+        last_amount: u128,
+    }
+
+    #[l1_handler]
+    fn on_l1_deposit(ref self: ContractState, from_address: felt252, amount: u128) {
+        self.last_from_l1.write(from_address);
+        self.last_amount.write(amount);
+    }
+
+    #[abi(embed_v0)]
+    impl BridgeImpl of super::IBridge<ContractState> {
+        fn get_last_l1_deposit(self: @ContractState) -> (felt252, u128) {
+            (self.last_from_l1.read(), self.last_amount.read())
+        }
+
+        fn verify_stark_sig(
+            self: @ContractState, pub_key: felt252, msg_hash: felt252, r: felt252, s: felt252,
+        ) -> bool {
+            check_ecdsa_signature(msg_hash, pub_key, r, s)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IBridgeDispatcher, IBridgeDispatcherTrait};
+    use snforge_std::{
+        ContractClassTrait, DeclareResultTrait, L1HandlerTrait, byte_array_as_felt_array, declare,
+    };
+    use snforge_std::signature::KeyPairTrait;
+    use snforge_std::signature::stark_curve::{
+        StarkCurveKeyPairImpl, StarkCurveSignerImpl, StarkCurveVerifierImpl,
+    };
+    use snforge_std::signature::secp256k1_curve::{
+        Secp256k1CurveKeyPairImpl, Secp256k1CurveSignerImpl, Secp256k1CurveVerifierImpl,
+    };
+    use snforge_std::signature::secp256r1_curve::{
+        Secp256r1CurveKeyPairImpl, Secp256r1CurveSignerImpl, Secp256r1CurveVerifierImpl,
+    };
+
+    #[test]
+    fn test_all_curves_and_l1_handler() {
+        let contract = declare("Bridge").unwrap().contract_class();
+        let (addr, _) = contract.deploy(@array![]).unwrap();
+        let disp = IBridgeDispatcher { contract_address: addr };
+
+        // 1. StarkCurve keypair sign + verify (both off-chain VerifierImpl and on-chain check_ecdsa_signature)
+        let kp = StarkCurveKeyPairImpl::from_secret_key(0x123456789abcdef);
+        let msg_hash = 0xdeadbeefcafe;
+        let (r, s) = kp.sign(msg_hash).unwrap();
+        assert(kp.verify(msg_hash, (r, s)), 'stark_verify_ok');
+        assert(!kp.verify(msg_hash + 1, (r, s)), 'stark_verify_bad_msg');
+        assert(disp.verify_stark_sig(kp.public_key, msg_hash, r, s), 'onchain_ecdsa_ok');
+
+        // 2. Secp256k1 keypair sign + verify
+        let k1 = Secp256k1CurveKeyPairImpl::from_secret_key(0xabcdef1234567890_u256);
+        let msg_u256: u256 = 0x11223344556677889900aabbccddeeff_u256;
+        let sig_k1 = k1.sign(msg_u256).unwrap();
+        assert(k1.verify(msg_u256, sig_k1), 'k1_verify_ok');
+        assert(!k1.verify(msg_u256 + 1, sig_k1), 'k1_verify_bad');
+
+        // 3. Secp256r1 keypair sign + verify
+        let r1 = Secp256r1CurveKeyPairImpl::from_secret_key(0x9876543210fedcba_u256);
+        let sig_r1 = r1.sign(msg_u256).unwrap();
+        assert(r1.verify(msg_u256, sig_r1), 'r1_verify_ok');
+        assert(!r1.verify(msg_u256 + 1, sig_r1), 'r1_verify_bad');
+
+        // 4. L1HandlerTrait::execute
+        let mut l1_tx = L1HandlerTrait::new(addr, selector!("on_l1_deposit"));
+        let res = l1_tx.execute(0x11112222, array![777_u128.into()].span());
+        assert(res.is_ok(), 'l1_handler_exec_ok');
+        let (from_l1, amount) = disp.get_last_l1_deposit();
+        assert(from_l1 == 0x11112222, 'l1_from_match');
+        assert(amount == 777_u128, 'l1_amount_match');
+
+        // 5. byte_array_as_felt_array
+        let ba: ByteArray = "hello uc";
+        let felts = byte_array_as_felt_array(@ba);
+        assert(felts.len() == 3, 'ba_felts_len');
+        assert(*felts.at(2) == 8, 'ba_pending_len');
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let rep_path = proj.dir.join("rep_sig.json");
+        run_test(TestArgs {
+            manifest_path: Some(manifest_path),
+            json: true,
+            report_path: Some(rep_path.clone()),
+            ..Default::default()
+        })
+        .expect("signature curves + L1HandlerTrait + byte_array_as_felt_array should pass");
+
+        let rep: serde_json::Value =
+            serde_json::from_slice(&fs::read(&rep_path).unwrap()).unwrap();
+        assert_eq!(rep["failed_count"], 0, "{rep}");
+        assert_eq!(rep["passed_count"], 1, "{rep}");
+    }
+
+    #[test]
+    fn test_uc_toml_zero_boilerplate_gas_budget_devnet_and_single_file_cairo() {
+        let _env = crate::test_env_shared();
+        let proj = TempTestProject::new("uc_nextgen_dx");
+        // Remove Scarb.toml if TempCairoProject created one, use pure uc.toml!
+        let _ = fs::remove_file(proj.dir.join("Scarb.toml"));
+        let uc_toml = proj.dir.join("uc.toml");
+        fs::write(
+            &uc_toml,
+            r#"[project]
+name = "uc_nextgen_dx"
+
+[test]
+devnet = true
+gas_report = true
+
+[prove]
+max_depth = 32
+"#,
+        )
+        .unwrap();
+        fs::write(
+            proj.dir.join("src/lib.cairo"),
+            r#"#[starknet::interface]
+pub trait IVault<TContractState> {
+    fn deposit(ref self: TContractState, amount: u64);
+    fn balance(self: @TContractState) -> u64;
+}
+
+#[starknet::contract]
+pub mod Vault {
+    use starknet::storage::{StoragePointerReadAccess, StoragePointerWriteAccess};
+
+    #[storage]
+    struct Storage {
+        bal: u64,
+    }
+
+    #[abi(embed_v0)]
+    impl VaultImpl of super::IVault<ContractState> {
+        #[prove]
+        fn deposit(ref self: ContractState, amount: u64) {
+            let cur = self.bal.read();
+            assert(cur <= 1_000_000_000 && amount <= 1_000_000_000, 'bounded');
+            self.bal.write(cur + amount);
+        }
+
+        fn balance(self: @ContractState) -> u64 {
+            self.bal.read()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IVaultDispatcher, IVaultDispatcherTrait};
+    use snforge_std::{ContractClassTrait, DeclareResultTrait, declare};
+
+    #[test]
+    #[gas_budget(l2_gas = 50000000)]
+    fn test_vault_deposit_within_budget() {
+        let contract = declare("Vault").unwrap().contract_class();
+        let (addr, _) = contract.deploy(@array![]).unwrap();
+        let disp = IVaultDispatcher { contract_address: addr };
+        disp.deposit(150);
+        assert(disp.balance() == 150, 'bal_150');
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        // 1. `uc build` auto-detects `uc.toml`, injects `starknet`, and auto-discovers `#[starknet::contract]`
+        run_build(BuildArgs {
+            common: BuildCommonArgs {
+                manifest_path: Some(uc_toml.clone()),
+                package: None,
+                workspace: false,
+                features: Vec::new(),
+                offline: true,
+                release: false,
+                profile: Some("dev".to_string()),
+            },
+            engine: EngineArg::Uc,
+            daemon_mode: DaemonModeArg::Off,
+            report_path: None,
+            record_failure: None,
+            json: false,
+            plan_only: false,
+        })
+        .expect("zero-boilerplate uc.toml build should succeed");
+        assert!(
+            proj.dir
+                .join("target/dev/uc_nextgen_dx_Vault.contract_class.json")
+                .is_file(),
+            "auto-discovered contract class JSON must be emitted"
+        );
+        assert!(
+            proj.dir
+                .join("target/dev/uc_nextgen_dx_Vault.compiled_contract_class.json")
+                .is_file(),
+            "auto-discovered CASM compiled contract class JSON must be emitted"
+        );
+
+        // 2. `uc test` runs with `devnet = true` and enforces `#[gas_budget]`
+        let rep_path = proj.dir.join("rep_dx.json");
+        run_test(TestArgs {
+            manifest_path: Some(uc_toml.clone()),
+            json: true,
+            report_path: Some(rep_path.clone()),
+            ..Default::default()
+        })
+        .expect("uc test with uc.toml + devnet = true + gas_budget should pass");
+        let rep: serde_json::Value =
+            serde_json::from_slice(&fs::read(&rep_path).unwrap()).unwrap();
+        assert_eq!(rep["failed_count"], 0, "{rep}");
+        assert!(
+            rep["devnet_url"]
+                .as_str()
+                .map(|s| s.starts_with("http://127.0.0.1:"))
+                .unwrap_or(false),
+            "devnet_url must be populated when [test] devnet = true: {rep}"
+        );
+
+        // 3. Single-file `.cairo` script mode (`// /// uc ... // ///`) with zero `uc.toml` in directory!
+        let script_dir = proj.dir.join("standalone_script");
+        fs::create_dir_all(&script_dir).unwrap();
+        let single_file = script_dir.join("mini_token.cairo");
+        fs::write(
+            &single_file,
+            r#"// /// uc
+// [project]
+// name = "mini_token_script"
+// ///
+
+pub fn safe_Double(x: u32) -> u64 {
+    x.into() * 2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_Double;
+
+    #[test]
+    fn test_double() {
+        assert(safe_Double(21) == 42, 'double_42');
+    }
+}
+"#,
+        )
+        .unwrap();
+        let single_rep = script_dir.join("single_rep.json");
+        run_test(TestArgs {
+            filter: Some(single_file.to_string_lossy().to_string()),
+            json: true,
+            report_path: Some(single_rep.clone()),
+            ..Default::default()
+        })
+        .expect("single-file .cairo test should pass without uc.toml or Scarb.toml");
+        let srep: serde_json::Value =
+            serde_json::from_slice(&fs::read(&single_rep).unwrap()).unwrap();
+        assert_eq!(srep["passed_count"], 1, "{srep}");
     }
 }
 

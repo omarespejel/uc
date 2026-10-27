@@ -6227,11 +6227,20 @@ fn prove_single_package(
     })
 }
 
-pub(crate) fn run_prove(args: ProveArgs) -> Result<()> {
+pub(crate) fn run_prove(mut args: ProveArgs) -> Result<()> {
+    if args.manifest_path.is_none() {
+        if let Some(ref f) = args.filter {
+            if f.ends_with(".cairo") && Path::new(f).is_file() {
+                args.manifest_path = Some(PathBuf::from(f));
+                args.filter = None;
+            }
+        }
+    }
     FUNCTION_TIMEOUT_MS.store(args.function_timeout_ms.max(1), std::sync::atomic::Ordering::Relaxed);
     KEEP_OBLIGATIONS.store(args.emit_smt.is_some(), std::sync::atomic::Ordering::Relaxed);
     let start = Instant::now();
     let mut pkg_reports = Vec::new();
+    let mut fail_on_unproven = false;
 
     if let Some(sierra_file) = &args.sierra_file {
         let mut text = fs::read_to_string(sierra_file)
@@ -6377,6 +6386,88 @@ pub(crate) fn run_prove(args: ProveArgs) -> Result<()> {
                 .unwrap_or("package")
                 .to_string();
             let crate_name = normalize_package_name_for_cairo_crate(&pkg_name);
+            let mut pkg_args = args.clone();
+            let pkg_dir = pkg_manifest.parent().unwrap_or(&workspace_root);
+            if let Some(prove_tbl) = manifest
+                .get("prove")
+                .or_else(|| manifest.get("uc").and_then(|u| u.get("prove")))
+                .and_then(TomlValue::as_table)
+            {
+                if let Some(d) = prove_tbl
+                    .get("max_depth")
+                    .or_else(|| prove_tbl.get("max-depth"))
+                    .and_then(TomlValue::as_integer)
+                    .and_then(|v| usize::try_from(v).ok())
+                {
+                    if pkg_args.max_depth == 48 {
+                        pkg_args.max_depth = d;
+                    }
+                }
+                if let Some(p) = prove_tbl
+                    .get("max_paths")
+                    .or_else(|| prove_tbl.get("max-paths"))
+                    .and_then(TomlValue::as_integer)
+                    .and_then(|v| usize::try_from(v).ok())
+                {
+                    if pkg_args.max_paths == 64 {
+                        pkg_args.max_paths = p;
+                    }
+                }
+                if pkg_args.emit_smt.is_none() {
+                    if prove_tbl
+                        .get("emit_smt")
+                        .or_else(|| prove_tbl.get("emit-smt"))
+                        .and_then(TomlValue::as_bool)
+                        == Some(true)
+                    {
+                        let smt_dir = workspace_root.join(".uc/smt");
+                        KEEP_OBLIGATIONS.store(true, std::sync::atomic::Ordering::Relaxed);
+                        pkg_args.emit_smt = Some(smt_dir);
+                    }
+                }
+                if pkg_args.check_upgrade.is_none() {
+                    if let Some(upg) = prove_tbl
+                        .get("upgrade_of")
+                        .or_else(|| prove_tbl.get("upgrade-of"))
+                        .or_else(|| prove_tbl.get("check_upgrade"))
+                        .and_then(TomlValue::as_str)
+                    {
+                        let candidate = pkg_dir.join(upg);
+                        pkg_args.check_upgrade = Some(if candidate.exists() {
+                            candidate.to_string_lossy().to_string()
+                        } else {
+                            upg.to_string()
+                        });
+                    }
+                }
+                if pkg_args.check_equivalence.is_none() {
+                    if let Some(eq) = prove_tbl
+                        .get("equivalence_with")
+                        .or_else(|| prove_tbl.get("equivalence-with"))
+                        .or_else(|| prove_tbl.get("check_equivalence"))
+                        .and_then(TomlValue::as_str)
+                    {
+                        pkg_args.check_equivalence = Some(pkg_dir.join(eq));
+                    }
+                }
+                if let Some(fail_policy) = prove_tbl
+                    .get("fail_on")
+                    .or_else(|| prove_tbl.get("fail-on"))
+                    .and_then(TomlValue::as_str)
+                {
+                    match fail_policy.trim() {
+                        "findings" | "counterexample" => pkg_args.fail_on_findings = true,
+                        "unproven" => {
+                            pkg_args.fail_on_findings = true;
+                            fail_on_unproven = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if pkg_args.fail_on_findings {
+                args.fail_on_findings = true;
+            }
             #[cfg(feature = "native-test-runner")]
             {
                 match with_native_compat_toolchain_fallback(|| {
@@ -6385,7 +6476,7 @@ pub(crate) fn run_prove(args: ProveArgs) -> Result<()> {
                         &workspace_root,
                         &pkg_name,
                         &crate_name,
-                        &args,
+                        &pkg_args,
                     )
                 }) {
                     Ok(rep) => pkg_reports.push(rep),
@@ -6613,12 +6704,20 @@ pub(crate) fn run_prove(args: ProveArgs) -> Result<()> {
             .is_some_and(|e| e.status == "NON_EQUIVALENT")
     });
 
-    if args.fail_on_findings
+    let any_unproven = fail_on_unproven
+        && report.packages.iter().any(|p| {
+            p.symbolic_proofs
+                .iter()
+                .any(|s| s.status != "PROVEN_SAFE")
+        });
+
+    if (args.fail_on_findings
         && (total_counterexamples > 0
             || total_caracal_findings > 0
             || any_invariant_violated
             || any_upgrade_unsafe
-            || any_non_equivalent)
+            || any_non_equivalent))
+        || any_unproven
     {
         std::process::exit(1);
     }

@@ -283,10 +283,11 @@ pub(super) fn load_fingerprint_index(path: &Path) -> Result<FingerprintIndex> {
         Ok(index) if index.schema_version == FINGERPRINT_INDEX_SCHEMA_VERSION => Ok(index),
         Ok(_) => Ok(FingerprintIndex::empty()),
         Err(err) => {
-            eprintln!(
-                "uc: warning: ignoring unreadable fingerprint index {}: {}",
-                path.display(),
-                err
+            let _ = fs::remove_file(path);
+            tracing::debug!(
+                path = %path.display(),
+                error = %err,
+                "ignoring and resetting unreadable fingerprint index"
             );
             Ok(FingerprintIndex::empty())
         }

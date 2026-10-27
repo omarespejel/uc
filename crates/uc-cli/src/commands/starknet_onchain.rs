@@ -585,38 +585,95 @@ pub(crate) fn resolve_sncast_profile_config(
         ..Default::default()
     };
 
-    // Check `snfoundry.toml` in workspace_root or ancestors
+    // 1. Check `[networks.<name>]` in `uc.toml` (or `[uc.networks.<name>]` in `Scarb.toml`).
+    let lookup_key = network_override
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&profile_name);
     for dir in workspace_root.ancestors().take(4) {
-        let snfoundry_path = dir.join("snfoundry.toml");
-        if snfoundry_path.is_file() {
-            if let Ok(text) = fs::read_to_string(&snfoundry_path) {
+        let uc_manifest = manifest_file_in_dir(dir);
+        if uc_manifest.is_file() {
+            if let Ok(text) = fs::read_to_string(&uc_manifest) {
                 if let Ok(val) = toml::from_str::<TomlValue>(&text) {
-                    if let Some(sncast_tbl) = val.get("sncast").and_then(TomlValue::as_table) {
-                        let prof_tbl = sncast_tbl
-                            .get(&profile_name)
-                            .and_then(TomlValue::as_table)
-                            .or_else(|| sncast_tbl.values().next().and_then(TomlValue::as_table));
-                        if let Some(t) = prof_tbl {
+                    let net_tbl = val
+                        .get("networks")
+                        .or_else(|| val.get("uc").and_then(|u| u.get("networks")))
+                        .and_then(TomlValue::as_table);
+                    if let Some(nets) = net_tbl {
+                        let entry = nets
+                            .get(lookup_key)
+                            .or_else(|| nets.get(&profile_name))
+                            .or_else(|| nets.get("default"))
+                            .and_then(TomlValue::as_table);
+                        if let Some(t) = entry {
                             resolved.url = t
                                 .get("url")
+                                .or_else(|| t.get("rpc"))
                                 .and_then(TomlValue::as_str)
                                 .map(str::to_string);
                             resolved.network = t
                                 .get("network")
                                 .and_then(TomlValue::as_str)
-                                .map(str::to_string);
+                                .map(str::to_string)
+                                .or_else(|| Some(lookup_key.to_string()));
                             resolved.account = t
                                 .get("account")
                                 .and_then(TomlValue::as_str)
                                 .map(str::to_string);
-                            if let Some(af) = t.get("accounts-file").or_else(|| t.get("accounts_file")).and_then(TomlValue::as_str) {
+                            resolved.account_address = t
+                                .get("account_address")
+                                .or_else(|| t.get("account-address"))
+                                .and_then(TomlValue::as_str)
+                                .map(str::to_string);
+                            if let Some(af) = t
+                                .get("accounts-file")
+                                .or_else(|| t.get("accounts_file"))
+                                .and_then(TomlValue::as_str)
+                            {
                                 resolved.accounts_file = Some(PathBuf::from(af));
                             }
+                            break;
                         }
                     }
                 }
             }
-            break;
+        }
+    }
+
+    // 2. Fallback: Check `snfoundry.toml` in workspace_root or ancestors
+    if resolved.url.is_none() && resolved.account.is_none() {
+        for dir in workspace_root.ancestors().take(4) {
+            let snfoundry_path = dir.join("snfoundry.toml");
+            if snfoundry_path.is_file() {
+                if let Ok(text) = fs::read_to_string(&snfoundry_path) {
+                    if let Ok(val) = toml::from_str::<TomlValue>(&text) {
+                        if let Some(sncast_tbl) = val.get("sncast").and_then(TomlValue::as_table) {
+                            let prof_tbl = sncast_tbl
+                                .get(&profile_name)
+                                .and_then(TomlValue::as_table)
+                                .or_else(|| sncast_tbl.values().next().and_then(TomlValue::as_table));
+                            if let Some(t) = prof_tbl {
+                                resolved.url = t
+                                    .get("url")
+                                    .and_then(TomlValue::as_str)
+                                    .map(str::to_string);
+                                resolved.network = t
+                                    .get("network")
+                                    .and_then(TomlValue::as_str)
+                                    .map(str::to_string);
+                                resolved.account = t
+                                    .get("account")
+                                    .and_then(TomlValue::as_str)
+                                    .map(str::to_string);
+                                if let Some(af) = t.get("accounts-file").or_else(|| t.get("accounts_file")).and_then(TomlValue::as_str) {
+                                    resolved.accounts_file = Some(PathBuf::from(af));
+                                }
+                            }
+                        }
+                    }
+                }
+                break;
+            }
         }
     }
 

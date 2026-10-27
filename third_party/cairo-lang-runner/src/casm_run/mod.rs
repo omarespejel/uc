@@ -291,6 +291,25 @@ pub struct StarknetState {
     active_call_frame_cheats: Vec<ActiveCallFrameCheats>,
     /// Monotonic counter for `KeyPairTrait::generate()`.
     next_keypair_secret: u64,
+    /// Recursive call tree recorded across nested syscalls.
+    pub recorded_calls: Vec<RecordedCall>,
+}
+
+/// A nested contract or library invocation recorded during execution.
+#[derive(Clone, Debug, Default)]
+pub struct RecordedCall {
+    pub contract_address: Felt252,
+    pub caller_address: Felt252,
+    pub class_hash: Felt252,
+    pub entry_point_selector: Felt252,
+    pub entry_point_type: &'static str,
+    pub call_type: &'static str,
+    pub calldata: Vec<Felt252>,
+    pub result: Vec<Felt252>,
+    pub events: Vec<(Felt252, Vec<Felt252>, Vec<Felt252>)>,
+    pub messages: Vec<(Felt252, Felt252, Vec<Felt252>)>,
+    pub calls: Vec<RecordedCall>,
+    pub l2_gas: u64,
 }
 /// The transaction and block context a devnet sets before executing an entry point.
 #[derive(Clone, Default)]
@@ -371,6 +390,11 @@ impl StarknetState {
     /// Takes every L2 to L1 message sent so far as `(from, to, payload)`.
     pub fn take_l2_to_l1_messages(&mut self) -> Vec<(Felt252, Felt252, Vec<Felt252>)> {
         std::mem::take(&mut self.all_l2_to_l1_messages)
+    }
+
+    /// Takes the tree of nested calls recorded during execution.
+    pub fn take_recorded_calls(&mut self) -> Vec<RecordedCall> {
+        std::mem::take(&mut self.recorded_calls)
     }
 
     /// Seeds a storage cell of the contract that is currently executing (the address a direct
@@ -1547,7 +1571,17 @@ impl CairoHintProcessor<'_> {
             let old_addrs = self
                 .starknet_state
                 .open_caller_context((deployed_contract_address, deployer_address));
-            let res = self.call_entry_point(gas_counter, runner, &class_hash, constructor, calldata, vm);
+            let res = self.call_entry_point_with_meta(
+                gas_counter,
+                runner,
+                &class_hash,
+                constructor,
+                Felt252::from_hex_unchecked("0x028ffe4ff0f226a9107253e17a904099aa4f63a02a5621de0576e5aa71bc5194"),
+                "CONSTRUCTOR",
+                "CALL",
+                calldata,
+                vm,
+            );
             self.starknet_state.close_caller_context(old_addrs);
             match res {
                 Ok(value) => value,
@@ -1646,7 +1680,17 @@ impl CairoHintProcessor<'_> {
             contract_address,
             self.starknet_state.exec_info.contract_address,
         ));
-        let res = self.call_entry_point(gas_counter, runner, &class_hash, entry_point, calldata, vm);
+        let res = self.call_entry_point_with_meta(
+            gas_counter,
+            runner,
+            &class_hash,
+            entry_point,
+            selector,
+            "EXTERNAL",
+            "CALL",
+            calldata,
+            vm,
+        );
         self.starknet_state.close_caller_context(old_addrs);
 
         match res {
@@ -1679,7 +1723,17 @@ impl CairoHintProcessor<'_> {
         let Some(entry_point) = contract_info.externals.get(&selector) else {
             fail_syscall!([b"ENTRYPOINT_NOT_FOUND", b"ENTRYPOINT_FAILED"]);
         };
-        match self.call_entry_point(gas_counter, runner, &class_hash, entry_point, calldata, vm) {
+        match self.call_entry_point_with_meta(
+            gas_counter,
+            runner,
+            &class_hash,
+            entry_point,
+            selector,
+            "EXTERNAL",
+            "LIBRARY_CALL",
+            calldata,
+            vm,
+        ) {
             Ok((res_data_start, res_data_end)) => {
                 Ok(SyscallResult::Success(vec![res_data_start.into(), res_data_end.into()]))
             }
@@ -1728,12 +1782,16 @@ impl CairoHintProcessor<'_> {
     }
 
     /// Executes the entry point with the given calldata.
-    fn call_entry_point(
+    #[allow(clippy::too_many_arguments)]
+    fn call_entry_point_with_meta(
         &mut self,
         gas_counter: &mut usize,
         runner: &SierraCasmRunner,
         class_hash: &Felt252,
         entry_point: &FunctionId,
+        selector: Felt252,
+        entry_point_type: &'static str,
+        call_type: &'static str,
         calldata: Vec<Felt252>,
         vm: &mut dyn VMWrapper,
     ) -> Result<(Relocatable, Relocatable), Vec<Felt252>> {
@@ -1746,25 +1804,61 @@ impl CairoHintProcessor<'_> {
             .registry()
             .get_function(entry_point)
             .expect("Entrypoint exists, but not found.");
+        let mut child_state = self.starknet_state.clone();
+        child_state.recorded_calls.clear();
+        let events_before = child_state.all_events.len();
+        let msgs_before = child_state.all_l2_to_l1_messages.len();
+        let gas_before = *gas_counter + gas_costs::ENTRY_POINT_INITIAL_BUDGET;
+        let calldata_copy = calldata.clone();
+        let contract_address = child_state.exec_info.contract_address;
+        let caller_address = child_state.exec_info.caller_address;
         let res = runner
             .run_function_with_starknet_context(
                 function,
                 vec![Arg::Array(calldata.into_iter().map(Arg::Value).collect())],
                 // The costs of the relevant syscall include `ENTRY_POINT_INITIAL_BUDGET` so we
                 // need to refund it here before running the entry point to avoid double charging.
-                Some(*gas_counter + gas_costs::ENTRY_POINT_INITIAL_BUDGET),
-                self.starknet_state.clone(),
+                Some(gas_before),
+                child_state,
             )
             .expect("Internal runner error.");
         self.syscalls_used_resources += res.used_resources;
         *gas_counter = res.gas_counter.unwrap().to_usize().unwrap();
         match res.value {
             RunResultValue::Success(value) => {
-                self.starknet_state = res.starknet_state;
+                let mut next_state = res.starknet_state;
+                let nested_calls = std::mem::take(&mut next_state.recorded_calls);
+                let direct_events = next_state
+                    .all_events
+                    .get(events_before..)
+                    .map(|s| s.to_vec())
+                    .unwrap_or_default();
+                let direct_msgs = next_state
+                    .all_l2_to_l1_messages
+                    .get(msgs_before..)
+                    .map(|s| s.to_vec())
+                    .unwrap_or_default();
                 let data = match res.return_array {
                     Some(data) => data,
                     None => read_array_result_as_vec(&res.memory, &value),
                 };
+                let mut parent_calls = std::mem::take(&mut self.starknet_state.recorded_calls);
+                parent_calls.push(RecordedCall {
+                    contract_address,
+                    caller_address,
+                    class_hash: *class_hash,
+                    entry_point_selector: selector,
+                    entry_point_type,
+                    call_type,
+                    calldata: calldata_copy,
+                    result: data.clone(),
+                    events: direct_events,
+                    messages: direct_msgs,
+                    calls: nested_calls,
+                    l2_gas: (gas_before as u64).saturating_sub(*gas_counter as u64),
+                });
+                next_state.recorded_calls = parent_calls;
+                self.starknet_state = next_state;
                 Ok(segment_with_data(vm, data.into_iter()).expect("failed to allocate segment"))
             }
             RunResultValue::Panic(panic_data) => Err(panic_data),
@@ -2302,6 +2396,80 @@ impl CairoHintProcessor<'_> {
                 let secret =
                     Felt252::from(0x5543_534b_0000_u64 + self.starknet_state.next_keypair_secret);
                 res_segment.write(secret)?;
+            }
+            "l1_handler_execute" => {
+                // inputs: [target, selector, from_address, payload_len, ...payload]
+                if inputs.len() < 4 {
+                    return Err(HintError::CustomHint(Box::from(
+                        "`l1_handler_execute` requires [target, selector, from_address, payload_len, ...]",
+                    )));
+                }
+                let target = inputs[0];
+                let selector = inputs[1];
+                let from_address = inputs[2];
+                let payload_len = inputs[3].to_usize().unwrap_or(0);
+                let payload = inputs.get(4..4 + payload_len).unwrap_or(&[]);
+                let mut calldata = Vec::with_capacity(1 + payload.len());
+                calldata.push(from_address);
+                calldata.extend_from_slice(payload);
+                let Some(class_hash) = self.starknet_state.deployed_contracts.get(&target).copied() else {
+                    res_segment.write(Felt252::from(1_u64))?;
+                    res_segment.write(Felt252::from(1_u64))?;
+                    res_segment.write(Felt252::from_bytes_be_slice(b"CONTRACT_NOT_DEPLOYED"))?;
+                    let res_segment_end = res_segment.ptr;
+                    insert_value_to_cellref!(vm, output_start, res_segment_start)?;
+                    insert_value_to_cellref!(vm, output_end, res_segment_end)?;
+                    return Ok(());
+                };
+                let runner = self.runner.expect("Runner is needed for starknet.");
+                let contract_info = runner
+                    .starknet_contracts_info
+                    .get(&class_hash)
+                    .expect("Deployed contract not found in registry.");
+                let Some(entry_point) = contract_info
+                    .l1_handlers
+                    .get(&selector)
+                    .or_else(|| contract_info.externals.get(&selector))
+                else {
+                    res_segment.write(Felt252::from(1_u64))?;
+                    res_segment.write(Felt252::from(1_u64))?;
+                    res_segment.write(Felt252::from_bytes_be_slice(b"ENTRYPOINT_NOT_FOUND"))?;
+                    let res_segment_end = res_segment.ptr;
+                    insert_value_to_cellref!(vm, output_start, res_segment_start)?;
+                    insert_value_to_cellref!(vm, output_end, res_segment_end)?;
+                    return Ok(());
+                };
+                let mut gas_budget: usize = usize::MAX / 4;
+                let old_addrs = self
+                    .starknet_state
+                    .open_caller_context((target, Felt252::zero()));
+                let res = self.call_entry_point_with_meta(
+                    &mut gas_budget,
+                    runner,
+                    &class_hash,
+                    entry_point,
+                    selector,
+                    "L1_HANDLER",
+                    "CALL",
+                    calldata,
+                    vm,
+                );
+                self.starknet_state.close_caller_context(old_addrs);
+                let mut l1_res_segment = MemBuffer::new(vm, res_segment_start);
+                match res {
+                    Ok(_) => {
+                        l1_res_segment.write(Felt252::zero())?;
+                    }
+                    Err(panic_data) => {
+                        l1_res_segment.write(Felt252::from(1_u64))?;
+                        l1_res_segment.write(panic_data.len())?;
+                        l1_res_segment.write_data(panic_data.iter())?;
+                    }
+                }
+                let res_segment_end = l1_res_segment.ptr;
+                insert_value_to_cellref!(vm, output_start, res_segment_start)?;
+                insert_value_to_cellref!(vm, output_end, res_segment_end)?;
+                return Ok(());
             }
             _ => Err(HintError::CustomHint(Box::from(format!(
                 "Unknown cheatcode selector: {selector}"

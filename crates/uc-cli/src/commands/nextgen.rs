@@ -198,6 +198,10 @@ pub(crate) struct NewArgs {
     #[arg(long)]
     pub(crate) starknet: bool,
 
+    /// Emit a legacy `Scarb.toml` instead of `uc.toml`.
+    #[arg(long)]
+    pub(crate) legacy_scarb: bool,
+
     /// Version control system to initialize.
     #[arg(long, value_enum, default_value_t = VcsKindArg::Git)]
     pub(crate) vcs: VcsKindArg,
@@ -230,6 +234,10 @@ pub(crate) struct InitArgs {
     /// Scaffold a Starknet smart contract template (`#[starknet::contract]`).
     #[arg(long)]
     pub(crate) starknet: bool,
+
+    /// Emit a legacy `Scarb.toml` instead of `uc.toml`.
+    #[arg(long)]
+    pub(crate) legacy_scarb: bool,
 
     /// Version control system to initialize.
     #[arg(long, value_enum, default_value_t = VcsKindArg::Git)]
@@ -1481,6 +1489,7 @@ fn scaffold_package_at(
     name_override: Option<&str>,
     edition: &str,
     starknet: bool,
+    legacy_scarb: bool,
     vcs: VcsKindArg,
     no_vcs: bool,
     allow_existing_dir: bool,
@@ -1496,10 +1505,11 @@ fn scaffold_package_at(
     let canonical_root = root_dir
         .canonicalize()
         .unwrap_or_else(|_| root_dir.to_path_buf());
-    let manifest_path = canonical_root.join("Scarb.toml");
+    let manifest_filename = if legacy_scarb { "Scarb.toml" } else { "uc.toml" };
+    let manifest_path = canonical_root.join(manifest_filename);
     if manifest_path.exists() {
         bail!(
-            "`Scarb.toml` already exists at `{}`",
+            "`{manifest_filename}` already exists at `{}`",
             manifest_path.display()
         );
     }
@@ -1516,7 +1526,23 @@ fn scaffold_package_at(
     validate_cairo_package_name(&raw_name)?;
 
     let mut created_files = Vec::new();
-    let manifest_content = if starknet {
+    let manifest_content = if !legacy_scarb {
+        format!(
+            r#"[project]
+name = "{raw_name}"
+version = "0.1.0"
+edition = "{edition}"
+
+[dependencies]
+
+[prove]
+fail-on = "counterexample"
+
+[test]
+fuzzer-runs = 256
+"#
+        )
+    } else if starknet {
         format!(
             r#"[package]
 name = "{raw_name}"
@@ -1634,6 +1660,7 @@ pub(crate) fn run_new(args: NewArgs) -> Result<()> {
         args.name.as_deref(),
         &args.edition,
         args.starknet,
+        args.legacy_scarb,
         args.vcs,
         args.no_vcs,
         false,
@@ -1668,6 +1695,7 @@ pub(crate) fn run_init(args: InitArgs) -> Result<()> {
         args.name.as_deref(),
         &args.edition,
         args.starknet,
+        args.legacy_scarb,
         args.vcs,
         args.no_vcs,
         true,
@@ -1729,11 +1757,9 @@ pub(crate) fn run_add(args: AddArgs) -> Result<()> {
     let manifest_path = base_manifest_path;
 
     let text = read_text_file_with_limit(&manifest_path, MAX_MANIFEST_BYTES, "manifest")?;
-    let mut doc: TomlValue = parse_manifest_toml(
-        &text,
-        &manifest_path,
-        "failed to parse Scarb.toml for `uc add`",
-    )?;
+    let mut doc: TomlValue = text
+        .parse::<TomlValue>()
+        .with_context(|| format!("failed to parse manifest for `uc add` {}", manifest_path.display()))?;
     let root_table = doc
         .as_table_mut()
         .context("Scarb.toml root must be a TOML table")?;
@@ -1839,11 +1865,9 @@ pub(crate) fn run_remove(args: RemoveArgs) -> Result<()> {
     let manifest_path = base_manifest_path;
 
     let text = read_text_file_with_limit(&manifest_path, MAX_MANIFEST_BYTES, "manifest")?;
-    let mut doc: TomlValue = parse_manifest_toml(
-        &text,
-        &manifest_path,
-        "failed to parse Scarb.toml for `uc remove`",
-    )?;
+    let mut doc: TomlValue = text
+        .parse::<TomlValue>()
+        .with_context(|| format!("failed to parse manifest for `uc remove` {}", manifest_path.display()))?;
     let root_table = doc
         .as_table_mut()
         .context("Scarb.toml root must be a TOML table")?;
@@ -4053,6 +4077,7 @@ mod tests {
             name: None,
             edition: "2024_07".to_string(),
             starknet: true,
+            legacy_scarb: false,
             no_vcs: true,
             vcs: VcsKindArg::None,
             json: false,
@@ -4060,7 +4085,7 @@ mod tests {
         })
         .expect("run_new --starknet should succeed");
 
-        let manifest_path = proj_dir.join("Scarb.toml");
+        let manifest_path = proj_dir.join("uc.toml");
         assert!(manifest_path.is_file());
         assert!(proj_dir.join("src/lib.cairo").is_file());
 
