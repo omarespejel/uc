@@ -14,7 +14,7 @@ use std::sync::{Arc, RwLock};
 pub(crate) const DEVNET_STRK_ADDRESS: &str = "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d";
 pub(crate) const DEVNET_ETH_ADDRESS: &str = "0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7";
 /// The JSON-RPC version the devnet serves (`pre_confirmed` tags, event and transaction indexes).
-const DEVNET_SPEC_VERSION: &str = "0.10.0";
+const DEVNET_SPEC_VERSION: &str = "0.10.4";
 /// The Starknet version whose rules the devnet follows: fees in L2 gas and blob data gas,
 /// Blake2s compiled class hashes.
 const DEVNET_STARKNET_VERSION: &str = "0.14.1";
@@ -445,7 +445,9 @@ const ERR_INSUFFICIENT_BALANCE: i64 = 54;
 const ERR_VALIDATION_FAILURE: i64 = 55;
 const ERR_COMPILED_CLASS_HASH_MISMATCH: i64 = 60;
 const ERR_UNSUPPORTED_TX_VERSION: i64 = 61;
+const ERR_INVALID_CONTRACT_CLASS: i64 = 50;
 const ERR_CLASS_ALREADY_DECLARED: i64 = 51;
+const ERR_COMPILATION_FAILED: i64 = 100;
 const ERR_UNSUPPORTED: i64 = -32601;
 const ERR_INVALID_PARAMS: i64 = -32602;
 
@@ -1506,6 +1508,26 @@ impl DevnetChain {
                 let class_hash = self.state.class_hash_at(&address).filter(|c| *c != Felt::ZERO).ok_or_else(|| RpcError::new(ERR_CONTRACT_NOT_FOUND, "Contract not found"))?;
                 self.classes.get(&class_hash).map(|c| c.class_json.clone()).ok_or_else(|| RpcError::new(ERR_CLASS_HASH_NOT_FOUND, "Class hash not found"))
             }
+            "starknet_getCompiledCasm" => {
+                let ch_val = p(0, "class_hash").or_else(|| p(1, "class_hash"));
+                let class_hash = felt(ch_val.as_ref().and_then(|v| v.as_str()).unwrap_or("0x0"))?;
+                let entry = self
+                    .classes
+                    .get(&class_hash)
+                    .ok_or_else(|| RpcError::new(ERR_CLASS_HASH_NOT_FOUND, "Class hash not found"))?;
+                let mut val = entry.class_json.clone();
+                if let Some(abi_text) = val.get("abi").and_then(|a| a.as_str()) {
+                    let parsed = serde_json::from_str::<serde_json::Value>(abi_text)
+                        .unwrap_or(serde_json::Value::Array(Vec::new()));
+                    val["abi"] = parsed;
+                }
+                let sierra_class = serde_json::from_value::<ContractClass>(val)
+                    .map_err(|e| RpcError::new(ERR_INVALID_CONTRACT_CLASS, format!("invalid Sierra class: {e}")))?;
+                let casm = compile_native_casm_contract(sierra_class, usize::MAX)
+                    .map_err(|e| RpcError::new(ERR_COMPILATION_FAILED, e.to_string()))?;
+                serde_json::to_value(&casm)
+                    .map_err(|e| RpcError::new(ERR_COMPILATION_FAILED, e.to_string()))
+            }
             "starknet_getStorageAt" => {
                 let address = felt(p(0, "contract_address").as_ref().and_then(|v| v.as_str()).unwrap_or("0x0"))?;
                 let key = felt(p(1, "key").as_ref().and_then(|v| v.as_str()).unwrap_or("0x0"))?;
@@ -1860,7 +1882,11 @@ impl DevnetChain {
                 }]))
             }
             "starknet_getStorageProof" => {
-                let b = self.block_by_id(p(0, "block_id").as_ref())?.clone();
+                let bid = p(0, "block_id");
+                if bid.as_ref().and_then(|v| v.as_str()) == Some("pre_confirmed") {
+                    return Err(RpcError::new(ERR_INVALID_PARAMS, "storage proof is not supported for pre_confirmed block"));
+                }
+                let b = self.block_by_id(bid.as_ref())?.clone();
                 let root = hex(&felt_from_digest(
                     "uc-devnet-root:",
                     &[&b.block_number.to_le_bytes(), b.block_hash.as_bytes()],
@@ -1879,6 +1905,16 @@ impl DevnetChain {
                     }
                 }))
             }
+            "starknet_subscribeNewHeads"
+            | "starknet_subscribeEvents"
+            | "starknet_subscribeTransactionStatus"
+            | "starknet_subscribeNewTransactionReceipts"
+            | "starknet_subscribeNewTransactions"
+            | "starknet_subscribePendingTransactions" => {
+                let sub_id = format!("0x{:x}", self.blocks.len() + self.txs.len() + 1);
+                Ok(serde_json::json!(sub_id))
+            }
+            "starknet_unsubscribe" => Ok(serde_json::json!(true)),
             _ => Err(RpcError::new(ERR_UNSUPPORTED, format!("Method not found: {method}"))),
         }
     }
@@ -2473,5 +2509,23 @@ pub mod Counter {
             )
             .unwrap();
         assert!(sp["global_roots"]["contracts_tree_root"].as_str().unwrap().starts_with("0x"));
+        assert!(chain
+            .handle_rpc(
+                "starknet_getStorageProof",
+                &serde_json::json!({ "block_id": "pre_confirmed" }),
+            )
+            .is_err());
+
+        // Starknet JSON-RPC v0.10.4: specVersion, getCompiledCasm, pre_confirmed tag, and WS subscriptions
+        let spec_ver = chain.handle_rpc("starknet_specVersion", &serde_json::json!([])).unwrap();
+        assert_eq!(spec_ver, serde_json::json!("0.10.4"));
+        let casm_res = chain
+            .handle_rpc("starknet_getCompiledCasm", &serde_json::json!({ "class_hash": class_hash }))
+            .unwrap();
+        assert!(casm_res["bytecode"].as_array().is_some_and(|b| !b.is_empty()));
+        let sub_id = chain.handle_rpc("starknet_subscribeNewHeads", &serde_json::json!({})).unwrap();
+        assert!(sub_id.as_str().is_some_and(|s| s.starts_with("0x")));
+        let unsub = chain.handle_rpc("starknet_unsubscribe", &serde_json::json!({ "subscription_id": sub_id })).unwrap();
+        assert_eq!(unsub, serde_json::json!(true));
     }
 }
