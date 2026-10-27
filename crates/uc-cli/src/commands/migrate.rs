@@ -93,6 +93,27 @@ pub(crate) fn convert_scarb_and_snfoundry_to_uc_toml(
         .and_then(TomlValue::as_table)
         .cloned()
         .unwrap_or_default();
+    if let Some(test_arr) = scarb_doc.get("test").and_then(TomlValue::as_array) {
+        let mut ext_contracts = Vec::new();
+        for item in test_arr {
+            if let Some(arr) = item
+                .as_table()
+                .and_then(|t| t.get("build-external-contracts"))
+                .and_then(TomlValue::as_array)
+            {
+                for c in arr {
+                    if !ext_contracts.contains(c) {
+                        ext_contracts.push(c.clone());
+                    }
+                }
+            }
+        }
+        if !ext_contracts.is_empty() {
+            test_tbl
+                .entry("build-external-contracts".to_string())
+                .or_insert(TomlValue::Array(ext_contracts));
+        }
+    }
     for snforge_source in [
         scarb_doc.get("tool").and_then(|t| t.get("snforge")),
         snfoundry_doc.and_then(|s| s.get("snforge")),

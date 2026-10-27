@@ -8781,7 +8781,7 @@ fn project_lockfile_dependency_version(
     dependency_name: &str,
 ) -> Result<Option<String>> {
     let workspace_root = metadata_cache_workspace_root(manifest_path)?;
-    let lock_path = workspace_root.join("Scarb.lock");
+    let lock_path = lockfile_in_dir(&workspace_root);
     let lock_text = match fs::read_to_string(&lock_path) {
         Ok(text) => text,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -10886,10 +10886,7 @@ fn run_cache(args: CacheArgs) -> Result<()> {
 
 fn run_cache_clean(args: CacheCleanArgs) -> Result<()> {
     let manifest_path = resolve_manifest_path(&args.manifest_path)?;
-    let workspace_root = manifest_path
-        .parent()
-        .context("manifest path has no parent")?
-        .to_path_buf();
+    let workspace_root = metadata_cache_workspace_root(&manifest_path)?;
     let cache_root = workspace_root.join(".uc/cache");
     if !cache_root.exists() {
         println!("uc cache is already clean: {}", cache_root.display());
@@ -11680,6 +11677,8 @@ fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildRespon
     let common = common_args_from_daemon_request(&request);
     let manifest_path = resolve_manifest_path(&common.manifest_path)?;
     let requested_backend = request.compile_backend.into_compile_backend();
+    let is_pure_uc_toml = manifest_path.file_name().and_then(|s| s.to_str()) == Some("uc.toml")
+        && !manifest_path.with_file_name("Scarb.toml").is_file();
     let build_result = (|| -> Result<DaemonBuildResponse> {
         if requested_backend == BuildCompileBackend::Native {
             ensure_daemon_native_toolchain_request_supported(&manifest_path)?;
@@ -11698,6 +11697,7 @@ fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildRespon
         Err(native_err)
             if requested_backend == BuildCompileBackend::Native
                 && request.native_fallback_to_scarb
+                && !is_pure_uc_toml
                 && native_error_allows_scarb_fallback(&native_err) =>
         {
             if native_disallow_scarb_fallback() {
@@ -14163,7 +14163,13 @@ fn collect_native_dependency_surface(
     let has_manifest_external_dependencies = !manifest_external.is_empty();
     let mut external = manifest_external;
     let root_crate_name = normalize_package_name_for_cairo_crate(root_package_name);
-    let (root_cairo_edition, _) = resolve_manifest_cairo_settings_from_manifest(manifest);
+    let (mut root_cairo_edition, _) = resolve_manifest_cairo_settings_from_manifest(manifest);
+    if root_cairo_edition.is_none() {
+        if let Some(ws_m) = workspace_manifest_fallback {
+            let (ws_ed, _) = resolve_manifest_cairo_settings_from_manifest(ws_m);
+            root_cairo_edition = ws_ed;
+        }
+    }
     let mut root_dependencies = path_roots.keys().cloned().collect::<BTreeSet<_>>();
     if !root_dependencies.is_empty() || has_manifest_external_dependencies {
         root_dependencies.insert(root_crate_name.clone());
@@ -14252,9 +14258,20 @@ fn collect_native_dependency_surface(
                 })
                 .unwrap_or((None, None));
         if dependency_cairo_edition.is_none() {
-            if let Some(ws_m) = local_dep_ws_manifest.as_ref().or(workspace_manifest_fallback) {
-                let (ws_ed, _) = resolve_manifest_cairo_settings_from_manifest(ws_m);
-                dependency_cairo_edition = ws_ed;
+            let dep_inherits_ws_edition = dependency_manifest
+                .get("package")
+                .or_else(|| dependency_manifest.get("project"))
+                .and_then(TomlValue::as_table)
+                .and_then(|t| t.get("edition"))
+                .and_then(TomlValue::as_table)
+                .and_then(|t| t.get("workspace"))
+                .and_then(TomlValue::as_bool)
+                == Some(true);
+            if dep_inherits_ws_edition {
+                if let Some(ws_m) = local_dep_ws_manifest.as_ref().or(workspace_manifest_fallback) {
+                    let (ws_ed, _) = resolve_manifest_cairo_settings_from_manifest(ws_m);
+                    dependency_cairo_edition = ws_ed;
+                }
             }
         }
         let dependency_label_prefix = format!("[dependency.{dependency_crate_name}]");
@@ -14558,6 +14575,9 @@ fn build_native_compile_context_uncached_with_features(
         .iter_mut()
         .find(|config| config.crate_name == crate_name)
     {
+        if root_config.cairo_edition.is_none() {
+            root_config.cairo_edition = cairo_edition.clone();
+        }
         if !root_config
             .dependencies
             .iter()
@@ -22156,8 +22176,39 @@ fn build_session_input_with_compiler_version(
     )?;
     validate_manifest_dependency_sanity_from_manifest(manifest_path, &manifest)?;
     let manifest_content_hash = compute_manifest_content_hash_bytes(manifest_text.as_bytes());
-    let (cairo_edition, cairo_lang_version) =
+    let (mut cairo_edition, cairo_lang_version) =
         resolve_manifest_cairo_settings_from_manifest(&manifest);
+    if cairo_edition.is_none() {
+        let inherits_ws_edition = manifest
+            .get("package")
+            .or_else(|| manifest.get("project"))
+            .and_then(TomlValue::as_table)
+            .and_then(|t| t.get("edition"))
+            .and_then(TomlValue::as_table)
+            .and_then(|t| t.get("workspace"))
+            .and_then(TomlValue::as_bool)
+            == Some(true);
+        if inherits_ws_edition {
+            if let Ok(ws_root) = metadata_cache_workspace_root(manifest_path) {
+                let ws_manifest_path = manifest_file_in_dir(&ws_root);
+                if ws_manifest_path != manifest_path && ws_manifest_path.is_file() {
+                    if let Ok(ws_text) = read_text_file_with_limit(
+                        &ws_manifest_path,
+                        MAX_MANIFEST_BYTES,
+                        "workspace manifest",
+                    ) {
+                        if let Ok(ws_manifest) =
+                            parse_manifest_toml(&ws_text, &ws_manifest_path, "workspace manifest")
+                        {
+                            let (ws_ed, _) =
+                                resolve_manifest_cairo_settings_from_manifest(&ws_manifest);
+                            cairo_edition = ws_ed;
+                        }
+                    }
+                }
+            }
+        }
+    }
     let mut cfg_set = build_session_cfg_set_from_manifest(&manifest)?;
     cfg_set.push(format!("workspace:{}", common.workspace));
     cfg_set.push(format!("release:{}", common.release));
@@ -22709,10 +22760,7 @@ fn prepare_daemon_build_plan_with_compiler_version(
         }
     }
 
-    let workspace_root = manifest_path
-        .parent()
-        .context("manifest path has no parent")?
-        .to_path_buf();
+    let workspace_root = metadata_cache_workspace_root(manifest_path)?;
     let session_input = build_session_input_with_compiler_version(
         common,
         manifest_path,

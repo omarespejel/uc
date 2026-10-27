@@ -16680,3 +16680,103 @@ edition = "2024_07"
     assert!(!root.join("target").exists());
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn workspace_member_edition_inheritance_and_migrate_external_contracts() {
+    let root = unique_test_dir("uc-ws-member-edition-inheritance");
+    let member_dir = root.join("packages/member_a");
+    fs::create_dir_all(member_dir.join("src")).unwrap();
+    let ws_manifest_path = root.join("uc.toml");
+    let member_manifest_path = member_dir.join("uc.toml");
+
+    fs::write(
+        &ws_manifest_path,
+        r#"[workspace]
+members = ["packages/member_a"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024_07"
+
+[workspace.dependencies]
+starknet = "2.16.0"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &member_manifest_path,
+        r#"[package]
+name = "member_a"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+starknet.workspace = true
+"#,
+    )
+    .unwrap();
+    fs::write(member_dir.join("src/lib.cairo"), "pub fn hello() -> felt252 { 1 }\n").unwrap();
+
+    let resolved_ws_root = metadata_cache_workspace_root(&member_manifest_path).unwrap();
+    assert_eq!(
+        normalize_fingerprint_path(&resolved_ws_root),
+        normalize_fingerprint_path(&root)
+    );
+
+    let ws_manifest: TomlValue =
+        parse_manifest_toml(&fs::read_to_string(&ws_manifest_path).unwrap(), &ws_manifest_path, "ws")
+            .unwrap();
+    let member_manifest: TomlValue = parse_manifest_toml(
+        &fs::read_to_string(&member_manifest_path).unwrap(),
+        &member_manifest_path,
+        "member",
+    )
+    .unwrap();
+    let surface = collect_native_dependency_surface(
+        &member_manifest,
+        Some(&ws_manifest),
+        &member_manifest_path,
+        &root,
+        "member_a",
+        false,
+    );
+    let root_cfg = surface
+        .crate_dependency_configs
+        .iter()
+        .find(|c| c.crate_name == "member_a")
+        .expect("member_a config must exist");
+    assert_eq!(root_cfg.cairo_edition.as_deref(), Some("2024_07"));
+
+    // Verify run_migrate preserves [[test]] build-external-contracts
+    let mig_dir = root.join("mig_pkg");
+    fs::create_dir_all(mig_dir.join("src")).unwrap();
+    let scarb_path = mig_dir.join("Scarb.toml");
+    fs::write(
+        &scarb_path,
+        r#"[package]
+name = "member_a"
+version.workspace = true
+edition.workspace = true
+
+[[test]]
+name = "member_a_unittest"
+build-external-contracts = ["ext_pkg::MyContract"]
+"#,
+    )
+    .unwrap();
+    run_migrate(MigrateArgs {
+        manifest_path: Some(scarb_path),
+        emit_uc_toml: None,
+        dry_run: false,
+        remove_legacy: false,
+        json: false,
+        report_path: None,
+    })
+    .unwrap();
+    let migrated = fs::read_to_string(mig_dir.join("uc.toml")).unwrap();
+    assert!(
+        migrated.contains("build-external-contracts") && migrated.contains("ext_pkg::MyContract"),
+        "migrated uc.toml must preserve build-external-contracts from [[test]]: {migrated}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}

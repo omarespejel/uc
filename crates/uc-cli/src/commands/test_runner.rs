@@ -2760,6 +2760,9 @@ pub(crate) fn compile_or_load_native_tests(
         .iter_mut()
         .find(|c| c.crate_name == crate_name)
     {
+        if root_cfg.cairo_edition.is_none() {
+            root_cfg.cairo_edition = cairo_edition.clone();
+        }
         for req in [crate_name, "snforge_std"] {
             if !root_cfg.dependencies.iter().any(|d| d == req) {
                 root_cfg.dependencies.push(req.to_string());
@@ -3449,26 +3452,34 @@ pub(crate) fn run_test(mut args: TestArgs) -> Result<()> {
             let mut total_passed = 0_usize;
             let mut total_failed = 0_usize;
             let mut total_ignored = 0_usize;
-            for member_manifest in member_manifests {
-                let temp_report = workspace_root
-                    .join(".uc/cache")
-                    .join(format!("test-ws-{}.json", epoch_ms_u64().unwrap_or_default()));
+            let ws_report_prefix = if args.json {
+                "test-ws-quiet"
+            } else {
+                "test-ws"
+            };
+            for (idx, member_manifest) in member_manifests.into_iter().enumerate() {
+                let temp_report = workspace_root.join(".uc/cache").join(format!(
+                    "{ws_report_prefix}-{}-{idx}.json",
+                    epoch_ms_u64().unwrap_or_default()
+                ));
                 let mut member_args = args.clone();
                 member_args.workspace = false;
                 member_args.manifest_path = Some(member_manifest);
                 member_args.json = false;
                 member_args.report_path = Some(temp_report.clone());
                 let res = run_test(member_args);
+                let mut member_failed = 0_usize;
                 if let Ok(bytes) = fs::read(&temp_report) {
                     if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                         total_passed += val
                             .get("passed_count")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0) as usize;
-                        total_failed += val
+                        member_failed = val
                             .get("failed_count")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0) as usize;
+                        total_failed += member_failed;
                         total_ignored += val
                             .get("ignored_count")
                             .and_then(|v| v.as_u64())
@@ -3479,19 +3490,24 @@ pub(crate) fn run_test(mut args: TestArgs) -> Result<()> {
                     }
                 }
                 let _ = fs::remove_file(&temp_report);
-                if total_failed == 0 {
+                if member_failed == 0 {
                     res?;
                 }
             }
             let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
             let status = if total_failed == 0 { "passed" } else { "failed" };
+            let discovered_count = if all_tests.is_empty() {
+                total_passed + total_failed + total_ignored
+            } else {
+                all_tests.len()
+            };
             let report = serde_json::json!({
                 "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
                 "status": status,
                 "runner": "uc-native-test",
                 "manifest_path": manifest_path.display().to_string(),
                 "workspace": true,
-                "discovered_count": all_tests.len(),
+                "discovered_count": discovered_count,
                 "passed_count": total_passed,
                 "failed_count": total_failed,
                 "ignored_count": total_ignored,
@@ -3602,6 +3618,19 @@ pub(crate) fn run_test(mut args: TestArgs) -> Result<()> {
     let (affected_modules_opt, current_affected_graph) =
         compute_affected_modules(&workspace_root, &package_name, &crate_name, &src_dir);
 
+    let ws_temp_report_name = args
+        .report_path
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .map(str::to_string);
+    let is_ws_temp_report = ws_temp_report_name
+        .as_deref()
+        .is_some_and(|n| n.starts_with("test-ws-"));
+    let is_ws_quiet_report = ws_temp_report_name
+        .as_deref()
+        .is_some_and(|n| n.starts_with("test-ws-quiet-"));
+
     // Fast path for `--affected` when affected graph already exists and 0 modules changed!
     if args.affected {
         if let Some(impacted) = &affected_modules_opt {
@@ -3622,7 +3651,18 @@ pub(crate) fn run_test(mut args: TestArgs) -> Result<()> {
                     "elapsed_ms": elapsed_ms,
                     "tests": Vec::<SingleTestResultReport>::new(),
                 });
-                if args.json || args.report_path.is_some() {
+                if is_ws_temp_report {
+                    if let Some(path) = args.report_path.as_deref() {
+                        write_json_report(path, &report)?;
+                    }
+                    if !is_ws_quiet_report {
+                        println!(
+                            "running 0 affected test(s) from {} (no modules changed; finished in {:.2}ms)",
+                            effective_manifest_path.display(),
+                            elapsed_ms
+                        );
+                    }
+                } else if args.json || args.report_path.is_some() {
                     emit_json_value(args.report_path.as_deref(), &report)?;
                 } else {
                     println!(
@@ -3661,6 +3701,8 @@ pub(crate) fn run_test(mut args: TestArgs) -> Result<()> {
                 if uses_external_snforge {
                     if let Ok(output) = Command::new("snforge")
                         .arg("test")
+                        .arg("--package")
+                        .arg(&package_name)
                         .current_dir(manifest_dir)
                         .output()
                     {
@@ -3668,16 +3710,50 @@ pub(crate) fn run_test(mut args: TestArgs) -> Result<()> {
                         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
                         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
                         let ok = output.status.success();
+                        let mut passed_count = 0_usize;
+                        let mut failed_count = 0_usize;
+                        let mut ignored_count = 0_usize;
+                        for line in stdout.lines() {
+                            let trimmed = line.trim();
+                            if let Some(rest) = trimmed.strip_prefix("Tests:") {
+                                for segment in rest.split(',') {
+                                    let parts: Vec<&str> = segment.split_whitespace().collect();
+                                    if parts.len() >= 2 {
+                                        if let Ok(n) = parts[0].parse::<usize>() {
+                                            match parts[1] {
+                                                "passed" => passed_count += n,
+                                                "failed" => failed_count += n,
+                                                "ignored" => ignored_count += n,
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         let report = serde_json::json!({
                             "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
                             "status": if ok { "passed" } else { "failed" },
                             "runner": "snforge-fallback",
+                            "package": package_name,
                             "manifest_path": effective_manifest_path.display().to_string(),
+                            "discovered_count": passed_count + failed_count + ignored_count,
+                            "passed_count": passed_count,
+                            "failed_count": failed_count,
+                            "ignored_count": ignored_count,
                             "elapsed_ms": elapsed_ms,
                             "stdout": stdout,
                             "stderr": stderr,
                         });
-                        if args.json || args.report_path.is_some() {
+                        if is_ws_temp_report {
+                            if let Some(path) = args.report_path.as_deref() {
+                                write_json_report(path, &report)?;
+                            }
+                            if !is_ws_quiet_report {
+                                print!("{stdout}");
+                                eprint!("{stderr}");
+                            }
+                        } else if args.json || args.report_path.is_some() {
                             emit_json_value(args.report_path.as_deref(), &report)?;
                         } else {
                             print!("{stdout}");
@@ -4481,9 +4557,14 @@ pub(crate) fn run_test(mut args: TestArgs) -> Result<()> {
             "tests": results,
         });
 
-        if args.json || args.report_path.is_some() {
+        if is_ws_temp_report {
+            if let Some(path) = args.report_path.as_deref() {
+                write_json_report(path, &report)?;
+            }
+        }
+        if !is_ws_temp_report && (args.json || args.report_path.is_some()) {
             emit_json_value(args.report_path.as_deref(), &report)?;
-        } else {
+        } else if !is_ws_quiet_report {
             println!(
                 "running {} test(s) from {} ({}, compile: {:.1}ms{}, exec: {:.1}ms)",
                 results.len(),

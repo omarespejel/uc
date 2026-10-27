@@ -1062,16 +1062,23 @@ fn compute_fast_package_source_digest(manifest_path: &Path) -> Result<String> {
     let manifest_bytes = fs::read(manifest_path)?;
     hasher.update(&manifest_bytes);
     let pkg_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
-    for lock_name in ["Scarb.lock", "uc.lock"] {
-        if let Ok(lock) = fs::read(pkg_dir.join(lock_name)) {
-            hasher.update(b"lock");
-            hasher.update(&lock);
+    let ws_root = metadata_cache_workspace_root(manifest_path).unwrap_or_else(|_| pkg_dir.to_path_buf());
+    for lock_dir in [pkg_dir, ws_root.as_path()] {
+        for lock_name in ["Scarb.lock", "uc.lock"] {
+            if let Ok(lock) = fs::read(lock_dir.join(lock_name)) {
+                hasher.update(b"lock");
+                hasher.update(&lock);
+            }
         }
     }
     hash_cairo_tree(&mut hasher, pkg_dir, &pkg_dir.join("src"))?;
     hash_cairo_tree(&mut hasher, pkg_dir, &pkg_dir.join("tests"))?;
 
-    if let Ok(manifest) = toml::from_str::<TomlValue>(&String::from_utf8_lossy(&manifest_bytes)) {
+    if let Ok(manifest) = parse_manifest_toml(
+        &String::from_utf8_lossy(&manifest_bytes),
+        manifest_path,
+        "manifest",
+    ) {
         for section in ["dependencies", "dev-dependencies"] {
             let Some(deps) = manifest.get(section).and_then(TomlValue::as_table) else {
                 continue;
@@ -1299,12 +1306,25 @@ pub(crate) fn run_check(args: CheckArgs) -> Result<()> {
         let workspace_root = metadata_cache_workspace_root(&manifest_path)?;
         let manifests = if args.workspace {
             resolve_all_workspace_member_manifests(&manifest_path, &workspace_root)?
-        } else {
+        } else if args.package.is_some() {
             vec![resolve_native_effective_manifest_path(
                 &manifest_path,
                 &workspace_root,
                 args.package.as_deref(),
             )?]
+        } else {
+            match resolve_native_effective_manifest_path(&manifest_path, &workspace_root, None) {
+                Ok(single) => vec![single],
+                Err(err) => {
+                    let members =
+                        resolve_all_workspace_member_manifests(&manifest_path, &workspace_root)?;
+                    if members.len() > 1 || members.first() != Some(&manifest_path) {
+                        members
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
         };
 
         let mut package_results = Vec::with_capacity(manifests.len());

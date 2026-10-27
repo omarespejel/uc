@@ -657,7 +657,10 @@ pub(crate) fn build_plan_report_from_args(args: &BuildArgs) -> Result<BuildPlanR
             }
 
             let configured_native_mode = native_build_mode();
-            let disallow_native_fallback = native_disallow_scarb_fallback();
+            let is_pure_uc_toml =
+                manifest_path.file_name().and_then(|s| s.to_str()) == Some("uc.toml")
+                    && !manifest_path.with_file_name("Scarb.toml").is_file();
+            let disallow_native_fallback = native_disallow_scarb_fallback() || is_pure_uc_toml;
             if matches!(configured_native_mode, NativeBuildMode::Require)
                 && !matches!(
                     support.decision_status,
@@ -1881,7 +1884,10 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                 Err(issue) => native_toolchain_report_for_issue(&toolchain_requirement, issue),
             });
             let configured_native_mode = native_build_mode();
-            let disallow_native_fallback = native_disallow_scarb_fallback();
+            let is_pure_uc_toml =
+                manifest_path.file_name().and_then(|s| s.to_str()) == Some("uc.toml")
+                    && !manifest_path.with_file_name("Scarb.toml").is_file();
+            let disallow_native_fallback = native_disallow_scarb_fallback() || is_pure_uc_toml;
             let preflight_fallback_diagnostic_index = std::cell::Cell::new(None::<usize>);
             let daemon_backend_fallback_diagnostic_index = std::cell::Cell::new(None::<usize>);
             if configured_native_mode != NativeBuildMode::Off {
@@ -2355,8 +2361,19 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                     {
                         let mut hint_state =
                             native_auto_preflight_hint_state(&workspace_root, &local_session_key)?;
+                        if use_compat_toolchain_fallback
+                            && matches!(
+                                hint_state,
+                                NativeAutoPreflightHintState::UnsupportedHint(_)
+                                    | NativeAutoPreflightHintState::FallbackHint(_)
+                            )
+                        {
+                            hint_state = NativeAutoPreflightHintState::Unknown;
+                        }
                         if matches!(hint_state, NativeAutoPreflightHintState::Unknown) {
-                            if let Some(reason) = native_compile_support_reason(&manifest_path)? {
+                            if let Some(reason) = with_native_compat_toolchain_fallback(|| {
+                                native_compile_support_reason(&manifest_path)
+                            })? {
                                 let _ = persist_daemon_local_native_unsupported_hint(
                                     &workspace_root,
                                     &local_session_key,
