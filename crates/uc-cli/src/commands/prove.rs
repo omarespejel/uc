@@ -6230,7 +6230,7 @@ fn prove_single_package(
 pub(crate) fn run_prove(mut args: ProveArgs) -> Result<()> {
     if args.sierra_file.is_none() {
         if let Some(ref f) = args.filter {
-            if f.ends_with(".json") && Path::new(f).is_file() {
+            if (f.ends_with(".json") && Path::new(f).is_file()) || f.starts_with("0x") {
                 args.sierra_file = Some(PathBuf::from(f));
                 args.filter = None;
             }
@@ -6251,8 +6251,28 @@ pub(crate) fn run_prove(mut args: ProveArgs) -> Result<()> {
     let mut fail_on_unproven = false;
 
     if let Some(sierra_file) = &args.sierra_file {
-        let mut text = fs::read_to_string(sierra_file)
-            .with_context(|| format!("failed to read {}", sierra_file.display()))?;
+        let sierra_str = sierra_file.to_string_lossy();
+        let mut text = if !sierra_file.is_file() && sierra_str.starts_with("0x") {
+            let rpc = resolve_read_rpc_url(None, Some("mainnet"))
+                .with_context(|| format!("unable to resolve RPC URL for `{sierra_str}`"))?;
+            let class_val = starknet_rpc_request(
+                &rpc,
+                "starknet_getClassAt",
+                serde_json::json!({ "block_id": "latest", "contract_address": sierra_str.as_ref() }),
+            )
+            .or_else(|_| {
+                starknet_rpc_request(
+                    &rpc,
+                    "starknet_getClass",
+                    serde_json::json!({ "block_id": "latest", "class_hash": sierra_str.as_ref() }),
+                )
+            })
+            .with_context(|| format!("failed to fetch on-chain Sierra class `{sierra_str}`"))?;
+            class_val.to_string()
+        } else {
+            fs::read_to_string(sierra_file)
+                .with_context(|| format!("failed to read {}", sierra_file.display()))?
+        };
         // Classes saved from JSON-RPC carry the ABI as a string; the class type wants the array.
         if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&text) {
             if let Some(abi_text) = v.get("abi").and_then(|a| a.as_str()) {

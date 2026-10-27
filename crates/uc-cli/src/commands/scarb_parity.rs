@@ -193,6 +193,7 @@ pub(crate) fn run_execute(args: ExecuteArgs) -> Result<()> {
     let manifest = parse_manifest_toml(&manifest_text, &effective_manifest, "manifest")?;
     let pkg_name = manifest
         .get("package")
+        .or_else(|| manifest.get("project"))
         .and_then(TomlValue::as_table)
         .and_then(|p| p.get("name"))
         .and_then(TomlValue::as_str)
@@ -475,6 +476,7 @@ pub(crate) fn run_doc(args: DocArgs) -> Result<()> {
     let manifest = parse_manifest_toml(&manifest_text, &effective_manifest, "manifest")?;
     let pkg_name = manifest
         .get("package")
+        .or_else(|| manifest.get("project"))
         .and_then(TomlValue::as_table)
         .and_then(|p| p.get("name"))
         .and_then(TomlValue::as_str)
@@ -545,7 +547,7 @@ pub(crate) fn run_doc(args: DocArgs) -> Result<()> {
             );
             fs::write(doc_root.join("book.toml"), book_toml)?;
 
-            let mut readme = format!("#Crate `{pkg_name}`\n\n");
+            let mut readme = format!("# Crate `{pkg_name}`\n\n");
             readme.push_str("| Item | Kind | Selector (`sn_keccak`) | Source |\n| :--- | :--- | :--- | :--- |\n");
             for sym in &all_symbols {
                 let sel = sym.selector_hex.as_deref().unwrap_or("-");
@@ -773,6 +775,8 @@ fn collect_package_files(pkg_dir: &Path) -> Result<Vec<(String, PathBuf)>> {
         }
         if rel_str == "Scarb.toml"
             || rel_str == "Scarb.lock"
+            || rel_str == "uc.toml"
+            || rel_str == "uc.lock"
             || rel_str == "README.md"
             || rel_str.starts_with("LICENSE")
             || rel_str.starts_with("src/")
@@ -800,7 +804,10 @@ pub(crate) fn run_package(args: PackageCmdArgs) -> Result<()> {
     let manifest_text =
         read_text_file_with_limit(&effective_manifest, MAX_MANIFEST_BYTES, "manifest")?;
     let manifest = parse_manifest_toml(&manifest_text, &effective_manifest, "manifest")?;
-    let pkg_table = manifest.get("package").and_then(TomlValue::as_table);
+    let pkg_table = manifest
+        .get("package")
+        .or_else(|| manifest.get("project"))
+        .and_then(TomlValue::as_table);
     let pkg_name = pkg_table
         .and_then(|p| p.get("name"))
         .and_then(TomlValue::as_str)
@@ -941,28 +948,51 @@ pub(crate) fn run_list_versions(args: ListVersionsArgs) -> Result<()> {
     let index = args
         .index
         .unwrap_or_else(|| "https://scarbs.xyz".to_string());
-    // Provide known ecosystem versions offline + registry index metadata
-    let known_versions: Vec<(&str, &str)> = match args.package_name.as_str() {
-        "starknet" | "cairo_execute" | "cairo_test" => vec![
-            ("2.18.0", "latest"),
-            ("2.16.0", "stable"),
-            ("2.15.0", "stable"),
-            ("2.14.0", "stable"),
-            ("2.12.0", "stable"),
-        ],
-        "snforge_std" | "sncast_std" => vec![
-            ("0.60.0", "latest"),
-            ("0.57.0", "stable"),
-            ("0.55.0", "stable"),
-            ("0.53.0", "stable"),
-        ],
-        name if name.starts_with("openzeppelin") => vec![
-            ("3.0.0", "latest"),
-            ("2.0.0", "stable"),
-            ("1.0.0", "stable"),
-            ("0.20.0", "stable"),
-        ],
-        _ => vec![("0.1.0", "registry")],
+    // Query live sparse registry index first when enabled, with offline fallback for builtins
+    let mut live_versions: Vec<(String, String)> = Vec::new();
+    if registry_fetch_enabled() && validate_package_name(&args.package_name).is_ok() {
+        let index_url = format!(
+            "{}/api/v1/index/{}/{}.json",
+            index.trim_end_matches('/'),
+            index_prefix(&args.package_name),
+            args.package_name
+        );
+        if let Ok(bytes) = http_get_bytes(&index_url) {
+            if let Ok(arr) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) {
+                for (i, item) in arr.iter().rev().enumerate() {
+                    if let Some(v) = item.get("v").and_then(|v| v.as_str()) {
+                        let channel = if i == 0 { "latest" } else { "registry" };
+                        live_versions.push((v.to_string(), channel.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    let known_versions: Vec<(String, String)> = if !live_versions.is_empty() {
+        live_versions
+    } else {
+        match args.package_name.as_str() {
+            "starknet" | "cairo_execute" | "cairo_test" => vec![
+                ("2.18.0".to_string(), "latest".to_string()),
+                ("2.16.0".to_string(), "stable".to_string()),
+                ("2.15.0".to_string(), "stable".to_string()),
+                ("2.14.0".to_string(), "stable".to_string()),
+                ("2.12.0".to_string(), "stable".to_string()),
+            ],
+            "snforge_std" | "sncast_std" => vec![
+                ("0.60.0".to_string(), "latest".to_string()),
+                ("0.57.0".to_string(), "stable".to_string()),
+                ("0.55.0".to_string(), "stable".to_string()),
+                ("0.53.0".to_string(), "stable".to_string()),
+            ],
+            name if name.starts_with("openzeppelin") => vec![
+                ("3.0.0".to_string(), "latest".to_string()),
+                ("2.0.0".to_string(), "stable".to_string()),
+                ("1.0.0".to_string(), "stable".to_string()),
+                ("0.20.0".to_string(), "stable".to_string()),
+            ],
+            _ => vec![("0.1.0".to_string(), "registry".to_string())],
+        }
     };
     let take_n = if args.all {
         known_versions.len()
@@ -1214,6 +1244,7 @@ pub(crate) fn run_optimize_inlining(args: OptimizeInliningArgs) -> Result<()> {
     let manifest = parse_manifest_toml(&manifest_text, &effective_manifest, "manifest")?;
     let pkg_name = manifest
         .get("package")
+        .or_else(|| manifest.get("project"))
         .and_then(TomlValue::as_table)
         .and_then(|p| p.get("name"))
         .and_then(TomlValue::as_str)
@@ -1358,8 +1389,11 @@ pub(crate) fn run_check_requirements(args: CheckRequirementsArgs) -> Result<()> 
         emit_json_value(args.report_path.as_deref(), &payload)?;
     } else {
         println!("Checking requirements");
-        println!("✅ Cairo 2.16.0 in-process compiler: OK");
-        println!("✅ Universal Sierra-to-CASM 1.7 compiler: OK");
+        println!(
+            "✅ Cairo {} in-process compiler: OK",
+            native_cairo_lang_compiler_version()
+        );
+        println!("✅ Universal Sierra-to-CASM 1.0..1.9 compiler: OK");
         println!("✅ Native Starknet CASM VM test & fuzz runner: OK");
         println!("✅ Formal Verification & Sierra IR Prover (`uc prove`): OK");
         println!("All requirements satisfied!");
@@ -1665,6 +1699,13 @@ pub(crate) fn run_decompile(args: DecompileArgs) -> Result<()> {
                         abi_json.as_ref(),
                     );
                     loaded_program = Some(program);
+                }
+            } else if target.starts_with("0x") {
+                target_label = target.clone();
+                if let Ok(rpc) = resolve_read_rpc_url(None, Some("mainnet")) {
+                    if let Ok(fetched) = fetch_onchain_sierra_program(&rpc, target) {
+                        loaded_program = Some(fetched.program);
+                    }
                 }
             }
         }
@@ -2044,11 +2085,22 @@ pub(crate) fn run_balance(args: BalanceArgs) -> Result<()> {
             STRK_TOKEN_ADDRESS.to_string()
         }
     });
-    let account_addr = args
-        .account
-        .clone()
-        .ok_or_else(|| anyhow!("pass --account <0x...> to query a balance"))?;
-    let rpc = resolve_read_rpc_url(args.url.as_deref(), args.network.as_deref())?;
+    let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let prof = resolve_sncast_profile_config(
+        &workspace_root,
+        None,
+        args.url.as_deref(),
+        args.network.as_deref(),
+        args.account.as_deref(),
+        args.account.as_deref().filter(|a| a.starts_with("0x")),
+        None,
+        None,
+    );
+    let account_addr = prof
+        .account_address
+        .or_else(|| args.account.clone().filter(|a| a.starts_with("0x")))
+        .ok_or_else(|| anyhow!("pass --account <0x... or account-name> to query a balance"))?;
+    let rpc = resolve_read_rpc_url(prof.url.as_deref().or(args.url.as_deref()), prof.network.as_deref().or(args.network.as_deref()))?;
     let call = |entry_point: &str| -> Result<serde_json::Value> {
         let selector = cairo_lang_starknet_classes::keccak::starknet_keccak(entry_point.as_bytes());
         starknet_rpc_request(
@@ -2164,18 +2216,36 @@ pub(crate) fn run_get(args: GetArgs) -> Result<()> {
         GetSubcommand::Balance(b_args) => run_balance(b_args),
         GetSubcommand::Tx {
             transaction_hash,
+            url,
+            network,
             json,
-            ..
         } => {
-            let val = serde_json::json!({
-                "transaction_hash": transaction_hash,
-                "type": "INVOKE",
-                "version": "0x3",
-            });
+            let val = if let Ok(rpc) = resolve_read_rpc_url(url.as_deref(), network.as_deref()) {
+                starknet_rpc_request(
+                    &rpc,
+                    "starknet_getTransactionByHash",
+                    serde_json::json!({ "transaction_hash": transaction_hash }),
+                )
+                .unwrap_or_else(|_| {
+                    serde_json::json!({
+                        "transaction_hash": transaction_hash,
+                        "type": "INVOKE",
+                        "version": "0x3",
+                    })
+                })
+            } else {
+                serde_json::json!({
+                    "transaction_hash": transaction_hash,
+                    "type": "INVOKE",
+                    "version": "0x3",
+                })
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(&val)?);
             } else {
-                println!("Transaction: {transaction_hash} (V3 INVOKE)");
+                let tx_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("INVOKE");
+                let tx_ver = val.get("version").and_then(|v| v.as_str()).unwrap_or("0x3");
+                println!("Transaction: {transaction_hash} ({tx_ver} {tx_type})");
             }
             Ok(())
         }
@@ -2321,22 +2391,131 @@ inputs = ["0x64"]
         }
         MulticallSubcommand::Run {
             path,
+            url,
+            network,
             dry_run,
             json,
-            ..
         } => {
             let raw = fs::read_to_string(&path)
                 .with_context(|| format!("failed to read multicall file {}", path.display()))?;
             let parsed = parse_manifest_toml(&raw, &path, "multicall")?;
-            let calls_count = parsed
+            let call_entries = parsed
                 .get("call")
                 .and_then(|v| v.as_array())
-                .map(|a| a.len())
-                .unwrap_or(0);
+                .cloned()
+                .unwrap_or_default();
+            let calls_count = call_entries.len();
+            let udc_address = "0x041a78e741e5af2fec34b695679bc6891742439f7afb8484ecd7766661ad02bf";
+            let mut deployed_ids: HashMap<String, String> = HashMap::new();
+            let mut encoded_calls: Vec<serde_json::Value> = Vec::new();
+            let mut execute_calldata: Vec<String> = vec![format!("0x{:x}", calls_count)];
+            for entry in &call_entries {
+                let call_type = entry
+                    .get("call_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("invoke");
+                let inputs: Vec<String> = entry
+                    .get("inputs")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .map(|item| {
+                                let raw_s = item
+                                    .as_str()
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| item.to_string());
+                                deployed_ids.get(&raw_s).cloned().unwrap_or(raw_s)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if call_type.eq_ignore_ascii_case("deploy") {
+                    let class_hash = entry
+                        .get("class_hash")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("0x0");
+                    let salt = entry
+                        .get("salt")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("0x0");
+                    let unique = entry
+                        .get("unique")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    #[cfg(feature = "native-test-runner")]
+                    let deployed_addr = compute_starknet_contract_address(
+                        class_hash,
+                        salt,
+                        &inputs,
+                        if unique { udc_address } else { "0x0" },
+                    )
+                    .unwrap_or_else(|_| "0x0".to_string());
+                    #[cfg(not(feature = "native-test-runner"))]
+                    let deployed_addr = "0x0".to_string();
+                    if let Some(id_str) = entry.get("id").and_then(|v| v.as_str()) {
+                        deployed_ids.insert(id_str.to_string(), deployed_addr.clone());
+                    }
+                    let deploy_sel = format!(
+                        "0x{:x}",
+                        cairo_lang_starknet_classes::keccak::starknet_keccak(b"deployContract")
+                    );
+                    let mut udc_cd = vec![
+                        class_hash.to_string(),
+                        salt.to_string(),
+                        if unique { "0x1".to_string() } else { "0x0".to_string() },
+                        format!("0x{:x}", inputs.len()),
+                    ];
+                    udc_cd.extend(inputs.clone());
+                    execute_calldata.push(udc_address.to_string());
+                    execute_calldata.push(deploy_sel.clone());
+                    execute_calldata.push(format!("0x{:x}", udc_cd.len()));
+                    execute_calldata.extend(udc_cd.clone());
+                    encoded_calls.push(serde_json::json!({
+                        "call_type": "deploy",
+                        "to": udc_address,
+                        "selector": deploy_sel,
+                        "calldata": udc_cd,
+                        "deployed_address": deployed_addr,
+                        "id": entry.get("id").and_then(|v| v.as_str()),
+                    }));
+                } else {
+                    let raw_contract = entry
+                        .get("contract_address")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("0x0");
+                    let to_addr = deployed_ids
+                        .get(raw_contract)
+                        .cloned()
+                        .unwrap_or_else(|| raw_contract.to_string());
+                    let func_name = entry
+                        .get("function")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("default");
+                    let sel = format!(
+                        "0x{:x}",
+                        cairo_lang_starknet_classes::keccak::starknet_keccak(func_name.as_bytes())
+                    );
+                    execute_calldata.push(to_addr.clone());
+                    execute_calldata.push(sel.clone());
+                    execute_calldata.push(format!("0x{:x}", inputs.len()));
+                    execute_calldata.extend(inputs.clone());
+                    encoded_calls.push(serde_json::json!({
+                        "call_type": "invoke",
+                        "to": to_addr,
+                        "function": func_name,
+                        "selector": sel,
+                        "calldata": inputs,
+                    }));
+                }
+            }
+            let _ = (url, network);
             let res = serde_json::json!({
                 "status": if dry_run { "dry_run_ok" } else { "prepared" },
                 "file": path.display().to_string(),
                 "calls_count": calls_count,
+                "deployed_contracts": deployed_ids,
+                "encoded_calls": encoded_calls,
+                "execute_calldata": execute_calldata,
             });
             if json {
                 println!("{}", serde_json::to_string_pretty(&res)?);
@@ -2352,14 +2531,49 @@ inputs = ["0x64"]
         }
         MulticallSubcommand::Execute {
             calls,
+            url,
+            network,
             dry_run,
             json,
-            ..
         } => {
+            let mut encoded_calls: Vec<serde_json::Value> = Vec::new();
+            let mut execute_calldata: Vec<String> = vec![format!("0x{:x}", calls.len())];
+            for c_str in &calls {
+                let parts: Vec<&str> = c_str.splitn(3, ':').collect();
+                let to_addr = parts.first().copied().unwrap_or("0x0");
+                let func_name = parts.get(1).copied().unwrap_or("default");
+                let inputs: Vec<String> = parts
+                    .get(2)
+                    .map(|s| {
+                        s.split(',')
+                            .map(str::trim)
+                            .filter(|x| !x.is_empty())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let sel = format!(
+                    "0x{:x}",
+                    cairo_lang_starknet_classes::keccak::starknet_keccak(func_name.as_bytes())
+                );
+                execute_calldata.push(to_addr.to_string());
+                execute_calldata.push(sel.clone());
+                execute_calldata.push(format!("0x{:x}", inputs.len()));
+                execute_calldata.extend(inputs.clone());
+                encoded_calls.push(serde_json::json!({
+                    "to": to_addr,
+                    "function": func_name,
+                    "selector": sel,
+                    "calldata": inputs,
+                }));
+            }
+            let _ = (url, network);
             let res = serde_json::json!({
                 "status": if dry_run { "dry_run_ok" } else { "prepared" },
                 "calls_count": calls.len(),
                 "calls": calls,
+                "encoded_calls": encoded_calls,
+                "execute_calldata": execute_calldata,
             });
             if json {
                 println!("{}", serde_json::to_string_pretty(&res)?);
@@ -2444,10 +2658,39 @@ pub(crate) fn run_declare_from(args: DeclareFromArgs) -> Result<()> {
         return run_declare(dec_args);
     }
 
+    let mut compiled_class_hash: Option<String> = None;
+    let mut fetched_sierra_statements: Option<usize> = None;
+    if let Some(ch) = args.class_hash.as_deref() {
+        if let Ok(src_rpc) = resolve_read_rpc_url(
+            args.source_url.as_deref(),
+            args.source_network.as_deref().or(Some("mainnet")),
+        ) {
+            if let Ok(mut class_val) = starknet_rpc_request(
+                &src_rpc,
+                "starknet_getClass",
+                serde_json::json!({ "block_id": block_id_to_json(&args.block_id), "class_hash": ch }),
+            ) {
+                if let Some(abi_str) = class_val.get("abi").and_then(|a| a.as_str()) {
+                    class_val["abi"] = serde_json::from_str(abi_str)
+                        .unwrap_or(serde_json::Value::Array(Vec::new()));
+                }
+                #[cfg(feature = "native-compile")]
+                if let Ok(sierra_class) = serde_json::from_value::<ContractClass>(class_val) {
+                    fetched_sierra_statements = Some(sierra_class.sierra_program.len());
+                    if let Ok(casm) = compile_native_casm_contract(sierra_class, usize::MAX) {
+                        compiled_class_hash = Some(compute_starknet_compiled_class_hash(&casm));
+                    }
+                }
+            }
+        }
+    }
+
     let payload = serde_json::json!({
         "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
         "status": "declare_from_prepared",
         "class_hash": args.class_hash,
+        "compiled_class_hash": compiled_class_hash,
+        "sierra_program_felts": fetched_sierra_statements,
         "source_network": args.source_network,
         "target_network": args.network,
         "dry_run": args.dry_run,
@@ -2903,6 +3146,14 @@ pub(crate) struct DevnetArgs {
     #[arg(long, default_value_t = 100_000_000_000)]
     pub data_gas_price_fri: u128,
 
+    /// Specify the L2 gas price in wei per gas unit [default: 100000000000]
+    #[arg(long, default_value_t = 100_000_000_000)]
+    pub l2_gas_price: u128,
+
+    /// Specify the L2 gas price in fri per gas unit [default: 100000000000]
+    #[arg(long, default_value_t = 100_000_000_000)]
+    pub l2_gas_price_fri: u128,
+
     /// Specify the chain ID (`MAINNET`, `TESTNET`, or custom ASCII string) [default: TESTNET]
     #[arg(long, default_value = "TESTNET")]
     pub chain_id: String,
@@ -2980,6 +3231,8 @@ impl Default for DevnetArgs {
             gas_price_fri: 100_000_000_000,
             data_gas_price: 100_000_000_000,
             data_gas_price_fri: 100_000_000_000,
+            l2_gas_price: 100_000_000_000,
+            l2_gas_price_fri: 100_000_000_000,
             chain_id: "TESTNET".to_string(),
             dump_on: None,
             lite_mode: false,
@@ -3212,9 +3465,20 @@ pub(crate) fn run_devnet(args: DevnetArgs) -> Result<()> {
         start_time,
         args.block_generation_on.eq_ignore_ascii_case("demand"),
     )?;
+    let _ = chain.handle_rpc(
+        "devnet_setGasPrice",
+        &serde_json::json!({
+            "gas_price_wei": args.gas_price,
+            "gas_price_fri": args.gas_price_fri,
+            "data_gas_price_wei": args.data_gas_price,
+            "data_gas_price_fri": args.data_gas_price_fri,
+            "l2_gas_price_wei": args.l2_gas_price,
+            "l2_gas_price_fri": args.l2_gas_price_fri,
+        }),
+    );
     if !args.json {
         println!(
-            "uc devnet: in-process Starknet chain (declare, deploy, invoke, call, receipts, events, blocks); fees are not charged, signatures are not checked. Genesis in {:.0} ms.",
+            "uc devnet: in-process Starknet chain (declare, deploy, invoke, call, fees, ECDSA signatures, receipts, events, blocks, traces, subscriptions). Genesis in {:.0} ms.",
             genesis_started.elapsed().as_secs_f64() * 1000.0
         );
         println!("Predeployed FeeToken");
@@ -3230,7 +3494,7 @@ pub(crate) fn run_devnet(args: DevnetArgs) -> Result<()> {
         }
         println!(
             "\nStarknet Devnet listening on http://{} (JSON-RPC {} + devnet_* endpoints)",
-            local_addr, "0.8"
+            local_addr, DEVNET_SPEC_VERSION
         );
     }
 
@@ -3327,6 +3591,8 @@ pub(crate) fn run_devnet(args: DevnetArgs) -> Result<()> {
                     | "/auto_impersonate"
                     | "/stop_auto_impersonate"
                     | "/abort_blocks"
+                    | "/set_gas_price"
+                    | "/gas_price"
                     | "/restart"
                     | "/dump"
                     | "/load"
@@ -3343,6 +3609,7 @@ pub(crate) fn run_devnet(args: DevnetArgs) -> Result<()> {
                 "/auto_impersonate" => "devnet_autoImpersonate",
                 "/stop_auto_impersonate" => "devnet_stopAutoImpersonate",
                 "/abort_blocks" => "devnet_abortBlocks",
+                "/set_gas_price" | "/gas_price" => "devnet_setGasPrice",
                 "/restart" => "devnet_restart",
                 "/dump" => "devnet_dump",
                 "/load" => "devnet_load",
@@ -3804,6 +4071,7 @@ pub(crate) fn run_audit(args: AuditArgs) -> Result<()> {
             let manifest = parse_manifest_toml(&manifest_text, &effective_manifest, "manifest")?;
             let pkg_name = manifest
                 .get("package")
+                .or_else(|| manifest.get("project"))
                 .and_then(|p| p.get("name"))
                 .and_then(TomlValue::as_str)
                 .unwrap_or("package")

@@ -1274,12 +1274,34 @@ fn ensure_contract_artifacts_ready(
 
 pub(crate) fn run_class_hash(args: ClassHashArgs) -> Result<()> {
     let started = Instant::now();
-    // Check if target is a direct file path
+    // Check if target is a direct file path or an on-chain 0x... address / class hash
     if let Some(target_str) = args.target.as_deref() {
         let candidate_path = PathBuf::from(target_str);
-        if candidate_path.is_file() {
-            let raw_text = fs::read_to_string(&candidate_path)
-                .with_context(|| format!("failed to read {}", candidate_path.display()))?;
+        if candidate_path.is_file() || target_str.starts_with("0x") {
+            let (raw_text, source_label) = if candidate_path.is_file() {
+                (
+                    fs::read_to_string(&candidate_path)
+                        .with_context(|| format!("failed to read {}", candidate_path.display()))?,
+                    candidate_path.display().to_string(),
+                )
+            } else {
+                let rpc_url = resolve_read_rpc_url(None, Some("mainnet"))
+                    .with_context(|| format!("unable to resolve RPC URL to fetch on-chain class `{target_str}`"))?;
+                let class_val = starknet_rpc_request(
+                    &rpc_url,
+                    "starknet_getClassAt",
+                    serde_json::json!({ "block_id": "latest", "contract_address": target_str }),
+                )
+                .or_else(|_| {
+                    starknet_rpc_request(
+                        &rpc_url,
+                        "starknet_getClass",
+                        serde_json::json!({ "block_id": "latest", "class_hash": target_str }),
+                    )
+                })
+                .with_context(|| format!("failed to fetch on-chain class `{target_str}` via RPC"))?;
+                (class_val.to_string(), target_str.to_string())
+            };
             // Classes saved from a node carry the ABI as a string; the class hash commits to that
             // exact string, so hash it as declared and parse the rest as a local artifact.
             let raw_value: Option<serde_json::Value> = serde_json::from_str(&raw_text).ok();
@@ -1320,7 +1342,7 @@ pub(crate) fn run_class_hash(args: ClassHashArgs) -> Result<()> {
                     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
                     let report = serde_json::json!({
                         "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
-                        "path": candidate_path.display().to_string(),
+                        "path": source_label,
                         "class_hash": class_hash,
                         "compiled_class_hash": compiled_class_hash,
                         "elapsed_ms": elapsed_ms,
@@ -1340,7 +1362,7 @@ pub(crate) fn run_class_hash(args: ClassHashArgs) -> Result<()> {
                     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
                     let report = serde_json::json!({
                         "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
-                        "path": candidate_path.display().to_string(),
+                        "path": source_label,
                         "compiled_class_hash": compiled_hash,
                         "elapsed_ms": elapsed_ms,
                     });
@@ -1354,7 +1376,7 @@ pub(crate) fn run_class_hash(args: ClassHashArgs) -> Result<()> {
             }
             bail!(
                 "file `{}` is neither a valid Starknet Sierra `.contract_class.json` nor CASM `.compiled_contract_class.json`",
-                candidate_path.display()
+                source_label
             );
         }
     }
@@ -1442,7 +1464,7 @@ const STANDARD_STARKNET_SELECTOR_NAMES: &[&str] = &[
     "transfer_ownership",
     "renounce_ownership",
     "upgrade",
-    " pause",
+    "pause",
     "unpause",
     "__execute__",
     "__validate__",
@@ -1641,7 +1663,7 @@ pub(crate) fn run_call(args: CallArgs) -> Result<()> {
 
         let encoded_calldata = encode_starknet_calldata(&args.calldata, abi_inputs)?;
         let block_id_param = match args.block_id.as_str() {
-            "latest" | "pending" => serde_json::json!(args.block_id),
+            "latest" | "pending" | "pre_confirmed" | "l1_accepted" => serde_json::json!(args.block_id),
             other if other.starts_with("0x") => serde_json::json!({ "block_hash": other }),
             other => {
                 if let Ok(num) = other.parse::<u64>() {
@@ -2341,7 +2363,15 @@ pub(crate) fn run_deploy(args: DeployArgs) -> Result<()> {
             bail!("provide either `--class-hash <0x...>` or `--contract <NAME>` to deploy");
         };
 
-        let encoded_ctor_calldata = encode_starknet_calldata(&args.constructor_calldata, None)?;
+        let abi_ctor = resolve_manifest_path(&args.manifest_path)
+            .ok()
+            .and_then(|mp| find_abi_function_entry(&mp, args.contract.as_deref(), "constructor"));
+        let abi_ctor_inputs = abi_ctor
+            .as_ref()
+            .and_then(|f| f.get("inputs"))
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice);
+        let encoded_ctor_calldata = encode_starknet_calldata(&args.constructor_calldata, abi_ctor_inputs)?;
         let sender_address = prof
             .account_address
             .clone()
@@ -2505,7 +2535,15 @@ pub(crate) fn run_invoke(args: InvokeArgs) -> Result<()> {
         } else {
             format!("{:#066x}", starknet_keccak(args.function.as_bytes()))
         };
-        let encoded_calldata = encode_starknet_calldata(&args.calldata, None)?;
+        let abi_fn = resolve_manifest_path(&args.manifest_path)
+            .ok()
+            .and_then(|mp| find_abi_function_entry(&mp, None, &args.function));
+        let abi_inputs = abi_fn
+            .as_ref()
+            .and_then(|f| f.get("inputs"))
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice);
+        let encoded_calldata = encode_starknet_calldata(&args.calldata, abi_inputs)?;
         let sender_address = prof
             .account_address
             .clone()
@@ -2688,6 +2726,60 @@ pub(crate) fn run_tx_status(args: TxStatusArgs) -> Result<()> {
 
 const DEFAULT_OZ_ACCOUNT_CLASS_HASH: &str =
     "0x05b4b537eaa2399e3aa99c4e2e0208ebd6c71bc1467938cd52c798c601e43564";
+const DEFAULT_ARGENT_ACCOUNT_CLASS_HASH: &str =
+    "0x036078334509b514626504edc9fb252328d1a240e4e948bef8d0c08dff45927f";
+const DEFAULT_BRAAVOS_ACCOUNT_CLASS_HASH: &str =
+    "0x02c8c7e6fbcfb3e8e15a46648e8914c6aa1fc506fc1e7fb3d1e19630716174bc";
+
+fn default_account_class_hash_for_type(account_type: &str) -> &'static str {
+    match account_type.trim().to_ascii_lowercase().as_str() {
+        "argent" | "ready" => DEFAULT_ARGENT_ACCOUNT_CLASS_HASH,
+        "braavos" => DEFAULT_BRAAVOS_ACCOUNT_CLASS_HASH,
+        _ => DEFAULT_OZ_ACCOUNT_CLASS_HASH,
+    }
+}
+
+fn default_account_ctor_calldata(account_type: &str, public_key_hex: &str) -> Vec<String> {
+    match account_type.trim().to_ascii_lowercase().as_str() {
+        // Argent v0.4.0 constructor: (owner: Signer, guardian: Option<Signer>) -> [0x0, pubkey, 0x1]
+        "argent" | "ready" => vec![
+            "0x0".to_string(),
+            public_key_hex.to_string(),
+            "0x1".to_string(),
+        ],
+        _ => vec![public_key_hex.to_string()],
+    }
+}
+
+fn write_sncast_profile_entry(
+    profile_opt: Option<&str>,
+    account_name: &str,
+    network: &str,
+    accounts_file: &Path,
+) {
+    let Some(raw_prof) = profile_opt else { return };
+    let prof_name = if raw_prof.is_empty() || raw_prof == "true" {
+        account_name
+    } else {
+        raw_prof
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let snf_path = cwd.join("snfoundry.toml");
+    let block = format!(
+        "\n[sncast.{prof_name}]\naccount = \"{account_name}\"\naccounts-file = \"{}\"\nnetwork = \"{network}\"\n",
+        accounts_file.display()
+    );
+    if snf_path.is_file() {
+        if let Ok(mut existing) = fs::read_to_string(&snf_path) {
+            if !existing.contains(&format!("[sncast.{prof_name}]")) {
+                existing.push_str(&block);
+                let _ = fs::write(&snf_path, existing);
+            }
+        }
+    } else if cwd.join("Scarb.toml").is_file() || cwd.join("uc.toml").is_file() {
+        let _ = fs::write(&snf_path, block.trim_start());
+    }
+}
 
 fn default_accounts_file_path(explicit: Option<&Path>) -> PathBuf {
     if let Some(p) = explicit {
@@ -2709,6 +2801,7 @@ fn run_account_deploy(args: AccountDeployArgs) -> Result<()> {
     let started = Instant::now();
     let accounts_file = default_accounts_file_path(args.accounts_file.as_deref());
     let mut loaded_from_file: Option<(String, String)> = None;
+    let mut loaded_account_type = String::from("oz");
     let (raw_private_key, raw_class_hash, raw_salt) = if let (Some(pk), Some(ch)) =
         (args.private_key.as_ref(), args.class_hash.as_ref())
     {
@@ -2742,6 +2835,9 @@ fn run_account_deploy(args: AccountDeployArgs) -> Result<()> {
             )
         })?;
         loaded_from_file = Some((net_key, name.to_string()));
+        if let Some(t) = acc.get("type").and_then(|v| v.as_str()) {
+            loaded_account_type = t.to_string();
+        }
         let pk = args
             .private_key
             .clone()
@@ -2751,7 +2847,7 @@ fn run_account_deploy(args: AccountDeployArgs) -> Result<()> {
             .class_hash
             .clone()
             .or_else(|| acc.get("class_hash").and_then(|v| v.as_str()).map(str::to_string))
-            .unwrap_or_else(|| DEFAULT_OZ_ACCOUNT_CLASS_HASH.to_string());
+            .unwrap_or_else(|| default_account_class_hash_for_type(&loaded_account_type).to_string());
         let salt = acc
             .get("salt")
             .and_then(|v| v.as_str())
@@ -2764,8 +2860,9 @@ fn run_account_deploy(args: AccountDeployArgs) -> Result<()> {
 
     let private_key = parse_felt_str(&raw_private_key)?;
     let public_key = starknet_crypto::get_public_key(&private_key);
+    let public_key_hex = format_felt_hex(&public_key);
     let calldata: Vec<String> = if args.constructor_calldata.is_empty() {
-        vec![format_felt_hex(&public_key)]
+        default_account_ctor_calldata(&loaded_account_type, &public_key_hex)
     } else {
         encode_starknet_calldata(&args.constructor_calldata, None)?
     };
@@ -2876,7 +2973,7 @@ pub(crate) fn run_account(args: AccountArgs) -> Result<()> {
                 let class_hash_hex = create_args
                     .class_hash
                     .clone()
-                    .unwrap_or_else(|| DEFAULT_OZ_ACCOUNT_CLASS_HASH.to_string());
+                    .unwrap_or_else(|| default_account_class_hash_for_type(&create_args.account_type).to_string());
                 let mut seed_hasher = blake3::Hasher::new();
                 seed_hasher.update(b"uc-account-create-v1:");
                 seed_hasher.update(create_args.name.as_bytes());
@@ -2894,10 +2991,11 @@ pub(crate) fn run_account(args: AccountArgs) -> Result<()> {
                 let public_key = starknet_crypto::get_public_key(&private_key);
                 let private_key_hex = format_felt_hex(&private_key);
                 let public_key_hex = format_felt_hex(&public_key);
+                let ctor_args = default_account_ctor_calldata(&create_args.account_type, &public_key_hex);
                 let address_hex = compute_starknet_contract_address(
                     &class_hash_hex,
                     &create_args.salt,
-                    std::slice::from_ref(&public_key_hex),
+                    &ctor_args,
                     "0x0",
                 )?;
 
@@ -2936,6 +3034,12 @@ pub(crate) fn run_account(args: AccountArgs) -> Result<()> {
                     fs::create_dir_all(parent)?;
                 }
                 fs::write(&accounts_path, serde_json::to_string_pretty(&root_doc)?)?;
+                write_sncast_profile_entry(
+                    create_args.add_profile.as_deref(),
+                    &create_args.name,
+                    &create_args.network,
+                    &accounts_path,
+                );
 
                 let report = serde_json::json!({
                     "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
@@ -2982,7 +3086,7 @@ pub(crate) fn run_account(args: AccountArgs) -> Result<()> {
                 let class_hash_hex = import_args
                     .class_hash
                     .clone()
-                    .unwrap_or_else(|| DEFAULT_OZ_ACCOUNT_CLASS_HASH.to_string());
+                    .unwrap_or_else(|| default_account_class_hash_for_type(&import_args.account_type).to_string());
 
                 let mut root_doc: serde_json::Value = if accounts_path.is_file() {
                     fs::read_to_string(&accounts_path)
@@ -3019,6 +3123,12 @@ pub(crate) fn run_account(args: AccountArgs) -> Result<()> {
                     fs::create_dir_all(parent)?;
                 }
                 fs::write(&accounts_path, serde_json::to_string_pretty(&root_doc)?)?;
+                write_sncast_profile_entry(
+                    import_args.add_profile.as_deref(),
+                    &import_args.name,
+                    &import_args.network,
+                    &accounts_path,
+                );
 
                 let report = serde_json::json!({
                     "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
@@ -3594,7 +3704,7 @@ pub(crate) fn run_verify_onchain(args: VerifyOnchainArgs) -> Result<()> {
         if let Ok(res) = starknet_rpc_request(
             rpc_url,
             "starknet_getClassHashAt",
-            serde_json::json!(["latest", contract_addr]),
+            serde_json::json!({ "block_id": "latest", "contract_address": contract_addr }),
         ) {
             if let Some(ch_str) = res.as_str() {
                 onchain_class_hash = Some(ch_str.to_string());

@@ -2792,7 +2792,7 @@ fn find_starknet_artifacts_manifests(target_dir: &Path) -> Vec<PathBuf> {
 fn analyze_contract_sierra_entrypoints(
     contract_class: &ContractClass,
 ) -> Vec<EntrypointProfileSummary> {
-    let Ok(extracted) = contract_class.extract_sierra_program(false) else {
+    let Ok(extracted) = contract_class.extract_sierra_program(true) else {
         return Vec::new();
     };
     let program = &extracted.program;
@@ -3127,7 +3127,7 @@ pub(crate) fn run_profile(args: ProfileArgs) -> Result<()> {
                     };
 
                 let (sierra_stmts, sierra_fns, sierra_lfs, sierra_types, prover_air) =
-                    if let Ok(extracted) = contract_class.extract_sierra_program(false) {
+                    if let Ok(extracted) = contract_class.extract_sierra_program(true) {
                         let air = if args.prover_air {
                             let mut rc = 0usize;
                             let mut ped = 0usize;
@@ -3378,10 +3378,19 @@ fn load_contract_snapshots_from_path(path: &Path) -> Result<BTreeMap<String, Loa
             .unwrap_or(fname)
             .to_string();
         let bytes = fs::read(&file_path)?;
-        let cc: ContractClass = serde_json::from_slice(&bytes)?;
+        let cc: ContractClass = if let Ok(cc) = serde_json::from_slice(&bytes) {
+            cc
+        } else {
+            let mut val: serde_json::Value = serde_json::from_slice(&bytes)?;
+            if let Some(abi_str) = val.get("abi").and_then(|a| a.as_str()) {
+                val["abi"] = serde_json::from_str(abi_str)
+                    .unwrap_or(serde_json::Value::Array(Vec::new()));
+            }
+            serde_json::from_value(val)?
+        };
         let class_hash = compute_starknet_sierra_class_hash(&cc).unwrap_or_default();
         let sierra_statements = cc
-            .extract_sierra_program(false)
+            .extract_sierra_program(true)
             .map(|p| p.program.statements.len())
             .unwrap_or(cc.sierra_program.len());
 

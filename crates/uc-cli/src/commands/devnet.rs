@@ -14,7 +14,7 @@ use std::sync::{Arc, RwLock};
 pub(crate) const DEVNET_STRK_ADDRESS: &str = "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d";
 pub(crate) const DEVNET_ETH_ADDRESS: &str = "0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7";
 /// The JSON-RPC version the devnet serves (`pre_confirmed` tags, event and transaction indexes).
-const DEVNET_SPEC_VERSION: &str = "0.10.4";
+pub(crate) const DEVNET_SPEC_VERSION: &str = "0.10.4";
 /// The Starknet version whose rules the devnet follows: fees in L2 gas and blob data gas,
 /// Blake2s compiled class hashes.
 const DEVNET_STARKNET_VERSION: &str = "0.14.1";
@@ -881,9 +881,13 @@ impl DevnetChain {
             RpcError::new(ERR_INSUFFICIENT_RESOURCES, "The transaction's resources don't cover validation or the minimal transaction fee")
                 .with_data(serde_json::json!(detail))
         };
-        for (name, (amount, price)) in [("L2 gas", bounds.l2_gas), ("L1 data gas", bounds.l1_data_gas), ("L1 gas", bounds.l1_gas)] {
-            if amount > 0 && price < DEVNET_GAS_PRICE {
-                return Err(insufficient(format!("Max {name} price ({price}) is lower than the actual gas price: {DEVNET_GAS_PRICE}.")));
+        for (name, (amount, price), actual_price) in [
+            ("L2 gas", bounds.l2_gas, self.l2_gas_price_fri),
+            ("L1 data gas", bounds.l1_data_gas, self.data_gas_price_fri),
+            ("L1 gas", bounds.l1_gas, self.gas_price_fri),
+        ] {
+            if amount > 0 && price < actual_price {
+                return Err(insufficient(format!("Max {name} price ({price}) is lower than the actual gas price: {actual_price}.")));
             }
         }
         if bounds.l2_gas.0 == 0 {
@@ -1116,8 +1120,8 @@ impl DevnetChain {
         }
         let tip = if charge { bounds.tip } else { 0 };
         let mut fee = u128::from(l2_gas)
-            .saturating_mul(DEVNET_GAS_PRICE.saturating_add(tip))
-            .saturating_add(u128::from(l1_data_gas).saturating_mul(DEVNET_GAS_PRICE));
+            .saturating_mul(self.l2_gas_price_fri.saturating_add(tip))
+            .saturating_add(u128::from(l1_data_gas).saturating_mul(self.data_gas_price_fri));
         let mut fee_transfer = None;
         if charge {
             fee = fee.min(bounds.max_fee());
@@ -1152,6 +1156,9 @@ impl DevnetChain {
             revert,
             l2_gas,
             l1_data_gas,
+            l1_gas_price: self.gas_price_fri,
+            l2_gas_price: self.l2_gas_price_fri,
+            l1_data_gas_price: self.data_gas_price_fri,
             fee,
             state_diff,
             contract_address: deploy.map(|_| sender),
@@ -1324,7 +1331,9 @@ impl DevnetChain {
             hex(&felt_from_digest("uc-devnet-diff-comm:", &[&block.block_number.to_le_bytes(), &(diff_len as u64).to_le_bytes()]))
         };
         let new_root = hex(&felt_from_digest("uc-devnet-root:", &[&block.block_number.to_le_bytes(), block.block_hash.as_bytes()]));
-        let price = serde_json::json!({ "price_in_fri": format!("{DEVNET_GAS_PRICE:#x}"), "price_in_wei": format!("{DEVNET_GAS_PRICE:#x}") });
+        let l1_price = serde_json::json!({ "price_in_fri": format!("{:#x}", self.gas_price_fri), "price_in_wei": format!("{:#x}", self.gas_price_wei) });
+        let data_price = serde_json::json!({ "price_in_fri": format!("{:#x}", self.data_gas_price_fri), "price_in_wei": format!("{:#x}", self.data_gas_price_wei) });
+        let l2_price = serde_json::json!({ "price_in_fri": format!("{:#x}", self.l2_gas_price_fri), "price_in_wei": format!("{:#x}", self.l2_gas_price_wei) });
         serde_json::json!({
             "status": "ACCEPTED_ON_L2",
             "block_hash": block.block_hash,
@@ -1333,9 +1342,9 @@ impl DevnetChain {
             "new_root": new_root,
             "timestamp": block.timestamp,
             "sequencer_address": block.sequencer_address,
-            "l1_gas_price": price,
-            "l1_data_gas_price": price,
-            "l2_gas_price": price,
+            "l1_gas_price": l1_price,
+            "l1_data_gas_price": data_price,
+            "l2_gas_price": l2_price,
             "l1_da_mode": "BLOB",
             "starknet_version": DEVNET_STARKNET_VERSION,
             "transaction_count": records.len(),
@@ -1486,6 +1495,9 @@ impl DevnetChain {
             }
             "starknet_getBlockTransactionCount" => Ok(serde_json::json!(self.block_by_id(p(0, "block_id").as_ref())?.transactions.len())),
             "starknet_getNonce" => {
+                if let Some(bid) = p(0, "block_id") {
+                    let _ = self.block_by_id(Some(&bid))?;
+                }
                 let address = felt(p(1, "contract_address").as_ref().and_then(|v| v.as_str()).unwrap_or("0x0"))?;
                 if self.state.class_hash_at(&address).is_none() {
                     return Err(RpcError::new(ERR_CONTRACT_NOT_FOUND, "Contract not found"));
@@ -1493,6 +1505,9 @@ impl DevnetChain {
                 Ok(serde_json::json!(format!("{:#x}", self.nonces.get(&address).copied().unwrap_or(0))))
             }
             "starknet_getClassHashAt" => {
+                if let Some(bid) = p(0, "block_id") {
+                    let _ = self.block_by_id(Some(&bid))?;
+                }
                 let address = felt(p(1, "contract_address").as_ref().and_then(|v| v.as_str()).unwrap_or("0x0"))?;
                 match self.state.class_hash_at(&address) {
                     Some(c) if c != Felt::ZERO => Ok(serde_json::json!(hex(&c))),
@@ -1500,10 +1515,16 @@ impl DevnetChain {
                 }
             }
             "starknet_getClass" => {
+                if let Some(bid) = p(0, "block_id") {
+                    let _ = self.block_by_id(Some(&bid))?;
+                }
                 let class_hash = felt(p(1, "class_hash").as_ref().and_then(|v| v.as_str()).unwrap_or("0x0"))?;
                 self.classes.get(&class_hash).map(|c| c.class_json.clone()).ok_or_else(|| RpcError::new(ERR_CLASS_HASH_NOT_FOUND, "Class hash not found"))
             }
             "starknet_getClassAt" => {
+                if let Some(bid) = p(0, "block_id") {
+                    let _ = self.block_by_id(Some(&bid))?;
+                }
                 let address = felt(p(1, "contract_address").as_ref().and_then(|v| v.as_str()).unwrap_or("0x0"))?;
                 let class_hash = self.state.class_hash_at(&address).filter(|c| *c != Felt::ZERO).ok_or_else(|| RpcError::new(ERR_CONTRACT_NOT_FOUND, "Contract not found"))?;
                 self.classes.get(&class_hash).map(|c| c.class_json.clone()).ok_or_else(|| RpcError::new(ERR_CLASS_HASH_NOT_FOUND, "Class hash not found"))
@@ -1529,6 +1550,9 @@ impl DevnetChain {
                     .map_err(|e| RpcError::new(ERR_COMPILATION_FAILED, e.to_string()))
             }
             "starknet_getStorageAt" => {
+                if let Some(bid) = p(2, "block_id") {
+                    let _ = self.block_by_id(Some(&bid))?;
+                }
                 let address = felt(p(0, "contract_address").as_ref().and_then(|v| v.as_str()).unwrap_or("0x0"))?;
                 let key = felt(p(1, "key").as_ref().and_then(|v| v.as_str()).unwrap_or("0x0"))?;
                 if self.state.class_hash_at(&address).is_none() {
@@ -1537,10 +1561,16 @@ impl DevnetChain {
                 Ok(serde_json::json!(hex(&self.state.storage_at(&address, &key))))
             }
             "starknet_call" => {
+                if let Some(bid) = p(1, "block_id") {
+                    let _ = self.block_by_id(Some(&bid))?;
+                }
                 let request = p(0, "request").unwrap_or_default();
                 self.call(&request)
             }
             "starknet_estimateFee" => {
+                if let Some(bid) = p(2, "block_id") {
+                    let _ = self.block_by_id(Some(&bid))?;
+                }
                 let txs = p(0, "request").and_then(|v| v.as_array().cloned()).unwrap_or_default();
                 let flags = simulation_flags(p(1, "simulation_flags"));
                 let mode = TxMode { skip_validate: flags.iter().any(|f| f == "SKIP_VALIDATE"), skip_fee_charge: true };
@@ -1552,6 +1582,9 @@ impl DevnetChain {
                 Ok(serde_json::json!(effects.iter().map(TxEffects::fee_estimate).collect::<Vec<_>>()))
             }
             "starknet_simulateTransactions" => {
+                if let Some(bid) = p(0, "block_id") {
+                    let _ = self.block_by_id(Some(&bid))?;
+                }
                 let txs = p(1, "transactions").and_then(|v| v.as_array().cloned()).unwrap_or_default();
                 let flags = simulation_flags(p(2, "simulation_flags"));
                 let mode = TxMode {
@@ -1564,7 +1597,21 @@ impl DevnetChain {
                     .map(|e| serde_json::json!({ "transaction_trace": e.trace(), "fee_estimation": e.fee_estimate() }))
                     .collect::<Vec<_>>()))
             }
-            "starknet_estimateMessageFee" => Ok(serde_json::json!({ "l1_gas_consumed": "0x0", "l1_gas_price": "0x1", "l2_gas_consumed": "0x0", "l2_gas_price": "0x1", "l1_data_gas_consumed": "0x0", "l1_data_gas_price": "0x1", "overall_fee": "0x0", "unit": "FRI" })),
+            "starknet_estimateMessageFee" => {
+                if let Some(bid) = p(1, "block_id") {
+                    let _ = self.block_by_id(Some(&bid))?;
+                }
+                Ok(serde_json::json!({
+                    "l1_gas_consumed": "0x0",
+                    "l1_gas_price": format!("{:#x}", self.gas_price_fri),
+                    "l2_gas_consumed": "0x0",
+                    "l2_gas_price": format!("{:#x}", self.l2_gas_price_fri),
+                    "l1_data_gas_consumed": "0x0",
+                    "l1_data_gas_price": format!("{:#x}", self.data_gas_price_fri),
+                    "overall_fee": "0x0",
+                    "unit": "FRI",
+                }))
+            }
             "starknet_addDeclareTransaction" => self.add_account_tx("DECLARE", &first_tx()),
             "starknet_addDeployAccountTransaction" => self.add_account_tx("DEPLOY_ACCOUNT", &first_tx()),
             "starknet_addInvokeTransaction" => self.add_account_tx("INVOKE", &first_tx()),
@@ -1973,6 +2020,9 @@ struct TxEffects {
     revert: Option<String>,
     l2_gas: u64,
     l1_data_gas: u64,
+    l1_gas_price: u128,
+    l2_gas_price: u128,
+    l1_data_gas_price: u128,
     fee: u128,
     state_diff: serde_json::Value,
     contract_address: Option<Felt>,
@@ -1985,14 +2035,13 @@ impl TxEffects {
     }
 
     fn fee_estimate(&self) -> serde_json::Value {
-        let price = format!("{DEVNET_GAS_PRICE:#x}");
         serde_json::json!({
             "l1_gas_consumed": "0x0",
-            "l1_gas_price": price,
+            "l1_gas_price": format!("{:#x}", self.l1_gas_price),
             "l2_gas_consumed": format!("{:#x}", self.l2_gas),
-            "l2_gas_price": price,
+            "l2_gas_price": format!("{:#x}", self.l2_gas_price),
             "l1_data_gas_consumed": format!("{:#x}", self.l1_data_gas),
-            "l1_data_gas_price": price,
+            "l1_data_gas_price": format!("{:#x}", self.l1_data_gas_price),
             "overall_fee": format!("{:#x}", self.fee),
             "unit": "FRI",
         })
@@ -2527,5 +2576,17 @@ pub mod Counter {
         assert!(sub_id.as_str().is_some_and(|s| s.starts_with("0x")));
         let unsub = chain.handle_rpc("starknet_unsubscribe", &serde_json::json!({ "subscription_id": sub_id })).unwrap();
         assert_eq!(unsub, serde_json::json!(true));
+
+        // Verify dynamic gas price in block header and block_id validation on state queries
+        let latest_blk = chain.handle_rpc("starknet_getBlockWithTxHashes", &serde_json::json!({ "block_id": "latest" })).unwrap();
+        assert_eq!(latest_blk["l1_gas_price"]["price_in_fri"], format!("0x{:x}", 250_000_000_000_u64));
+        assert_eq!(latest_blk["l1_gas_price"]["price_in_wei"], format!("0x{:x}", 200_000_000_000_u64));
+        let bad_blk_err = chain
+            .handle_rpc(
+                "starknet_getNonce",
+                &serde_json::json!({ "block_id": { "block_number": 999_999 }, "contract_address": acc.address }),
+            )
+            .unwrap_err();
+        assert_eq!(bad_blk_err.code, ERR_BLOCK_NOT_FOUND);
     }
 }
