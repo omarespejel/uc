@@ -40,15 +40,24 @@ extracted into scarb's cache layout), built 13 artifacts and ran the 41 betshare
 uc reads packages scarb downloaded; scarb keeps its own download ledger and will fetch again
 what uc downloaded.
 
-**Differential testing at scale (2026-10-26).** `benchmarks/differential/` generates random Cairo
+**Differential testing at scale (2026-10-27).** `benchmarks/differential/` generates random Cairo
 programs with an exact Python model of their semantics and compares uc with the reference tools:
 
-- *Tests:* 16,000 generated cases (checked arithmetic, division by zero, bitwise ops, `if`,
-  loops, calls between generated functions, `Checked*` traits matched on `Option`, struct round
-  trips, arithmetic in the wider type narrowed back with `try_into().unwrap()`, `felt252`
-  arithmetic that wraps modulo the prime, `assert`). `uc test`, snforge 0.60 and the Python model
-  agree on every case. On the last 8,000 cases the suites took 90 s under uc and 246 s under
-  snforge.
+- *Tests:* 17,600 generated cases across unsigned (`u8..u256`) and signed (`i8..i128`) integers
+  (checked arithmetic, division by zero, bitwise ops `&`/`|`/`^`, `if`, loops, calls between
+  generated functions, `Checked*` traits matched on `Option`, struct round trips, arithmetic in
+  the wider type narrowed back with `try_into().unwrap()`, `felt252` arithmetic that wraps modulo
+  the prime, `assert`). `uc test`, snforge 0.60 and the Python model agree on every case. On the
+  8,000-case batch the suites took 90 s under uc and 246 s under snforge.
+- *Cheatcodes & multi-contract state:* `cheatcode_diff.py` generates 400 stateful multi-contract
+  tests across 16 packages (`Target` + `Router` contracts) combining per-contract and global
+  cheats (`caller_address`, `block_timestamp`, `block_number`, `sequencer_address`),
+  `CheatSpan::TargetCalls(N)`, counted `mock_call(..., n_times)` and `start_mock_call`,
+  `store`/`load`, `spy_events`, `spy_messages_to_l1` (`MessageToL1SpyAssertionsTrait`), and
+  parameterized `#[fuzzer(runs: N, seed: S)]` tests. `uc test` and snforge 0.60 agree on all 400
+  tests (`0 uc_vs_snforge`). The campaign caught snforge's `CheatStatus::Uncheated` transition
+  when mixing per-contract and global cheats (stopping or expiring a per-contract cheat overrides
+  an active global cheat on that contract, and `*_global` clears per-contract overrides).
 - *Builds:* 40 generated packages and 120 contract artifacts are byte-identical to scarb 2.18.
   `build_matrix.py` covers 48 manifest shapes (`[lib]`, `[[target.starknet-contract]]`, both,
   `sierra-text`, `casm`, `sierra = false`, with and without a contract module). It found that uc
@@ -57,12 +66,13 @@ programs with an exact Python model of their semantics and compares uc with the 
   transaction hashes, 47 class hashes and 35 Blake2s compiled class hashes are all equal. 138
   addresses also match `sncast utils contract-address`. `onchain_class_hash.py` re-hashed 66 live
   mainnet Sierra classes (Sierra 1.3 to 1.9, from 321 addresses), and every one matches the chain.
-- *Prover:* `uc prove` runs on thousands of generated `u8` functions, and brute force over the
-  whole input space decides each verdict. A `PROVEN_SAFE` function that can panic would be
-  unsound. A counterexample whose witness does not panic is a false positive. The campaigns found
-  three false-positive causes, all fixed: constant divisors declared after their use,
-  `felt252` conversions the engine did not model, and constraints on unmodeled values read as
-  state guards. Since then they have found neither unsound verdicts nor false counterexamples.
+- *Prover:* `uc prove` runs on thousands of generated unsigned (`u8..u256`) and signed (`i8..i128`)
+  functions, and brute force / reference evaluation over the input space decides each verdict. A
+  `PROVEN_SAFE` function that can panic would be unsound. A counterexample whose witness does not
+  panic is a false positive. Across 682 additional generated signed/unsigned/bitwise functions in
+  `run_arith.py` (`seed 42` and `seed 99`), `uc prove` produced 0 unsound verdicts and 0 false
+  counterexamples, and z3 verified all 80,620 decided SMT obligations from the 525-function suite
+  with 0 disagreements.
 
 **Real bytecode.** `benchmarks/scripts/run_mainnet_audit.py` fetches 20 well-known mainnet
 classes over JSON-RPC and audits them with no source: 16 are Sierra classes (4 are Cairo 0 or
@@ -203,12 +213,13 @@ that appeared or disappeared relative to the previous class. State lives in
 with every panic path's constraints as a `(check-sat)` obligation and the verdict uc expects
 (`unsat` for an unreachable panic, `sat` plus a pinned witness for a counterexample), and
 `obligations.json` listing them. `benchmarks/scripts/check_smt_obligations.py --dir target/smt`
-runs z3 or cvc5 over the files and reports every disagreement. On 2026-10-26 z3 checked
-102,344 obligations from erc8004, betshare and the deployed STRK class and disagreed with
-none. It agreed with all 94,490 that uc decided; the other 7,854 are paths uc leaves
-undecided or decides only up to state, exported as `unknown`. The obligations
-cover the numeric path constraints uc reasons about; values uc treats as opaque (storage reads,
-call results) are free constants in the files, so agreement checks the solver, not the model.
+runs z3 or cvc5 over the files and reports every disagreement. On 2026-10-27 z3 checked
+182,964 obligations from erc8004 (39,203), betshare (21,638), the deployed STRK class (40,205)
+and 525 generated signed/unsigned/bitwise functions (81,918) and disagreed with none. It agreed
+with all 172,186 that uc decided; the other 10,778 are paths uc leaves undecided or decides
+only up to state, exported as `unknown`. The obligations cover the numeric and bitwise path
+constraints uc reasons about; values uc treats as opaque (storage reads, call results) are free
+constants in the files, so agreement checks the solver, not the model.
 
 The taint detectors run on Sierra, so they also work on deployed classes with no debug names:
 entry points are named from the ABI by selector and `PanicResult` is recognised structurally.
@@ -281,12 +292,13 @@ equal, but L2 gas is not (see below).
 
 Served: `starknet_addDeclareTransaction`, `addDeployAccountTransaction`, `addInvokeTransaction`,
 `call`, `estimateFee`, `simulateTransactions`, `getNonce`, `getClassHashAt`, `getClass`, `getClassAt`, `getStorageAt`,
-`getTransactionByHash` / `Receipt` / `Status`, `getBlockWithTxHashes` / `WithTxs`, `getEvents`,
+`getTransactionByHash` / `Receipt` / `Status`, `getBlockWithTxHashes` / `WithTxs` / `WithReceipts`, `getEvents`,
 `getStateUpdate`, `traceTransaction`, `blockNumber`, `chainId`, `specVersion`, plus `devnet_mint`,
 `devnet_createBlock`, `devnet_setTime`, `devnet_increaseTime`, `devnet_getPredeployedAccounts`
 and the `/predeployed_accounts`, `/mint`, `/create_block`, `/is_alive` routes. One block per
 transaction (`--block-generation-on demand` to batch). Receipts carry events, revert reasons from
-nested calls, the fee and the gas used.
+nested calls, the fee and the gas used; sealed blocks populate the runner's block-hash table so
+`get_block_hash_syscall` resolves historical blocks (`number <= current_block - 10`).
 
 ## Starkscan
 
@@ -327,8 +339,7 @@ It exits 1 when a required check fails.
 
 - `uc devnet` measures L2 gas with cairo-lang-runner's syscall costs, which are lighter than
   blockifier's. A counter increment costs about 69k L2 gas there and 1.14M on starknet-devnet.
-  Block commitments are `0x0`, nested calls are not broken out in traces, and the block-hash
-  contract at `0x1` is not kept.
+  Block commitments are `0x0`, and nested calls are not broken out in traces.
 - Fuzz runs collect statement coverage for corpus guidance on their own thread only; `--coverage`
   and `--lcov` still switch the whole run to the unsliced program, which is slower.
 - `uc fetch` writes `Scarb.lock` only when the package has none; it does not update an existing

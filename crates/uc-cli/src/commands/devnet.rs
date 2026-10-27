@@ -778,6 +778,7 @@ impl DevnetChain {
                 self.txs[i].receipt["block_hash"] = serde_json::json!(block.block_hash);
             }
         }
+        self.state.set_block_hash(number, hash);
         self.blocks.push(block);
         self.blocks.last().unwrap()
     }
@@ -1420,6 +1421,16 @@ impl DevnetChain {
                 let b = self.block_by_id(p(0, "block_id").as_ref())?.clone();
                 Ok(self.block_json(&b, true))
             }
+            "starknet_getBlockWithReceipts" => {
+                let b = self.block_by_id(p(0, "block_id").as_ref())?.clone();
+                let mut json = self.block_json(&b, false);
+                let txs: Vec<serde_json::Value> = self
+                    .block_txs(&b)
+                    .map(|t| serde_json::json!({ "transaction": t.transaction, "receipt": t.receipt }))
+                    .collect();
+                json["transactions"] = serde_json::json!(txs);
+                Ok(json)
+            }
             "starknet_getBlockTransactionCount" => Ok(serde_json::json!(self.block_by_id(p(0, "block_id").as_ref())?.transactions.len())),
             "starknet_getNonce" => {
                 let address = felt(p(1, "contract_address").as_ref().and_then(|v| v.as_str()).unwrap_or("0x0"))?;
@@ -2010,5 +2021,12 @@ pub mod Counter {
         assert!(strk_balance_of(&mut chain, &hex(&address)) < 1_000_000_000_000_000_000);
         let pk = chain.handle_rpc("starknet_call", &serde_json::json!({ "request": { "contract_address": hex(&address), "entry_point_selector": hex(&selector("get_public_key")), "calldata": [] } })).unwrap();
         assert_eq!(pk, serde_json::json!([hex(&public_key)]));
+
+        // starknet_getBlockWithReceipts returns block header + paired (transaction, receipt) entries
+        let bwr = chain.handle_rpc("starknet_getBlockWithReceipts", &serde_json::json!({ "block_id": "latest" })).unwrap();
+        assert_eq!(bwr["status"], "ACCEPTED_ON_L2");
+        let txs_with_receipts = bwr["transactions"].as_array().expect("transactions array");
+        assert!(!txs_with_receipts.is_empty());
+        assert!(txs_with_receipts[0].get("transaction").is_some() && txs_with_receipts[0].get("receipt").is_some());
     }
 }

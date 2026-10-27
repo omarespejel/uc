@@ -511,13 +511,13 @@ Omar Espejel
 
 <img data-src="./assets/uc.svg" title="uc benchmark" style="width:65.0%" class="r-stretch quarto-figure-center"><p class="caption">betshare, 2026-10-25, same window (<code>benchmarks/results/head-to-head-20261025-162907.json</code>): cold build scarb 11.90 s vs uc 5.23 s; warm 0.27 s vs 0.03 s; 41 tests warm snforge 2.43 s vs uc 0.85 s; 13/13 artifacts byte-identical. erc8004 (168 tests, seven with over a million VM steps): uc 11.6 s and 2.2 GB peak vs snforge 0.60 16.9 s and 3.3 GB, same machine.</p></section>
 <section id="uv-1" class="slide level2">
-<h2>uc — What Is Actually Verified (2026-10-26)</h2>
+<h2>uc — What Is Actually Verified (2026-10-27)</h2>
 <ul>
 <li><strong>Byte-identical artifacts</strong>: on erc8004 (6 contracts, OpenZeppelin v3) all 13 files from <code>uc build</code> equal <code>scarb 2.18 build</code> byte for byte, Sierra and CASM included</li>
-<li><strong>Same test verdicts as snforge 0.60</strong>: betshare 41/41, erc8004 168/168; a mutated contract fails the right test under uc</li>
+<li><strong>Same test verdicts as snforge 0.60</strong>: betshare 41/41, erc8004 168/168, plus 400 stateful multi-contract cheatcode tests across 16 packages; a mutated contract fails the right test under uc</li>
 <li><strong>Fresh machine</strong>: empty HOME, empty cache, no scarb on PATH: uc fetched 12 OpenZeppelin packages from scarbs.xyz (SHA-256 checked), built 13 artifacts, ran 41 tests green</li>
-<li><strong>Real bytecode</strong>: 16 deployed mainnet classes (STRK, ETH, USDC, Ekubo, AVNU, zkLend, StarkGate, Vesu, Pragma...) audited from chain with no source: 2,843 Sierra functions, 92 findings, 6 counterexamples, 32 s; z3 confirms every decided proof obligation on erc8004, betshare and STRK (94,490)</li>
-<li><strong>Random programs, thousands of cases</strong>: 16,000 generated test cases give the same verdict under uc, snforge 0.60 and a Python model; 120 artifacts and 48 manifest shapes match scarb; 4,000 hashes match starknet-py; 66 live mainnet classes re-hash to the chain's hash; brute force over thousands of generated functions finds no unsound <code>uc prove</code> verdict</li>
+<li><strong>Real bytecode</strong>: 16 deployed mainnet classes (STRK, ETH, USDC, Ekubo, AVNU, zkLend, StarkGate, Vesu, Pragma...) audited from chain with no source: 2,843 Sierra functions, 92 findings, 6 counterexamples, 32 s; z3 confirms every decided proof obligation across erc8004, betshare, STRK and 525 generated signed/unsigned/bitwise functions (172,186 / 172,186 agreed, 0 disagreed)</li>
+<li><strong>Random programs, thousands of cases</strong>: 17,600 generated unsigned &amp; signed test cases give the same verdict under uc, snforge 0.60 and a Python model; 120 artifacts and 48 manifest shapes match scarb; 4,000 hashes match starknet-py; 66 live mainnet classes re-hash to the chain's hash; brute force over thousands of generated functions finds no unsound <code>uc prove</code> verdict</li>
 <li><strong>Self-contained</strong>: Cairo 2.18.0 compiler and 164 corelib files embedded; <code>uc --version</code> says which</li>
 </ul>
 </section>

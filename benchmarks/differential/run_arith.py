@@ -32,7 +32,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from arith_gen import Function, TYPES, prelude, rand_value  # noqa: E402
+from arith_gen import Function, TYPES, prelude, rand_value, tmax, tmin  # noqa: E402
 
 MANIFEST = """[package]
 name = "{name}"
@@ -58,7 +58,7 @@ allow-prebuilt-plugins = ["snforge_std"]
 
 
 def cairo_value(v, ty):
-    return f"{v}_{ty}"
+    return f"({v}_{ty})" if v < 0 else f"{v}_{ty}"
 
 
 def write_package(root, name, functions, cases):
@@ -149,15 +149,22 @@ def build_parity(uc, pkg):
 
 
 def prove_campaign(uc, out, rng, count):
-    """u8 functions brute-forced over their whole domain. Helpers `h*` are called by the `p*`
+    """u8 and i8 functions brute-forced over their whole domain. Helpers `h*` are called by the `p*`
     functions (inlining, callee panics); every function is checked."""
     pkg = out / "prove_pkg"
     (pkg / "src").mkdir(parents=True)
     (pkg / "Scarb.toml").write_text('[package]\nname = "prove_pkg"\nversion = "0.1.0"\nedition = "2024_07"\n\n[dependencies]\nstarknet = "2.18.0"\n')
-    helpers = [Function(rng, f"h{i}", "u8", rng.randint(1, 2), max_depth=2) for i in range(max(4, count // 20))]
-    functions = helpers + [Function(rng, f"p{i}", "u8", rng.randint(1, 2), helpers=helpers) for i in range(count)]
+    helpers = [
+        Function(rng, f"h{i}", "i8" if i % 3 == 0 else "u8", rng.randint(1, 2), max_depth=2)
+        for i in range(max(4, count // 20))
+    ]
+    functions = helpers + [
+        Function(rng, f"p{i}", "i8" if i % 4 == 0 else "u8", rng.randint(1, 2), helpers=helpers)
+        for i in range(count)
+    ]
     (pkg / "src" / "lib.cairo").write_text("\n\n".join([prelude()] + [f.cairo() for f in functions]) + "\n")
-    p, secs = run([uc, "prove", "--json", "--stateful-runs", "0"], pkg, timeout=3600)
+    smt_dir = out / "smt_out"
+    p, secs = run([uc, "prove", "--json", "--stateful-runs", "0", "--emit-smt", str(smt_dir)], pkg, timeout=3600)
     out_text = p.stdout
     try:
         rep = json.loads(out_text[out_text.index("{"):])
@@ -167,7 +174,8 @@ def prove_campaign(uc, out, rng, count):
     count = len(functions)
     results = {"functions": count, "seconds": round(secs, 1), "status_counts": {}, "unsound": [], "false_cex": [], "missing": [], "panicking_functions": 0}
     for f in functions:
-        domain = itertools.product(range(256), repeat=len(f.params))
+        lo, hi = tmin(f.ty), tmax(f.ty)
+        domain = itertools.product(range(lo, hi + 1), repeat=len(f.params))
         panics = [args for args in domain if f.outcome(args)[0] == "panic"]
         pr = proofs.get(f.name)
         if pr is None:
@@ -185,7 +193,7 @@ def prove_campaign(uc, out, rng, count):
                 args = tuple(int(ce[k]) for k in sorted(ce, key=lambda k: int(k.split("_")[-1]) if k.split("_")[-1].isdigit() else 0))[: len(f.params)]
             except (ValueError, KeyError):
                 args = None
-            if args is not None and len(args) == len(f.params) and all(0 <= a <= 255 for a in args):
+            if args is not None and len(args) == len(f.params) and all(lo <= a <= hi for a in args):
                 if f.outcome(args)[0] != "panic":
                     results["false_cex"].append({"function": f.name, "witness": args, "reason": pr.get("counterexample_reason"), "source": f.cairo(), "any_panic": bool(panics)})
     return results
@@ -213,7 +221,7 @@ def main():
         pkg = out / name
         functions, cases = [], []
         for fi in range(args.functions):
-            ty = rng.choices(list(TYPES), weights=[4, 2, 2, 2, 1])[0]
+            ty = rng.choices(list(TYPES), weights=[4, 2, 2, 2, 1, 2, 1])[0]
             f = Function(rng, f"f{fi}", ty, rng.randint(1, 3), helpers=functions[-12:])
             functions.append(f)
             for ci in range(args.cases):

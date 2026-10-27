@@ -647,6 +647,83 @@ pub(crate) fn discover_source_test_locations(
     map
 }
 
+fn discover_fuzzer_configs(manifest_dir: &Path, src_dir: &Path) -> BTreeMap<String, (Option<usize>, Option<u64>)> {
+    let mut map = BTreeMap::new();
+    for check_dir in [src_dir.to_path_buf(), manifest_dir.join("tests")] {
+        if !check_dir.is_dir() {
+            continue;
+        }
+        for entry in WalkDir::new(check_dir).follow_links(false).into_iter().flatten() {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path();
+            if !path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("cairo"))
+            {
+                continue;
+            }
+            let Ok(source) = fs::read_to_string(path) else {
+                continue;
+            };
+            let mut pending_fuzzer: Option<(Option<usize>, Option<u64>)> = None;
+            for raw_line in source.lines() {
+                let line = raw_line
+                    .split_once("//")
+                    .map(|(h, _)| h)
+                    .unwrap_or(raw_line)
+                    .trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Some(after) = line.split("#[fuzzer").nth(1) {
+                    let mut runs = None;
+                    let mut seed = None;
+                    let inner = after
+                        .trim_start_matches('(')
+                        .split(')')
+                        .next()
+                        .unwrap_or("");
+                    for part in inner.split(',') {
+                        if let Some((k, v)) = part.split_once(':') {
+                            let k = k.trim();
+                            let v_clean: String = v.trim().chars().filter(|c| *c != '_').collect();
+                            if k == "runs" {
+                                runs = v_clean.parse::<usize>().ok();
+                            } else if k == "seed" {
+                                seed = if let Some(h) = v_clean.strip_prefix("0x") {
+                                    u64::from_str_radix(h, 16).ok()
+                                } else {
+                                    v_clean.parse::<u64>().ok()
+                                };
+                            }
+                        }
+                    }
+                    pending_fuzzer = Some((runs, seed));
+                }
+                if let Some(cfg) = pending_fuzzer {
+                    let trimmed = line.strip_prefix("pub ").unwrap_or(line).trim_start();
+                    if let Some(rest) = trimmed.strip_prefix("fn ") {
+                        let fn_name: String = rest
+                            .chars()
+                            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                            .collect();
+                        if !fn_name.is_empty() {
+                            map.insert(fn_name, cfg);
+                            pending_fuzzer = None;
+                        }
+                    } else if !line.starts_with("#[") {
+                        pending_fuzzer = None;
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+
 fn project_uses_external_snforge_cheatcodes(manifest_path: &Path, src_dir: &Path) -> bool {
     if let Ok(manifest_text) = fs::read_to_string(manifest_path) {
         if manifest_text.contains("snforge_std") {
@@ -1144,8 +1221,11 @@ pub fn stop_mock_call(contract_address: ContractAddress, function_selector: felt
 pub fn mock_call<T, +Serde<T>, +Drop<T>>(
     contract_address: ContractAddress, function_selector: felt252, ret_data: T, n_times: u32
 ) {
-    let _ = n_times;
-    start_mock_call(contract_address, function_selector, ret_data);
+    let mut inputs: Array<felt252> = array![
+        contract_address.into(), function_selector, n_times.into()
+    ];
+    ret_data.serialize(ref inputs);
+    let _ = starknet::testing::cheatcode::<'mock_call_counted'>(inputs.span());
 }
 
 pub fn store(target: ContractAddress, storage_address: felt252, serialized_value: Span<felt252>) {
@@ -1656,10 +1736,30 @@ pub trait MessageToL1SpyAssertionsTrait {
 
 pub impl MessageToL1SpyAssertionsTraitImpl of MessageToL1SpyAssertionsTrait {
     fn assert_sent(ref self: MessageToL1Spy, messages: @Array<(ContractAddress, MessageToL1)>) {
-        let _ = messages;
+        let received = self.get_messages();
+        for (expected_from, expected_msg) in messages.span() {
+            let mut found = false;
+            for (from, msg) in received.messages.span() {
+                if from == expected_from && msg == expected_msg {
+                    found = true;
+                    break;
+                };
+            };
+            assert(found, 'Message was not sent');
+        };
     }
     fn assert_not_sent(ref self: MessageToL1Spy, messages: @Array<(ContractAddress, MessageToL1)>) {
-        let _ = messages;
+        let received = self.get_messages();
+        for (expected_from, expected_msg) in messages.span() {
+            let mut found = false;
+            for (from, msg) in received.messages.span() {
+                if from == expected_from && msg == expected_msg {
+                    found = true;
+                    break;
+                };
+            };
+            assert(!found, 'Message was sent');
+        };
     }
 }
 "#;
@@ -1882,7 +1982,7 @@ pub(crate) fn compile_or_load_native_tests(
         manifest_path,
         workspace_root,
         package_name,
-        true,
+        false,
     );
     let mut crate_roots = BTreeMap::new();
     crate_roots.insert(crate_name.to_string(), src_dir.clone());
@@ -2311,10 +2411,14 @@ fn generate_fuzz_words(
         return out;
     }
 
-    for (ty_name, word_size) in param_specs {
+    for (param_idx, (ty_name, word_size)) in param_specs.iter().enumerate() {
         for word_idx in 0..*word_size {
             let raw = if run_idx < BOUNDARY_SEEDS.len() {
-                BOUNDARY_SEEDS[run_idx]
+                if param_idx == 0 || run_idx % 3 == 0 {
+                    BOUNDARY_SEEDS[run_idx]
+                } else {
+                    BOUNDARY_SEEDS[(run_idx + param_idx * 5) % BOUNDARY_SEEDS.len()]
+                }
             } else {
                 match rng.next_u64() % 4 {
                     0 => (rng.next_u64() % 1024) as u128 + 1,
@@ -2646,6 +2750,7 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
         project_uses_external_snforge_cheatcodes(&effective_manifest_path, &src_dir);
 
     let source_locations = discover_source_test_locations(&workspace_root, &src_dir);
+    let fuzzer_configs = discover_fuzzer_configs(manifest_dir, &src_dir);
     let (affected_modules_opt, current_affected_graph) =
         compute_affected_modules(&workspace_root, &package_name, &crate_name, &src_dir);
 
@@ -2938,22 +3043,20 @@ pub(crate) fn run_test(args: TestArgs) -> Result<()> {
                 let _release = ReleaseFunctionRunner(&runner, func);
 
                 let param_specs = runner.user_param_types_and_sizes(func);
-                let is_fuzz_or_invariant = !param_specs.is_empty()
-                    && (args.fuzz_runs > 0
-                        || short_name.contains("fuzz")
-                        || short_name.contains("invariant")
-                        || short_name.contains("prop"));
+                let is_fuzz_or_invariant = !param_specs.is_empty();
 
                 if is_fuzz_or_invariant {
                     // Coverage guides the corpus; keep it on this thread only so the other tests
                     // (and the ones that run after this one) stay on the sliced fast path.
                     let _coverage = runner.scoped_coverage(true);
+                    let (attr_runs, attr_seed) =
+                        fuzzer_configs.get(short_name).copied().unwrap_or((None, None));
                     let total_runs = if args.fuzz_runs > 0 {
                         args.fuzz_runs
                     } else {
-                        32
+                        attr_runs.unwrap_or(32)
                     };
-                    let base_seed = args.fuzz_seed.unwrap_or_else(|| {
+                    let base_seed = args.fuzz_seed.or(attr_seed).unwrap_or_else(|| {
                         let h = blake3::hash(name.as_bytes());
                         let mut b = [0u8; 8];
                         b.copy_from_slice(&h.as_bytes()[..8]);
@@ -4669,6 +4772,138 @@ mod tests {
         assert_eq!(mut_summary["killed"], 2);
         assert_eq!(mut_summary["survived"], 0);
         assert_eq!(mut_summary["mutation_score_pct"], 100.0);
+    }
+
+    #[test]
+    fn parameterized_tests_fuzzer_attr_counted_mock_call_and_l1_message_spy_work() {
+        let _env = crate::test_env_shared();
+        let proj = TempTestProject::new("fuzz_mock_l1_spy");
+        let manifest_path = proj.dir.join("Scarb.toml");
+        fs::write(
+            &manifest_path,
+            r#"[package]
+name = "fuzz_mock_l1_demo"
+version = "0.1.0"
+edition = "2024_07"
+
+[dependencies]
+starknet = "2.16.0"
+snforge_std = "0.56.0"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            proj.dir.join("src/lib.cairo"),
+            r#"#[starknet::interface]
+pub trait IOracle<TContractState> {
+    fn get_price(self: @TContractState) -> u64;
+    fn get_bn(self: @TContractState) -> u64;
+    fn ping_l1(ref self: TContractState, to_l1: felt252, amount: felt252);
+}
+
+#[starknet::contract]
+pub mod Oracle {
+    use starknet::get_block_number;
+    use starknet::syscalls::send_message_to_l1_syscall;
+    use starknet::SyscallResultTrait;
+
+    #[storage]
+    struct Storage {}
+
+    #[abi(embed_v0)]
+    impl OracleImpl of super::IOracle<ContractState> {
+        fn get_price(self: @ContractState) -> u64 {
+            100_u64
+        }
+
+        fn get_bn(self: @ContractState) -> u64 {
+            get_block_number()
+        }
+
+        fn ping_l1(ref self: ContractState, to_l1: felt252, amount: felt252) {
+            send_message_to_l1_syscall(to_l1, array![amount].span()).unwrap_syscall();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IOracleDispatcher, IOracleDispatcherTrait};
+    use snforge_std::{
+        CheatSpan, ContractClassTrait, DeclareResultTrait, cheat_block_number, declare, mock_call,
+        start_cheat_block_number, start_cheat_block_number_global, stop_cheat_block_number,
+        stop_cheat_block_number_global,
+        spy_messages_to_l1, MessageToL1, MessageToL1SpyAssertionsTrait,
+    };
+
+    #[test]
+    #[fuzzer(runs: 12, seed: 99)]
+    fn check_addition_commutes(a: u64, b: u64) {
+        let lhs: u128 = a.into() + b.into();
+        let rhs: u128 = b.into() + a.into();
+        assert(lhs == rhs, 'commute');
+    }
+
+    #[test]
+    fn test_counted_mock_call_and_l1_spy() {
+        let contract = declare("Oracle").unwrap().contract_class();
+        let (addr, _) = contract.deploy(@array![]).unwrap();
+        let disp = IOracleDispatcher { contract_address: addr };
+
+        // Mock `get_price` for 2 calls, and also set `cheat_block_number` for 2 TargetCalls:
+        // mocked calls still tick TargetCalls on `addr`!
+        cheat_block_number(addr, 5555_u64, CheatSpan::TargetCalls(2));
+        mock_call(addr, selector!("get_price"), 777_u64, 2);
+        assert(disp.get_price() == 777_u64, 'mock_1');
+        assert(disp.get_bn() == 5555_u64, 'bn_2nd_call');
+        assert(disp.get_bn() == 2000_u64, 'bn_expired_after_2_calls');
+        assert(disp.get_price() == 777_u64, 'mock_2');
+        assert(disp.get_price() == 100_u64, 'mock_expired_3');
+
+        // Global cheat vs per-contract stop / expiry transitions (`CheatStatus::Uncheated`)
+        start_cheat_block_number(addr, 3333_u64);
+        start_cheat_block_number_global(4444_u64);
+        assert(disp.get_bn() == 4444_u64, 'global_overrides_target');
+        stop_cheat_block_number(addr);
+        assert(disp.get_bn() == 2000_u64, 'stop_target_uncheats_over_glob');
+        start_cheat_block_number(addr, 6666_u64);
+        assert(disp.get_bn() == 6666_u64, 'target_recheated');
+        stop_cheat_block_number_global();
+        assert(disp.get_bn() == 2000_u64, 'stop_global_clears_target');
+
+        let mut spy = spy_messages_to_l1();
+        disp.ping_l1(0x1234, 42);
+        spy.assert_sent(@array![
+            (addr, MessageToL1 { to_address: 0x1234.try_into().unwrap(), payload: array![42] })
+        ]);
+        spy.assert_not_sent(@array![
+            (addr, MessageToL1 { to_address: 0x1234.try_into().unwrap(), payload: array![99] })
+        ]);
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let rep_path = proj.dir.join("rep.json");
+        run_test(TestArgs {
+            manifest_path: Some(manifest_path),
+            json: true,
+            report_path: Some(rep_path.clone()),
+            ..Default::default()
+        })
+        .expect("parameterized test + counted mock_call + l1 spy should pass");
+
+        let rep: serde_json::Value =
+            serde_json::from_slice(&fs::read(&rep_path).unwrap()).unwrap();
+        assert_eq!(rep["failed_count"], 0, "{rep}");
+        let commute_test = rep["tests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"].as_str().unwrap().ends_with("check_addition_commutes"))
+            .expect("check_addition_commutes entry");
+        assert_eq!(commute_test["fuzz_runs"], 12, "{commute_test}");
     }
 }
 

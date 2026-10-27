@@ -139,44 +139,60 @@ type Log = (Vec<Felt252>, Vec<Felt252>);
 // L2 to L1 message type signature
 type L2ToL1Message = (Felt252, Vec<Felt252>);
 
-/// Per-contract cheat value with optional remaining call count (`CheatSpan::TargetCalls`).
+/// Per-contract cheat value (`Some(v)` when cheated, `None` when explicitly uncheated/expired)
+/// with optional remaining call count (`CheatSpan::TargetCalls`).
 #[derive(Clone, Debug)]
 struct CheatEntry<T> {
-    value: T,
+    value: Option<T>,
     remaining_calls: Option<u64>,
 }
 
 impl<T> CheatEntry<T> {
     fn from_span(value: T, span_felt: Option<Felt252>) -> Self {
         let remaining_calls = span_felt.and_then(|f| f.to_u64()).filter(|&n| n > 0);
-        Self { value, remaining_calls }
+        Self {
+            value: Some(value),
+            remaining_calls,
+        }
+    }
+
+    fn uncheated() -> Self {
+        Self {
+            value: None,
+            remaining_calls: None,
+        }
     }
 }
 
 fn take_or_clone_cheat<T: Clone>(
     map: &mut HashMap<Felt252, CheatEntry<T>>,
+    global: &Option<T>,
     addr: &Felt252,
 ) -> Option<T> {
-    let (val, remove) = {
-        let entry = map.get_mut(addr)?;
-        let val = entry.value.clone();
-        let remove = match &mut entry.remaining_calls {
-            Some(rem) => {
-                if *rem <= 1 {
-                    true
-                } else {
-                    *rem -= 1;
-                    false
-                }
-            }
-            None => false,
-        };
-        (val, remove)
+    let Some(entry) = map.get_mut(addr) else {
+        return global.clone();
     };
-    if remove {
-        map.remove(addr);
+    let val = entry.value.clone()?;
+    if let Some(rem) = &mut entry.remaining_calls {
+        if *rem <= 1 {
+            entry.value = None;
+            entry.remaining_calls = None;
+        } else {
+            *rem -= 1;
+        }
     }
     Some(val)
+}
+
+fn peek_cheat<T: Clone>(
+    map: &HashMap<Felt252, CheatEntry<T>>,
+    global: &Option<T>,
+    addr: &Felt252,
+) -> Option<T> {
+    match map.get(addr) {
+        Some(entry) => entry.value.clone(),
+        None => global.clone(),
+    }
 }
 
 #[derive(Clone, Default)]
@@ -217,8 +233,8 @@ pub struct StarknetState {
     block_hash: HashMap<u64, Felt252>,
     /// Optional forced address for the next `deploy_syscall` (`deploy_at`).
     next_deploy_address: Option<Felt252>,
-    /// Mocked contract calls `((contract_address, selector) -> serialized_return_data)`.
-    mocked_calls: HashMap<(Felt252, Felt252), Vec<Felt252>>,
+    /// Mocked contract calls `((contract_address, selector) -> CheatEntry<serialized_return_data>)`.
+    mocked_calls: HashMap<(Felt252, Felt252), CheatEntry<Vec<Felt252>>>,
     /// Per-contract cheated caller addresses.
     cheated_caller_address: HashMap<Felt252, CheatEntry<Felt252>>,
     /// Global cheated caller address.
@@ -330,6 +346,10 @@ impl StarknetState {
         self.storage.entry(contract).or_default().insert(key, value);
     }
 
+    pub fn set_block_hash(&mut self, block_number: u64, block_hash: Felt252) {
+        self.block_hash.insert(block_number, block_hash);
+    }
+
     /// Storage cells whose value differs from `before`, as `(contract, key, value)` sorted by
     /// contract then key (a write of the value already stored is no change).
     pub fn storage_diff(&self, before: &StarknetState) -> Vec<(Felt252, Felt252, Felt252)> {
@@ -405,19 +425,71 @@ impl StarknetState {
     ) -> (Felt252, Felt252) {
         let frame = ActiveCallFrameCheats {
             contract_address: new_contract_address,
-            caller_address: take_or_clone_cheat(&mut self.cheated_caller_address, &new_contract_address),
-            block_timestamp: take_or_clone_cheat(&mut self.cheated_block_timestamp, &new_contract_address),
-            block_number: take_or_clone_cheat(&mut self.cheated_block_number, &new_contract_address),
-            sequencer_address: take_or_clone_cheat(&mut self.cheated_sequencer_address, &new_contract_address),
-            tx_hash: take_or_clone_cheat(&mut self.cheated_tx_hash, &new_contract_address),
-            tx_version: take_or_clone_cheat(&mut self.cheated_tx_version, &new_contract_address),
-            account_address: take_or_clone_cheat(&mut self.cheated_account_address, &new_contract_address),
-            nonce: take_or_clone_cheat(&mut self.cheated_nonce, &new_contract_address),
-            chain_id: take_or_clone_cheat(&mut self.cheated_chain_id, &new_contract_address),
-            tip: take_or_clone_cheat(&mut self.cheated_tip, &new_contract_address),
-            signature: take_or_clone_cheat(&mut self.cheated_signature, &new_contract_address),
-            proof_facts: take_or_clone_cheat(&mut self.cheated_proof_facts, &new_contract_address),
-            resource_bounds: take_or_clone_cheat(&mut self.cheated_resource_bounds, &new_contract_address),
+            caller_address: take_or_clone_cheat(
+                &mut self.cheated_caller_address,
+                &self.global_caller_address,
+                &new_contract_address,
+            ),
+            block_timestamp: take_or_clone_cheat(
+                &mut self.cheated_block_timestamp,
+                &self.global_block_timestamp,
+                &new_contract_address,
+            ),
+            block_number: take_or_clone_cheat(
+                &mut self.cheated_block_number,
+                &self.global_block_number,
+                &new_contract_address,
+            ),
+            sequencer_address: take_or_clone_cheat(
+                &mut self.cheated_sequencer_address,
+                &self.global_sequencer_address,
+                &new_contract_address,
+            ),
+            tx_hash: take_or_clone_cheat(
+                &mut self.cheated_tx_hash,
+                &self.global_tx_hash,
+                &new_contract_address,
+            ),
+            tx_version: take_or_clone_cheat(
+                &mut self.cheated_tx_version,
+                &self.global_tx_version,
+                &new_contract_address,
+            ),
+            account_address: take_or_clone_cheat(
+                &mut self.cheated_account_address,
+                &self.global_account_address,
+                &new_contract_address,
+            ),
+            nonce: take_or_clone_cheat(
+                &mut self.cheated_nonce,
+                &self.global_nonce,
+                &new_contract_address,
+            ),
+            chain_id: take_or_clone_cheat(
+                &mut self.cheated_chain_id,
+                &self.global_chain_id,
+                &new_contract_address,
+            ),
+            tip: take_or_clone_cheat(
+                &mut self.cheated_tip,
+                &self.global_tip,
+                &new_contract_address,
+            ),
+            signature: take_or_clone_cheat(
+                &mut self.cheated_signature,
+                &self.global_signature,
+                &new_contract_address,
+            ),
+            proof_facts: take_or_clone_cheat(
+                &mut self.cheated_proof_facts,
+                &self.global_proof_facts,
+                &new_contract_address,
+            ),
+            resource_bounds: take_or_clone_cheat(
+                &mut self.cheated_resource_bounds,
+                &self.global_resource_bounds,
+                &new_contract_address,
+            ),
         };
         self.active_call_frame_cheats.push(frame);
         let old_contract_address =
@@ -1203,153 +1275,135 @@ impl CairoHintProcessor<'_> {
             .last()
             .filter(|f| f.contract_address == cur_contract);
 
-        let signature: Vec<Felt252> = if let Some(frame) = active_frame {
-            frame
-                .signature
-                .as_ref()
-                .or(self.starknet_state.global_signature.as_ref())
-                .unwrap_or(&tx_info.signature)
-                .clone()
-        } else {
-            self.starknet_state
-                .cheated_signature
-                .get(&cur_contract)
-                .map(|e| &e.value)
-                .or(self.starknet_state.global_signature.as_ref())
-                .unwrap_or(&tx_info.signature)
-                .clone()
-        };
-        let proof_facts: Vec<Felt252> = if let Some(frame) = active_frame {
-            frame
-                .proof_facts
-                .as_ref()
-                .or(self.starknet_state.global_proof_facts.as_ref())
-                .unwrap_or(&tx_info.proof_facts)
-                .clone()
-        } else {
-            self.starknet_state
-                .cheated_proof_facts
-                .get(&cur_contract)
-                .map(|e| &e.value)
-                .or(self.starknet_state.global_proof_facts.as_ref())
-                .unwrap_or(&tx_info.proof_facts)
-                .clone()
-        };
-        let resource_bounds: Vec<ResourceBounds> = if let Some(frame) = active_frame {
-            frame
-                .resource_bounds
-                .as_ref()
-                .or(self.starknet_state.global_resource_bounds.as_ref())
-                .unwrap_or(&tx_info.resource_bounds)
-                .clone()
-        } else {
-            self.starknet_state
-                .cheated_resource_bounds
-                .get(&cur_contract)
-                .map(|e| &e.value)
-                .or(self.starknet_state.global_resource_bounds.as_ref())
-                .unwrap_or(&tx_info.resource_bounds)
-                .clone()
-        };
+        let signature: Vec<Felt252> = active_frame
+            .map(|f| f.signature.clone())
+            .unwrap_or_else(|| {
+                peek_cheat(
+                    &self.starknet_state.cheated_signature,
+                    &self.starknet_state.global_signature,
+                    &cur_contract,
+                )
+            })
+            .unwrap_or_else(|| tx_info.signature.clone());
+        let proof_facts: Vec<Felt252> = active_frame
+            .map(|f| f.proof_facts.clone())
+            .unwrap_or_else(|| {
+                peek_cheat(
+                    &self.starknet_state.cheated_proof_facts,
+                    &self.starknet_state.global_proof_facts,
+                    &cur_contract,
+                )
+            })
+            .unwrap_or_else(|| tx_info.proof_facts.clone());
+        let resource_bounds: Vec<ResourceBounds> = active_frame
+            .map(|f| f.resource_bounds.clone())
+            .unwrap_or_else(|| {
+                peek_cheat(
+                    &self.starknet_state.cheated_resource_bounds,
+                    &self.starknet_state.global_resource_bounds,
+                    &cur_contract,
+                )
+            })
+            .unwrap_or_else(|| tx_info.resource_bounds.clone());
         let version = active_frame
             .map(|f| f.tx_version)
             .unwrap_or_else(|| {
-                self.starknet_state
-                    .cheated_tx_version
-                    .get(&cur_contract)
-                    .map(|e| e.value)
+                peek_cheat(
+                    &self.starknet_state.cheated_tx_version,
+                    &self.starknet_state.global_tx_version,
+                    &cur_contract,
+                )
             })
-            .or(self.starknet_state.global_tx_version)
             .unwrap_or(tx_info.version);
         let account_contract_address = active_frame
             .map(|f| f.account_address)
             .unwrap_or_else(|| {
-                self.starknet_state
-                    .cheated_account_address
-                    .get(&cur_contract)
-                    .map(|e| e.value)
+                peek_cheat(
+                    &self.starknet_state.cheated_account_address,
+                    &self.starknet_state.global_account_address,
+                    &cur_contract,
+                )
             })
-            .or(self.starknet_state.global_account_address)
             .unwrap_or(tx_info.account_contract_address);
         let transaction_hash = active_frame
             .map(|f| f.tx_hash)
             .unwrap_or_else(|| {
-                self.starknet_state
-                    .cheated_tx_hash
-                    .get(&cur_contract)
-                    .map(|e| e.value)
+                peek_cheat(
+                    &self.starknet_state.cheated_tx_hash,
+                    &self.starknet_state.global_tx_hash,
+                    &cur_contract,
+                )
             })
-            .or(self.starknet_state.global_tx_hash)
             .unwrap_or(tx_info.transaction_hash);
         let nonce = active_frame
             .map(|f| f.nonce)
             .unwrap_or_else(|| {
-                self.starknet_state
-                    .cheated_nonce
-                    .get(&cur_contract)
-                    .map(|e| e.value)
+                peek_cheat(
+                    &self.starknet_state.cheated_nonce,
+                    &self.starknet_state.global_nonce,
+                    &cur_contract,
+                )
             })
-            .or(self.starknet_state.global_nonce)
             .unwrap_or(tx_info.nonce);
         let chain_id = active_frame
             .map(|f| f.chain_id)
             .unwrap_or_else(|| {
-                self.starknet_state
-                    .cheated_chain_id
-                    .get(&cur_contract)
-                    .map(|e| e.value)
+                peek_cheat(
+                    &self.starknet_state.cheated_chain_id,
+                    &self.starknet_state.global_chain_id,
+                    &cur_contract,
+                )
             })
-            .or(self.starknet_state.global_chain_id)
             .unwrap_or(tx_info.chain_id);
         let tip = active_frame
             .map(|f| f.tip)
             .unwrap_or_else(|| {
-                self.starknet_state
-                    .cheated_tip
-                    .get(&cur_contract)
-                    .map(|e| e.value)
+                peek_cheat(
+                    &self.starknet_state.cheated_tip,
+                    &self.starknet_state.global_tip,
+                    &cur_contract,
+                )
             })
-            .or(self.starknet_state.global_tip)
             .unwrap_or(tx_info.tip);
         let block_number = active_frame
             .map(|f| f.block_number)
             .unwrap_or_else(|| {
-                self.starknet_state
-                    .cheated_block_number
-                    .get(&cur_contract)
-                    .map(|e| e.value)
+                peek_cheat(
+                    &self.starknet_state.cheated_block_number,
+                    &self.starknet_state.global_block_number,
+                    &cur_contract,
+                )
             })
-            .or(self.starknet_state.global_block_number)
             .unwrap_or(block_info.block_number);
         let block_timestamp = active_frame
             .map(|f| f.block_timestamp)
             .unwrap_or_else(|| {
-                self.starknet_state
-                    .cheated_block_timestamp
-                    .get(&cur_contract)
-                    .map(|e| e.value)
+                peek_cheat(
+                    &self.starknet_state.cheated_block_timestamp,
+                    &self.starknet_state.global_block_timestamp,
+                    &cur_contract,
+                )
             })
-            .or(self.starknet_state.global_block_timestamp)
             .unwrap_or(block_info.block_timestamp);
         let sequencer_address = active_frame
             .map(|f| f.sequencer_address)
             .unwrap_or_else(|| {
-                self.starknet_state
-                    .cheated_sequencer_address
-                    .get(&cur_contract)
-                    .map(|e| e.value)
+                peek_cheat(
+                    &self.starknet_state.cheated_sequencer_address,
+                    &self.starknet_state.global_sequencer_address,
+                    &cur_contract,
+                )
             })
-            .or(self.starknet_state.global_sequencer_address)
             .unwrap_or(block_info.sequencer_address);
         let caller_address = active_frame
             .map(|f| f.caller_address)
             .unwrap_or_else(|| {
-                self.starknet_state
-                    .cheated_caller_address
-                    .get(&cur_contract)
-                    .map(|e| e.value)
+                peek_cheat(
+                    &self.starknet_state.cheated_caller_address,
+                    &self.starknet_state.global_caller_address,
+                    &cur_contract,
+                )
             })
-            .or(self.starknet_state.global_caller_address)
             .unwrap_or(exec_info.caller_address);
         let mut res_segment = MemBuffer::new_segment(vm);
         let signature_start = res_segment.ptr;
@@ -1529,12 +1583,40 @@ impl CairoHintProcessor<'_> {
     ) -> Result<SyscallResult, HintError> {
         deduct_gas!(gas_counter, CALL_CONTRACT);
 
-        if let Some(mock_ret) = self
-            .starknet_state
-            .mocked_calls
-            .get(&(contract_address, selector))
-            .cloned()
-        {
+        let mock_ret = {
+            if let Some(entry) = self
+                .starknet_state
+                .mocked_calls
+                .get_mut(&(contract_address, selector))
+            {
+                let val = entry.value.clone().unwrap_or_default();
+                let remove = match &mut entry.remaining_calls {
+                    Some(rem) => {
+                        if *rem <= 1 {
+                            true
+                        } else {
+                            *rem -= 1;
+                            false
+                        }
+                    }
+                    None => false,
+                };
+                if remove {
+                    self.starknet_state
+                        .mocked_calls
+                        .remove(&(contract_address, selector));
+                }
+                Some(val)
+            } else {
+                None
+            }
+        };
+        if let Some(mock_ret) = mock_ret {
+            let caller_address = self.starknet_state.exec_info.contract_address;
+            let old_context = self
+                .starknet_state
+                .open_caller_context((contract_address, caller_address));
+            self.starknet_state.close_caller_context(old_context);
             let (res_data_start, res_data_end) =
                 segment_with_data(vm, mock_ret.into_iter()).expect("failed to allocate segment");
             return Ok(SyscallResult::Success(vec![res_data_start.into(), res_data_end.into()]));
@@ -1816,9 +1898,29 @@ impl CairoHintProcessor<'_> {
             }
             "start_mock_call" => {
                 if inputs.len() >= 2 {
-                    self.starknet_state
-                        .mocked_calls
-                        .insert((inputs[0], inputs[1]), inputs[2..].to_vec());
+                    self.starknet_state.mocked_calls.insert(
+                        (inputs[0], inputs[1]),
+                        CheatEntry {
+                            value: Some(inputs[2..].to_vec()),
+                            remaining_calls: None,
+                        },
+                    );
+                }
+            }
+            "mock_call_counted" => {
+                if inputs.len() >= 3 {
+                    let count = inputs[2].to_u64().unwrap_or(0);
+                    if count == 0 {
+                        self.starknet_state.mocked_calls.remove(&(inputs[0], inputs[1]));
+                    } else {
+                        self.starknet_state.mocked_calls.insert(
+                            (inputs[0], inputs[1]),
+                            CheatEntry {
+                                value: Some(inputs[3..].to_vec()),
+                                remaining_calls: Some(count),
+                            },
+                        );
+                    }
                 }
             }
             "stop_mock_call" => {
@@ -1835,13 +1937,17 @@ impl CairoHintProcessor<'_> {
                 }
             }
             "uncheat_caller" | "stop_cheat_caller_address" => {
-                self.starknet_state.cheated_caller_address.remove(&as_single_input(inputs)?);
+                self.starknet_state
+                    .cheated_caller_address
+                    .insert(as_single_input(inputs)?, CheatEntry::uncheated());
             }
             "cheat_caller_global" => {
                 self.starknet_state.global_caller_address = Some(as_single_input(inputs)?);
+                self.starknet_state.cheated_caller_address.clear();
             }
             "uncheat_caller_global" => {
                 self.starknet_state.global_caller_address = None;
+                self.starknet_state.cheated_caller_address.clear();
             }
             "cheat_timestamp" | "start_cheat_block_timestamp" => {
                 if inputs.len() >= 2 {
@@ -1852,13 +1958,17 @@ impl CairoHintProcessor<'_> {
                 }
             }
             "uncheat_timestamp" | "stop_cheat_block_timestamp" => {
-                self.starknet_state.cheated_block_timestamp.remove(&as_single_input(inputs)?);
+                self.starknet_state
+                    .cheated_block_timestamp
+                    .insert(as_single_input(inputs)?, CheatEntry::uncheated());
             }
             "cheat_timestamp_global" => {
                 self.starknet_state.global_block_timestamp = Some(as_single_input(inputs)?);
+                self.starknet_state.cheated_block_timestamp.clear();
             }
             "uncheat_timestamp_global" => {
                 self.starknet_state.global_block_timestamp = None;
+                self.starknet_state.cheated_block_timestamp.clear();
             }
             "cheat_block_number" | "start_cheat_block_number" => {
                 if inputs.len() >= 2 {
@@ -1869,13 +1979,17 @@ impl CairoHintProcessor<'_> {
                 }
             }
             "uncheat_block_number" | "stop_cheat_block_number" => {
-                self.starknet_state.cheated_block_number.remove(&as_single_input(inputs)?);
+                self.starknet_state
+                    .cheated_block_number
+                    .insert(as_single_input(inputs)?, CheatEntry::uncheated());
             }
             "cheat_block_number_global" | "start_cheat_block_number_global" => {
                 self.starknet_state.global_block_number = Some(as_single_input(inputs)?);
+                self.starknet_state.cheated_block_number.clear();
             }
             "uncheat_block_number_global" | "stop_cheat_block_number_global" => {
                 self.starknet_state.global_block_number = None;
+                self.starknet_state.cheated_block_number.clear();
             }
             "cheat_sequencer" | "start_cheat_sequencer_address" => {
                 if inputs.len() >= 2 {
@@ -1886,13 +2000,17 @@ impl CairoHintProcessor<'_> {
                 }
             }
             "uncheat_sequencer" | "stop_cheat_sequencer_address" => {
-                self.starknet_state.cheated_sequencer_address.remove(&as_single_input(inputs)?);
+                self.starknet_state
+                    .cheated_sequencer_address
+                    .insert(as_single_input(inputs)?, CheatEntry::uncheated());
             }
             "cheat_sequencer_global" => {
                 self.starknet_state.global_sequencer_address = Some(as_single_input(inputs)?);
+                self.starknet_state.cheated_sequencer_address.clear();
             }
             "uncheat_sequencer_global" => {
                 self.starknet_state.global_sequencer_address = None;
+                self.starknet_state.cheated_sequencer_address.clear();
             }
             "cheat_tx_hash" | "start_cheat_transaction_hash" => {
                 if inputs.len() >= 2 {
@@ -1903,13 +2021,17 @@ impl CairoHintProcessor<'_> {
                 }
             }
             "uncheat_tx_hash" | "stop_cheat_transaction_hash" => {
-                self.starknet_state.cheated_tx_hash.remove(&as_single_input(inputs)?);
+                self.starknet_state
+                    .cheated_tx_hash
+                    .insert(as_single_input(inputs)?, CheatEntry::uncheated());
             }
             "cheat_tx_hash_global" => {
                 self.starknet_state.global_tx_hash = Some(as_single_input(inputs)?);
+                self.starknet_state.cheated_tx_hash.clear();
             }
             "uncheat_tx_hash_global" => {
                 self.starknet_state.global_tx_hash = None;
+                self.starknet_state.cheated_tx_hash.clear();
             }
             "cheat_tx_ver" | "start_cheat_transaction_version" => {
                 if inputs.len() >= 2 {
@@ -1920,13 +2042,17 @@ impl CairoHintProcessor<'_> {
                 }
             }
             "uncheat_tx_ver" | "stop_cheat_transaction_version" => {
-                self.starknet_state.cheated_tx_version.remove(&as_single_input(inputs)?);
+                self.starknet_state
+                    .cheated_tx_version
+                    .insert(as_single_input(inputs)?, CheatEntry::uncheated());
             }
             "cheat_tx_ver_global" => {
                 self.starknet_state.global_tx_version = Some(as_single_input(inputs)?);
+                self.starknet_state.cheated_tx_version.clear();
             }
             "uncheat_tx_ver_global" => {
                 self.starknet_state.global_tx_version = None;
+                self.starknet_state.cheated_tx_version.clear();
             }
             "cheat_acct_addr" => {
                 if inputs.len() >= 2 {
@@ -1937,13 +2063,17 @@ impl CairoHintProcessor<'_> {
                 }
             }
             "uncheat_acct_addr" => {
-                self.starknet_state.cheated_account_address.remove(&as_single_input(inputs)?);
+                self.starknet_state
+                    .cheated_account_address
+                    .insert(as_single_input(inputs)?, CheatEntry::uncheated());
             }
             "cheat_acct_addr_global" => {
                 self.starknet_state.global_account_address = Some(as_single_input(inputs)?);
+                self.starknet_state.cheated_account_address.clear();
             }
             "uncheat_acct_addr_global" => {
                 self.starknet_state.global_account_address = None;
+                self.starknet_state.cheated_account_address.clear();
             }
             "cheat_nonce" | "start_cheat_nonce" => {
                 if inputs.len() >= 2 {
@@ -1954,13 +2084,17 @@ impl CairoHintProcessor<'_> {
                 }
             }
             "uncheat_nonce" | "stop_cheat_nonce" => {
-                self.starknet_state.cheated_nonce.remove(&as_single_input(inputs)?);
+                self.starknet_state
+                    .cheated_nonce
+                    .insert(as_single_input(inputs)?, CheatEntry::uncheated());
             }
             "cheat_nonce_global" | "start_cheat_nonce_global" => {
                 self.starknet_state.global_nonce = Some(as_single_input(inputs)?);
+                self.starknet_state.cheated_nonce.clear();
             }
             "uncheat_nonce_global" | "stop_cheat_nonce_global" => {
                 self.starknet_state.global_nonce = None;
+                self.starknet_state.cheated_nonce.clear();
             }
             "cheat_chain_id" => {
                 if inputs.len() >= 2 {
@@ -1971,13 +2105,17 @@ impl CairoHintProcessor<'_> {
                 }
             }
             "uncheat_chain_id" => {
-                self.starknet_state.cheated_chain_id.remove(&as_single_input(inputs)?);
+                self.starknet_state
+                    .cheated_chain_id
+                    .insert(as_single_input(inputs)?, CheatEntry::uncheated());
             }
             "cheat_chain_id_global" => {
                 self.starknet_state.global_chain_id = Some(as_single_input(inputs)?);
+                self.starknet_state.cheated_chain_id.clear();
             }
             "uncheat_chain_id_global" => {
                 self.starknet_state.global_chain_id = None;
+                self.starknet_state.cheated_chain_id.clear();
             }
             "cheat_tip" => {
                 if inputs.len() >= 2 {
@@ -1988,13 +2126,17 @@ impl CairoHintProcessor<'_> {
                 }
             }
             "uncheat_tip" => {
-                self.starknet_state.cheated_tip.remove(&as_single_input(inputs)?);
+                self.starknet_state
+                    .cheated_tip
+                    .insert(as_single_input(inputs)?, CheatEntry::uncheated());
             }
             "cheat_tip_global" => {
                 self.starknet_state.global_tip = Some(as_single_input(inputs)?);
+                self.starknet_state.cheated_tip.clear();
             }
             "uncheat_tip_global" => {
                 self.starknet_state.global_tip = None;
+                self.starknet_state.cheated_tip.clear();
             }
             "cheat_sig" | "start_cheat_signature" => {
                 if !inputs.is_empty() {
@@ -2012,13 +2154,17 @@ impl CairoHintProcessor<'_> {
                 }
             }
             "uncheat_sig" | "stop_cheat_signature" => {
-                self.starknet_state.cheated_signature.remove(&as_single_input(inputs)?);
+                self.starknet_state
+                    .cheated_signature
+                    .insert(as_single_input(inputs)?, CheatEntry::uncheated());
             }
             "cheat_sig_global" | "start_cheat_signature_global" => {
                 self.starknet_state.global_signature = Some(inputs);
+                self.starknet_state.cheated_signature.clear();
             }
             "uncheat_sig_global" | "stop_cheat_signature_global" => {
                 self.starknet_state.global_signature = None;
+                self.starknet_state.cheated_signature.clear();
             }
             "cheat_proof_facts" => {
                 if inputs.len() >= 2 {
@@ -2029,13 +2175,17 @@ impl CairoHintProcessor<'_> {
                 }
             }
             "uncheat_proof_facts" => {
-                self.starknet_state.cheated_proof_facts.remove(&as_single_input(inputs)?);
+                self.starknet_state
+                    .cheated_proof_facts
+                    .insert(as_single_input(inputs)?, CheatEntry::uncheated());
             }
             "cheat_proof_facts_glob" => {
                 self.starknet_state.global_proof_facts = Some(inputs);
+                self.starknet_state.cheated_proof_facts.clear();
             }
             "uncheat_proof_facts_glob" => {
                 self.starknet_state.global_proof_facts = None;
+                self.starknet_state.cheated_proof_facts.clear();
             }
             "cheat_res_bounds" => {
                 if inputs.len() >= 3 {
@@ -2060,7 +2210,7 @@ impl CairoHintProcessor<'_> {
             "uncheat_res_bounds" => {
                 self.starknet_state
                     .cheated_resource_bounds
-                    .remove(&as_single_input(inputs)?);
+                    .insert(as_single_input(inputs)?, CheatEntry::uncheated());
             }
             "cheat_res_bounds_glob" => {
                 if !inputs.is_empty() {
@@ -2076,10 +2226,12 @@ impl CairoHintProcessor<'_> {
                         idx += 3;
                     }
                     self.starknet_state.global_resource_bounds = Some(bounds);
+                    self.starknet_state.cheated_resource_bounds.clear();
                 }
             }
             "uncheat_res_bounds_glob" => {
                 self.starknet_state.global_resource_bounds = None;
+                self.starknet_state.cheated_resource_bounds.clear();
             }
             "store_storage" => {
                 if inputs.len() >= 3 {

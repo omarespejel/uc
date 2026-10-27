@@ -13,10 +13,19 @@ snforge against.
 """
 import random
 
-TYPES = {"u8": 8, "u16": 16, "u32": 32, "u64": 64, "u128": 128}
-WIDER = {"u8": "u16", "u16": "u32", "u32": "u64", "u64": "u128", "u128": "u256"}
-WIDTH = dict(TYPES, u256=256)
-BIN_OPS = ["+", "-", "*", "/", "%", "&", "|", "^"]
+TYPES = {"u8": 8, "u16": 16, "u32": 32, "u64": 64, "u128": 128, "i8": 8, "i16": 16}
+WIDER = {
+    "u8": "u16",
+    "u16": "u32",
+    "u32": "u64",
+    "u64": "u128",
+    "u128": "u256",
+    "i8": "i16",
+    "i16": "i32",
+}
+WIDTH = dict(TYPES, u256=256, i32=32)
+BIN_OPS_UNSIGNED = ["+", "-", "*", "/", "%", "&", "|", "^"]
+BIN_OPS_SIGNED = ["+", "-", "*"]
 CMP_OPS = ["<", "<=", ">", ">=", "==", "!="]
 CHECKED = {"+": "CheckedAdd::checked_add", "-": "CheckedSub::checked_sub", "*": "CheckedMul::checked_mul"}
 FIELD_PRIME = 2**251 + 17 * 2**192 + 1
@@ -26,23 +35,34 @@ class Panic(Exception):
     pass
 
 
+def is_signed(ty):
+    return ty.startswith("i")
+
+
+def tmin(ty):
+    return -(1 << (WIDTH[ty] - 1)) if is_signed(ty) else 0
+
+
 def tmax(ty):
-    return (1 << WIDTH[ty]) - 1
+    return (1 << (WIDTH[ty] - 1)) - 1 if is_signed(ty) else (1 << WIDTH[ty]) - 1
 
 
 def edge_values(ty):
-    m = tmax(ty)
-    return sorted({0, 1, 2, 3, m, m - 1, m // 2, m // 2 + 1, 7, 15 if m >= 15 else 1})
+    lo, hi = tmin(ty), tmax(ty)
+    pts = {0, 1, 2, 3, hi, hi - 1, hi // 2, hi // 2 + 1, 7, 15 if hi >= 15 else 1}
+    if lo < 0:
+        pts |= {lo, lo + 1, -1, -2, -3, -7, lo // 2}
+    return sorted(v for v in pts if lo <= v <= hi)
 
 
 def rand_value(rng, ty):
-    m = tmax(ty)
+    lo, hi = tmin(ty), tmax(ty)
     pick = rng.random()
     if pick < 0.45:
         return rng.choice(edge_values(ty))
     if pick < 0.75:
-        return rng.randint(0, min(m, 300))
-    return rng.randint(0, m)
+        return rng.randint(max(lo, -300), min(hi, 300))
+    return rng.randint(lo, hi)
 
 
 def prelude():
@@ -53,7 +73,7 @@ def prelude():
 def arith(op, a, b, ty):
     """Checked `+ - *` in `ty`: the result, or None on overflow or underflow."""
     r = {"+": a + b, "-": a - b, "*": a * b}[op]
-    return r if 0 <= r <= tmax(ty) else None
+    return r if tmin(ty) <= r <= tmax(ty) else None
 
 
 # Expression AST:
@@ -74,7 +94,8 @@ def gen_expr(rng, ty, names, depth, helpers=()):
         h = rng.choice(callable_helpers)
         return ("call", h, [sub() for _ in h.params])
     if r < 0.27:
-        return ("checked", rng.choice(list(CHECKED)), sub(), sub(), sub())
+        checked_ops = ["+", "-"] if is_signed(ty) else list(CHECKED)
+        return ("checked", rng.choice(checked_ops), sub(), sub(), sub())
     if r < 0.32:
         return ("pair", sub(), sub(), rng.random() < 0.5)
     if r < 0.38:
@@ -83,7 +104,8 @@ def gen_expr(rng, ty, names, depth, helpers=()):
         return ("felt", rng.choice(["+", "-", "*"]), sub(), sub())
     if r < 0.47:
         return ("assert", rng.choice(CMP_OPS), sub(2), sub(2), sub())
-    return ("bin", rng.choice(BIN_OPS), sub(), sub())
+    ops = BIN_OPS_SIGNED if is_signed(ty) else BIN_OPS_UNSIGNED
+    return ("bin", rng.choice(ops), sub(), sub())
 
 
 def render(e, ty):
@@ -91,7 +113,7 @@ def render(e, ty):
     if k == "var":
         return e[1]
     if k == "const":
-        return f"{e[1]}_{ty}"
+        return f"({e[1]}_{ty})" if e[1] < 0 else f"{e[1]}_{ty}"
     if k == "bin":
         return f"({render(e[2], ty)} {e[1]} {render(e[3], ty)})"
     if k == "if":
@@ -159,14 +181,18 @@ def evaluate(e, ty, env):
         r = arith(e[1], a, b, WIDER[ty])
         if r is None:
             raise Panic(f"{WIDER[ty]} {e[1]} overflow")
-        if r > tmax(ty):
+        if not (tmin(ty) <= r <= tmax(ty)):
             raise Panic("Option::unwrap failed")
         return r
     if k == "felt":
         a = evaluate(e[2], ty, env)
         b = evaluate(e[3], ty, env)
-        r = {"+": a + b, "-": a - b, "*": a * b}[e[1]] % FIELD_PRIME
-        if r > tmax(ty):
+        fa = a % FIELD_PRIME
+        fb = b % FIELD_PRIME
+        r = {"+": fa + fb, "-": fa - fb, "*": fa * fb}[e[1]] % FIELD_PRIME
+        if r >= FIELD_PRIME + tmin(ty):
+            r -= FIELD_PRIME
+        if not (tmin(ty) <= r <= tmax(ty)):
             raise Panic("Option::unwrap failed")
         return r
     x = evaluate(e[2], ty, env)

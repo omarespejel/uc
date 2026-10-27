@@ -1844,20 +1844,24 @@ impl SymExpr {
         }
     }
 
-    /// True when the integer reading of a felt252 value can be negative (a subtraction or a
-    /// negative constant): in Cairo such a value wraps to a huge field element.
-    fn may_be_negative(&self) -> bool {
+    /// True when the integer reading of a felt252 value can be negative (a subtraction, a
+    /// negative constant, or a signed parameter): in Cairo such a value wraps to a huge field
+    /// element.
+    fn may_be_negative(&self, param_bounds: &[(String, i128, i128)]) -> bool {
         match self {
             Self::Const(v) => *v < 0,
             Self::Sub(..) => true,
-            Self::Param(..) | Self::SymbolicOpaque(_) => false,
+            Self::Param(idx, _) => param_bounds.get(*idx).is_some_and(|(_, lo, _)| *lo < 0),
+            Self::SymbolicOpaque(_) => false,
             Self::Add(a, b)
             | Self::Mul(a, b)
             | Self::Div(a, b)
             | Self::Rem(a, b)
             | Self::BitAnd(a, b)
             | Self::BitOr(a, b)
-            | Self::BitXor(a, b) => a.may_be_negative() || b.may_be_negative(),
+            | Self::BitXor(a, b) => {
+                a.may_be_negative(param_bounds) || b.may_be_negative(param_bounds)
+            }
         }
     }
 
@@ -2073,34 +2077,78 @@ fn smt_int(v: i128) -> String {
 
 /// Renders a symbolic expression in SMT-LIB 2 over `Int`. Opaque values (storage reads, call
 /// results) become free constants collected in `opaque`, so they are unconstrained in the file,
-/// exactly as the in-process solver treats them.
-fn smt_expr(e: &SymExpr, opaque: &mut BTreeSet<String>) -> String {
+/// exactly as the in-process solver treats them; bitwise subexpressions carry their interval
+/// bounds `[lo, hi]` from `expr_interval`.
+fn smt_expr(
+    e: &SymExpr,
+    param_lo: &[i128],
+    param_hi: &[i128],
+    opaque: &mut BTreeMap<String, Option<(i128, i128)>>,
+    bit_exprs: &mut BTreeMap<String, SymExpr>,
+) -> String {
+    if let Some(v) = e.eval(&[]) {
+        return smt_int(v);
+    }
     match e {
         SymExpr::Param(idx, _) => format!("p{idx}"),
         SymExpr::Const(v) => smt_int(*v),
         SymExpr::SymbolicOpaque(name) => {
             let n = format!("o_{}", smt_name(name));
-            opaque.insert(n.clone());
+            opaque.entry(n.clone()).or_insert(None);
             n
         }
-        SymExpr::Add(a, b) => format!("(+ {} {})", smt_expr(a, opaque), smt_expr(b, opaque)),
-        SymExpr::Sub(a, b) => format!("(- {} {})", smt_expr(a, opaque), smt_expr(b, opaque)),
-        SymExpr::Mul(a, b) => format!("(* {} {})", smt_expr(a, opaque), smt_expr(b, opaque)),
-        SymExpr::Div(a, b) => format!("(div {} {})", smt_expr(a, opaque), smt_expr(b, opaque)),
-        SymExpr::Rem(a, b) => format!("(mod {} {})", smt_expr(a, opaque), smt_expr(b, opaque)),
-        // QF_NIA has no bitwise operators: the result is a free constant named after the
-        // expression, so equal expressions share it.
-        SymExpr::BitAnd(..) | SymExpr::BitOr(..) | SymExpr::BitXor(..) => {
-            let n = format!("o_bit_{}", smt_name(&e.format_human()));
-            opaque.insert(n.clone());
+        SymExpr::Add(a, b) => format!(
+            "(+ {} {})",
+            smt_expr(a, param_lo, param_hi, opaque, bit_exprs),
+            smt_expr(b, param_lo, param_hi, opaque, bit_exprs)
+        ),
+        SymExpr::Sub(a, b) => format!(
+            "(- {} {})",
+            smt_expr(a, param_lo, param_hi, opaque, bit_exprs),
+            smt_expr(b, param_lo, param_hi, opaque, bit_exprs)
+        ),
+        SymExpr::Mul(a, b) => format!(
+            "(* {} {})",
+            smt_expr(a, param_lo, param_hi, opaque, bit_exprs),
+            smt_expr(b, param_lo, param_hi, opaque, bit_exprs)
+        ),
+        SymExpr::Div(a, b) => format!(
+            "(div {} {})",
+            smt_expr(a, param_lo, param_hi, opaque, bit_exprs),
+            smt_expr(b, param_lo, param_hi, opaque, bit_exprs)
+        ),
+        SymExpr::Rem(a, b) => format!(
+            "(mod {} {})",
+            smt_expr(a, param_lo, param_hi, opaque, bit_exprs),
+            smt_expr(b, param_lo, param_hi, opaque, bit_exprs)
+        ),
+        // QF_NIA has no bitwise operators: the result is a constant named after the expression
+        // (plus a short hash so `&`, `|`, `^` never collide after sanitization) with its interval
+        // and algebraic bounds asserted, so equal expressions share it and interval-refuted
+        // obligations remain unsat in external QF_NIA solvers.
+        SymExpr::BitAnd(a, b) | SymExpr::BitOr(a, b) | SymExpr::BitXor(a, b) => {
+            let _ = smt_expr(a, param_lo, param_hi, opaque, bit_exprs);
+            let _ = smt_expr(b, param_lo, param_hi, opaque, bit_exprs);
+            let human = e.format_human();
+            let digest = blake3::hash(human.as_bytes()).to_hex();
+            let n = format!("o_bit_{}_{}", smt_name(&human), &digest.as_str()[..8]);
+            let interval = expr_interval(e, param_lo, param_hi);
+            opaque.entry(n.clone()).or_insert(interval);
+            bit_exprs.entry(n.clone()).or_insert_with(|| e.clone());
             n
         }
     }
 }
 
-fn smt_constraint(c: &SymConstraint, opaque: &mut BTreeSet<String>) -> String {
-    let l = smt_expr(&c.lhs, opaque);
-    let r = smt_expr(&c.rhs, opaque);
+fn smt_constraint(
+    c: &SymConstraint,
+    param_lo: &[i128],
+    param_hi: &[i128],
+    opaque: &mut BTreeMap<String, Option<(i128, i128)>>,
+    bit_exprs: &mut BTreeMap<String, SymExpr>,
+) -> String {
+    let l = smt_expr(&c.lhs, param_lo, param_hi, opaque, bit_exprs);
+    let r = smt_expr(&c.rhs, param_lo, param_hi, opaque, bit_exprs);
     match c.op {
         CmpOp::Eq => format!("(= {l} {r})"),
         CmpOp::Ne => format!("(not (= {l} {r}))"),
@@ -2115,14 +2163,51 @@ fn smt_constraint(c: &SymConstraint, opaque: &mut BTreeSet<String>) -> String {
 /// `(push 1) ... (check-sat) (pop 1)` block preceded by `; expected: <verdict>`; a `sat` path
 /// gets a second block that pins the witness values, which must also be `sat`.
 pub(crate) fn render_smt_obligations(proof: &SymbolicFunctionProofReport) -> String {
-    let mut opaque = BTreeSet::new();
+    let param_lo: Vec<i128> = proof.param_bounds.iter().map(|(_, l, _)| *l).collect();
+    let param_hi: Vec<i128> = proof.param_bounds.iter().map(|(_, _, h)| *h).collect();
+    let mut opaque: BTreeMap<String, Option<(i128, i128)>> = BTreeMap::new();
     let mut blocks = String::new();
     for (i, ob) in proof.obligations.iter().enumerate() {
-        let asserts: Vec<String> = ob
+        let mut bit_exprs: BTreeMap<String, SymExpr> = BTreeMap::new();
+        let mut asserts: Vec<String> = ob
             .constraints
             .iter()
-            .map(|c| format!("  (assert {}) ; {}", smt_constraint(c, &mut opaque), c.reason.replace('\n', " ")))
+            .map(|c| {
+                format!(
+                    "  (assert {}) ; {}",
+                    smt_constraint(c, &param_lo, &param_hi, &mut opaque, &mut bit_exprs),
+                    c.reason.replace('\n', " ")
+                )
+            })
             .collect();
+        let bit_snapshot: Vec<(String, SymExpr)> =
+            bit_exprs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        for (bname, bexpr) in &bit_snapshot {
+            match bexpr {
+                SymExpr::BitAnd(a, b) => {
+                    let sa = smt_expr(a, &param_lo, &param_hi, &mut opaque, &mut bit_exprs);
+                    let sb = smt_expr(b, &param_lo, &param_hi, &mut opaque, &mut bit_exprs);
+                    asserts.push(format!(
+                        "  (assert (and (<= 0 {bname}) (=> (and (<= 0 {sa}) (<= 0 {sb})) (and (<= {bname} {sa}) (<= {bname} {sb}) (=> (or (= {sa} 0) (= {sb} 0)) (= {bname} 0)) (=> (= {sa} {sb}) (= {bname} {sa}))))))"
+                    ));
+                }
+                SymExpr::BitOr(a, b) => {
+                    let sa = smt_expr(a, &param_lo, &param_hi, &mut opaque, &mut bit_exprs);
+                    let sb = smt_expr(b, &param_lo, &param_hi, &mut opaque, &mut bit_exprs);
+                    asserts.push(format!(
+                        "  (assert (and (<= 0 {bname}) (=> (and (<= 0 {sa}) (<= 0 {sb})) (and (>= {bname} {sa}) (>= {bname} {sb}) (<= {bname} (+ {sa} {sb})) (=> (= {sa} {sb}) (= {bname} {sa}))))))"
+                    ));
+                }
+                SymExpr::BitXor(a, b) => {
+                    let sa = smt_expr(a, &param_lo, &param_hi, &mut opaque, &mut bit_exprs);
+                    let sb = smt_expr(b, &param_lo, &param_hi, &mut opaque, &mut bit_exprs);
+                    asserts.push(format!(
+                        "  (assert (and (<= 0 {bname}) (=> (and (<= 0 {sa}) (<= 0 {sb})) (and (<= {bname} (+ {sa} {sb})) (=> (= {sa} {sb}) (= {bname} 0)) (=> (= {sa} 0) (= {bname} {sb})) (=> (= {sb} 0) (= {bname} {sa}))))))"
+                    ));
+                }
+                _ => {}
+            }
+        }
         blocks.push_str(&format!("; obligation {i}: expected {}\n(push 1)\n", ob.expected));
         if asserts.is_empty() {
             blocks.push_str("  ; no path constraints\n");
@@ -2135,6 +2220,11 @@ pub(crate) fn render_smt_obligations(proof: &SymbolicFunctionProofReport) -> Str
             for (idx, v) in w.iter().enumerate() {
                 blocks.push_str(&format!("\n  (assert (= p{idx} {}))", smt_int(*v)));
             }
+            for (bname, bexpr) in &bit_exprs {
+                if let Some(bv) = bexpr.eval(w) {
+                    blocks.push_str(&format!("\n  (assert (= {bname} {}))", smt_int(bv)));
+                }
+            }
             blocks.push_str("\n(check-sat)\n(pop 1)\n");
         }
     }
@@ -2142,15 +2232,22 @@ pub(crate) fn render_smt_obligations(proof: &SymbolicFunctionProofReport) -> Str
     out.push_str(&format!("; uc prove obligations for {}\n", proof.function));
     out.push_str(&format!("; status: {}; panic paths: {}; unreachable: {}; undecided: {}\n",
         proof.status, proof.panic_paths, proof.unreachable_panic_paths, proof.undecided_panic_paths));
-    out.push_str("; Integers model Cairo's unsigned types with their bounds asserted below; div and mod are\n");
+    out.push_str("; Integers model Cairo's integer types with their bounds asserted below; div and mod are\n");
     out.push_str("; SMT-LIB Euclidean operations, equal to Cairo's for non-negative operands. Opaque values\n");
     out.push_str("; (storage reads, call results, non-numeric data) are free constants.\n");
     out.push_str("(set-logic QF_NIA)\n");
     for (idx, (name, lo, hi)) in proof.param_bounds.iter().enumerate() {
         out.push_str(&format!("(declare-const p{idx} Int) ; {name}\n(assert (and (<= {} p{idx}) (<= p{idx} {})))\n", smt_int(*lo), smt_int(*hi)));
     }
-    for o in &opaque {
+    for (o, bounds) in &opaque {
         out.push_str(&format!("(declare-const {o} Int)\n"));
+        if let Some((lo, hi)) = bounds {
+            out.push_str(&format!(
+                "(assert (and (<= {} {o}) (<= {o} {})))\n",
+                smt_int(*lo),
+                smt_int(*hi)
+            ));
+        }
     }
     out.push_str(&blocks);
     out
@@ -2206,7 +2303,13 @@ pub(crate) fn witness_calldata(witness: &[i128], param_types: &[String]) -> Vec<
             out.extend(["0x0", "0x0", "0x0"].map(str::to_string));
             continue;
         }
-        let felt = if *v < 0 { Felt::ZERO - Felt::from(v.unsigned_abs()) } else { Felt::from(*v as u128) };
+        let felt = if *v < 0 {
+            Felt::ZERO - Felt::from(v.unsigned_abs())
+        } else if ty.ends_with("::u128") && *v >= i128::MAX / 4 - 1024 {
+            Felt::from(u128::MAX - (i128::MAX / 4 - *v) as u128)
+        } else {
+            Felt::from(*v as u128)
+        };
         out.push(format!("{felt:#x}"));
         if ty.ends_with("::u256") {
             out.push("0x0".to_string());
@@ -2286,7 +2389,17 @@ fn concrete_panic_confirms_witness(predicted_reason: &str, panic_message: &str) 
     }
     let predicted = predicted_reason.to_ascii_lowercase();
     if predicted.contains("overflow") || predicted.contains("underflow") {
-        return panic_message.contains("Overflow") || panic_message.contains("overflow");
+        if predicted.contains("downcast") || predicted.contains("try_from_felt252") {
+            return panic_message.contains("Overflow")
+                || panic_message.contains("overflow")
+                || panic_message.contains("Underflow")
+                || panic_message.contains("underflow")
+                || panic_message.contains("unwrap failed");
+        }
+        return panic_message.contains("Overflow")
+            || panic_message.contains("overflow")
+            || panic_message.contains("Underflow")
+            || panic_message.contains("underflow");
     }
     if predicted.contains("division") || predicted.contains("div") || predicted.contains("_is_zero") {
         return panic_message.contains("Division by 0")
@@ -2362,6 +2475,15 @@ fn track_detector_storage_slot(
                 }
             }
         }
+    } else if matches!(
+        gid,
+        "storage_base_address_from_felt252" | "pedersen" | "hades_permutation"
+    ) {
+        if let Some(addr) = inv.args.iter().find_map(|a| slot_of_var.get(&a.id).copied()) {
+            for r in &branch.results {
+                slot_of_var.insert(r.id, addr);
+            }
+        }
     } else if gid == "struct_construct" || gid == "struct_deconstruct" {
         if let Some(first) = inv.args.first() {
             if let Some(addr) = slot_of_var.get(&first.id).copied() {
@@ -2413,19 +2535,31 @@ fn is_numeric_sierra_type(ty_name: &str) -> bool {
     )
 }
 
+fn min_bound_for_sierra_type(ty_name: &str) -> i128 {
+    let t = ty_name.rsplit("::").next().unwrap_or(ty_name);
+    match t {
+        "i8" => i8::MIN as i128,
+        "i16" => i16::MIN as i128,
+        "i32" => i32::MIN as i128,
+        "i64" => i64::MIN as i128,
+        "i128" => -(i128::MAX / 4),
+        _ => 0,
+    }
+}
+
 fn max_bound_for_sierra_type(ty_name: &str) -> i128 {
-    if ty_name.ends_with("bool") {
-        1
-    } else if ty_name.ends_with("u8") {
-        u8::MAX as i128
-    } else if ty_name.ends_with("u16") {
-        u16::MAX as i128
-    } else if ty_name.ends_with("u32") {
-        u32::MAX as i128
-    } else if ty_name.ends_with("u64") {
-        u64::MAX as i128
-    } else {
-        i128::MAX / 4
+    let t = ty_name.rsplit("::").next().unwrap_or(ty_name);
+    match t {
+        "bool" => 1,
+        "u8" => u8::MAX as i128,
+        "u16" => u16::MAX as i128,
+        "u32" | "usize" => u32::MAX as i128,
+        "u64" => u64::MAX as i128,
+        "i8" => i8::MAX as i128,
+        "i16" => i16::MAX as i128,
+        "i32" => i32::MAX as i128,
+        "i64" => i64::MAX as i128,
+        _ => i128::MAX / 4,
     }
 }
 
@@ -2556,17 +2690,18 @@ fn expr_interval(e: &SymExpr, lo: &[i128], hi: &[i128]) -> Option<(i128, i128)> 
             (0, ah.min(bh - 1))
         }
         SymExpr::BitAnd(a, b) => {
-            let ((al, ah), (bl, bh)) = (expr_interval(a, lo, hi)?, expr_interval(b, lo, hi)?);
-            if al < 0 || bl < 0 {
+            let ((_, ah), (_, bh)) = (expr_interval(a, lo, hi)?, expr_interval(b, lo, hi)?);
+            if ah < 0 || bh < 0 {
                 return None;
             }
             (0, ah.min(bh))
         }
         SymExpr::BitOr(a, b) | SymExpr::BitXor(a, b) => {
             let ((al, ah), (bl, bh)) = (expr_interval(a, lo, hi)?, expr_interval(b, lo, hi)?);
-            if al < 0 || bl < 0 {
+            if ah < 0 || bh < 0 {
                 return None;
             }
+            let (al, bl) = (al.max(0), bl.max(0));
             let low = if matches!(e, SymExpr::BitOr(..)) { al.max(bl) } else { 0 };
             (low, pow2_above(ah.max(bh))?)
         }
@@ -3318,13 +3453,13 @@ fn sierra_type_max(index: &SierraProgramIndex<'_>, ty: &ConcreteTypeId) -> Optio
     is_numeric_sierra_type(&name).then(|| max_bound_for_sierra_type(&name))
 }
 
-/// Smallest value of a numeric Sierra type (`BoundedInt<lo, hi>`; 0 for unsigned), if known.
+/// Smallest value of a numeric Sierra type (`BoundedInt<lo, hi>`; signed `i8`..`i128`; 0 for unsigned), if known.
 fn sierra_type_min(index: &SierraProgramIndex<'_>, ty: &ConcreteTypeId) -> Option<i128> {
     let name = index.type_name(ty);
     if let Some(rest) = name.split("BoundedInt<").nth(1) {
         return rest.split(',').next()?.trim().parse::<i128>().ok();
     }
-    is_numeric_sierra_type(&name).then_some(0)
+    is_numeric_sierra_type(&name).then(|| min_bound_for_sierra_type(&name))
 }
 
 /// Panic-valued variables of a function, computed once per program.
@@ -3396,6 +3531,7 @@ fn run_symbolic_verification_for_function(
     // Extract symbolic value parameters (excluding builtins like GasBuiltin, RangeCheck, System)
     let mut param_bounds: Vec<(String, i128, i128)> = Vec::new();
     let mut initial_vars: HashMap<u64, SymExpr> = HashMap::new();
+    let mut initial_comps: HashMap<u64, CompVal> = HashMap::new();
     let mut initial_var_max: HashMap<u64, i128> = HashMap::new();
     let mut param_descriptions: Vec<String> = Vec::new();
     let mut param_types: Vec<String> = Vec::new();
@@ -3419,13 +3555,33 @@ fn run_symbolic_verification_for_function(
             .as_ref()
             .map(|s| s.as_str().to_string())
             .unwrap_or_else(|| format!("arg_{p_idx}"));
+        let min_b = min_bound_for_sierra_type(&ty_name);
         let max_b = max_bound_for_sierra_type(&ty_name);
-        param_bounds.push((pname.clone(), 0, max_b));
-        param_types.push(ty_name.clone());
         param_descriptions.push(format!("{pname}: {ty_name}"));
-        initial_vars.insert(p.id.id, SymExpr::Param(p_idx, pname));
-        if is_numeric_sierra_type(&ty_name) {
+        if ty_name.ends_with("::u256") {
+            let low_name = format!("{pname}.low");
+            let high_name = format!("{pname}.high");
+            let low_idx = param_bounds.len();
+            param_bounds.push((low_name.clone(), 0, max_b));
+            param_types.push("core::integer::u128".to_string());
+            let high_idx = param_bounds.len();
+            param_bounds.push((high_name.clone(), 0, max_b));
+            param_types.push("core::integer::u128".to_string());
+            initial_comps.insert(
+                p.id.id,
+                CompVal::Struct(vec![
+                    CompVal::Expr(Some(SymExpr::Param(low_idx, low_name))),
+                    CompVal::Expr(Some(SymExpr::Param(high_idx, high_name))),
+                ]),
+            );
             initial_var_max.insert(p.id.id, max_b);
+        } else {
+            param_bounds.push((pname.clone(), min_b, max_b));
+            param_types.push(ty_name.clone());
+            initial_vars.insert(p.id.id, SymExpr::Param(p_idx, pname));
+            if is_numeric_sierra_type(&ty_name) {
+                initial_var_max.insert(p.id.id, max_b);
+            }
         }
     }
 
@@ -3435,7 +3591,7 @@ fn run_symbolic_verification_for_function(
         depth: 0,
         cur_func: func_idx,
         frames: Vec::new(),
-        comps: HashMap::new(),
+        comps: initial_comps,
         unknown_panic: false,
         frame_serial: 0,
         next_serial: 0,
@@ -3756,10 +3912,16 @@ fn run_symbolic_verification_for_function(
                                 assign_val(&mut state, res.id, CompVal::Struct(members));
                             }
                         } else if gid == "struct_deconstruct" {
-                            if let Some(CompVal::Struct(members)) = inv.args.last().map(|a| val_of(&state, a.id)) {
-                                if members.len() == branch.results.len() {
-                                    for (r, m) in branch.results.iter().zip(members) {
-                                        assign_val(&mut state, r.id, m);
+                            if let Some(arg) = inv.args.last() {
+                                if let CompVal::Struct(members) = val_of(&state, arg.id) {
+                                    let member_max = state.var_max.get(&arg.id).copied();
+                                    if members.len() == branch.results.len() {
+                                        for (r, m) in branch.results.iter().zip(members) {
+                                            if let (Some(max), CompVal::Expr(Some(_))) = (member_max, &m) {
+                                                state.var_max.insert(r.id, max);
+                                            }
+                                            assign_val(&mut state, r.id, m);
+                                        }
                                     }
                                 }
                             }
@@ -4059,34 +4221,96 @@ fn run_symbolic_verification_for_function(
                                 || gid == "bounded_int_trim_max"
                                 || gid == "bounded_int_trim_min"
                                 || gid.ends_with("_overflowing_add")
-                                || gid.ends_with("_overflowing_sub");
+                                || gid.ends_with("_overflowing_sub")
+                                || gid.ends_with("_overflowing_add_impl")
+                                || gid.ends_with("_overflowing_sub_impl")
+                                || gid.ends_with("_diff");
 
                             if gid == "downcast" && !inv.args.is_empty() {
                                 // Branch 0: the value fits the target type (and is the result);
-                                // branch 1: it does not (the overflow path of checked `*` and
-                                // narrowing conversions).
+                                // branch 1: it does not (the overflow/underflow path of checked
+                                // arithmetic and narrowing conversions).
                                 let arg_id = inv.args[inv.args.len() - 1].id;
+                                let source_min = lf.type_args.first().and_then(|t| sierra_type_min(index, t)).unwrap_or(0);
+                                let source_max = lf.type_args.first().and_then(|t| sierra_type_max(index, t)).unwrap_or(i128::MAX / 4);
+                                let target_min = lf.type_args.get(1).and_then(|t| sierra_type_min(index, t)).unwrap_or(0);
                                 let target_max = lf.type_args.get(1).and_then(|t| sierra_type_max(index, t));
                                 if let (Some(arg_expr), Some(max_val)) = (state.vars.get(&arg_id).cloned(), target_max) {
+                                    let below_possible = source_min < target_min
+                                        || (target_min == 0 && arg_expr.may_be_negative(&param_bounds));
+                                    let above_possible = source_max > max_val
+                                        || !matches!(arg_expr, SymExpr::Param(..));
+                                    child.performed_computation = true;
                                     if b_idx == 0 {
                                         if let Some(res_var) = branch.results.last() {
                                             child.vars.insert(res_var.id, arg_expr.clone());
                                             child.var_max.insert(res_var.id, max_val);
                                         }
+                                        if below_possible {
+                                            child.constraints.push(SymConstraint {
+                                                lhs: arg_expr.clone(),
+                                                op: CmpOp::Ge,
+                                                rhs: SymExpr::Const(target_min),
+                                                reason: format!(
+                                                    "arithmetic underflow in `downcast`: {} >= {target_min}",
+                                                    arg_expr.format_human()
+                                                ),
+                                                is_overflow_branch: false,
+                                            });
+                                        }
+                                        child.constraints.push(SymConstraint {
+                                            lhs: arg_expr.clone(),
+                                            op: CmpOp::Le,
+                                            rhs: SymExpr::Const(max_val),
+                                            reason: format!(
+                                                "arithmetic overflow in `downcast`: {} <= {max_val}",
+                                                arg_expr.format_human()
+                                            ),
+                                            is_overflow_branch: false,
+                                        });
+                                    } else {
+                                        if below_possible && above_possible {
+                                            let mut below = child.clone();
+                                            below.constraints.push(SymConstraint {
+                                                lhs: arg_expr.clone(),
+                                                op: CmpOp::Lt,
+                                                rhs: SymExpr::Const(target_min),
+                                                reason: format!(
+                                                    "arithmetic underflow in `downcast`: {} < {target_min}",
+                                                    arg_expr.format_human()
+                                                ),
+                                                is_overflow_branch: true,
+                                            });
+                                            if queue.len() < pending_cap {
+                                                queue.push_back(below);
+                                            } else {
+                                                exploration_truncated = true;
+                                            }
+                                        }
+                                        if below_possible && !above_possible {
+                                            child.constraints.push(SymConstraint {
+                                                lhs: arg_expr.clone(),
+                                                op: CmpOp::Lt,
+                                                rhs: SymExpr::Const(target_min),
+                                                reason: format!(
+                                                    "arithmetic underflow in `downcast`: {} < {target_min}",
+                                                    arg_expr.format_human()
+                                                ),
+                                                is_overflow_branch: true,
+                                            });
+                                        } else {
+                                            child.constraints.push(SymConstraint {
+                                                lhs: arg_expr.clone(),
+                                                op: CmpOp::Gt,
+                                                rhs: SymExpr::Const(max_val),
+                                                reason: format!(
+                                                    "arithmetic overflow in `downcast`: {} > {max_val}",
+                                                    arg_expr.format_human()
+                                                ),
+                                                is_overflow_branch: true,
+                                            });
+                                        }
                                     }
-                                    child.performed_computation = true;
-                                    let op = if b_idx == 0 { CmpOp::Le } else { CmpOp::Gt };
-                                    child.constraints.push(SymConstraint {
-                                        lhs: arg_expr.clone(),
-                                        op,
-                                        rhs: SymExpr::Const(max_val),
-                                        reason: format!(
-                                            "arithmetic overflow in `downcast`: {} {} {max_val}",
-                                            arg_expr.format_human(),
-                                            if b_idx == 0 { "<=" } else { ">" }
-                                        ),
-                                        is_overflow_branch: b_idx == 1,
-                                    });
                                 }
                             } else if gid.ends_with("_is_zero") && !inv.args.is_empty() {
                                 let arg_id = inv.args[inv.args.len() - 1].id;
@@ -4173,6 +4397,7 @@ fn run_symbolic_verification_for_function(
                                 // Branch 0: the felt fits the integer type; branch 1: it does not.
                                 let arg_id = inv.args[inv.args.len() - 1].id;
                                 let ty_prefix = gid.split('_').next().unwrap_or("u128");
+                                let min_val = min_bound_for_sierra_type(ty_prefix);
                                 let max_val = max_bound_for_sierra_type(ty_prefix);
                                 if let Some(arg_expr) = state.vars.get(&arg_id).cloned() {
                                     // Narrowing a computed felt252 (`(a - b).try_into()`) is
@@ -4180,9 +4405,8 @@ fn run_symbolic_verification_for_function(
                                     if !matches!(arg_expr, SymExpr::Param(..) | SymExpr::Const(_) | SymExpr::SymbolicOpaque(_)) {
                                         child.performed_computation = true;
                                     }
-                                    // A negative integer reading is a field element above every
-                                    // integer type, so it lands on the failure branch too.
-                                    let negative_possible = arg_expr.may_be_negative();
+                                    // A negative integer reading below `min_val` lands on the failure branch too.
+                                    let negative_possible = arg_expr.may_be_negative(&param_bounds);
                                     if b_idx == 0 {
                                         if let Some(res_var) = branch.results.last() {
                                             child.vars.insert(res_var.id, arg_expr.clone());
@@ -4192,7 +4416,7 @@ fn run_symbolic_verification_for_function(
                                             child.constraints.push(SymConstraint {
                                                 lhs: arg_expr.clone(),
                                                 op: CmpOp::Ge,
-                                                rhs: SymExpr::Const(0),
+                                                rhs: SymExpr::Const(min_val),
                                                 reason: format!("{gid}({}) branch 0", arg_expr.format_human()),
                                                 is_overflow_branch: false,
                                             });
@@ -4202,9 +4426,9 @@ fn run_symbolic_verification_for_function(
                                         below.constraints.push(SymConstraint {
                                             lhs: arg_expr.clone(),
                                             op: CmpOp::Lt,
-                                            rhs: SymExpr::Const(0),
+                                            rhs: SymExpr::Const(min_val),
                                             reason: format!(
-                                                "{gid}({}) branch 1: negative, wraps above the type",
+                                                "{gid}({}) branch 1: below type minimum {min_val}",
                                                 arg_expr.format_human()
                                             ),
                                             is_overflow_branch: !is_raw(&arg_expr),
@@ -4327,6 +4551,115 @@ fn run_symbolic_verification_for_function(
                                             rhs.format_human()
                                         ),
                                         is_overflow_branch: b_idx == 1 && !(is_raw(&lhs) && is_raw(&rhs)),
+                                    });
+                                }
+                            } else if (gid.ends_with("_overflowing_add_impl") || gid.ends_with("_overflowing_sub_impl"))
+                                && inv.args.len() >= 2
+                            {
+                                // Signed 3-branch overflowing add/sub:
+                                // branch 0: in range [min_val, max_val]
+                                // branch 1: below min_val (signed underflow)
+                                // branch 2: above max_val (signed overflow)
+                                let lhs_id = inv.args[inv.args.len() - 2].id;
+                                let rhs_id = inv.args[inv.args.len() - 1].id;
+                                let a = state.vars.get(&lhs_id).cloned();
+                                let b = state.vars.get(&rhs_id).cloned();
+                                let ty_prefix = gid.split('_').next().unwrap_or("i128");
+                                let min_val = min_bound_for_sierra_type(ty_prefix);
+                                let max_val = max_bound_for_sierra_type(ty_prefix);
+                                if let (Some(lhs), Some(rhs)) = half_known(a, b, lhs_id, rhs_id) {
+                                    let is_add = gid.ends_with("_overflowing_add_impl");
+                                    let comb_expr = cap_sym_expr(
+                                        if is_add {
+                                            SymExpr::Add(Box::new(lhs), Box::new(rhs))
+                                        } else {
+                                            SymExpr::Sub(Box::new(lhs), Box::new(rhs))
+                                        },
+                                        branch.results.last().map(|r| r.id).unwrap_or(0),
+                                    );
+                                    if let Some(res_var) = branch.results.last() {
+                                        child.vars.insert(res_var.id, comb_expr.clone());
+                                        child.var_max.insert(res_var.id, max_val);
+                                    }
+                                    child.performed_computation = true;
+                                    match b_idx {
+                                        0 => {
+                                            child.constraints.push(SymConstraint {
+                                                lhs: comb_expr.clone(),
+                                                op: CmpOp::Ge,
+                                                rhs: SymExpr::Const(min_val),
+                                                reason: format!(
+                                                    "in-range lower bound in `{gid}`: {} >= {min_val}",
+                                                    comb_expr.format_human()
+                                                ),
+                                                is_overflow_branch: false,
+                                            });
+                                            child.constraints.push(SymConstraint {
+                                                lhs: comb_expr.clone(),
+                                                op: CmpOp::Le,
+                                                rhs: SymExpr::Const(max_val),
+                                                reason: format!(
+                                                    "in-range upper bound in `{gid}`: {} <= {max_val}",
+                                                    comb_expr.format_human()
+                                                ),
+                                                is_overflow_branch: false,
+                                            });
+                                        }
+                                        1 => {
+                                            child.constraints.push(SymConstraint {
+                                                lhs: comb_expr.clone(),
+                                                op: CmpOp::Lt,
+                                                rhs: SymExpr::Const(min_val),
+                                                reason: format!(
+                                                    "arithmetic underflow in `{gid}`: {} < {min_val}",
+                                                    comb_expr.format_human()
+                                                ),
+                                                is_overflow_branch: true,
+                                            });
+                                        }
+                                        _ => {
+                                            child.constraints.push(SymConstraint {
+                                                lhs: comb_expr.clone(),
+                                                op: CmpOp::Gt,
+                                                rhs: SymExpr::Const(max_val),
+                                                reason: format!(
+                                                    "arithmetic overflow in `{gid}`: {} > {max_val}",
+                                                    comb_expr.format_human()
+                                                ),
+                                                is_overflow_branch: true,
+                                            });
+                                        }
+                                    }
+                                }
+                            } else if gid.ends_with("_diff") && inv.args.len() >= 2 {
+                                // Signed diff / comparison (`i*_diff`):
+                                // branch 0: lhs >= rhs (result is unsigned lhs - rhs)
+                                // branch 1: lhs < rhs (result is wrapped lhs - rhs)
+                                let lhs_id = inv.args[inv.args.len() - 2].id;
+                                let rhs_id = inv.args[inv.args.len() - 1].id;
+                                let a = state.vars.get(&lhs_id).cloned();
+                                let b = state.vars.get(&rhs_id).cloned();
+                                if let (Some(lhs), Some(rhs)) = half_known(a, b, lhs_id, rhs_id) {
+                                    if b_idx == 0 {
+                                        if let Some(res_var) = branch.results.last() {
+                                            let diff_expr = cap_sym_expr(
+                                                SymExpr::Sub(Box::new(lhs.clone()), Box::new(rhs.clone())),
+                                                res_var.id,
+                                            );
+                                            child.vars.insert(res_var.id, diff_expr);
+                                        }
+                                    }
+                                    let op = if b_idx == 0 { CmpOp::Ge } else { CmpOp::Lt };
+                                    child.constraints.push(SymConstraint {
+                                        lhs: lhs.clone(),
+                                        op,
+                                        rhs: rhs.clone(),
+                                        reason: format!(
+                                            "{gid}({}, {}) branch {b_idx}",
+                                            lhs.format_human(),
+                                            rhs.format_human()
+                                        ),
+                                        is_overflow_branch: false,
                                     });
                                 }
                             }
@@ -4530,7 +4863,32 @@ fn verify_counterexamples_concretely(
             continue;
         };
         let (_, short_name) = extract_contract_and_short_name(&proof.function);
-        let arg_literals: Vec<String> = ce_map.values().cloned().collect();
+        let ordered_pairs: Vec<(String, String)> = if !proof.param_bounds.is_empty() {
+            proof
+                .param_bounds
+                .iter()
+                .filter_map(|(pname, _, _)| ce_map.get(pname).map(|v| (pname.clone(), v.clone())))
+                .collect()
+        } else {
+            ce_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+        let mut arg_literals: Vec<String> = Vec::new();
+        let mut idx = 0usize;
+        while idx < ordered_pairs.len() {
+            if ordered_pairs[idx].0.ends_with(".low")
+                && ordered_pairs.get(idx + 1).is_some_and(|(n, _)| n.ends_with(".high"))
+            {
+                arg_literals.push(format!(
+                    "u256 {{ low: {}, high: {} }}",
+                    ordered_pairs[idx].1,
+                    ordered_pairs[idx + 1].1
+                ));
+                idx += 2;
+            } else {
+                arg_literals.push(ordered_pairs[idx].1.clone());
+                idx += 1;
+            }
+        }
         let base_func = proof.function.split('[').next().unwrap_or(&proof.function);
         let reason_comment = proof
             .counterexample_reason
@@ -4543,8 +4901,10 @@ fn verify_counterexamples_concretely(
                 arg_literals.join(", ")
             ));
         } else {
-            let witness_pairs: Vec<String> =
-                ce_map.iter().map(|(k, v)| format!("{k} = {v}")).collect();
+            let witness_pairs: Vec<String> = ordered_pairs
+                .iter()
+                .map(|(k, v)| format!("{k} = {v}"))
+                .collect();
             proof.repro_test = Some(format!(
                 "// Counterexample in `{}` ({reason_comment})\n// Solved witness: {}\n#[test]\n#[should_panic]\nfn repro_{short_name}() {{\n    // Invoke `{base_func}` with the witness values above:\n    panic!(\"{reason_comment}\");\n}}",
                 proof.function,
@@ -4595,9 +4955,18 @@ fn verify_counterexamples_concretely(
         };
 
         let mut user_args = Vec::new();
-        for (_k, v_str) in ce_map {
-            let parsed = v_str.parse::<u128>().unwrap_or(0);
-            user_args.push(Arg::Value(Felt252::from(parsed)));
+        for (i, (_k, v_str)) in ordered_pairs.iter().enumerate() {
+            let v = v_str.parse::<i128>().unwrap_or(0);
+            let ty = proof.param_types.get(i).map(String::as_str).unwrap_or("");
+            let felt = if v < 0 {
+                Felt252::ZERO - Felt252::from(v.unsigned_abs())
+            } else if ty.ends_with("::u128") && v >= i128::MAX / 4 - 1024 {
+                let offset = (i128::MAX / 4 - v) as u128;
+                Felt252::from(u128::MAX - offset)
+            } else {
+                Felt252::from(v as u128)
+            };
+            user_args.push(Arg::Value(felt));
         }
 
         if let Ok(run_res) = runner.run_function_with_starknet_context(
@@ -4957,6 +5326,100 @@ fn extract_sierra_upgrade_signature(
             }
         }
     }
+    let mut record_slot_felt = |slot: &starknet_types_core::felt::Felt| {
+        let hex_slot = format!("0x{:x}", slot);
+        let name = keccak_reverse.get(&hex_slot).cloned();
+        storage_slots.entry(hex_slot).or_insert(name);
+    };
+    // Also discover Cairo 2.18 `Map` and `Vec` storage slots: `<field>::InternalContractMemberStateImpl::address`
+    // returns `const_as_immediate<Const<felt252, sn_keccak(field)>>`, which callers pass into
+    // `pedersen` / `hades_permutation` -> `storage_base_address_from_felt252`.
+    let mut func_const_return: HashMap<usize, starknet_types_core::felt::Felt> = HashMap::new();
+    for func_idx in 0..program.funcs.len() {
+        let (_, start, end) = index.func_ranges[func_idx];
+        let mut slot_of_var: HashMap<u64, starknet_types_core::felt::Felt> = HashMap::new();
+        for stmt_idx in start..end {
+            match &program.statements[stmt_idx] {
+                Statement::Invocation(inv) => {
+                    if let Some(lf) = index.libfuncs.get(&inv.libfunc_id.id) {
+                        track_detector_storage_slot(&mut slot_of_var, lf.generic_id.as_str(), lf, inv);
+                    }
+                }
+                Statement::Return(ret_vars) if ret_vars.len() == 1 => {
+                    if let Some(slot) = slot_of_var.get(&ret_vars[0].id).copied() {
+                        func_const_return.insert(func_idx, slot);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    for _round in 0..3 {
+        for func_idx in 0..program.funcs.len() {
+            let (_, start, end) = index.func_ranges[func_idx];
+            let mut slot_of_var: HashMap<u64, starknet_types_core::felt::Felt> = HashMap::new();
+            for stmt_idx in start..end {
+                match &program.statements[stmt_idx] {
+                    Statement::Invocation(inv) => {
+                        let Some(lf) = index.libfuncs.get(&inv.libfunc_id.id) else {
+                            continue;
+                        };
+                        let gid = lf.generic_id.as_str();
+                        track_detector_storage_slot(&mut slot_of_var, gid, lf, inv);
+                        if gid == "function_call" {
+                            if let Some(callee_idx) =
+                                lf.user_func_callee.and_then(|cid| index.func_by_id.get(&cid).copied())
+                            {
+                                if let Some(slot) = func_const_return.get(&callee_idx).copied() {
+                                    for b in &inv.branches {
+                                        for r in &b.results {
+                                            slot_of_var.insert(r.id, slot);
+                                        }
+                                    }
+                                } else if let Some(slot) =
+                                    inv.args.iter().find_map(|a| slot_of_var.get(&a.id).copied())
+                                {
+                                    for b in &inv.branches {
+                                        for r in &b.results {
+                                            slot_of_var.insert(r.id, slot);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if matches!(
+                            gid,
+                            "storage_base_address_const"
+                                | "storage_base_address_from_felt252"
+                                | "storage_address_from_base"
+                                | "storage_address_from_base_and_offset"
+                                | "storage_read_syscall"
+                                | "storage_write_syscall"
+                        ) {
+                            for a in &inv.args {
+                                if let Some(slot) = slot_of_var.get(&a.id) {
+                                    record_slot_felt(slot);
+                                }
+                            }
+                            for b in &inv.branches {
+                                for r in &b.results {
+                                    if let Some(slot) = slot_of_var.get(&r.id) {
+                                        record_slot_felt(slot);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Statement::Return(ret_vars) if ret_vars.len() == 1 => {
+                        if let Some(slot) = slot_of_var.get(&ret_vars[0].id).copied() {
+                            func_const_return.insert(func_idx, slot);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 
     let mut entrypoints: BTreeMap<String, (String, usize)> = BTreeMap::new();
     let mut protected_entrypoints = BTreeSet::new();
@@ -5204,19 +5667,18 @@ fn check_functional_equivalence_against_baseline(
                 continue;
             }
             if is_wrapper || !map.contains_key(&short) {
-                let arity = if is_wrapper {
-                    count_wrapper_calldata_pops(index, func_idx)
-                } else {
-                    proofs
-                        .iter()
-                        .find(|p| p.function.ends_with(&format!("::{short}")))
-                        .map(|p| p.params.len())
-                        .unwrap_or(0)
-                };
                 let proof = proofs
                     .iter()
                     .find(|p| p.function.ends_with(&format!("::{short}")))
                     .cloned();
+                let arity = if is_wrapper {
+                    count_wrapper_calldata_pops(index, func_idx)
+                } else {
+                    proof
+                        .as_ref()
+                        .map(|p| p.param_bounds.len())
+                        .unwrap_or(0)
+                };
                 map.insert(short, (func_idx, is_wrapper, arity, proof));
             }
         }
@@ -5227,6 +5689,64 @@ fn check_functional_equivalence_against_baseline(
     let cand_map = collect_entrypoints(&cand_index, candidate_crate_name, candidate_proofs);
 
     let boundary_values: &[u128] = &[0, 1, 2, 3, 7, 10, 42, 100, 255, 1000, 10_000, 10_001, 65_535];
+    let format_execution_outcome =
+        |res: &mut cairo_lang_runner::RunResultStarknet| -> String {
+            match &res.value {
+                RunResultValue::Panic(p) => format!("Panic({})", format_for_panic(p.iter().cloned())),
+                RunResultValue::Success(vals) => {
+                    let ret = res.return_array.as_ref().unwrap_or(vals);
+                    let sdiff = res.starknet_state.storage_diff(&StarknetState::default());
+                    let events = res.starknet_state.take_events();
+                    let l2_to_l1 = res.starknet_state.take_l2_to_l1_messages();
+                    if sdiff.is_empty() && events.is_empty() && l2_to_l1.is_empty() {
+                        format!("Ok({ret:?})")
+                    } else {
+                        format!("Ok(ret={ret:?}, storage={sdiff:?}, events={events:?}, l2_to_l1={l2_to_l1:?})")
+                    }
+                }
+            }
+        };
+    let build_witness_vectors = |arity: usize,
+                                 bp: Option<&SymbolicFunctionProofReport>,
+                                 cp: Option<&SymbolicFunctionProofReport>|
+     -> Vec<Vec<u128>> {
+        if arity == 0 {
+            return vec![Vec::new()];
+        }
+        let mut vecs: Vec<Vec<u128>> = Vec::new();
+        for proof_opt in [bp, cp].into_iter().flatten() {
+            if let Some(ce) = &proof_opt.counterexample {
+                let w: Vec<u128> = proof_opt
+                    .param_bounds
+                    .iter()
+                    .filter_map(|(name, _, _)| ce.get(name)?.parse::<u128>().ok())
+                    .collect();
+                if w.len() == arity {
+                    vecs.push(w);
+                }
+            }
+        }
+        for &v0 in boundary_values {
+            vecs.push(vec![v0; arity]);
+        }
+        if arity >= 2 {
+            let pair_seeds: &[u128] = &[0, 1, 2, 3, 7, 10, 42, 100, 255];
+            for &a in pair_seeds {
+                for &b in pair_seeds {
+                    if a != b {
+                        let mut w = vec![0u128; arity];
+                        w[0] = a;
+                        w[1] = b;
+                        for (i, slot) in w.iter_mut().enumerate().skip(2) {
+                            *slot = pair_seeds[(i + 1) % pair_seeds.len()];
+                        }
+                        vecs.push(w);
+                    }
+                }
+            }
+        }
+        vecs
+    };
     let mut entries = Vec::new();
 
     for (short, (b_idx, b_wrap, b_arity, b_proof)) in &base_map {
@@ -5256,13 +5776,14 @@ fn check_functional_equivalence_against_baseline(
             continue;
         }
 
+        let witness_vectors = build_witness_vectors(*b_arity, b_proof.as_ref(), c_proof.as_ref());
+
         // Check symbolic precondition & panic-path equivalence first
         if let (Some(bp), Some(cp)) = (b_proof, c_proof) {
             if bp.preconditions != cp.preconditions || bp.status != cp.status {
                 // Probe boundary witnesses in SierraCasmRunner to find a concrete diverging witness
                 let mut found_witness = None;
-                for &v0 in boundary_values {
-                    let witness_words = vec![v0; *b_arity];
+                for witness_words in &witness_vectors {
                     let make_args = |is_wrap: bool| -> Vec<Arg> {
                         let felts: Vec<Arg> = witness_words
                             .iter()
@@ -5287,15 +5808,9 @@ fn check_functional_equivalence_against_baseline(
                         Some(10_000_000),
                         StarknetState::default(),
                     );
-                    if let (Ok(br), Ok(cr)) = (b_res, c_res) {
-                        let b_str = match &br.value {
-                            RunResultValue::Success(vals) => format!("Ok({vals:?})"),
-                            RunResultValue::Panic(p) => format!("Panic({})", format_for_panic(p.iter().cloned())),
-                        };
-                        let c_str = match &cr.value {
-                            RunResultValue::Success(vals) => format!("Ok({vals:?})"),
-                            RunResultValue::Panic(p) => format!("Panic({})", format_for_panic(p.iter().cloned())),
-                        };
+                    if let (Ok(mut br), Ok(mut cr)) = (b_res, c_res) {
+                        let b_str = format_execution_outcome(&mut br);
+                        let c_str = format_execution_outcome(&mut cr);
                         if b_str != c_str {
                             found_witness = Some((
                                 witness_words.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
@@ -5336,8 +5851,7 @@ fn check_functional_equivalence_against_baseline(
 
         // Sweep boundary witnesses in SierraCasmRunner even when preconditions look similar
         let mut concrete_divergence = None;
-        for &v0 in boundary_values {
-            let witness_words = vec![v0; *b_arity];
+        for witness_words in &witness_vectors {
             let make_args = |is_wrap: bool| -> Vec<Arg> {
                 let felts: Vec<Arg> = witness_words
                     .iter()
@@ -5362,15 +5876,9 @@ fn check_functional_equivalence_against_baseline(
                 Some(10_000_000),
                 StarknetState::default(),
             );
-            if let (Ok(br), Ok(cr)) = (b_res, c_res) {
-                let b_str = match &br.value {
-                    RunResultValue::Success(vals) => format!("Ok({vals:?})"),
-                    RunResultValue::Panic(p) => format!("Panic({})", format_for_panic(p.iter().cloned())),
-                };
-                let c_str = match &cr.value {
-                    RunResultValue::Success(vals) => format!("Ok({vals:?})"),
-                    RunResultValue::Panic(p) => format!("Panic({})", format_for_panic(p.iter().cloned())),
-                };
+            if let (Ok(mut br), Ok(mut cr)) = (b_res, c_res) {
+                let b_str = format_execution_outcome(&mut br);
+                let c_str = format_execution_outcome(&mut cr);
                 if b_str != c_str {
                     concrete_divergence = Some((
                         witness_words.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
@@ -7225,5 +7733,315 @@ pub mod Vault {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn smt_export_bounds_bitwise_opaque_terms_and_pins_witness() {
+        let param_bounds = vec![("x".to_string(), 0, 255)];
+        let bit_and = SymExpr::BitAnd(
+            Box::new(SymExpr::Param(0, "x".to_string())),
+            Box::new(SymExpr::Const(15)),
+        );
+        let obligations = vec![PathObligation {
+            expected: "unsat",
+            constraints: vec![SymConstraint {
+                lhs: bit_and.clone(),
+                op: CmpOp::Gt,
+                rhs: SymExpr::Const(200),
+                reason: "bitwise mask > 200".to_string(),
+                is_overflow_branch: false,
+            }],
+            witness: None,
+            reason: "bitwise mask > 200".to_string(),
+        }];
+        let proof = SymbolicFunctionProofReport {
+            function: "demo::mask".to_string(),
+            kind: "function".to_string(),
+            params: vec!["x: u8".to_string()],
+            status: "PROVEN_SAFE".to_string(),
+            explored_paths: 1,
+            ok_paths: 0,
+            panic_paths: 1,
+            unreachable_panic_paths: 1,
+            undecided_panic_paths: 0,
+            exploration_truncated: false,
+            proven_overflow_free: true,
+            preconditions: Vec::new(),
+            counterexample: None,
+            counterexample_calldata: None,
+            smt_file: None,
+            obligations,
+            param_bounds,
+            param_types: vec!["u8".to_string()],
+            counterexample_reason: None,
+            concrete_verified: None,
+            concrete_panic_data: None,
+            repro_test: None,
+        };
+        let smt = render_smt_obligations(&proof);
+        assert!(
+            smt.contains("(declare-const o_bit__x___15__2fab59d7 Int)")
+                && smt.contains(
+                    "(assert (and (<= 0 o_bit__x___15__2fab59d7) (<= o_bit__x___15__2fab59d7 15)))"
+                ),
+            "expected interval bounds [0, 15] on bitwise opaque term in SMT export, got:\n{smt}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "native-test-runner")]
+    fn signed_integers_u256_downcast_and_param_order_concrete_verification_work() {
+        let _env = crate::test_env_shared();
+        let root = std::env::temp_dir().join(format!(
+            "uc-prove-signed-u256-{}-{}",
+            std::process::id(),
+            epoch_ms_u64().unwrap_or(3)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).expect("create src");
+        fs::write(
+            root.join("Scarb.toml"),
+            r#"[package]
+name = "signed_u256_demo"
+version = "0.1.0"
+edition = "2024_07"
+
+[dependencies]
+starknet = "2.16.0"
+"#,
+        )
+        .expect("write Scarb.toml");
+
+        fs::write(
+            root.join("src/lib.cairo"),
+            r#"
+pub fn add_i8_unbounded(a: i8, b: i8) -> i8 {
+    a + b
+}
+
+pub fn sub_i8_underflow(a: i8) -> i8 {
+    a - 10_i8
+}
+
+pub fn guarded_i8_add(a: i8, b: i8) -> i8 {
+    assert!(a >= 0_i8 && a <= 50_i8, "a_range");
+    assert!(b >= 0_i8 && b <= 50_i8, "b_range");
+    a + b
+}
+
+pub fn downcast_i8_to_u8(x: i8) -> u8 {
+    x.try_into().unwrap()
+}
+
+pub fn add_u256_unbounded(a: u256, b: u256) -> u256 {
+    a + b
+}
+
+pub fn prove_non_alpha_sub(z_lhs: u64, a_rhs: u64) -> u64 {
+    z_lhs - a_rhs
+}
+"#,
+        )
+        .expect("write lib.cairo");
+
+        let args = ProveArgs {
+            max_depth: 64,
+            max_paths: 1024,
+            caracal: false,
+            stateful_runs: 0,
+            ..ProveArgs::default()
+        };
+        let report = prove_single_package(
+            &root.join("Scarb.toml"),
+            &root,
+            "signed_u256_demo",
+            "signed_u256_demo",
+            &args,
+        )
+        .expect("prove_single_package");
+        let _ = fs::remove_dir_all(&root);
+
+        let find_proof = |suffix: &str| -> &SymbolicFunctionProofReport {
+            report
+                .symbolic_proofs
+                .iter()
+                .find(|p| p.function.ends_with(suffix))
+                .unwrap_or_else(|| panic!("missing proof for {suffix}"))
+        };
+
+        let p_add_i8 = find_proof("add_i8_unbounded");
+        assert_eq!(p_add_i8.status, "COUNTEREXAMPLE_FOUND", "{p_add_i8:?}");
+        assert_eq!(p_add_i8.concrete_verified, Some(true), "{p_add_i8:?}");
+
+        let p_sub_i8 = find_proof("sub_i8_underflow");
+        assert_eq!(p_sub_i8.status, "COUNTEREXAMPLE_FOUND", "{p_sub_i8:?}");
+        assert_eq!(p_sub_i8.concrete_verified, Some(true), "{p_sub_i8:?}");
+
+        let p_guarded_i8 = find_proof("guarded_i8_add");
+        assert_eq!(p_guarded_i8.status, "GUARDED_SAFE", "{p_guarded_i8:?}");
+        assert!(p_guarded_i8.proven_overflow_free, "{p_guarded_i8:?}");
+
+        let p_downcast = find_proof("downcast_i8_to_u8");
+        assert_eq!(p_downcast.status, "COUNTEREXAMPLE_FOUND", "{p_downcast:?}");
+        assert_eq!(p_downcast.concrete_verified, Some(true), "{p_downcast:?}");
+
+        let p_u256 = find_proof("add_u256_unbounded");
+        assert_eq!(p_u256.status, "COUNTEREXAMPLE_FOUND", "{p_u256:?}");
+        assert_eq!(p_u256.concrete_verified, Some(true), "{p_u256:?}");
+
+        let p_sub = find_proof("prove_non_alpha_sub");
+        assert_eq!(p_sub.status, "COUNTEREXAMPLE_FOUND", "{p_sub:?}");
+        assert_eq!(p_sub.concrete_verified, Some(true), "{p_sub:?}");
+    }
+
+    #[test]
+    #[cfg(feature = "native-test-runner")]
+    fn upgrade_safety_detects_removed_map_slot_and_equivalence_detects_asymmetric_and_storage_divergence() {
+        let _env = crate::test_env_shared();
+        let root = std::env::temp_dir().join(format!(
+            "uc-prove-upg-eq-{}-{}",
+            std::process::id(),
+            epoch_ms_u64().unwrap_or(4)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let base_dir = root.join("baseline");
+        let cand_dir = root.join("candidate");
+        fs::create_dir_all(base_dir.join("src")).unwrap();
+        fs::create_dir_all(cand_dir.join("src")).unwrap();
+
+        let scarb_toml = r#"[package]
+name = "upg_eq_demo"
+version = "0.1.0"
+edition = "2024_07"
+
+[dependencies]
+starknet = "2.16.0"
+"#;
+        fs::write(base_dir.join("Scarb.toml"), scarb_toml).unwrap();
+        fs::write(cand_dir.join("Scarb.toml"), scarb_toml).unwrap();
+
+        fs::write(
+            base_dir.join("src/lib.cairo"),
+            r#"
+#[starknet::contract]
+pub mod TokenVault {
+    use starknet::storage::{
+        Map, StorageMapReadAccess, StorageMapWriteAccess,
+        StoragePointerReadAccess, StoragePointerWriteAccess,
+    };
+
+    #[storage]
+    struct Storage {
+        val: u64,
+        balances: Map<u64, u64>,
+    }
+
+    #[external(v0)]
+    pub fn set_balance(ref self: ContractState, user: u64, amount: u64) {
+        self.balances.write(user, amount);
+    }
+
+    #[external(v0)]
+    pub fn get_balance(self: @ContractState, user: u64) -> u64 {
+        self.balances.read(user)
+    }
+
+    #[external(v0)]
+    pub fn sub_pair(self: @ContractState, a: u64, b: u64) -> u64 {
+        if a >= b { a - b } else { 0 }
+    }
+
+    #[external(v0)]
+    pub fn write_val(ref self: ContractState, v: u64) {
+        self.val.write(v);
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        fs::write(
+            cand_dir.join("src/lib.cairo"),
+            r#"
+#[starknet::contract]
+pub mod TokenVault {
+    use starknet::storage::{StoragePointerReadAccess, StoragePointerWriteAccess};
+
+    #[storage]
+    struct Storage {
+        val: u64,
+    }
+
+    #[external(v0)]
+    pub fn set_balance(ref self: ContractState, _user: u64, _amount: u64) {}
+
+    #[external(v0)]
+    pub fn get_balance(self: @ContractState, _user: u64) -> u64 {
+        0
+    }
+
+    #[external(v0)]
+    pub fn sub_pair(self: @ContractState, a: u64, b: u64) -> u64 {
+        if b >= a { b - a } else { 0 }
+    }
+
+    #[external(v0)]
+    pub fn write_val(ref self: ContractState, v: u64) {
+        self.val.write(v + 1);
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let args = ProveArgs {
+            max_depth: 64,
+            max_paths: 1024,
+            caracal: false,
+            stateful_runs: 0,
+            check_upgrade: Some(base_dir.display().to_string()),
+            check_equivalence: Some(base_dir.clone()),
+            ..ProveArgs::default()
+        };
+        let pkg_report = prove_single_package(
+            &cand_dir.join("Scarb.toml"),
+            &cand_dir,
+            "upg_eq_demo",
+            "upg_eq_demo",
+            &args,
+        )
+        .expect("prove_single_package");
+        let _ = fs::remove_dir_all(&root);
+
+        let upg = pkg_report.upgrade_safety.expect("upgrade_safety");
+        assert_eq!(upg.status, "UPGRADE_UNSAFE", "{upg:?}");
+        assert!(
+            upg.removed_storage_slots
+                .iter()
+                .any(|s| s.contains("balances")),
+            "expected removed Map slot `balances` to be detected, got: {:?}",
+            upg.removed_storage_slots
+        );
+
+        let eq = pkg_report.equivalence.expect("equivalence");
+        assert_eq!(eq.status, "NON_EQUIVALENT", "{eq:?}");
+        let sub_entry = eq
+            .functions
+            .iter()
+            .find(|e| e.function == "sub_pair")
+            .expect("sub_pair entry");
+        assert_eq!(
+            sub_entry.status, "DIVERGENCE_FOUND",
+            "expected asymmetric witness to catch sub_pair divergence, got: {sub_entry:?}"
+        );
+        let write_entry = eq
+            .functions
+            .iter()
+            .find(|e| e.function == "write_val")
+            .expect("write_val entry");
+        assert_eq!(
+            write_entry.status, "DIVERGENCE_FOUND",
+            "expected storage diff comparison to catch write_val divergence, got: {write_entry:?}"
+        );
     }
 }
