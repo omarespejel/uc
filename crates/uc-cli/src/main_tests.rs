@@ -12820,6 +12820,42 @@ fn native_prune_crate_cache_files_removes_blob_metadata_companions() {
     fs::remove_dir_all(&workspace).ok();
 }
 
+/// The embedded corelib must be Cairo 2.18.0's, packed from `third_party/corelib` by
+/// `scripts/pack_embedded_corelib.py`. From 2026-10-25 to 2026-10-28 macro-expanded dispatcher
+/// code sat in `starknet/account.cairo` and shipped in the binary unnoticed; the pin makes such an
+/// edit fail here. On a Cairo upgrade, repack from the release's corelib and update the digest.
+#[cfg(feature = "native-compile")]
+#[test]
+fn embedded_corelib_is_the_pinned_cairo_release() {
+    use sha2::{Digest, Sha256};
+    assert_eq!(
+        hex::encode(Sha256::digest(UC_EMBEDDED_CORELIB_PACK)),
+        "c2a016c16cd46d0ef8447b670c3d7ac8363d955596d2957d353ccbc43000c3cf",
+        "the embedded corelib changed; it must stay byte-identical to the Cairo release's corelib"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn best_effort_journal_writes_never_recreate_a_deleted_cache() {
+    let dir = unique_test_dir("uc-native-source-journal-deleted-cache");
+    let state = NativeSourceChangeJournal {
+        changed_files: BTreeSet::from(["src/lib.cairo".to_string()]),
+        removed_files: BTreeSet::new(),
+        overflowed: false,
+        cursor: 3,
+        applied_cursor: 3,
+    };
+    persist_native_source_change_journal(&dir, &state).expect("journal persists");
+    fs::remove_dir_all(dir.join(".uc")).expect("delete the cache like a workspace cleanup");
+    persist_native_source_change_journal_best_effort(&dir, &state);
+    assert!(
+        !dir.join(".uc").exists(),
+        "a best-effort journal write must not recreate .uc in a deleted workspace"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_source_journal_persistence_round_trip_and_consumption() {

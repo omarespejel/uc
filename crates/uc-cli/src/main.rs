@@ -17253,11 +17253,13 @@ fn persist_native_source_change_journal_best_effort(
     workspace_root: &Path,
     state: &NativeSourceChangeJournal,
 ) {
-    if !workspace_root.is_dir()
-        || (!workspace_root.join("uc.toml").is_file()
-            && !workspace_root.join("Scarb.toml").is_file())
-        || !workspace_root.join(".uc/cache/native-session").is_dir()
-    {
+    // Best-effort writes never create directories: a daemon thread can still commit a journal
+    // while its workspace is being deleted, and recreating `.uc/cache` there leaves a stray tree.
+    let journal_dir_exists = native_source_journal_path(workspace_root)
+        .ok()
+        .and_then(|path| path.parent().map(Path::is_dir))
+        .unwrap_or(false);
+    if !journal_dir_exists {
         return;
     }
     if let Err(err) = persist_native_source_change_journal(workspace_root, state) {
