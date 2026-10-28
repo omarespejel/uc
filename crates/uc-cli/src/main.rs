@@ -271,7 +271,28 @@ const DEFAULT_SOURCE_STORE_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 #[cfg(feature = "native-compile")]
 const DEFAULT_NATIVE_MAX_CASM_BYTECODE_SIZE: usize = 81_290;
 const DEFAULT_SCARB_TOOLCHAIN_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
-const DAEMON_PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// This uc build: the package version plus the executable's size and modification time, which
+/// change with every rebuild or reinstall (one `stat`, no hashing). Every build so far reports
+/// the same package version, so caches of compiler output and the daemon handshake use this:
+/// a daemon or a cache left by an older build would otherwise serve that build's compiler.
+fn uc_build_identity() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION.get_or_init(|| {
+        let build = std::env::current_exe()
+            .and_then(fs::metadata)
+            .map(|meta| {
+                let modified = meta
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map(|elapsed| elapsed.as_nanos())
+                    .unwrap_or_default();
+                format!("{:x}-{modified:x}", meta.len())
+            })
+            .unwrap_or_else(|_| "unknown".to_string());
+        format!("{}+{build}", env!("CARGO_PKG_VERSION"))
+    })
+}
 const CACHEABLE_ARTIFACT_SUFFIXES: [&str; 7] = [
     ".sierra.json",
     ".sierra",
@@ -10850,13 +10871,13 @@ fn validate_metadata_format_version(version: u32) -> Result<()> {
 }
 
 fn validate_daemon_protocol_version(version: &str) -> Result<()> {
-    if version == DAEMON_PROTOCOL_VERSION {
+    if version == uc_build_identity() {
         return Ok(());
     }
     bail!(
-        "daemon protocol mismatch (daemon={}, client={})",
+        "daemon protocol mismatch (request={}, this build={})",
         version,
-        DAEMON_PROTOCOL_VERSION
+        uc_build_identity()
     );
 }
 
@@ -11138,6 +11159,8 @@ fn run_daemon_stop(args: DaemonSocketArgs) -> Result<()> {
 }
 
 fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
+    // Fix the build identity before the executable can be replaced on disk.
+    let _ = uc_build_identity();
     #[cfg(not(unix))]
     {
         let _ = args;
@@ -11166,7 +11189,7 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
             pid: std::process::id(),
             started_at_epoch_ms: epoch_ms_u64()?,
             socket_path: socket_path.display().to_string(),
-            protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+            protocol_version: uc_build_identity().to_string(),
             healthy: true,
             total_requests: 0,
             failed_requests: 0,
@@ -11402,7 +11425,7 @@ fn try_uc_build_via_daemon(
                 if fallback_to_local {
                     if daemon_response_protocol_mismatch(&message) {
                         eprintln!(
-                            "uc: daemon protocol mismatch ({message}), falling back to local engine"
+                            "uc: daemon protocol mismatch ({message}), falling back to local engine; `uc daemon stop` retires the old daemon"
                         );
                     } else {
                         eprintln!(
@@ -11505,7 +11528,7 @@ fn daemon_build_request_from_common(
     native_fallback_to_scarb: bool,
 ) -> DaemonBuildRequest {
     DaemonBuildRequest {
-        protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+        protocol_version: uc_build_identity().to_string(),
         manifest_path: manifest_path.display().to_string(),
         package: common.package.clone(),
         workspace: common.workspace,
@@ -11538,7 +11561,7 @@ fn daemon_metadata_request_from_args(
     capture_output: bool,
 ) -> DaemonMetadataRequest {
     DaemonMetadataRequest {
-        protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+        protocol_version: uc_build_identity().to_string(),
         manifest_path: manifest_path.display().to_string(),
         format_version: args.format_version,
         offline: args.offline,
@@ -16623,6 +16646,7 @@ fn native_compile_session_signature(
 fn native_compile_session_signature_hash(signature: &NativeCompileSessionSignature) -> String {
     let mut hasher = Hasher::new();
     hasher.update(b"uc-native-session-image-signature-v2");
+    hasher.update(uc_build_identity().as_bytes());
     hasher.update(normalize_fingerprint_path(&signature.manifest_path).as_bytes());
     hasher.update(signature.manifest_content_hash.as_bytes());
     hasher.update(signature.context.package_name.as_bytes());
@@ -17691,6 +17715,7 @@ fn native_crate_cache_root_path(workspace_root: &Path) -> Result<PathBuf> {
 fn native_crate_cache_entry_hash(signature_hash: &str, crate_cache_key: &str) -> String {
     let mut hasher = Hasher::new();
     hasher.update(b"uc-native-crate-cache-entry-v1");
+    hasher.update(uc_build_identity().as_bytes());
     hasher.update(signature_hash.as_bytes());
     hasher.update(b"\x1F");
     hasher.update(crate_cache_key.as_bytes());
@@ -18217,6 +18242,7 @@ fn native_global_corelib_cache_key(
     let root_fp = native_crate_cache_root_fingerprint(corelib_src).ok()?;
     let mut hasher = Hasher::new();
     hasher.update(b"uc-global-corelib-lowering-cache-v1");
+    hasher.update(uc_build_identity().as_bytes());
     hasher.update(native_cairo_lang_compiler_version().as_bytes());
     hasher.update(if skip_unused_import_diagnostics { b"1" } else { b"0" });
     hasher.update(root_fp.as_bytes());

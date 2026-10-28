@@ -493,6 +493,7 @@ pub(super) fn build_fingerprint_context_digest(
 ) -> String {
     let mut hasher = Hasher::new();
     hasher.update(b"uc-build-fingerprint-context-v1");
+    hasher.update(uc_build_identity().as_bytes());
     hasher.update(scarb_version.as_bytes());
     hasher.update(current_build_env_fingerprint().as_bytes());
     hasher.update(manifest_identity.as_bytes());

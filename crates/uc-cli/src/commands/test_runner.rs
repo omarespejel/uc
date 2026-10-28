@@ -2724,6 +2724,7 @@ fn compile_or_load_native_tests_with_mode(
     let sources_hash = native_tracked_sources_content_hash(workspace_root, &tracked_sources)?;
     let mut cache_hasher = blake3::Hasher::new();
     cache_hasher.update(b"uc-test-compilation-v7:");
+    cache_hasher.update(uc_build_identity().as_bytes());
     cache_hasher.update(UC_SNFORGE_STD_SHIM_SOURCE.as_bytes());
     cache_hasher.update(native_cairo_lang_compiler_version().as_bytes());
     cache_hasher.update(manifest_text.as_bytes());

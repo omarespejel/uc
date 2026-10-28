@@ -3697,7 +3697,7 @@ fn daemon_metadata_request_roundtrip_preserves_fields() {
         Path::new("/tmp/workspace/Scarb.toml")
     );
     assert_eq!(restored.format_version, 2);
-    assert_eq!(request.protocol_version, DAEMON_PROTOCOL_VERSION);
+    assert_eq!(request.protocol_version, uc_build_identity());
     assert!(restored.offline);
     assert_eq!(
         restored.global_cache_dir,
@@ -3730,7 +3730,7 @@ fn daemon_build_request_roundtrip_preserves_async_cache_persist() {
 
     assert!(request.async_cache_persist);
     assert!(!request.capture_output);
-    assert_eq!(request.protocol_version, DAEMON_PROTOCOL_VERSION);
+    assert_eq!(request.protocol_version, uc_build_identity());
     assert_eq!(restored.package, common.package);
     assert_eq!(restored.workspace, common.workspace);
     assert_eq!(restored.features, common.features);
@@ -3787,7 +3787,7 @@ starknet = "={requested_version}"
     let _helper = ScopedDynamicEnvVar::set_with_lock(&_guard, helper_env, &helper_path);
 
     let request = DaemonBuildRequest {
-        protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+        protocol_version: uc_build_identity().to_string(),
         manifest_path: manifest_path.display().to_string(),
         package: None,
         workspace: false,
@@ -3973,7 +3973,7 @@ fn native_compile_session_heap_estimate_scales_with_tracked_source_bytes() {
 fn daemon_build_request_serialization_supports_async_cache_persist_wire_field() {
     let request = DaemonRequest::Build {
         payload: DaemonBuildRequest {
-            protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+            protocol_version: uc_build_identity().to_string(),
             manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
             package: None,
             workspace: false,
@@ -4000,7 +4000,7 @@ fn daemon_build_request_serialization_supports_async_cache_persist_wire_field() 
         DaemonRequest::Build { payload } => {
             assert!(payload.async_cache_persist);
             assert!(payload.capture_output);
-            assert_eq!(payload.protocol_version, DAEMON_PROTOCOL_VERSION);
+            assert_eq!(payload.protocol_version, uc_build_identity());
             assert_eq!(payload.manifest_path, "/tmp/workspace/Scarb.toml");
             assert_eq!(payload.features, vec!["feature_a".to_string()]);
             assert_eq!(payload.compile_backend, DaemonBuildBackend::Native);
@@ -4014,14 +4014,14 @@ fn daemon_build_request_serialization_supports_async_cache_persist_wire_field() 
 fn daemon_build_request_defaults_capture_output_when_missing_from_wire() {
     let json = format!(
             "{{\"type\":\"build\",\"protocol_version\":\"{}\",\"manifest_path\":\"/tmp/workspace/Scarb.toml\",\"package\":null,\"workspace\":false,\"features\":[],\"offline\":false,\"release\":false,\"profile\":null,\"async_cache_persist\":false}}",
-            DAEMON_PROTOCOL_VERSION
+            uc_build_identity()
         );
     let decoded: DaemonRequest =
         serde_json::from_str(&json).expect("failed to decode daemon request");
     match decoded {
         DaemonRequest::Build { payload } => {
             assert!(payload.capture_output);
-            assert_eq!(payload.protocol_version, DAEMON_PROTOCOL_VERSION);
+            assert_eq!(payload.protocol_version, uc_build_identity());
             assert_eq!(payload.compile_backend, DaemonBuildBackend::Scarb);
             assert!(!payload.native_fallback_to_scarb);
         }
@@ -4049,12 +4049,12 @@ fn daemon_build_request_payload_wrapped_wire_format_is_decoded() {
                 "native_fallback_to_scarb":true
             }}
         }}"#,
-        DAEMON_PROTOCOL_VERSION
+        uc_build_identity()
     );
     let decoded = decode_daemon_request(&json).expect("failed to decode wrapped daemon request");
     match decoded {
         DaemonRequest::Build { payload } => {
-            assert_eq!(payload.protocol_version, DAEMON_PROTOCOL_VERSION);
+            assert_eq!(payload.protocol_version, uc_build_identity());
             assert_eq!(payload.features, vec!["feature_a".to_string()]);
             assert_eq!(payload.compile_backend, DaemonBuildBackend::Native);
             assert!(payload.async_cache_persist);
@@ -4085,7 +4085,7 @@ fn daemon_build_request_payload_fields_override_hybrid_root_fields() {
                 "native_fallback_to_scarb":true
             }}
         }}"#,
-        DAEMON_PROTOCOL_VERSION
+        uc_build_identity()
     );
     let decoded = decode_daemon_request(&json).expect("failed to decode hybrid daemon request");
     match decoded {
@@ -4362,7 +4362,7 @@ fn daemon_build_response_defaults_compile_backend_to_scarb_when_missing_from_wir
 fn daemon_metadata_request_serialization_supports_wire_format() {
     let request = DaemonRequest::Metadata {
         payload: DaemonMetadataRequest {
-            protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+            protocol_version: uc_build_identity().to_string(),
             manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
             format_version: 1,
             offline: false,
@@ -4377,7 +4377,7 @@ fn daemon_metadata_request_serialization_supports_wire_format() {
         serde_json::from_str(&json).expect("failed to decode daemon request");
     match decoded {
         DaemonRequest::Metadata { payload } => {
-            assert_eq!(payload.protocol_version, DAEMON_PROTOCOL_VERSION);
+            assert_eq!(payload.protocol_version, uc_build_identity());
             assert_eq!(payload.manifest_path, "/tmp/workspace/Scarb.toml");
             assert_eq!(payload.format_version, 1);
             assert!(!payload.offline);
@@ -4442,7 +4442,7 @@ fn daemon_request_protocol_validation_rejects_mismatch_for_build_and_metadata() 
 fn daemon_request_protocol_validation_accepts_current_protocol() {
     let build = DaemonRequest::Build {
         payload: DaemonBuildRequest {
-            protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+            protocol_version: uc_build_identity().to_string(),
             manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
             package: None,
             workspace: false,
@@ -4458,7 +4458,7 @@ fn daemon_request_protocol_validation_accepts_current_protocol() {
     };
     let metadata = DaemonRequest::Metadata {
         payload: DaemonMetadataRequest {
-            protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+            protocol_version: uc_build_identity().to_string(),
             manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
             format_version: 1,
             offline: false,
@@ -8887,7 +8887,7 @@ fn daemon_request_read_timeout_prefers_build_override_for_build_requests() {
 
     let build_request = DaemonRequest::Build {
         payload: DaemonBuildRequest {
-            protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+            protocol_version: uc_build_identity().to_string(),
             manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
             package: None,
             workspace: false,
@@ -9216,6 +9216,18 @@ fn cache_object_matches_expected_recomputes_when_object_changes() {
     );
 
     fs::remove_dir_all(&dir).ok();
+}
+
+/// A daemon or cache from another uc build must not be trusted, and every build so far shares
+/// the package version, so the identity carries the executable's stamp.
+#[test]
+fn build_identity_carries_the_executable_stamp() {
+    let identity = uc_build_identity();
+    let stamp = identity
+        .strip_prefix(concat!(env!("CARGO_PKG_VERSION"), "+"))
+        .expect("identity starts with the package version");
+    assert_ne!(stamp, "unknown");
+    assert!(stamp.contains('-'), "size-mtime stamp: {identity}");
 }
 
 #[test]
