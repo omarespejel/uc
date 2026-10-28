@@ -83,8 +83,11 @@ verification record, and `uc verify-onchain --submit` writes it.
 - `uc prove --emit-smt <dir>` writes SMT-LIB obligations per function plus `obligations.json`;
   `benchmarks/scripts/check_smt_obligations.py --dir <dir>` checks them with z3 or cvc5.
 - Detector findings carry `severity`, `confidence`, `detector`, `function`,
-  `sierra_statement_idx`, `description`, `recommendation`, `taint_flow`. Guarded
-  check-effects-interactions shapes (a write before the external call) are reported at `Low`.
+  `sierra_statement_idx`, `description`, `recommendation`, `taint_flow`. Reentrancy
+  (`caracal-cei-reentrancy-sierra`) is `Medium` at most: `Medium` when storage is read before an
+  external call and written after it with no guard, `Low` otherwise. Writes with no caller check
+  (`caracal-unprotected-state-mutation`) are `Critical` for upgrades, `High` for privileged names
+  (`set_*`, `mint`, `withdraw`, ...), `Low` otherwise; L1 handlers are not checked by it.
 
 ## Known limits (do not work around silently)
 

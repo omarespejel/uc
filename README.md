@@ -224,10 +224,15 @@ constants in the files, so agreement checks the solver, not the model.
 The taint detectors run on Sierra, so they also work on deployed classes with no debug names:
 entry points are named from the ABI by selector and `PanicResult` is recognised structurally.
 Detectors: unprotected state mutation and arbitrary calls on the entry surface, check-effects-
-interactions (lock and reentrancy-guard shapes are downgraded, not hidden), caller-controlled
-loop bounds (interprocedural, numeric parameters only, capped bounds excluded), unvalidated
-storage writes in constructors and setters, swallowed syscall errors, redundant `divmod`,
-bitwise parity. `#[test]` bodies are never symbolic targets; `prove_*`, `invariant_*` and
+interactions, caller-controlled loop bounds (interprocedural, numeric parameters only, capped
+bounds excluded), unvalidated storage writes in constructors and setters, swallowed syscall
+errors, redundant `divmod`, bitwise parity. Severities follow what the evidence shows. A write
+with no caller check is Critical for an upgrade, High when the name signals a privileged action
+(`set_*`, `mint`, `withdraw`, `pause`, ...) and Low otherwise; L1 handlers are left out, since
+they authenticate the L1 sender rather than the caller. Reentrancy is Medium at most, as in
+Slither and Caracal for calls that move no native value: Medium needs storage read before the
+external call and written after it with no guard, and locks, guard writes and write-only shapes
+are Low. `#[test]` bodies are never symbolic targets; `prove_*`, `invariant_*` and
 `check_*` functions are.
 
 ## Local chain

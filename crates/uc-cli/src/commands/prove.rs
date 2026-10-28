@@ -1120,6 +1120,38 @@ fn is_sensitive_state_mutator_name(short_name: &str) -> bool {
         || lower == "__execute__"
 }
 
+/// Whether the error payload a syscall's `Err` branch produces (`payload`) is handled: returned
+/// (`?`), matched on (`assert(res.is_ok())`, a retry on `ENTRYPOINT_NOT_FOUND`) or handed to a
+/// function. A payload that is only dropped, as in `let _ = call_contract_syscall(..)`, is
+/// swallowed. Sierra functions never jump backwards (loops are recursion), so one forward pass
+/// from the branch target sees every use.
+fn syscall_error_handled(index: &SierraProgramIndex<'_>, payload: u64, from: usize, end: usize) -> bool {
+    let mut derived: HashSet<u64> = HashSet::from([payload]);
+    for statement in &index.program.statements[from..end] {
+        match statement {
+            Statement::Invocation(inv) => {
+                if inv.args.iter().any(|arg| derived.contains(&arg.id)) {
+                    let generic = index
+                        .libfuncs
+                        .get(&inv.libfunc_id.id)
+                        .map(|lf| lf.generic_id.as_str())
+                        .unwrap_or_default();
+                    if matches!(generic, "enum_match" | "enum_snapshot_match" | "function_call") {
+                        return true;
+                    }
+                    derived.extend(inv.branches.iter().flat_map(|b| b.results.iter().map(|r| r.id)));
+                }
+            }
+            Statement::Return(vars) => {
+                if vars.iter().any(|var| derived.contains(&var.id)) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn run_caracal_sierra_analysis(
     index: &SierraProgramIndex<'_>,
     summaries: &[FunctionInterprocSummary],
@@ -1167,6 +1199,15 @@ fn run_caracal_sierra_analysis(
         let is_constructor_wrapper = fname.contains("::__constructor::")
             || fname.ends_with("__constructor");
         let (contract_or_mod, short_name) = extract_contract_and_short_name(&fname);
+        // Findings are deduplicated per function; impl names (`VaultImpl`, `ERC20Impl`) repeat
+        // across contracts, so the key is the function's module path, not its last segment.
+        let dedup_scope = fname
+            .split('[')
+            .next()
+            .unwrap_or(&fname)
+            .rsplit_once("::")
+            .map(|(module, _)| module.to_string())
+            .unwrap_or_default();
         let is_constructor = is_constructor_wrapper || short_name == "constructor";
         if contract_or_mod.ends_with("DispatcherImpl")
             || contract_or_mod.ends_with("LibraryDispatcherImpl")
@@ -1210,6 +1251,9 @@ fn run_caracal_sierra_analysis(
         // A storage write that precedes the first external call is the shape of a reentrancy
         // guard or a lock (`start()` writes, call, `end()` writes).
         let mut storage_write_before_external_call = false;
+        // A storage read before the external call that a later write overwrites is the shape a
+        // reentrant call can exploit: it runs against state the function has already read.
+        let mut storage_read_before_external_call = false;
         // Lock recognition: a slot that is read, then written before the external call, is a
         // lock held across the call; writing it back after the call releases it.
         let mut slot_of_var: HashMap<u64, starknet_types_core::felt::Felt> = HashMap::new();
@@ -1249,6 +1293,9 @@ fn run_caracal_sierra_analysis(
             if gid == "storage_read_syscall" {
                 if let Some(slot) = inv.args.last().and_then(|a| slot_of_var.get(&a.id)) {
                     slots_read.insert(*slot);
+                }
+                if seen_external_call_stmt.is_none() {
+                    storage_read_before_external_call = true;
                 }
             }
             if gid == "storage_write_syscall" && seen_external_call_stmt.is_none() && inv.args.len() >= 2 {
@@ -1336,6 +1383,12 @@ fn run_caracal_sierra_analysis(
                         if callee_sum.enforces_signature_guard {
                             signature_checked_before = true;
                         }
+                        if callee_sum.performs_storage_read
+                            && !callee_sum.performs_external_call
+                            && seen_external_call_stmt.is_none()
+                        {
+                            storage_read_before_external_call = true;
+                        }
                         if callee_sum.performs_external_call && seen_external_call_stmt.is_none() {
                             seen_external_call_stmt = Some(stmt_idx);
                         }
@@ -1365,7 +1418,7 @@ fn run_caracal_sierra_analysis(
                         {
                             let key = (
                                 "caracal-tainted-loop-bound-sierra".to_string(),
-                                contract_or_mod.clone(),
+                                dedup_scope.clone(),
                                 short_name.clone(),
                             );
                             if seen_keys.insert(key) {
@@ -1418,8 +1471,11 @@ fn run_caracal_sierra_analysis(
             // "unprotected" even when every caller checks the caller address.
             let is_entry_surface =
                 is_external_wrapper || (!has_wrapper && !summaries[func_idx].has_callers);
+            // L1 handlers run only for L1 messages, so the caller is never an account; they
+            // authenticate the L1 sender (`from_address`), which the caller check cannot see.
             if is_state_write
                 && !is_constructor
+                && !is_l1_handler_wrapper
                 && !fname.contains('[')
                 && (is_external_wrapper || !has_wrapper)
             {
@@ -1436,18 +1492,23 @@ fn run_caracal_sierra_analysis(
                 if !has_auth && contract_requires_auth && is_entry_surface {
                     let key = (
                         "caracal-unprotected-state-mutation".to_string(),
-                        contract_or_mod.clone(),
+                        dedup_scope.clone(),
                         short_name.clone(),
                     );
                     if seen_keys.insert(key) {
                         findings.push(CaracalSierraFinding {
                             detector: "caracal-unprotected-state-mutation".to_string(),
+                            // Without a caller check, the risk depends on what the function is for:
+                            // upgrades and privileged-sounding names are serious, anything else
+                            // is usually meant to be permissionless (pokes, syncs, cleanups).
                             severity: if short_name.contains("upgrade")
                                 || gid == "replace_class_syscall"
                             {
                                 "Critical".to_string()
-                            } else {
+                            } else if is_sensitive_state_mutator_name(&short_name) {
                                 "High".to_string()
+                            } else {
+                                "Low".to_string()
                             },
                             confidence: "High".to_string(),
                             contract_or_module: contract_or_mod.clone(),
@@ -1457,7 +1518,14 @@ fn run_caracal_sierra_analysis(
                                 "{} `{contract_or_mod}::{short_name}` reaches `{gid}` at Sierra statement #{stmt_idx} on a CFG path with no dominating `get_caller_address()` or signature verification guard.",
                                 if is_external_wrapper { "External entrypoint" } else { "Uncalled function" }
                             ),
-                            recommendation: "Enforce caller access control (e.g., `assert_only_owner(@self)` or `OwnableComponent`) before mutating contract storage or upgrading class hashes.".to_string(),
+                            recommendation: if short_name.contains("upgrade")
+                                || gid == "replace_class_syscall"
+                                || is_sensitive_state_mutator_name(&short_name)
+                            {
+                                "Enforce caller access control (e.g., `assert_only_owner(@self)` or `OwnableComponent`) before mutating contract storage or upgrading class hashes.".to_string()
+                            } else {
+                                "Anyone can call this function and change storage. If it is meant to be permissionless, nothing to do; otherwise add a caller check (e.g., `assert_only_owner(@self)`).".to_string()
+                            },
                             taint_flow: vec![
                                 format!("entrypoint({short_name})"),
                                 "no_dominating_caller_check".to_string(),
@@ -1485,15 +1553,18 @@ fn run_caracal_sierra_analysis(
                     if call_stmt < stmt_idx && !releases_lock {
                         let key = (
                             "caracal-cei-reentrancy-sierra".to_string(),
-                            contract_or_mod.clone(),
+                            dedup_scope.clone(),
                             short_name.clone(),
                         );
                         if seen_keys.insert(key) {
                             let under_lock = !lock_slots.is_empty();
                             let guarded = under_lock || storage_write_before_external_call;
+                            // Reentrancy is Medium at most, as in Slither and Caracal for calls
+                            // that move no native value; Medium needs state read before the call.
+                            let stale_state = !guarded && storage_read_before_external_call;
                             findings.push(CaracalSierraFinding {
                                 detector: "caracal-cei-reentrancy-sierra".to_string(),
-                                severity: if guarded { "Low".to_string() } else { "High".to_string() },
+                                severity: if stale_state { "Medium".to_string() } else { "Low".to_string() },
                                 confidence: if under_lock {
                                     "Low".to_string()
                                 } else if guarded {
@@ -1513,9 +1584,13 @@ fn run_caracal_sierra_analysis(
                                     format!(
                                         "`{contract_or_mod}::{short_name}` writes storage before and after an external call (statement #{call_stmt}). The pre-call write is not a lock (its slot is never read first), so it does not block re-entry on its own; the post-call write at statement #{stmt_idx} still runs on reentered state."
                                     )
+                                } else if stale_state {
+                                    format!(
+                                        "Check-Effects-Interactions violation in `{contract_or_mod}::{short_name}`: storage is read, then an external contract is called (Sierra statement #{call_stmt}), then storage is written (statement #{stmt_idx}), with no prior state write that could act as a guard. A reentrant call runs against the state read before the call."
+                                    )
                                 } else {
                                     format!(
-                                        "Check-Effects-Interactions violation in `{contract_or_mod}::{short_name}`: external contract call at Sierra statement #{call_stmt} precedes storage write at statement #{stmt_idx} with no prior state write that could act as a guard."
+                                        "`{contract_or_mod}::{short_name}` writes storage at statement #{stmt_idx} after an external call (statement #{call_stmt}) with no prior state write that could act as a guard. Nothing is read before the call, so a reentrant call sees no stale state in this function; check the functions that call it."
                                     )
                                 },
                                 recommendation: "Perform all `storage_write_syscall` state updates before invoking `call_contract_syscall`, or hold a lock (read, assert, write) across the call and release it after.".to_string(),
@@ -1541,7 +1616,7 @@ fn run_caracal_sierra_analysis(
             {
                 let key = (
                     "caracal-unvalidated-external-storage-write".to_string(),
-                    contract_or_mod.clone(),
+                    dedup_scope.clone(),
                     short_name.clone(),
                 );
                 if seen_keys.insert(key) {
@@ -1582,7 +1657,7 @@ fn run_caracal_sierra_analysis(
                 {
                     let key = (
                         "caracal-unprotected-arbitrary-call".to_string(),
-                        contract_or_mod.clone(),
+                        dedup_scope.clone(),
                         short_name.clone(),
                     );
                     if seen_keys.insert(key) {
@@ -1613,13 +1688,20 @@ fn run_caracal_sierra_analysis(
                         BranchTarget::Fallthrough => stmt_idx + 1,
                         BranchTarget::Statement(s) => s.0,
                     };
+                    // The failure is swallowed only if nothing handles its payload: returning it
+                    // (`?`), matching on it or passing it on all hand it to code that decides.
+                    let error_handled = err_branch
+                        .results
+                        .last()
+                        .is_some_and(|payload| syscall_error_handled(index, payload.id, err_target, end));
                     if err_target >= start
                         && err_target < end
                         && can_reach_ok[err_target - start]
+                        && !error_handled
                     {
                         let key = (
                             "caracal-swallowed-syscall-error".to_string(),
-                            contract_or_mod.clone(),
+                            dedup_scope.clone(),
                             short_name.clone(),
                         );
                         if seen_keys.insert(key) {
@@ -1651,7 +1733,7 @@ fn run_caracal_sierra_analysis(
                 if let Some(prev_stmt) = divmod_numerator_vars.insert(num_var, stmt_idx) {
                     let key = (
                         "caracal-redundant-divrem-sierra".to_string(),
-                        contract_or_mod.clone(),
+                        dedup_scope.clone(),
                         short_name.clone(),
                     );
                     if seen_keys.insert(key) {
@@ -1679,7 +1761,7 @@ fn run_caracal_sierra_analysis(
             if gid == "bitwise" || gid.ends_with("_bitwise") {
                 let key = (
                     "caracal-bitwise-parity-sierra".to_string(),
-                    contract_or_mod.clone(),
+                    dedup_scope.clone(),
                     short_name.clone(),
                 );
                 if seen_keys.insert(key) {
@@ -1713,7 +1795,7 @@ fn run_caracal_sierra_analysis(
             {
                 let key = (
                     "caracal-tainted-loop-bound-sierra".to_string(),
-                    contract_or_mod.clone(),
+                    dedup_scope.clone(),
                     short_name.clone(),
                 );
                 if seen_keys.insert(key) {
@@ -6211,6 +6293,33 @@ fn write_sarif_report(sarif_path: &Path, report: &ProveWorkspaceReport) -> Resul
     write_json_report(sarif_path, &sarif_doc)
 }
 
+/// Source builds name every entry point wrapper `<Contract>::__wrapper__<name>`; only the contract
+/// class says which are L1 handlers. Rename those to `<Contract>::__l1_handler::<name>`, as
+/// `synthesize_contract_function_names` names them in classes without debug info, so the
+/// detectors treat L1 handlers alike in both.
+#[cfg(feature = "native-test-runner")]
+pub(crate) fn mark_l1_handler_wrappers<'a>(
+    program: &mut Program,
+    contracts: impl IntoIterator<Item = &'a cairo_lang_starknet::contract::ContractInfo>,
+) {
+    let handlers: HashSet<u64> = contracts
+        .into_iter()
+        .flat_map(|info| info.l1_handlers.values().map(|function| function.id))
+        .collect();
+    for func in &mut program.funcs {
+        if !handlers.contains(&func.id.id) {
+            continue;
+        }
+        let renamed = func.id.debug_name.as_ref().and_then(|name| {
+            name.rsplit_once("::__wrapper__")
+                .map(|(prefix, short)| format!("{prefix}::__l1_handler::{short}"))
+        });
+        if let Some(renamed) = renamed {
+            func.id.debug_name = Some(renamed.into());
+        }
+    }
+}
+
 #[cfg(feature = "native-test-runner")]
 fn prove_single_package(
     manifest_path: &Path,
@@ -6222,7 +6331,7 @@ fn prove_single_package(
     use cairo_lang_runner::SierraCasmRunner;
     use cairo_lang_sierra_to_casm::metadata::MetadataComputationConfig;
 
-    let (compilation, _cache_hit, _compile_ms) = compile_or_load_native_tests_for_prove(
+    let (mut compilation, _cache_hit, _compile_ms) = compile_or_load_native_tests_for_prove(
         manifest_path,
         workspace_root,
         package_name,
@@ -6230,6 +6339,10 @@ fn prove_single_package(
         &args.features,
         args.no_cache,
     )?;
+    mark_l1_handler_wrappers(
+        &mut compilation.sierra_program.program,
+        compilation.metadata.contracts_info.values(),
+    );
 
     let program = &compilation.sierra_program.program;
     let (mut symbolic_proofs, caracal_findings) = analyze_sierra_program(
@@ -7342,6 +7455,22 @@ pub mod UnrelatedWriteVault {
 }
 
 #[starknet::contract]
+pub mod StaleVault {
+    use starknet::ContractAddress;
+    use starknet::storage::{StoragePointerReadAccess, StoragePointerWriteAccess};
+    use super::{ICalleeDispatcher, ICalleeDispatcherTrait};
+    #[storage]
+    struct Storage { balance: u64 }
+    #[abi(embed_v0)]
+    impl VaultImpl of super::IVault<ContractState> {
+        fn withdraw(ref self: ContractState, target: ContractAddress) {
+            let balance = self.balance.read();
+            ICalleeDispatcher { contract_address: target }.ping();
+            self.balance.write(balance - 1);
+        }
+    }
+}
+#[starknet::contract]
 pub mod NakedVault {
     use starknet::ContractAddress;
     use starknet::storage::{StoragePointerReadAccess, StoragePointerWriteAccess};
@@ -7367,13 +7496,152 @@ pub mod NakedVault {
             .filter(|f| f.detector == "caracal-cei-reentrancy-sierra" && f.function == "withdraw")
             .map(|f| (f.severity.clone(), f.description.clone()))
             .collect();
-        assert_eq!(cei.len(), 3, "one verdict per vault: {cei:?}");
+        assert_eq!(cei.len(), 4, "one verdict per vault: {cei:?}");
         let locked = cei.iter().find(|(_, d)| d.contains("holding a lock")).expect("lock verdict");
         assert_eq!(locked.0, "Low", "{locked:?}");
         let unrelated = cei.iter().find(|(_, d)| d.contains("not a lock")).expect("unrelated pre-write verdict");
         assert_eq!(unrelated.0, "Low", "{unrelated:?}");
-        let naked = cei.iter().find(|(_, d)| d.contains("no prior state write")).expect("naked verdict");
-        assert_eq!(naked.0, "High", "{naked:?}");
+        // Calling out and then writing, with nothing read first, leaves no stale state to exploit.
+        let naked = cei.iter().find(|(_, d)| d.contains("sees no stale state")).expect("naked verdict");
+        assert_eq!(naked.0, "Low", "{naked:?}");
+        // Read, call, write: a reentrant call runs against the balance read before the call.
+        let stale = cei.iter().find(|(_, d)| d.contains("state read before the call")).expect("stale verdict");
+        assert_eq!(stale.0, "Medium", "{stale:?}");
+    }
+
+    /// A vendored-plugin patch (2026-10-28) skipped dispatchers for any `AccountContract` trait
+    /// whose module mentioned `AccountContractDispatcher`; user account interfaces then failed to
+    /// compile natively while scarb built them. The plugin must match upstream.
+    #[test]
+    fn user_account_contract_interfaces_keep_their_dispatcher() {
+        let _env = crate::test_env_shared();
+        let root = std::env::temp_dir().join(format!("uc-account-dispatcher-{}-{}", std::process::id(), epoch_ms_u64().unwrap_or(1)));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("Scarb.toml"), "[package]\nname = \"acct_disp\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n\n[dependencies]\nstarknet = \"2.18.0\"\n").unwrap();
+        fs::write(root.join("src/lib.cairo"), r#"
+#[starknet::interface]
+pub trait AccountContract<T> {
+    fn get_x(self: @T) -> felt252;
+}
+
+pub fn read_x(addr: starknet::ContractAddress) -> felt252 {
+    AccountContractDispatcher { contract_address: addr }.get_x()
+}
+"#).unwrap();
+        let compiled = compile_or_load_native_tests(&root.join("Scarb.toml"), &root, "acct_disp", "acct_disp", &[], true);
+        let _ = fs::remove_dir_all(&root);
+        assert!(compiled.is_ok(), "{:?}", compiled.err());
+    }
+
+    /// Every major mainnet token was flagged for its upgrade routine, which propagates a failed
+    /// library call to its caller with `?` instead of dropping it.
+    #[test]
+    fn swallowed_syscall_errors_exclude_propagated_ones() {
+        let _env = crate::test_env_shared();
+        let root = std::env::temp_dir().join(format!("uc-swallow-test-{}-{}", std::process::id(), epoch_ms_u64().unwrap_or(1)));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("Scarb.toml"), "[package]\nname = \"swallow_demo\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n\n[dependencies]\nstarknet = \"2.18.0\"\n").unwrap();
+        fs::write(root.join("src/lib.cairo"), r#"
+#[starknet::contract]
+pub mod Caller {
+    use starknet::{ContractAddress, SyscallResult, SyscallResultTrait};
+    use starknet::syscalls::call_contract_syscall;
+    #[storage]
+    struct Storage {}
+    fn forward(target: ContractAddress) -> SyscallResult<Span<felt252>> {
+        let data = call_contract_syscall(target, selector!("ping"), array![].span())?;
+        Result::Ok(data)
+    }
+    #[external(v0)]
+    fn swallow(ref self: ContractState, target: ContractAddress) -> u32 {
+        match call_contract_syscall(target, selector!("ping"), array![].span()) {
+            Result::Ok(data) => data.len(),
+            Result::Err(_) => 0,
+        }
+    }
+    #[external(v0)]
+    fn propagate(ref self: ContractState, target: ContractAddress) -> u32 {
+        forward(target).unwrap_syscall().len()
+    }
+    #[external(v0)]
+    fn ignore(ref self: ContractState, target: ContractAddress) {
+        let _ = call_contract_syscall(target, selector!("ping"), array![].span());
+    }
+    #[external(v0)]
+    fn checked(ref self: ContractState, target: ContractAddress) {
+        let res = call_contract_syscall(target, selector!("ping"), array![].span());
+        assert(res.is_ok(), 'PING_FAILED');
+    }
+    #[external(v0)]
+    fn unwrap(ref self: ContractState, target: ContractAddress) -> u32 {
+        call_contract_syscall(target, selector!("ping"), array![].span()).unwrap_syscall().len()
+    }
+}
+"#).unwrap();
+        let (comp, _, _) = compile_or_load_native_tests(&root.join("Scarb.toml"), &root, "swallow_demo", "swallow_demo", &[], true).expect("compile");
+        let (_, findings) = analyze_sierra_program(&comp.sierra_program.program, "swallow_demo", None, 1024, 1024, true, None);
+        let _ = fs::remove_dir_all(&root);
+        let swallowed: BTreeSet<String> = findings
+            .iter()
+            .filter(|f| f.detector == "caracal-swallowed-syscall-error")
+            .map(|f| f.function.clone())
+            .collect();
+        assert!(swallowed.contains("swallow") && swallowed.contains("ignore"), "{swallowed:?}");
+        assert!(!swallowed.contains("checked"), "{swallowed:?}");
+        assert!(!swallowed.contains("forward") && !swallowed.contains("propagate"), "{swallowed:?}");
+        assert!(!swallowed.contains("unwrap"), "{swallowed:?}");
+    }
+
+    /// Mainnet audits flagged StarkGate's `approve_l1_address` (an L1 handler) and permissionless
+    /// cleanups such as Ekubo's `clear_core_protocol_fee` as High.
+    #[test]
+    fn unprotected_writes_skip_l1_handlers_and_grade_by_purpose() {
+        let _env = crate::test_env_shared();
+        let root = std::env::temp_dir().join(format!("uc-unprotected-test-{}-{}", std::process::id(), epoch_ms_u64().unwrap_or(1)));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("Scarb.toml"), "[package]\nname = \"unprot_demo\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n\n[dependencies]\nstarknet = \"2.18.0\"\n").unwrap();
+        fs::write(root.join("src/lib.cairo"), r#"
+#[starknet::contract]
+pub mod Bridge {
+    use starknet::ContractAddress;
+    use starknet::storage::{Map, StorageMapReadAccess, StorageMapWriteAccess, StoragePointerReadAccess, StoragePointerWriteAccess};
+    #[storage]
+    struct Storage { l1_bridge: felt252, owner: ContractAddress, note: felt252, balances: Map<felt252, u128> }
+    #[constructor]
+    fn constructor(ref self: ContractState, l1_bridge: felt252, owner: ContractAddress) {
+        self.l1_bridge.write(l1_bridge);
+        self.owner.write(owner);
+    }
+    #[l1_handler]
+    fn handle_deposit(ref self: ContractState, from_address: felt252, account: felt252, amount: u128) {
+        assert(from_address == self.l1_bridge.read(), 'ONLY_L1_BRIDGE');
+        self.balances.write(account, self.balances.read(account) + amount);
+    }
+    #[external(v0)]
+    fn set_note(ref self: ContractState, note: felt252) {
+        self.note.write(note);
+    }
+    #[external(v0)]
+    fn poke(ref self: ContractState) {
+        self.note.write(0);
+    }
+}
+"#).unwrap();
+        let (mut comp, _, _) = compile_or_load_native_tests(&root.join("Scarb.toml"), &root, "unprot_demo", "unprot_demo", &[], true).expect("compile");
+        mark_l1_handler_wrappers(&mut comp.sierra_program.program, comp.metadata.contracts_info.values());
+        let (_, findings) = analyze_sierra_program(&comp.sierra_program.program, "unprot_demo", None, 1024, 1024, true, None);
+        let _ = fs::remove_dir_all(&root);
+        let unprotected: BTreeMap<String, String> = findings
+            .iter()
+            .filter(|f| f.detector == "caracal-unprotected-state-mutation")
+            .map(|f| (f.function.clone(), f.severity.clone()))
+            .collect();
+        assert!(!unprotected.contains_key("handle_deposit"), "L1 handlers are not account entry points: {unprotected:?}");
+        assert_eq!(unprotected.get("set_note").map(String::as_str), Some("High"), "{unprotected:?}");
+        assert_eq!(unprotected.get("poke").map(String::as_str), Some("Low"), "{unprotected:?}");
     }
 
     /// Functions in which the differential campaigns (`benchmarks/differential/run_arith.py`)
