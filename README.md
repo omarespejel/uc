@@ -74,11 +74,31 @@ programs with an exact Python model of their semantics and compares uc with the 
   counterexamples, and z3 verified all 80,620 decided SMT obligations from the 525-function suite
   with 0 disagreements.
 
+**Checked against the live chain.** `benchmarks/live/live_check.py` follows a network block by
+block and uses the chain as the oracle. Every v3 transaction hash must match `uc utils tx-hash`.
+Every declared class must match `uc class-hash --casm` on both the class hash and the compiled
+class hash the sequencer accepted, and `uc audit` must finish on it. Sampled invokes must match
+`starknet_traceTransaction` call for call under `uc trace`, and `starknet_call` under `uc call`.
+Disagreements are saved with their inputs, and `--port` serves a live page. On 2026-10-28 it
+found two bugs in its first hour, both fixed. Invokes that carry `proof_facts` (client-side
+proven transactions, which spec 0.10 returns with `INCLUDE_PROOF_FACTS`) were hashed without
+them: 2 of 10,879 Sepolia transactions. `uc trace` reported a call at address `0x0` for every
+reverted transaction. After the fixes, 671 mainnet and 1,425 Sepolia blocks agreed on every
+check: 5,241 transaction hashes, 179 traces with 1,091 decoded selectors, and 180 calls. The two
+classes declared on Sepolia during the first run matched on both the class hash and the
+compiled class hash.
+
 **Real bytecode.** `benchmarks/scripts/run_mainnet_audit.py` fetches 20 well-known mainnet
 classes over JSON-RPC and audits them with no source: 16 are Sierra classes (4 are Cairo 0 or
-misaddressed). It analyses 2,843 functions and reports 92 detector findings and 6
-reachable-panic witnesses (`mainnet-audit-20261026-063241.json`, 32 s). The witnesses were 23
-before callees were inlined and callee verdicts used. Each function gets a 15 s budget, 1024 statements per path and
+misaddressed). It analyses 2,843 functions and reports no High finding, 22 Medium (each a
+storage read, an external call, then a storage write) and 50 Low
+(`mainnet-audit-20261028-080822.json`). Until 2026-10-28 the detectors rated 47 findings in these
+classes High. Checked against the protocols' source, they were L1 handlers taken for
+unprotected entry points, a permissionless cleanup and a one-shot initializer graded like
+privileged setters, errors returned to the caller read as swallowed, and every write after a
+call rated High; the detectors now grade by the evidence (see Formal verification). Panics that
+need a helper's parameter at its type bound are preconditions, so no witness is reported. Each
+function gets a 15 s budget, 1024 statements per path and
 1024 paths; the explorer is depth-first with a bounded pending set, so the largest class in the
 corpus (Ekubo core, 208 functions) peaks below 50 MB. Results are written to
 `benchmarks/results/`. They are a measurement of the prover, not a security review of those
@@ -359,6 +379,7 @@ cargo +stable build --release   # what the release workflow builds; verified 202
 cargo test --release            # 521 tests
 python3 benchmarks/scripts/run_head_to_head.py --uc target/release/uc --project <dir> ...
 python3 benchmarks/scripts/run_mainnet_audit.py --uc target/release/uc
+python3 benchmarks/live/live_check.py --uc target/release/uc --port 8790   # follow mainnet live
 ```
 
 The compiler crates live in `third_party/` as patched copies of the crates.io 2.18.0 sources
