@@ -1906,14 +1906,10 @@ pub(crate) fn run_trace_tx(args: TraceTxArgs) -> Result<()> {
         .or_else(|| trace_json.get("result").and_then(|r| r.get("execute_invocation")))
         .unwrap_or(&trace_json);
 
-    let contract_addr = root_inv
-        .get("contract_address")
-        .and_then(|v| v.as_str())
-        .unwrap_or("0x0");
-    let raw_sel = root_inv
-        .get("entry_point_selector")
-        .and_then(|v| v.as_str())
-        .unwrap_or("0x0");
+    // A reverted transaction's `execute_invocation` holds only `revert_reason`: it has no root
+    // call and no call tree.
+    let contract_addr = root_inv.get("contract_address").and_then(|v| v.as_str());
+    let raw_sel = root_inv.get("entry_point_selector").and_then(|v| v.as_str());
     let revert_reason = root_inv.get("revert_reason").and_then(|v| v.as_str());
 
     // Name every call from the ABI of the class it ran (one class fetch per distinct class) and
@@ -1929,12 +1925,14 @@ pub(crate) fn run_trace_tx(args: TraceTxArgs) -> Result<()> {
         _ => None,
     };
     let mut calls: Vec<serde_json::Value> = Vec::new();
-    flatten_trace_calls(root_inv, 0, &selector_dict, &mut class_names, &mut labels, &mut calls);
+    if contract_addr.is_some() {
+        flatten_trace_calls(root_inv, 0, &selector_dict, &mut class_names, &mut labels, &mut calls);
+    }
     let decoded_sel = calls
         .first()
         .and_then(|c| c.get("function").and_then(|f| f.as_str()))
         .map(str::to_string)
-        .unwrap_or_else(|| selector_dict.get(raw_sel).cloned().unwrap_or_else(|| raw_sel.to_string()));
+        .or_else(|| raw_sel.map(|sel| selector_dict.get(sel).cloned().unwrap_or_else(|| sel.to_string())));
     let mut participants: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     for c in &calls {
         if let Some(addr) = c.get("contract_address").and_then(|v| v.as_str()) {
