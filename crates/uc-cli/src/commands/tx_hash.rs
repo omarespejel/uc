@@ -104,6 +104,12 @@ pub(crate) fn v3_transaction_hash(tx: &serde_json::Value, chain_id: Felt) -> Res
             let mut fields = common_prefix("invoke", tx, "sender_address", chain_id)?;
             fields.push(poseidon_hash_many(&felts_of(tx.get("account_deployment_data"))?));
             fields.push(poseidon_hash_many(&felts_of(tx.get("calldata"))?));
+            // Client-side proven invokes (Starknet 0.14.1+) commit to their proof facts; the
+            // RPC returns them with `response_flags: ["INCLUDE_PROOF_FACTS"]` (spec 0.10).
+            let proof_facts = felts_of(tx.get("proof_facts"))?;
+            if !proof_facts.is_empty() {
+                fields.push(poseidon_hash_many(&proof_facts));
+            }
             Ok(poseidon_hash_many(&fields))
         }
         "DECLARE" => {
@@ -265,5 +271,17 @@ mod tests {
         assert!(verify(&pubkey, &hash));
         assert!(!verify(&pubkey, &(hash + Felt::ONE)));
         assert!(!verify(&starknet_crypto::get_public_key(&Felt::from(7u64)), &hash));
+    }
+
+    /// A client-side proven invoke on Sepolia (block 17267910). Without its proof facts the hash
+    /// came out as 0x7a88..476e, and the live checker (`benchmarks/live`) caught the mismatch.
+    #[test]
+    fn invoke_with_proof_facts_hashes_like_the_sequencer() {
+        let tx: serde_json::Value = serde_json::from_str(r#"{"account_deployment_data": [], "calldata": ["0x1", "0x4718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d", "0x35a73cd311a05d46deda634c5ee045db92f811b4e74bca4437fcb5302b7af33", "0x1", "0x5a018f06581781371af2d639e5c905e5da998acbc53136f17e6ec99bdd77aa"], "fee_data_availability_mode": "L1", "nonce": "0x562", "nonce_data_availability_mode": "L1", "paymaster_data": [], "proof_facts": ["0x50524f4f4631", "0x5649525455414c5f534e4f53", "0x53f6c9fcfd31d27279ff7d7e422b44623550a732b59fe193354a7316a96daa1", "0x5649525455414c5f534e4f5330", "0x1077c34", "0x77725f4dd3d8dd85fab6b66df9ee997a018c97a0e995d9085fa4e49a526fc61", "0x57ed4d5e20d617d8cc087a5882eae4f71d005172326be6439b2e1fd8b4dc57", "0x0"], "resource_bounds": {"l1_data_gas": {"max_amount": "0x1b0", "max_price_per_unit": "0x18bcc"}, "l1_gas": {"max_amount": "0x10000", "max_price_per_unit": "0x5c275b61eba2"}, "l2_gas": {"max_amount": "0x7000000", "max_price_per_unit": "0x8d5d73c8c"}}, "sender_address": "0x5a018f06581781371af2d639e5c905e5da998acbc53136f17e6ec99bdd77aa", "signature": ["0x34a780cc797e282d77538af1ffd8aeca4dca3c9bab77b110a57829fb7f02462", "0x51b3d3e9a60ef5bdfcfdd59d3e874ad234674641c91bcb4e2e747ec8383ebea"], "tip": "0x0", "type": "INVOKE", "version": "0x3"}"#).unwrap();
+        let chain = Felt::from_bytes_be_slice(b"SN_SEPOLIA");
+        assert_eq!(format_felt_hex(&v3_transaction_hash(&tx, chain).unwrap()), "0x6b111fd33b65714eb950cf4b7aee50697c4b1fdf6c36668c88edb711185e33e");
+        let mut without = tx.clone();
+        without.as_object_mut().unwrap().remove("proof_facts");
+        assert_ne!(format_felt_hex(&v3_transaction_hash(&without, chain).unwrap()), "0x6b111fd33b65714eb950cf4b7aee50697c4b1fdf6c36668c88edb711185e33e");
     }
 }
