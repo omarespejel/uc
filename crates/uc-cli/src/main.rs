@@ -20292,6 +20292,14 @@ fn native_diagnostic_crates(
     }
 }
 
+/// Best effort: without the marker the next build checks the dependencies again.
+#[cfg(feature = "native-compile")]
+fn native_record_clean_dependencies(marker: &Path) {
+    if let Some(parent) = marker.parent() {
+        let _ = fs::create_dir_all(parent).and_then(|()| fs::write(marker, b""));
+    }
+}
+
 /// Names one exact set of dependencies for this build of uc. Scarb skips the crates it loads
 /// from its cache, which it writes only for crates without errors; uc checks a set once.
 #[cfg(feature = "native-compile")]
@@ -21256,9 +21264,7 @@ fn run_native_build_inner(
         stderr: diagnostics.text(),
     };
     if let Some(marker) = diagnostics.clean_dependencies_marker() {
-        if let Some(parent) = marker.parent() {
-            let _ = fs::create_dir_all(parent).and_then(|()| fs::write(&marker, b""));
-        }
+        native_record_clean_dependencies(&marker);
     }
     tracing::debug!(
         manifest_path = %manifest_path.display(),

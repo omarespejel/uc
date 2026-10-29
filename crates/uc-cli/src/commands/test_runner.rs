@@ -3123,6 +3123,8 @@ fn compile_or_load_native_tests_with_mode(
             let discovered_contracts =
                 cairo_lang_starknet::contract::find_contracts(&db, &contract_crate_ids);
 
+            // Dependencies too, as snforge's scarb build checks them (see `uc build`).
+            let diagnostic_crates = crate::native_diagnostic_crates(&db, &test_crate_inputs);
             let mut diag_string = String::new();
             let compiled = cairo_lang_test_plugin::compile_test_prepared_db(
                 &db,
@@ -3138,7 +3140,8 @@ fn compile_or_load_native_tests_with_mode(
                 },
                 test_crate_inputs.clone(),
                 DiagnosticsReporter::write_to_string(&mut diag_string)
-                    .with_crates(&test_crate_inputs)
+                    .with_crates(&diagnostic_crates.checked)
+                    .with_ignore_warnings_crates(&diagnostic_crates.dependencies)
                     .allow_warnings(),
             )
             .map_err(|err| {
@@ -3153,6 +3156,10 @@ fn compile_or_load_native_tests_with_mode(
                     anyhow!("Cairo test compilation failed:\n{}", diag_string.trim())
                 }
             })?;
+
+            if let Some(marker) = &diagnostic_crates.clean_dependencies_marker {
+                crate::native_record_clean_dependencies(marker);
+            }
 
             // Register `snforge_std::declare("<ContractName>")` class_hash aliases in `contracts_info`
             // Insert dependency contracts first and root/integration crate contracts second so root
@@ -6243,6 +6250,31 @@ mod tests {
         let expected: Vec<(String, String)> =
             expected.iter().map(|(n, s)| (n.to_string(), s.to_string())).collect();
         assert_eq!(outcomes, expected, "{rep}");
+    }
+
+    #[test]
+    fn dependency_code_errors_fail_uc_test_like_snforge() {
+        let _env = crate::test_env_shared();
+        // snforge builds with scarb, which checks every crate; uc test checked only the package.
+        let proj = TempTestProject::new("dep_error_test");
+        let dep = proj.dir.join("dep");
+        fs::create_dir_all(dep.join("src")).unwrap();
+        fs::write(dep.join("Scarb.toml"), "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n").unwrap();
+        fs::write(dep.join("src/lib.cairo"), "pub fn good() -> felt252 { 1 }\nfn unused_broken() -> felt252 { undefined_thing() }\n").unwrap();
+        let manifest_path = proj.dir.join("Scarb.toml");
+        fs::write(
+            &manifest_path,
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n\n[dependencies]\ndep = { path = \"dep\" }\n",
+        )
+        .unwrap();
+        fs::write(
+            proj.dir.join("src/lib.cairo"),
+            "fn one() -> felt252 { dep::good() }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn uses_dep() {\n        assert(super::one() == 1, 'one');\n    }\n}\n",
+        )
+        .unwrap();
+        let err = run_test(TestArgs { manifest_path: Some(manifest_path), ..Default::default() })
+            .expect_err("an error in a dependency must fail the test build");
+        assert!(format!("{err:#}").contains("Function not found"), "{err:#}");
     }
 
     #[test]
