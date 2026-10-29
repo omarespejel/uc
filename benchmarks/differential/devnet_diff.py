@@ -5,13 +5,18 @@
         --uc-devnet http://127.0.0.1:5062/rpc --reference http://127.0.0.1:5061/rpc
 
 Declares a fresh Counter class with `uc declare`, deploys it with `uc deploy`, invokes and calls
-it, then probes the nodes directly over JSON-RPC: receipts, blocks, events, storage, nonces,
-state updates, traces, fee estimates, simulation, a reverted call, a stale nonce and a bad
-signature (raw transactions signed with starknet-py, independent of uc). Each probe is reported
-as `same` (equal values), `same_shape` (equal keys, values differ, as with fees), `differ`, or
-`unsupported` on one side. Writes <out>/summary.json.
+it, then probes the nodes directly over JSON-RPC: receipts, blocks, events (paged), storage,
+nonces, state updates, traces, fee estimates, simulation, and the edge cases a client meets:
+a reverted call, a stale nonce, a bad signature, resource bounds too low, a fee the account
+cannot pay, unknown transactions, contracts, classes and blocks, and a failing call. Raw
+transactions are hashed with `uc utils tx-hash` (checked against mainnet and Sepolia by
+`benchmarks/live`) and signed by this script's own STARK-curve ECDSA, so the reference node
+independently checks every signature. Each probe is reported as `same`, `same_error` (both
+nodes return the same error code), `same_shape` (equal keys, values differ, as with fees),
+`differ`, or `unsupported` on one side. Writes <out>/summary.json; exit 1 on `differ`.
 """
 import argparse
+import hashlib
 import json
 import random
 import subprocess
@@ -19,10 +24,83 @@ import sys
 import urllib.request
 from pathlib import Path
 
-from starknet_py.hash.selector import get_selector_from_name
-from starknet_py.hash.transaction import CommonTransactionV3Fields, TransactionHashPrefix, compute_invoke_v3_transaction_hash
-from starknet_py.hash.utils import message_signature
-from starknet_py.net.client_models import DAMode, ResourceBounds, ResourceBoundsMapping
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "live"))
+from live_check import sn_keccak  # noqa: E402
+
+# STARK curve (y^2 = x^3 + x + BETA over P) and its ECDSA, as starknet-crypto signs.
+P = 2**251 + 17 * 2**192 + 1
+BETA = 0x6F21413EFBE40DE150E596D72F7A8C5609AD26C15C915C1F4CDFCB99CEE9E89
+N = 0x800000000000010FFFFFFFFFFFFFFFFB781126DCAE7B2321E66A241ADC64D2F
+G = (0x1EF15C18599971B7BECED415A40F0C7DEACFD9B0D1819E03D723D8BC943CFCA,
+     0x5668060AA49730B7BE4801DF46EC62DE53ECD11ABE43A32873000C36E8DC1F)
+
+
+def ec_add(a, b):
+    if a is None or b is None:
+        return a or b
+    if a[0] == b[0]:
+        if (a[1] + b[1]) % P == 0:
+            return None
+        m = (3 * a[0] * a[0] + 1) * pow(2 * a[1], -1, P) % P
+    else:
+        m = (b[1] - a[1]) * pow(b[0] - a[0], -1, P) % P
+    x = (m * m - a[0] - b[0]) % P
+    return x, (m * (a[0] - x) - a[1]) % P
+
+
+def ec_mul(k, point):
+    acc = None
+    while k:
+        if k & 1:
+            acc = ec_add(acc, point)
+        point, k = ec_add(point, point), k >> 1
+    return acc
+
+
+def sign(msg_hash, private_key):
+    k = int.from_bytes(hashlib.sha256(f"{private_key}:{msg_hash}".encode()).digest(), "big")
+    while True:
+        k = k % (N - 1) + 1
+        r = ec_mul(k, G)[0] % N
+        s = pow(k, -1, N) * (msg_hash + r * private_key) % N
+        if 0 < r < 2**251 and 0 < s < N and pow(s, -1, N) < 2**251:
+            return r, s
+        k += 1
+
+
+def verify(msg_hash, public_key_x, r, s):
+    y2 = (pow(public_key_x, 3, P) + public_key_x + BETA) % P
+    if pow(y2, (P - 1) // 2, P) != 1:
+        return False
+    y = tonelli(y2)
+    w = pow(s, -1, N)
+    for public in ((public_key_x, y), (public_key_x, P - y)):
+        point = ec_add(ec_mul(msg_hash * w % N, G), ec_mul(r * w % N, public))
+        if point and point[0] % N == r:
+            return True
+    return False
+
+
+def tonelli(n):
+    """Square root modulo P (P - 1 is divisible by a large power of two)."""
+    q, e = P - 1, 0
+    while q % 2 == 0:
+        q, e = q // 2, e + 1
+    z = 3
+    while pow(z, (P - 1) // 2, P) != P - 1:
+        z += 1
+    m, c, t, r = e, pow(z, q, P), pow(n, q, P), pow(n, (q + 1) // 2, P)
+    while t != 1:
+        i, t2 = 0, t
+        while t2 != 1:
+            t2, i = t2 * t2 % P, i + 1
+        b = pow(c, 1 << (m - i - 1), P)
+        m, c, t, r = i, b * b % P, t * b * b % P, r * b % P
+    return r
+
+
+def get_selector_from_name(name):
+    return sn_keccak(name)
 
 COUNTER = """#[starknet::interface]
 pub trait ICounter<T> { fn increase(ref self: T, by: u64); fn get(self: @T) -> u64; fn tag(self: @T) -> felt252; }
@@ -63,8 +141,11 @@ def uc_json(uc, args, cwd):
         return {"error": (p.stderr or p.stdout)[-600:]}
 
 
-def raw_invoke(url, account, calls, nonce, signature_override=None):
-    """An INVOKE V3 built and signed with starknet-py; resource bounds from the node's estimate."""
+UC = None
+
+
+def raw_invoke(url, account, calls, nonce, signature_override=None, bounds_override=None):
+    """An INVOKE V3 with bounds from the node's estimate, hashed by uc and signed here."""
     calldata = [len(calls)]
     for to, selector, args in calls:
         calldata += [to, selector, len(args), *args]
@@ -74,15 +155,20 @@ def raw_invoke(url, account, calls, nonce, signature_override=None):
                 "resource_bounds": {k: {"max_amount": "0x0", "max_price_per_unit": "0x0"} for k in ("l1_gas", "l2_gas", "l1_data_gas")}}
     kind, est = rpc(url, "starknet_estimateFee", {"request": [unsigned], "simulation_flags": ["SKIP_VALIDATE"], "block_id": "latest"})
     est = est[0] if kind == "ok" else {}
+
     def bound(consumed, price, floor):
-        return ResourceBounds(max_amount=max(int(est.get(consumed, "0x0"), 16) * 2, floor), max_price_per_unit=max(int(est.get(price, "0x0"), 16) * 2, 1))
-    rb = ResourceBoundsMapping(l1_gas=bound("l1_gas_consumed", "l1_gas_price", 0), l2_gas=bound("l2_gas_consumed", "l2_gas_price", 2_000_000), l1_data_gas=bound("l1_data_gas_consumed", "l1_data_gas_price", 1000))
-    chain = int(rpc(url, "starknet_chainId", [])[1], 16)
-    common = CommonTransactionV3Fields(tx_prefix=TransactionHashPrefix.INVOKE, version=3, address=sender, tip=0, resource_bounds=rb, paymaster_data=[], nonce_data_availability_mode=DAMode.L1, fee_data_availability_mode=DAMode.L1, chain_id=chain, nonce=nonce)
-    tx_hash = compute_invoke_v3_transaction_hash(account_deployment_data=[], calldata=calldata, common_fields=common)
-    r, s = message_signature(tx_hash, int(account["private_key"], 16))
-    tx = dict(unsigned, signature=[hex(x) for x in (signature_override or [r, s])],
-              resource_bounds={k: {"max_amount": hex(getattr(rb, k).max_amount), "max_price_per_unit": hex(getattr(rb, k).max_price_per_unit)} for k in ("l1_gas", "l2_gas", "l1_data_gas")})
+        return {"max_amount": hex(max(int(est.get(consumed, "0x0"), 16) * 2, floor)),
+                "max_price_per_unit": hex(max(int(est.get(price, "0x0"), 16) * 2, 1))}
+
+    unsigned["resource_bounds"] = bounds_override or {"l1_gas": bound("l1_gas_consumed", "l1_gas_price", 0),
+                                                      "l2_gas": bound("l2_gas_consumed", "l2_gas_price", 2_000_000),
+                                                      "l1_data_gas": bound("l1_data_gas_consumed", "l1_data_gas_price", 1000)}
+    chain = rpc(url, "starknet_chainId", [])[1]
+    p = subprocess.run([UC, "utils", "tx-hash", "--tx", "-", "--chain-id", chain, "--json"], input=json.dumps(unsigned), capture_output=True, text=True)
+    tx_hash = int(json.loads(p.stdout)["transaction_hash"], 16)
+    r, s = sign(tx_hash, int(account["private_key"], 16))
+    assert verify(tx_hash, int(account["public_key"], 16), r, s), "the script's own signature does not verify"
+    tx = dict(unsigned, signature=[hex(x) for x in (signature_override or [r, s])])
     return rpc(url, "starknet_addInvokeTransaction", {"invoke_transaction": tx}), tx_hash
 
 
@@ -127,6 +213,28 @@ def scenario(uc, url, pkg):
     out["reverted"] = reverted
     if reverted[0] == "ok":
         out["reverted_receipt"] = rpc(url, "starknet_getTransactionReceipt", {"transaction_hash": reverted[1]["transaction_hash"]})
+    nonce = int(rpc(url, "starknet_getNonce", {"block_id": "latest", "contract_address": acc["address"]})[1], 16)
+    tiny = {k: {"max_amount": "0x1", "max_price_per_unit": "0x1"} for k in ("l1_gas", "l2_gas", "l1_data_gas")}
+    out["bounds_too_low"] = raw_invoke(url, acc, inc, nonce, bounds_override=tiny)[0]
+    huge = dict(tiny, l2_gas={"max_amount": hex(10**9), "max_price_per_unit": hex(10**30)})
+    out["fee_unaffordable"] = raw_invoke(url, acc, inc, nonce, bounds_override=huge)[0]
+    unknown = "0x123456789abcdef"
+    out["unknown_receipt"] = rpc(url, "starknet_getTransactionReceipt", {"transaction_hash": unknown})
+    out["unknown_status"] = rpc(url, "starknet_getTransactionStatus", {"transaction_hash": unknown})
+    out["unknown_class_at"] = rpc(url, "starknet_getClassHashAt", {"block_id": "latest", "contract_address": unknown})
+    out["unknown_storage"] = rpc(url, "starknet_getStorageAt", {"contract_address": unknown, "key": "0x1", "block_id": "latest"})
+    out["unknown_nonce"] = rpc(url, "starknet_getNonce", {"block_id": "latest", "contract_address": unknown})
+    out["unknown_class"] = rpc(url, "starknet_getClass", {"block_id": "latest", "class_hash": unknown})
+    out["future_block"] = rpc(url, "starknet_getBlockWithTxHashes", {"block_id": {"block_number": 10**9}})
+    out["call_missing_entry"] = rpc(url, "starknet_call", {"request": {"contract_address": addr or "0x0", "entry_point_selector": hex(get_selector_from_name("no_such_entry_point")), "calldata": []}, "block_id": "latest"})
+    out["estimate_stale_nonce"] = rpc(url, "starknet_estimateFee", {"request": [dict(probe_tx, nonce="0x0")], "simulation_flags": [], "block_id": "latest"})
+    page1 = rpc(url, "starknet_getEvents", {"filter": {"from_block": {"block_number": 0}, "to_block": "latest", "chunk_size": 1}})
+    out["events_page_1"] = page1
+    token = page1[1].get("continuation_token") if page1[0] == "ok" else None
+    if token:
+        out["events_page_2"] = rpc(url, "starknet_getEvents", {"filter": {"from_block": {"block_number": 0}, "to_block": "latest", "chunk_size": 1, "continuation_token": token}})
+    out["block_hash_and_number"] = rpc(url, "starknet_blockHashAndNumber", [])
+    out["block_with_receipts"] = rpc(url, "starknet_getBlockWithReceipts", {"block_id": "latest"})
     return out
 
 
@@ -141,6 +249,8 @@ def shape(v):
 def classify(a, b):
     if a == b:
         return "same"
+    if all(isinstance(x, (list, tuple)) and len(x) == 2 and x[0] == "err" for x in (a, b)):
+        return "same_error" if a[1].get("code") == b[1].get("code") else "differ"
     if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)) and len(a) == 2 and len(b) == 2 and a[0] != b[0]:
         return "unsupported_uc" if a[0] == "err" else "unsupported_reference"
     return "same_shape" if shape(a) == shape(b) else "differ"
@@ -153,7 +263,8 @@ def main():
     ap.add_argument("--uc-devnet", required=True)
     ap.add_argument("--reference", required=True)
     args = ap.parse_args()
-    uc = str(Path(args.uc).resolve())
+    global UC
+    uc = UC = str(Path(args.uc).resolve())
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=False)
     pkg = out / "pkg"
@@ -164,7 +275,7 @@ def main():
     verdicts = {k: classify(results["uc"].get(k), results["reference"].get(k)) for k in results["reference"]}
     (out / "summary.json").write_text(json.dumps({"verdicts": verdicts, "results": results}, indent=2, default=str))
     print(json.dumps(verdicts, indent=1))
-    return 0
+    return 1 if "differ" in verdicts.values() else 0
 
 
 if __name__ == "__main__":
