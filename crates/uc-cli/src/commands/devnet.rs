@@ -432,7 +432,15 @@ impl RpcError {
     }
 }
 
+/// The entry points an execution may reach.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EntryKind {
+    External,
+    L1Handler,
+}
+
 const ERR_CONTRACT_NOT_FOUND: i64 = 20;
+const ERR_ENTRYPOINT_NOT_FOUND: i64 = 21;
 const ERR_BLOCK_NOT_FOUND: i64 = 24;
 const ERR_INVALID_TX_INDEX: i64 = 27;
 const ERR_CLASS_HASH_NOT_FOUND: i64 = 28;
@@ -603,7 +611,7 @@ impl DevnetChain {
             chain.deploy_at(address, account_class, &[public_key], Felt::ZERO)?;
             let (low, high) = u256_parts(&acc.initial_balance).map_err(|e| anyhow!("{}", e.message))?;
             for token in [strk, eth] {
-                let out = chain.execute(token, selector("mint"), vec![address, low, high], Felt::ZERO, &DevnetExecutionContext::default(), EXECUTION_GAS_BUDGET)?;
+                let out = chain.execute(token, selector("mint"), vec![address, low, high], Felt::ZERO, &DevnetExecutionContext::default(), EXECUTION_GAS_BUDGET, EntryKind::External)?;
                 if let Some(p) = out.panic {
                     bail!("genesis mint failed: {}", cairo_lang_runner::casm_run::format_for_panic(p.into_iter()));
                 }
@@ -763,16 +771,17 @@ impl DevnetChain {
         }
     }
 
-    /// Runs the external entry point `selector` of the contract at `contract`.
-    fn execute(&mut self, contract: Felt, selector_felt: Felt, calldata: Vec<Felt>, caller: Felt, tx: &DevnetExecutionContext, gas_budget: usize) -> Result<ExecutionOutcome> {
+    /// Runs the entry point `selector` of the contract at `contract`. Calls reach external
+    /// entry points only; L1 handlers run only for L1 messages, as on Starknet.
+    #[allow(clippy::too_many_arguments)]
+    fn execute(&mut self, contract: Felt, selector_felt: Felt, calldata: Vec<Felt>, caller: Felt, tx: &DevnetExecutionContext, gas_budget: usize, kind: EntryKind) -> Result<ExecutionOutcome> {
         let class_hash = self.state.class_hash_at(&contract).ok_or_else(|| anyhow!("CONTRACT_NOT_FOUND"))?;
         let info = self.infos.get(&class_hash).ok_or_else(|| anyhow!("class {} not declared", hex(&class_hash)))?;
-        let function = info
-            .externals
-            .get(&selector_felt)
-            .or_else(|| info.l1_handlers.get(&selector_felt))
-            .cloned()
-            .ok_or_else(|| anyhow!("ENTRYPOINT_NOT_FOUND"))?;
+        let entry_points = match kind {
+            EntryKind::External => &info.externals,
+            EntryKind::L1Handler => &info.l1_handlers,
+        };
+        let function = entry_points.get(&selector_felt).cloned().ok_or_else(|| anyhow!("ENTRYPOINT_NOT_FOUND"))?;
         self.run_function(class_hash, function, selector_felt, contract, calldata, caller, tx, gas_budget)
     }
 
@@ -947,7 +956,7 @@ impl DevnetChain {
     fn validate_tx(&mut self, account: Felt, entry: &str, calldata: Vec<Felt>, ctx: &DevnetExecutionContext) -> Result<ExecutionOutcome, RpcError> {
         let failure = |detail: String| RpcError::new(ERR_VALIDATION_FAILURE, "Account validation failed").with_data(serde_json::json!(detail));
         let out = self
-            .execute(account, selector(entry), calldata, Felt::ZERO, ctx, EXECUTION_GAS_BUDGET)
+            .execute(account, selector(entry), calldata, Felt::ZERO, ctx, EXECUTION_GAS_BUDGET, EntryKind::External)
             .map_err(|e| failure(format!("The `{entry}` entry point of {} could not run: {e}", hex(&account))))?;
         if let Some(p) = &out.panic {
             return Err(failure(format!(
@@ -1097,7 +1106,7 @@ impl DevnetChain {
                 EXECUTION_GAS_BUDGET
             };
             let out = self
-                .execute(sender, selector("__execute__"), calldata.clone(), Felt::ZERO, &ctx, budget)
+                .execute(sender, selector("__execute__"), calldata.clone(), Felt::ZERO, &ctx, budget, EntryKind::External)
                 .map_err(|e| RpcError::new(ERR_TX_EXECUTION_ERROR, e.to_string()))?;
             if let Some(p) = &out.panic {
                 revert = Some(cairo_lang_runner::casm_run::format_for_panic(p.clone().into_iter()));
@@ -1127,7 +1136,7 @@ impl DevnetChain {
             fee = fee.min(bounds.max_fee());
             let (strk, sequencer) = (self.strk(), self.sequencer);
             let out = self
-                .execute(strk, selector("transfer"), vec![sequencer, Felt::from(fee), Felt::ZERO], sender, &ctx, EXECUTION_GAS_BUDGET)
+                .execute(strk, selector("transfer"), vec![sequencer, Felt::from(fee), Felt::ZERO], sender, &ctx, EXECUTION_GAS_BUDGET, EntryKind::External)
                 .map_err(|e| RpcError::new(ERR_TX_EXECUTION_ERROR, e.to_string()))?;
             if let Some(p) = &out.panic {
                 return Err(RpcError::new(ERR_INSUFFICIENT_BALANCE, "Account balance is not enough to cover the transaction cost")
@@ -1230,9 +1239,15 @@ impl DevnetChain {
             return Err(RpcError::new(ERR_CONTRACT_NOT_FOUND, "Contract not found"));
         }
         let snapshot = self.state.clone();
-        let result = self.execute(contract, selector_felt, calldata, Felt::ZERO, &DevnetExecutionContext::default(), EXECUTION_GAS_BUDGET);
+        let result = self.execute(contract, selector_felt, calldata, Felt::ZERO, &DevnetExecutionContext::default(), EXECUTION_GAS_BUDGET, EntryKind::External);
         self.state = snapshot;
-        let outcome = result.map_err(|e| RpcError::new(ERR_CONTRACT_ERROR, "Contract error").with_data(serde_json::json!({ "revert_error": e.to_string() })))?;
+        let outcome = result.map_err(|e| {
+            if e.to_string() == "ENTRYPOINT_NOT_FOUND" {
+                RpcError::new(ERR_ENTRYPOINT_NOT_FOUND, "Requested entrypoint does not exist in the contract")
+            } else {
+                RpcError::new(ERR_CONTRACT_ERROR, "Contract error").with_data(serde_json::json!({ "revert_error": e.to_string() }))
+            }
+        })?;
         if let Some(p) = outcome.panic {
             let reason = cairo_lang_runner::casm_run::format_for_panic(p.into_iter());
             return Err(RpcError::new(ERR_CONTRACT_ERROR, "Contract error").with_data(serde_json::json!({ "revert_error": reason })));
@@ -1424,7 +1439,7 @@ impl DevnetChain {
         let (low, high) = u256_parts(&amount)?;
         let before = self.state.clone();
         let outcome = self
-            .execute(token, selector("mint"), vec![address, low, high], Felt::ZERO, &DevnetExecutionContext::default(), EXECUTION_GAS_BUDGET)
+            .execute(token, selector("mint"), vec![address, low, high], Felt::ZERO, &DevnetExecutionContext::default(), EXECUTION_GAS_BUDGET, EntryKind::External)
             .map_err(|e| RpcError::new(ERR_TX_EXECUTION_ERROR, e.to_string()))?;
         if let Some(p) = outcome.panic {
             return Err(RpcError::new(ERR_TX_EXECUTION_ERROR, cairo_lang_runner::casm_run::format_for_panic(p.into_iter())));
@@ -1442,7 +1457,7 @@ impl DevnetChain {
         let transaction = serde_json::json!({ "type": "INVOKE", "version": "0x3", "sender_address": "0x0", "calldata": [], "nonce": "0x0", "signature": [], "devnet_mint": { "address": hex(&address), "amount": amount, "unit": unit } });
         let hash_hex = self.record("INVOKE", tx_hash, transaction, receipt, trace);
         let snapshot = self.state.clone();
-        let balance = self.execute(token, selector("balanceOf"), vec![address], Felt::ZERO, &DevnetExecutionContext::default(), EXECUTION_GAS_BUDGET).ok();
+        let balance = self.execute(token, selector("balanceOf"), vec![address], Felt::ZERO, &DevnetExecutionContext::default(), EXECUTION_GAS_BUDGET, EntryKind::External).ok();
         self.state = snapshot;
         let new_balance = balance
             .and_then(|o| (o.retdata.len() == 2).then(|| u256_to_decimal(&o.retdata[0], &o.retdata[1])))
@@ -1692,6 +1707,7 @@ impl DevnetChain {
                         Felt::ZERO,
                         &DevnetExecutionContext::default(),
                         EXECUTION_GAS_BUDGET,
+                        EntryKind::External,
                     )
                     .ok();
                 self.state = snapshot;
@@ -1863,6 +1879,7 @@ impl DevnetChain {
                         Felt::ZERO,
                         &DevnetExecutionContext::default(),
                         EXECUTION_GAS_BUDGET,
+                        EntryKind::L1Handler,
                     );
                 }
                 let tx_hash = felt_from_digest(
@@ -2397,6 +2414,8 @@ pub mod Counter {
         fn increase(ref self: ContractState, by: u64) { self.value.write(self.value.read() + by); }
         fn get(self: @ContractState) -> u64 { self.value.read() }
     }
+    #[l1_handler]
+    fn bump(ref self: ContractState, from_address: felt252, by: u64) { self.value.write(self.value.read() + by); }
 }
 "#).unwrap();
         run_build(BuildArgs {
@@ -2435,6 +2454,14 @@ pub mod Counter {
         assert!(update["state_diff"]["deployed_contracts"].as_array().unwrap().iter().any(|d| parse_felt_str(d["address"].as_str().unwrap()).unwrap() == expected));
         let inc = vec!["0x1".to_string(), deployed.clone(), hex(&selector("increase")), "0x1".to_string(), "0x2".to_string()];
         invoke(&mut chain, signed_invoke(id, &acc, inc.clone(), 2, bounds(L2), None)).unwrap();
+        let got = chain.handle_rpc("starknet_call", &serde_json::json!({ "request": { "contract_address": deployed, "entry_point_selector": hex(&selector("get")), "calldata": [] }, "block_id": "latest" })).unwrap();
+        assert_eq!(got, serde_json::json!(["0x2a"]));
+        // Calls reach external entry points only: a missing one and the L1 handler are both
+        // ENTRYPOINT_NOT_FOUND (21), and the handler does not run.
+        for name in ["no_such_entry_point", "bump"] {
+            let call = serde_json::json!({ "request": { "contract_address": deployed, "entry_point_selector": hex(&selector(name)), "calldata": ["0x0", "0x5"] }, "block_id": "latest" });
+            assert_eq!(chain.handle_rpc("starknet_call", &call).unwrap_err().code, ERR_ENTRYPOINT_NOT_FOUND, "{name}");
+        }
         let got = chain.handle_rpc("starknet_call", &serde_json::json!({ "request": { "contract_address": deployed, "entry_point_selector": hex(&selector("get")), "calldata": [] }, "block_id": "latest" })).unwrap();
         assert_eq!(got, serde_json::json!(["0x2a"]));
         let events = chain.handle_rpc("starknet_getEvents", &serde_json::json!({ "filter": { "address": DEVNET_STRK_ADDRESS, "chunk_size": 10 } })).unwrap();
