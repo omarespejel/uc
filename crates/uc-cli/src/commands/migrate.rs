@@ -497,7 +497,7 @@ pub(crate) fn run_migrate(args: MigrateArgs) -> Result<()> {
         write_json_report(report_path, &report)?;
     }
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        json_println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!(
             "uc migrate: {} {}",

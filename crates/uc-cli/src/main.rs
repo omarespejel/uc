@@ -107,6 +107,22 @@ use uc_core::compare::{compare_diagnostics, extract_diagnostic_lines, Diagnostic
 use uc_core::session::SessionInput;
 use walkdir::WalkDir;
 
+/// A JSON document went to stdout. A failing `--json` run prints its error as JSON only when
+/// nothing was printed yet, so stdout always holds exactly one document.
+static STDOUT_JSON_PRINTED: AtomicBool = AtomicBool::new(false);
+
+fn note_json_printed() {
+    STDOUT_JSON_PRINTED.store(true, Ordering::Relaxed);
+}
+
+/// `println!` for a JSON document on stdout.
+macro_rules! json_println {
+    ($($arg:tt)*) => {{
+        $crate::note_json_printed();
+        println!($($arg)*);
+    }};
+}
+
 #[cfg(feature = "dev-benchmark-command")]
 mod benchmark_cmd;
 mod cache;
@@ -3057,9 +3073,29 @@ fn normalize_multicall_cli_args(raw_args: Vec<String>) -> Vec<String> {
 fn main() -> Result<()> {
     init_observability();
     let normalized_args = normalize_multicall_cli_args(std::env::args().collect());
+    let json = normalized_args
+        .iter()
+        .skip(1)
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "--json");
     let cli = Cli::parse_from(normalized_args);
+    let result = dispatch_command(cli.command);
+    if let Err(err) = &result {
+        if json && !STDOUT_JSON_PRINTED.load(Ordering::Relaxed) {
+            let envelope = serde_json::json!({
+                "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
+                "status": "failed",
+                "exit_code": 1,
+                "error": format!("{err:#}"),
+            });
+            println!("{envelope}");
+        }
+    }
+    result
+}
 
-    match cli.command {
+fn dispatch_command(command: Commands) -> Result<()> {
+    match command {
         Commands::Daemon(args) => run_daemon(args),
         #[cfg(feature = "dev-benchmark-command")]
         Commands::Benchmark(args) => benchmark_cmd::run(args),
@@ -3157,7 +3193,7 @@ fn emit_json_value<T: Serialize>(report_path: Option<&Path>, value: &T) -> Resul
     if let Some(path) = report_path {
         write_json_report(path, value)?;
     }
-    println!(
+    json_println!(
         "{}",
         serde_json::to_string_pretty(value).context("failed to serialize JSON report")?
     );
@@ -7624,7 +7660,7 @@ fn run_build_entry(args: BuildArgs) -> Result<()> {
                     "error": err_str,
                 });
                 if let Ok(serialized) = serde_json::to_string(&envelope) {
-                    println!("{serialized}");
+                    json_println!("{serialized}");
                 }
             }
             Err(err)
@@ -7996,14 +8032,14 @@ fn run_inspect(args: InspectArgs) -> Result<()> {
                 }
             }
             InspectFieldArg::Abi => {
-                println!(
+                json_println!(
                     "{}",
                     serde_json::to_string_pretty(c.get("abi").unwrap_or(&serde_json::Value::Null))?
                 );
                 return Ok(());
             }
             InspectFieldArg::EntryPoints => {
-                println!(
+                json_println!(
                     "{}",
                     serde_json::to_string_pretty(
                         c.get("entry_points_by_type")
@@ -8408,7 +8444,7 @@ fn run_native_support(args: NativeSupportArgs) -> Result<()> {
             }
         }
         SupportFormatArg::Json => {
-            println!(
+            json_println!(
                 "{}",
                 serde_json::to_string(&report)
                     .context("failed to serialize native support report")?

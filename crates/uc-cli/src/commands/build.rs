@@ -477,7 +477,7 @@ fn emit_build_plan_report(args: &BuildArgs, report: &BuildPlanReport) -> Result<
         write_json_report(path, report)?;
     }
     if args.json {
-        println!(
+        json_println!(
             "{}",
             serde_json::to_string(report).context("failed to serialize build plan report")?
         );
@@ -1810,7 +1810,7 @@ fn try_run_native_multi_member_workspace_build(
             write_json_report(path, &report)?;
         }
         if emit_json {
-            println!(
+            json_println!(
                 "{}",
                 serde_json::to_string(&report).context("failed to serialize build report")?
             );
@@ -2832,7 +2832,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             write_json_report(path, &report)?;
         }
         if emit_json {
-            println!(
+            json_println!(
                 "{}",
                 serde_json::to_string(&report).context("failed to serialize build report")?
             );

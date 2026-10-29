@@ -2239,7 +2239,7 @@ pub(crate) fn run_get(args: GetArgs) -> Result<()> {
                 })
             };
             if json {
-                println!("{}", serde_json::to_string_pretty(&val)?);
+                json_println!("{}", serde_json::to_string_pretty(&val)?);
             } else {
                 let tx_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("INVOKE");
                 let tx_ver = val.get("version").and_then(|v| v.as_str()).unwrap_or("0x3");
@@ -2270,7 +2270,7 @@ pub(crate) fn run_get(args: GetArgs) -> Result<()> {
                 "nonce": nonce_str,
             });
             if json {
-                println!("{}", serde_json::to_string_pretty(&val)?);
+                json_println!("{}", serde_json::to_string_pretty(&val)?);
             } else {
                 println!("Nonce for {contract_address} at {block_id}: {nonce_str}");
             }
@@ -2299,7 +2299,7 @@ pub(crate) fn run_get(args: GetArgs) -> Result<()> {
                 "class_hash": class_hash_str,
             });
             if json {
-                println!("{}", serde_json::to_string_pretty(&val)?);
+                json_println!("{}", serde_json::to_string_pretty(&val)?);
             } else {
                 println!("Class hash at {contract_address} ({block_id}): {class_hash_str}");
             }
@@ -2516,7 +2516,7 @@ inputs = ["0x64"]
                 "execute_calldata": execute_calldata,
             });
             if json {
-                println!("{}", serde_json::to_string_pretty(&res)?);
+                json_println!("{}", serde_json::to_string_pretty(&res)?);
             } else {
                 println!(
                     "Multicall `{}`: {} call(s) validated (dry_run={})",
@@ -2574,7 +2574,7 @@ inputs = ["0x64"]
                 "execute_calldata": execute_calldata,
             });
             if json {
-                println!("{}", serde_json::to_string_pretty(&res)?);
+                json_println!("{}", serde_json::to_string_pretty(&res)?);
             } else {
                 println!(
                     "Multicall execute: {} call(s) prepared",
@@ -2817,7 +2817,7 @@ pub(crate) fn run_ledger(args: LedgerArgs) -> Result<()> {
         LedgerSubcommand::AppVersion { json } => {
             let v = serde_json::json!({ "version": "2.3.1" });
             if json {
-                println!("{}", serde_json::to_string_pretty(&v)?);
+                json_println!("{}", serde_json::to_string_pretty(&v)?);
             } else {
                 println!("version: 2.3.1");
             }
@@ -2834,7 +2834,7 @@ pub(crate) fn run_ledger(args: LedgerArgs) -> Result<()> {
                 let sk = Felt::from_bytes_be(&pk_bytes);
                 let pub_key = format_felt_hex(&starknet_crypto::get_public_key(&sk));
                 if json {
-                    println!(
+                    json_println!(
                         "{}",
                         serde_json::to_string_pretty(
                             &serde_json::json!({ "path": path, "public_key": pub_key })
@@ -2867,7 +2867,7 @@ pub(crate) fn run_ledger(args: LedgerArgs) -> Result<()> {
                 let r_hex = format_felt_hex(&signed.r);
                 let s_hex = format_felt_hex(&signed.s);
                 if json {
-                    println!(
+                    json_println!(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
                             "path": path,
@@ -3037,7 +3037,7 @@ pub(crate) fn run_utils(args: UtilsArgs) -> Result<()> {
             let parsed = parse_serialized_felt_args(Some(&arguments.join(" ")), None)?;
             let hex_list: Vec<String> = parsed.iter().map(|v| format!("0x{v:x}")).collect();
             if json {
-                println!(
+                json_println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({ "calldata": hex_list }))?
                 );
@@ -3064,7 +3064,7 @@ pub(crate) fn run_utils(args: UtilsArgs) -> Result<()> {
                 &calldata,
             )?;
             if json {
-                println!(
+                json_println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,

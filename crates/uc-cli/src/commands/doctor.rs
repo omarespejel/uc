@@ -134,7 +134,7 @@ pub(crate) fn run_doctor(args: DoctorArgs) -> Result<()> {
             .iter()
             .map(|c| serde_json::json!({ "check": c.name, "ok": c.ok, "detail": c.detail, "fix": c.fix }))
             .collect();
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "schema_version": UC_AGENT_JSON_SCHEMA_VERSION, "ok": failed == 0, "checks": rows }))?);
+        json_println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "schema_version": UC_AGENT_JSON_SCHEMA_VERSION, "ok": failed == 0, "checks": rows }))?);
     } else {
         for c in &checks {
             println!("{} {:<26} {}", if c.ok { "ok  " } else { "FAIL" }, c.name, c.detail);

@@ -6858,7 +6858,7 @@ pub(crate) fn run_prove(mut args: ProveArgs) -> Result<()> {
         }
     }
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        json_println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         for pkg in &report.packages {
             println!(

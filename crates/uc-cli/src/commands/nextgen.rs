@@ -985,7 +985,7 @@ pub(crate) fn run_fmt(args: FmtArgs) -> Result<()> {
         }
 
         if args.json {
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            json_println!("{}", serde_json::to_string_pretty(&report)?);
         } else if emit_mode == FmtEmitMode::Stdout {
             for f in &report.files {
                 if let Some(out) = &f.formatted_output {
@@ -1373,7 +1373,7 @@ pub(crate) fn run_check(args: CheckArgs) -> Result<()> {
         }
 
         if args.json {
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            json_println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
             for pkg in &report.packages {
                 for diag in &pkg.diagnostics {
@@ -1490,7 +1490,7 @@ pub(crate) fn run_clean(args: CleanArgs) -> Result<()> {
     }
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        json_println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!(
             "uc clean: {} {} file(s) ({:.2} MB) in {:.1}ms",
@@ -1714,7 +1714,7 @@ pub(crate) fn run_new(args: NewArgs) -> Result<()> {
         write_json_report(report_path, &report)?;
     }
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        json_println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!(
             "Created `{}` package ({}) at {}",
@@ -1749,7 +1749,7 @@ pub(crate) fn run_init(args: InitArgs) -> Result<()> {
         write_json_report(report_path, &report)?;
     }
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        json_println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!(
             "Initialized `{}` package ({}) at {}",
@@ -1885,7 +1885,7 @@ pub(crate) fn run_add(args: AddArgs) -> Result<()> {
         write_json_report(report_path, &report)?;
     }
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        json_println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         for dep in &report.mutated_dependencies {
             println!(
@@ -1968,7 +1968,7 @@ pub(crate) fn run_remove(args: RemoveArgs) -> Result<()> {
         write_json_report(report_path, &report)?;
     }
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        json_println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         for dep in &report.mutated_dependencies {
             println!(
@@ -2292,7 +2292,7 @@ pub(crate) fn run_tree(args: TreeArgs) -> Result<()> {
         write_json_report(report_path, &report)?;
     }
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        json_println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print!("{rendered_tree}");
     }
@@ -2430,7 +2430,7 @@ pub(crate) fn run_expand(args: ExpandArgs) -> Result<()> {
             write_json_report(report_path, &report)?;
         }
         if args.json {
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            json_println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
             for m in &report.modules {
                 println!(
@@ -2878,9 +2878,9 @@ pub(crate) fn run_lint(args: LintArgs) -> Result<()> {
                     "results": sarif_results
                 }]
             });
-            println!("{}", serde_json::to_string_pretty(&sarif)?);
+            json_println!("{}", serde_json::to_string_pretty(&sarif)?);
         } else if args.json {
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            json_println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
             for f in &report.findings {
                 println!(
@@ -3409,7 +3409,7 @@ pub(crate) fn run_profile(args: ProfileArgs) -> Result<()> {
         }
 
         if args.json {
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            json_println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
             for c in &report.contracts {
                 println!(
@@ -3752,7 +3752,7 @@ pub(crate) fn run_diff(args: DiffArgs) -> Result<()> {
         }
 
         if args.json {
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            json_println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
             for e in &report.contracts {
                 println!(
@@ -3980,7 +3980,7 @@ pub(crate) fn run_abi(args: AbiArgs) -> Result<()> {
 pub(crate) fn run_manifest_path(args: ManifestPathArgs) -> Result<()> {
     let manifest_path = resolve_manifest_path(&args.manifest_path)?;
     if args.json {
-        println!(
+        json_println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "manifest_path": manifest_path.display().to_string()
@@ -4015,7 +4015,7 @@ pub(crate) fn run_script(args: RunScriptArgs) -> Result<()> {
 
     if args.list || args.script.is_none() {
         if args.json {
-            println!("{}", serde_json::to_string_pretty(&scripts_table)?);
+            json_println!("{}", serde_json::to_string_pretty(&scripts_table)?);
         } else if scripts_table.is_empty() {
             println!("No scripts defined in [scripts] of {}", manifest_path.display());
         } else {

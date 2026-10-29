@@ -447,7 +447,7 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
                     "audited": false,
                 });
                 if args.json {
-                    println!("{}", serde_json::to_string(&doc)?);
+                    json_println!("{}", serde_json::to_string(&doc)?);
                 } else {
                     println!(
                         "{} class {} unchanged at block {}",
@@ -467,7 +467,7 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
                 )?;
                 let (doc, next) = diff_watch(&state, &summary, &args.address, block_number);
                 if args.json {
-                    println!("{}", serde_json::to_string(&doc)?);
+                    json_println!("{}", serde_json::to_string(&doc)?);
                 } else {
                     print_watch_check(&doc);
                 }
