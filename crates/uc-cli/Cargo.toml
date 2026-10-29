@@ -13,6 +13,7 @@ default = ["native-compile", "native-test-runner"]
 native-compile = [
   "dep:cairo-lang-compiler",
   "dep:cairo-lang-defs",
+  "dep:cairo-lang-diagnostics",
   "dep:cairo-lang-filesystem",
   "dep:cairo-lang-formatter",
   "dep:cairo-lang-lowering",
@@ -44,6 +45,7 @@ anyhow.workspace = true
 blake3.workspace = true
 cairo-lang-compiler = { workspace = true, optional = true }
 cairo-lang-defs = { workspace = true, optional = true }
+cairo-lang-diagnostics = { workspace = true, optional = true }
 cairo-lang-filesystem = { workspace = true, optional = true }
 cairo-lang-formatter = { workspace = true, optional = true }
 cairo-lang-lowering = { workspace = true, optional = true }

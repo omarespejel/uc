@@ -10,6 +10,8 @@ use cairo_lang_compiler::compile_prepared_db_program_artifact;
 use cairo_lang_compiler::compile_prepared_db_program;
 #[cfg(feature = "native-compile")]
 use cairo_lang_compiler::CompilerConfig;
+#[cfg(feature = "native-compile")]
+use cairo_lang_compiler::diagnostics::{DiagnosticsError, DiagnosticsReporter};
 #[cfg(all(feature = "native-compile", not(feature = "helper-cairo-214")))]
 use cairo_lang_sierra::program::VersionedProgram;
 #[cfg(feature = "native-compile")]
@@ -1852,6 +1854,8 @@ struct NativeCompileContext {
     external_non_starknet_dependencies: Vec<String>,
     path_dependency_roots: Vec<NativePathDependencyRoot>,
     crate_dependency_configs: Vec<NativeCrateDependencyConfig>,
+    /// The manifest asks for another Cairo toolchain and uc compiles it in compatibility mode.
+    toolchain_compat: bool,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -2212,6 +2216,10 @@ struct BuildCacheEntry {
     fingerprint: String,
     profile: String,
     artifacts: Vec<CachedArtifact>,
+    /// Compiler warnings of the build that produced the artifacts; a cache hit replays them,
+    /// as scarb prints warnings on every build.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    warnings: String,
 }
 
 #[derive(Clone)]
@@ -9963,15 +9971,17 @@ fn ensure_native_manifest_cairo_version_supported(manifest: &TomlValue) -> Resul
 }
 
 #[cfg(feature = "native-compile")]
+/// Returns whether the manifest needs compatibility mode (it asks for another toolchain).
 fn ensure_native_manifest_cairo_version_supported_at_path(
     manifest_path: &Path,
     manifest: &TomlValue,
-) -> Result<()> {
+) -> Result<bool> {
     let requirement = resolve_native_toolchain_requirement(manifest_path, manifest)?;
     ensure_native_toolchain_requirement_supported_with_compiler(
         &requirement,
         native_cairo_lang_compiler_version(),
-    )
+    )?;
+    Ok(select_native_toolchain_from_requirement(&requirement)?.is_err())
 }
 
 #[cfg(feature = "native-compile")]
@@ -12136,7 +12146,7 @@ fn try_local_uc_cache_hit(
             "uc: cache hit, restored {} artifacts\n",
             entry.artifacts.len()
         ),
-        stderr: String::new(),
+        stderr: entry.warnings.clone(),
     };
     Ok(Some((run, fingerprint, telemetry)))
 }
@@ -12240,7 +12250,7 @@ fn run_build_with_uc_cache(
                         "uc: cache hit, restored {} artifacts\n",
                         entry.artifacts.len()
                     ),
-                    stderr: String::new(),
+                    stderr: entry.warnings.clone(),
                 };
                 if compile_backend == BuildCompileBackend::Native {
                     native_sync_state_on_cache_hit(&canonical_workspace_root);
@@ -12278,7 +12288,7 @@ fn run_build_with_uc_cache(
                 None
             };
         telemetry.cache_lookup_ms += shared_lookup_start.elapsed().as_secs_f64() * 1000.0;
-        if let Some(restored_count) = shared_restore {
+        if let Some((restored_count, warnings)) = shared_restore {
             let total_elapsed_ms =
                 telemetry.fingerprint_ms + telemetry.cache_lookup_ms + telemetry.cache_restore_ms;
             let run = CommandRun {
@@ -12293,7 +12303,7 @@ fn run_build_with_uc_cache(
                 exit_code: 0,
                 elapsed_ms: total_elapsed_ms,
                 stdout: format!("uc: cache hit, restored {} artifacts\n", restored_count),
-                stderr: String::new(),
+                stderr: warnings,
             };
             if compile_backend == BuildCompileBackend::Native {
                 native_sync_state_on_cache_hit(&canonical_workspace_root);
@@ -12361,6 +12371,10 @@ fn run_build_with_uc_cache(
     if run.exit_code == 0 {
         ensure_fingerprint(&mut fingerprint, &mut telemetry)?;
         let fingerprint_value = fingerprint.as_deref().unwrap_or_default();
+        let warnings = match compile_backend {
+            BuildCompileBackend::Native => run.stderr.as_str(),
+            BuildCompileBackend::Scarb => "",
+        };
         if options.async_cache_persist {
             telemetry.cache_persist_async = true;
             let mut precomputed_cached_artifacts: Option<Vec<CachedArtifact>> = None;
@@ -12380,6 +12394,7 @@ fn run_build_with_uc_cache(
                     fingerprint_value,
                     &objects_dir,
                     &shared_cached_artifacts,
+                    warnings,
                 ) {
                     tracing::warn!(
                         error = %format!("{err:#}"),
@@ -12400,6 +12415,7 @@ fn run_build_with_uc_cache(
                     workspace_root: canonical_workspace_root.clone(),
                     profile: profile.to_string(),
                     fingerprint: fingerprint_value.to_string(),
+                    warnings: warnings.to_string(),
                     artifact_relative_paths: native_artifact_relative_paths.clone(),
                     cached_artifacts: precomputed_cached_artifacts,
                     cache_root: cache_root.clone(),
@@ -12434,6 +12450,7 @@ fn run_build_with_uc_cache(
                 &canonical_workspace_root,
                 profile,
                 fingerprint_value,
+                warnings,
                 native_artifact_relative_paths.as_deref(),
                 &cache_root,
                 &objects_dir,
@@ -12447,6 +12464,7 @@ fn run_build_with_uc_cache(
                     fingerprint_value,
                     &objects_dir,
                     &cached_artifacts,
+                    warnings,
                 )?;
             }
             telemetry.cache_persist_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
@@ -14459,7 +14477,8 @@ fn build_native_compile_context_uncached_with_features(
         manifest_path,
         "failed to parse manifest for native compile",
     )?;
-    ensure_native_manifest_cairo_version_supported_at_path(manifest_path, &manifest)?;
+    let toolchain_compat =
+        ensure_native_manifest_cairo_version_supported_at_path(manifest_path, &manifest)?;
     let resolved_features = resolve_manifest_native_features(&manifest, requested_features);
     let manifest_content_hash = if resolved_features.is_empty() {
         compute_manifest_content_hash_bytes(manifest_text.as_bytes())
@@ -14675,6 +14694,7 @@ fn build_native_compile_context_uncached_with_features(
         external_non_starknet_dependencies,
         path_dependency_roots,
         crate_dependency_configs,
+        toolchain_compat,
     })
 }
 
@@ -14741,7 +14761,9 @@ fn mark_native_fallback_eligible_for_external_dependencies(
             "native compile manifest includes non-starknet dependencies ({deps}); retrying with scarb fallback is allowed"
         )));
     }
-    if is_native_compat_toolchain_fallback_active() {
+    // Code errors in a project on uc's own toolchain are final: scarb would print them again.
+    let code_error = err.downcast_ref::<DiagnosticsError>().is_some();
+    if is_native_compat_toolchain_fallback_active() && (context.toolchain_compat || !code_error) {
         return mark_native_fallback_eligible(err.context(
             "native compile compat toolchain lane encountered syntax/API mismatch; retrying with scarb fallback is allowed",
         ));
@@ -16102,36 +16124,6 @@ fn native_indexed_source_metric(
         .len()
         .saturating_add(removed_files.len())
         .saturating_sub(unmatched_sources.len())
-}
-
-#[cfg(feature = "native-compile")]
-fn native_filter_changed_files_to_contract_source_index(
-    changed_files: &[String],
-    removed_files: &[String],
-    by_source: &HashMap<String, Vec<usize>>,
-    dependency_index_complete: bool,
-) -> (Vec<String>, Vec<String>) {
-    let has_absolute_paths = changed_files
-        .iter()
-        .chain(removed_files.iter())
-        .any(|source| Path::new(source).is_absolute());
-    if has_absolute_paths {
-        return (changed_files.to_vec(), removed_files.to_vec());
-    }
-    if !dependency_index_complete {
-        return (changed_files.to_vec(), removed_files.to_vec());
-    }
-    let scoped_changed = changed_files
-        .iter()
-        .filter(|source| by_source.contains_key(source.as_str()))
-        .cloned()
-        .collect();
-    let scoped_removed = removed_files
-        .iter()
-        .filter(|source| by_source.contains_key(source.as_str()))
-        .cloned()
-        .collect();
-    (scoped_changed, scoped_removed)
 }
 
 #[cfg(feature = "native-compile")]
@@ -19878,31 +19870,20 @@ fn with_native_compile_session<T>(
             refresh_action,
             NativeSessionRefreshAction::IncrementalChangedSet
         ) {
-            let (by_source, dependency_index_complete) = native_contract_source_index(
-                &session.contract_output_plans,
-                &session.contract_source_dependencies,
-            );
-            let (scoped_changed_files, scoped_removed_files) =
-                native_filter_changed_files_to_contract_source_index(
-                    &changed_files,
-                    &removed_files,
-                    &by_source,
-                    dependency_index_complete,
-                );
-            if !scoped_changed_files.is_empty() || !scoped_removed_files.is_empty() {
-                // Prefer file-keyed override updates for relevant source changes to avoid coarse
-                // full-DB invalidation on every incremental refresh.
+            if !changed_files.is_empty() || !removed_files.is_empty() {
+                // Every change reaches the db, also one no contract depends on: the build still
+                // checks that file, as scarb does.
+                // Prefer file-keyed override updates to avoid coarse full-DB invalidation on every
+                // incremental refresh.
                 match native_apply_file_keyed_session_updates(
                     &mut session.db,
                     workspace_root,
-                    &scoped_changed_files,
-                    &scoped_removed_files,
+                    &changed_files,
+                    &removed_files,
                 ) {
                     Ok(applied_override_update) => {
                         if applied_override_update {
                             tracing::debug!(
-                                scoped_changed_files = scoped_changed_files.len(),
-                                scoped_removed_files = scoped_removed_files.len(),
                                 changed_files = changed_files.len(),
                                 removed_files = removed_files.len(),
                                 drift_scan_ms,
@@ -19910,8 +19891,6 @@ fn with_native_compile_session<T>(
                             );
                         } else {
                             tracing::debug!(
-                                scoped_changed_files = scoped_changed_files.len(),
-                                scoped_removed_files = scoped_removed_files.len(),
                                 changed_files = changed_files.len(),
                                 removed_files = removed_files.len(),
                                 drift_scan_ms,
@@ -19940,13 +19919,6 @@ fn with_native_compile_session<T>(
                         state_mutated = true;
                     }
                 }
-            } else {
-                tracing::debug!(
-                    changed_files = changed_files.len(),
-                    removed_files = removed_files.len(),
-                    drift_scan_ms,
-                    "native changed-file set does not affect tracked contracts; skipping file-keyed session update"
-                );
             }
             if let Some((tracked_sources, tracked_source_bytes, tracked_sources_content_hash)) =
                 current_source_snapshot.take()
@@ -20172,16 +20144,196 @@ fn validate_native_profile_name(profile: &str) -> Result<()> {
     Ok(())
 }
 
+/// What the native compiler reported. The caller prints it, so a daemon build shows its
+/// diagnostics in the client's terminal instead of the daemon's.
+#[derive(Clone, Default)]
+#[cfg(feature = "native-compile")]
+struct NativeDiagnosticsLog(Arc<Mutex<NativeDiagnosticsText>>);
+
+#[derive(Default)]
+#[cfg(feature = "native-compile")]
+struct NativeDiagnosticsText {
+    text: String,
+    errors: usize,
+    warnings: usize,
+    /// Each compile of a build (contract batches, the `[lib]` target) checks the same crates.
+    seen: HashSet<String>,
+    /// A compile checked every crate, so nothing is left to check.
+    full_check_done: bool,
+    /// Recorded once a successful build has checked its dependencies.
+    clean_dependencies_marker: Option<PathBuf>,
+}
+
+#[cfg(feature = "native-compile")]
+impl NativeDiagnosticsLog {
+    fn record(&self, entry: &cairo_lang_diagnostics::FormattedDiagnosticEntry) {
+        let text = entry.to_string();
+        let mut log = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !log.seen.insert(text.clone()) {
+            return;
+        }
+        match entry.severity() {
+            cairo_lang_diagnostics::Severity::Error => log.errors += 1,
+            cairo_lang_diagnostics::Severity::Warning => log.warnings += 1,
+        }
+        log.text.push_str(&text);
+    }
+
+    fn mark_full_check(&self, crates: &NativeDiagnosticCrates) {
+        let mut log = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        log.full_check_done = true;
+        if crates.clean_dependencies_marker.is_some() {
+            log.clean_dependencies_marker = crates.clean_dependencies_marker.clone();
+        }
+    }
+
+    fn clean_dependencies_marker(&self) -> Option<PathBuf> {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clean_dependencies_marker.clone()
+    }
+
+    fn full_check_done(&self) -> bool {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).full_check_done
+    }
+
+    fn text(&self) -> String {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).text.clone()
+    }
+
+    /// The diagnostics followed by Scarb's closing line for a failed compile.
+    fn failure_report(&self, package: &str) -> String {
+        let log = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+        let mut report = format!(
+            "{}error: could not compile `{package}` due to {}",
+            log.text,
+            count(log.errors.max(1), "previous error")
+        );
+        if log.warnings > 0 {
+            report.push_str(&format!(" and {}", count(log.warnings, "warning")));
+        }
+        report.push('\n');
+        report
+    }
+}
+
+/// The crates whose errors fail a native compile.
+#[derive(Debug, Default)]
+#[cfg(feature = "native-compile")]
+struct NativeDiagnosticCrates {
+    checked: Vec<CrateInput>,
+    dependencies: Vec<CrateInput>,
+    /// Where to record that the dependencies passed, when this build checks them.
+    clean_dependencies_marker: Option<PathBuf>,
+}
+
+/// Scarb fails on an error in any crate it compiles, dependencies included, and hides
+/// dependency warnings. The pinned corelib is error-free, so uc skips it, and so are
+/// dependencies an earlier build already checked.
+#[cfg(feature = "native-compile")]
+fn native_diagnostic_crates(
+    db: &RootDatabase,
+    main_crate_inputs: &[CrateInput],
+) -> NativeDiagnosticCrates {
+    let mut dependencies = Vec::new();
+    for crate_id in db.crates() {
+        let input = crate_id.long(db).clone().into_crate_input(db);
+        let corelib = matches!(&input, CrateInput::Real { name, .. } if name == cairo_lang_filesystem::db::CORELIB_CRATE_NAME);
+        if corelib || main_crate_inputs.contains(&input) || dependencies.contains(&input) {
+            continue;
+        }
+        dependencies.push(input);
+    }
+    let mut checked = main_crate_inputs.to_vec();
+    let marker = native_clean_dependencies_marker(db, &dependencies);
+    let clean = marker.as_ref().is_some_and(|path| path.is_file());
+    if !clean {
+        checked.extend(dependencies.iter().cloned());
+    }
+    NativeDiagnosticCrates {
+        checked,
+        dependencies,
+        clean_dependencies_marker: if clean { None } else { marker },
+    }
+}
+
+/// Names one exact set of dependencies for this build of uc. Scarb skips the crates it loads
+/// from its cache, which it writes only for crates without errors; uc checks a set once.
+#[cfg(feature = "native-compile")]
+fn native_clean_dependencies_marker(
+    db: &RootDatabase,
+    dependencies: &[CrateInput],
+) -> Option<PathBuf> {
+    if dependencies.is_empty() {
+        return None;
+    }
+    let mut keys = Vec::with_capacity(dependencies.len());
+    for crate_id in CrateInput::into_crate_ids(db, dependencies.iter().cloned()) {
+        let descriptor = native_crate_cache_descriptor_for_crate(db, crate_id)?;
+        let settings = &db.crate_config(crate_id)?.settings;
+        keys.push(format!("{}\n{settings:?}", descriptor.cache_key));
+    }
+    keys.sort();
+    let mut hasher = Hasher::new();
+    hasher.update(b"uc-clean-dependencies-v1");
+    hasher.update(uc_build_identity().as_bytes());
+    for key in keys {
+        hasher.update(b"\0");
+        hasher.update(key.as_bytes());
+    }
+    Some(
+        native_global_cache_root_dir()?
+            .join("clean-dependencies-v1")
+            .join(hasher.finalize().to_hex().as_str()),
+    )
+}
+
+/// Checks every crate unless a compile of this build did. Builds that reuse artifacts or compile
+/// only the contracts a change touched skip that check, but scarb would still report the rest.
+#[cfg(feature = "native-compile")]
+fn native_ensure_diagnostics(
+    session: &NativeCompileSessionSnapshot,
+    context: &NativeCompileContext,
+    diagnostics: &NativeDiagnosticsLog,
+) -> Result<()> {
+    if diagnostics.full_check_done() {
+        return Ok(());
+    }
+    let started = Instant::now();
+    let crates = native_diagnostic_crates(&session.db, &session.main_crate_inputs);
+    let log = diagnostics.clone();
+    let checked = DiagnosticsReporter::callback(move |entry| log.record(&entry))
+        .with_crates(&crates.checked)
+        .with_ignore_warnings_crates(&crates.dependencies)
+        .allow_warnings()
+        .ensure(&session.db);
+    native_progress_log(format!(
+        "native diagnostics check finished in {:.1}ms (crates={})",
+        started.elapsed().as_secs_f64() * 1000.0,
+        crates.checked.len()
+    ));
+    checked.map_err(|err| {
+        mark_native_fallback_eligible_for_external_dependencies(
+            anyhow::Error::new(err).context("native cairo compile failed"),
+            context,
+        )
+    })?;
+    diagnostics.mark_full_check(&crates);
+    Ok(())
+}
+
 #[cfg(feature = "native-compile")]
 fn native_compiler_config<'a>(
-    main_crate_inputs: &'a [CrateInput],
+    crates: &NativeDiagnosticCrates,
+    diagnostics: &NativeDiagnosticsLog,
     profile: &str,
     capture_statement_locations: bool,
 ) -> CompilerConfig<'a> {
     let mut compiler_config = CompilerConfig::default();
-    compiler_config.diagnostics_reporter = compiler_config
-        .diagnostics_reporter
-        .with_crates(main_crate_inputs)
+    let diagnostics = diagnostics.clone();
+    compiler_config.diagnostics_reporter =
+        DiagnosticsReporter::callback(move |entry| diagnostics.record(&entry))
+        .with_crates(&crates.checked)
+        .with_ignore_warnings_crates(&crates.dependencies)
         // Match Scarb UX: warnings should not fail `build`.
         .allow_warnings();
     // Scarb built-in profiles default to `sierra-replace-ids = true` for dev-like
@@ -20285,21 +20437,8 @@ fn run_native_build_inner(
     let signature = native_compile_session_signature(manifest_path, &context);
     let compile_start = Instant::now();
     let session_scope_start = Instant::now();
-    let (
-        artifact_count,
-        frontend_compile_ms,
-        casm_ms,
-        artifact_write_ms,
-        produced_paths,
-        changed_files_count,
-        removed_files_count,
-        total_contracts,
-        compiled_contracts,
-        impacted_subset_used,
-        journal_fallback_full_scan,
-        dependency_updates,
-        contract_output_plans,
-    ) = with_native_compile_session(
+    let diagnostics = NativeDiagnosticsLog::default();
+    let session_result = with_native_compile_session(
         workspace_root,
         &signature,
         daemon_context,
@@ -20333,6 +20472,7 @@ fn run_native_build_inner(
                         contracts = session.contract_output_plans.len(),
                         "native compile reused cached artifacts for unchanged source set"
                     );
+                    native_ensure_diagnostics(session, &context, &diagnostics)?;
                     return Ok((
                         keep_files.len(),
                         0.0,
@@ -20372,6 +20512,7 @@ fn run_native_build_inner(
                             contracts = session.contract_output_plans.len(),
                             "native compile reused cached artifacts for changed files outside the tracked contract set"
                         );
+                        native_ensure_diagnostics(session, &context, &diagnostics)?;
                         return Ok((
                             keep_files.len(),
                             0.0,
@@ -20460,8 +20601,11 @@ fn run_native_build_inner(
             let codegen_opts = resolve_manifest_native_cairo_codegen_options(manifest_path);
             if contracts.is_empty() {
                 let frontend_compile_start = Instant::now();
+                let diagnostic_crates =
+                    native_diagnostic_crates(&session.db, &session.main_crate_inputs);
                 let mut compiler_config = native_compiler_config(
-                    &session.main_crate_inputs,
+                    &diagnostic_crates,
+                    &diagnostics,
                     profile,
                     capture_statement_locations,
                 );
@@ -20487,7 +20631,19 @@ fn run_native_build_inner(
                         })?;
                         native_lib_target_outputs(program_artifact, &context.package_name, props)?
                     }
-                    None => Vec::new(),
+                    None => {
+                        // Scarb's contract target still checks the crate when it finds no
+                        // contract, so code errors fail the build here too.
+                        compile_starknet_prepared_db(&session.db, &[], compiler_config).map_err(
+                            |err| {
+                                mark_native_fallback_eligible_for_external_dependencies(
+                                    err.context("native cairo compile failed"),
+                                    &context,
+                                )
+                            },
+                        )?;
+                        Vec::new()
+                    }
                 };
                 #[cfg(feature = "helper-cairo-214")]
                 let mut outputs = {
@@ -20512,6 +20668,7 @@ fn run_native_build_inner(
                         serde_json::to_vec(&manifest)?,
                     ));
                 }
+                diagnostics.mark_full_check(&diagnostic_crates);
                 let frontend_compile_ms = frontend_compile_start.elapsed().as_secs_f64() * 1000.0;
                 native_progress_log(format!(
                     "native cairo program compile finished in {:.1}ms",
@@ -20634,7 +20791,11 @@ fn run_native_build_inner(
                         "native contract compile using verified no-diagnostics fast path",
                     );
                 }
-                native_run_contract_compile_batches(
+                let diagnostic_crates =
+                    native_diagnostic_crates(&session.db, &session.main_crate_inputs);
+                let full_check = selected_indices.len() == contracts.len()
+                    && (cfg!(feature = "helper-cairo-214") || !skip_global_contract_diagnostics);
+                let compiled = native_run_contract_compile_batches(
                     &all_plans,
                     &selected_indices,
                     native_progress_compile_batch_size(),
@@ -20644,7 +20805,8 @@ fn run_native_build_inner(
                             .map(|index| &contracts[*index])
                             .collect();
                         let mut compiler_config = native_compiler_config(
-                            &session.main_crate_inputs,
+                            &diagnostic_crates,
+                            &diagnostics,
                             profile,
                             capture_statement_locations,
                         );
@@ -20689,7 +20851,11 @@ fn run_native_build_inner(
                             )
                         })
                     },
-                )?
+                )?;
+                if full_check {
+                    diagnostics.mark_full_check(&diagnostic_crates);
+                }
+                compiled
             };
             #[cfg(debug_assertions)]
             {
@@ -20699,7 +20865,8 @@ fn run_native_build_inner(
                         &session.db,
                         &[contract],
                         native_compiler_config(
-                            &session.main_crate_inputs,
+                            &native_diagnostic_crates(&session.db, &session.main_crate_inputs),
+                            &NativeDiagnosticsLog::default(),
                             profile,
                             capture_statement_locations,
                         ),
@@ -20905,8 +21072,11 @@ fn run_native_build_inner(
             #[cfg(not(feature = "helper-cairo-214"))]
             let lib_compile_ms = if let Some(props) = context.lib_target {
                 let lib_started = Instant::now();
+                let diagnostic_crates =
+                    native_diagnostic_crates(&session.db, &session.main_crate_inputs);
                 let mut compiler_config = native_compiler_config(
-                    &session.main_crate_inputs,
+                    &diagnostic_crates,
+                    &diagnostics,
                     profile,
                     capture_statement_locations,
                 );
@@ -20920,6 +21090,7 @@ fn run_native_build_inner(
                 let program_artifact =
                     compile_prepared_db_program_artifact(&session.db, crate_ids, compiler_config)
                         .context("native cairo compile of the [lib] target failed")?;
+                diagnostics.mark_full_check(&diagnostic_crates);
                 for (name, bytes) in
                     native_lib_target_outputs(program_artifact, &context.package_name, props)?
                 {
@@ -20944,6 +21115,7 @@ fn run_native_build_inner(
             let total_contracts = contracts.len() as u64;
             let impacted_subset_used =
                 native_impacted_subset_used(total_contracts as usize, compiled_contracts as usize);
+            native_ensure_diagnostics(session, &context, &diagnostics)?;
             Ok((
                 keep_files.len(),
                 frontend_compile_ms,
@@ -20960,7 +21132,44 @@ fn run_native_build_inner(
                 Some(all_plans),
             ))
         },
-    )?;
+    );
+    let (
+        artifact_count,
+        frontend_compile_ms,
+        casm_ms,
+        artifact_write_ms,
+        produced_paths,
+        changed_files_count,
+        removed_files_count,
+        total_contracts,
+        compiled_contracts,
+        impacted_subset_used,
+        journal_fallback_full_scan,
+        dependency_updates,
+        contract_output_plans,
+    ) = match session_result {
+        Ok(values) => values,
+        // A code error on uc's own toolchain is the build's answer: report it like scarb.
+        Err(err)
+            if err.downcast_ref::<DiagnosticsError>().is_some()
+                && !native_error_allows_scarb_fallback(&err) =>
+        {
+            let run = CommandRun {
+                command: vec![
+                    "uc-native".to_string(),
+                    "build".to_string(),
+                    "--manifest-path".to_string(),
+                    manifest_path.display().to_string(),
+                ],
+                exit_code: 1,
+                elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+                stdout: String::new(),
+                stderr: diagnostics.failure_report(&context.package_name),
+            };
+            return Ok((run, NativeBuildPhaseTelemetry::default(), Vec::new()));
+        }
+        Err(err) => return Err(err),
+    };
     native_update_compile_session_post_build_state(
         workspace_root,
         &signature,
@@ -21008,8 +21217,13 @@ fn run_native_build_inner(
         exit_code: 0,
         elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
         stdout: format!("uc: native compile produced {} artifacts\n", artifact_count),
-        stderr: String::new(),
+        stderr: diagnostics.text(),
     };
+    if let Some(marker) = diagnostics.clean_dependencies_marker() {
+        if let Some(parent) = marker.parent() {
+            let _ = fs::create_dir_all(parent).and_then(|()| fs::write(&marker, b""));
+        }
+    }
     tracing::debug!(
         manifest_path = %manifest_path.display(),
         workspace_root = %workspace_root.display(),
@@ -22918,7 +23132,7 @@ fn try_restore_daemon_shared_cache(
     profile: &str,
     session_key: &str,
     fingerprint: &str,
-) -> Result<Option<usize>> {
+) -> Result<Option<(usize, String)>> {
     if !daemon_shared_cache_enabled() {
         return Ok(None);
     }
@@ -22959,7 +23173,7 @@ fn try_restore_daemon_shared_cache(
     )?) {
         return Ok(None);
     }
-    Ok(Some(entry.artifacts.len()))
+    Ok(Some((entry.artifacts.len(), entry.warnings)))
 }
 
 fn persist_daemon_shared_cache_entry_with_artifacts(
@@ -22969,6 +23183,7 @@ fn persist_daemon_shared_cache_entry_with_artifacts(
     fingerprint: &str,
     source_objects_dir: &Path,
     cached_artifacts: &[CachedArtifact],
+    warnings: &str,
 ) -> Result<()> {
     if !daemon_shared_cache_enabled() {
         return Ok(());
@@ -23003,7 +23218,7 @@ fn persist_daemon_shared_cache_entry_with_artifacts(
         }
     }
 
-    persist_cache_entry(profile, fingerprint, cached_artifacts, &shared_entry_path)?;
+    persist_cache_entry(profile, fingerprint, warnings, cached_artifacts, &shared_entry_path)?;
     let max_bytes = daemon_shared_cache_max_bytes();
     if max_bytes > 0 {
         enforce_cache_size_budget_with_budget(&shared_cache_root, max_bytes)?;

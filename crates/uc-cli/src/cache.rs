@@ -177,6 +177,7 @@ pub(super) struct AsyncPersistTask {
     pub(super) workspace_root: PathBuf,
     pub(super) profile: String,
     pub(super) fingerprint: String,
+    pub(super) warnings: String,
     pub(super) artifact_relative_paths: Option<Vec<String>>,
     pub(super) cached_artifacts: Option<Vec<CachedArtifact>>,
     pub(super) cache_root: PathBuf,
@@ -202,6 +203,7 @@ pub(super) fn run_async_persist_worker(receiver: Receiver<AsyncPersistTask>) {
                 persist_cache_entry(
                     &task.profile,
                     &task.fingerprint,
+                    &task.warnings,
                     cached_artifacts,
                     &task.entry_path,
                 )?;
@@ -215,6 +217,7 @@ pub(super) fn run_async_persist_worker(receiver: Receiver<AsyncPersistTask>) {
                 &task.workspace_root,
                 &task.profile,
                 &task.fingerprint,
+                &task.warnings,
                 task.artifact_relative_paths.as_deref(),
                 &task.cache_root,
                 &task.objects_dir,
@@ -233,6 +236,7 @@ pub(super) fn run_async_persist_worker(receiver: Receiver<AsyncPersistTask>) {
 pub(super) fn persist_cache_entry(
     profile: &str,
     fingerprint: &str,
+    warnings: &str,
     cached_artifacts: &[CachedArtifact],
     entry_path: &Path,
 ) -> Result<()> {
@@ -241,6 +245,7 @@ pub(super) fn persist_cache_entry(
         fingerprint: fingerprint.to_string(),
         profile: profile.to_string(),
         artifacts: cached_artifacts.to_vec(),
+        warnings: warnings.to_string(),
     };
 
     let bytes = serde_json::to_vec(&entry)?;
@@ -256,6 +261,7 @@ pub(super) fn persist_cache_entry_for_build(
     workspace_root: &Path,
     profile: &str,
     fingerprint: &str,
+    warnings: &str,
     artifact_relative_paths: Option<&[String]>,
     cache_root: &Path,
     objects_dir: &Path,
@@ -265,6 +271,7 @@ pub(super) fn persist_cache_entry_for_build(
         workspace_root,
         profile,
         fingerprint,
+        warnings,
         artifact_relative_paths,
         cache_root,
         objects_dir,
@@ -277,6 +284,7 @@ pub(super) fn persist_cache_entry_for_build_with_artifacts(
     workspace_root: &Path,
     profile: &str,
     fingerprint: &str,
+    warnings: &str,
     artifact_relative_paths: Option<&[String]>,
     cache_root: &Path,
     objects_dir: &Path,
@@ -290,7 +298,7 @@ pub(super) fn persist_cache_entry_for_build_with_artifacts(
         artifact_relative_paths,
     )?;
     let _cache_lock = acquire_cache_lock(cache_root)?;
-    persist_cache_entry(profile, fingerprint, &cached_artifacts, entry_path)?;
+    persist_cache_entry(profile, fingerprint, warnings, &cached_artifacts, entry_path)?;
     if should_enforce_cache_size_budget_now() {
         enforce_cache_size_budget(cache_root)?;
     }

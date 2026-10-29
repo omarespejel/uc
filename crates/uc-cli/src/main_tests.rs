@@ -7166,6 +7166,7 @@ fn native_compile_context_cache_ttl_eviction_prunes_stale_entries() {
         external_non_starknet_dependencies: Vec::new(),
         path_dependency_roots: Vec::new(),
         crate_dependency_configs: Vec::new(),
+        toolchain_compat: false,
     };
     let mut cache = HashMap::new();
     cache.insert(
@@ -9023,6 +9024,7 @@ fn build_entry_cache_eviction_removes_oldest_entries() {
         fingerprint: "fp".to_string(),
         profile: "dev".to_string(),
         artifacts: Vec::new(),
+        warnings: String::new(),
     };
     let mut cache = HashMap::new();
     cache.insert(
@@ -9142,10 +9144,12 @@ fn load_cache_entry_cached_invalidates_when_file_changes() {
         fingerprint: "fp-a".to_string(),
         profile: "dev".to_string(),
         artifacts: Vec::new(),
+        warnings: "warning[E0001]: Unused variable.\n".to_string(),
     };
     persist_cache_entry(
         &first.profile,
         &first.fingerprint,
+        &first.warnings,
         &first.artifacts,
         &entry_path,
     )
@@ -9154,6 +9158,8 @@ fn load_cache_entry_cached_invalidates_when_file_changes() {
         .expect("failed to load first cache entry")
         .expect("first cache entry should exist");
     assert_eq!(loaded_first.fingerprint, "fp-a");
+    // A cache hit replays the warnings of the build that filled the entry.
+    assert_eq!(loaded_first.warnings, first.warnings);
 
     // Ensure file mtime changes for the metadata-based cache validator.
     thread::sleep(Duration::from_millis(5));
@@ -9162,10 +9168,12 @@ fn load_cache_entry_cached_invalidates_when_file_changes() {
         fingerprint: "fp-b".to_string(),
         profile: "dev".to_string(),
         artifacts: Vec::new(),
+        warnings: String::new(),
     };
     persist_cache_entry(
         &second.profile,
         &second.fingerprint,
+        &second.warnings,
         &second.artifacts,
         &entry_path,
     )
@@ -9617,6 +9625,7 @@ fn async_persist_worker_uses_precomputed_cached_artifacts() {
             workspace_root: workspace,
             profile: "dev".to_string(),
             fingerprint: "fingerprint".to_string(),
+            warnings: String::new(),
             artifact_relative_paths: None,
             cached_artifacts: Some(vec![artifact]),
             cache_root: cache_root.clone(),
@@ -9731,6 +9740,7 @@ edition = "2024_07"
     persist_cache_entry(
         profile,
         &fingerprint,
+        "",
         &[CachedArtifact {
             relative_path: artifact_rel.to_string(),
             blake3_hex: artifact_hash.clone(),
@@ -11209,6 +11219,7 @@ fn native_test_compile_session_signature(
                 cairo_edition: Some("2024_07".to_string()),
                 dependencies: vec!["starknet".to_string()],
             }],
+            toolchain_compat: false,
         },
     }
 }
@@ -12310,6 +12321,7 @@ mod AtomicLock {
         external_non_starknet_dependencies: Vec::new(),
         path_dependency_roots: Vec::new(),
         crate_dependency_configs: Vec::new(),
+        toolchain_compat: false,
     };
     let tracked_sources = BTreeMap::from([
         (
@@ -12414,6 +12426,7 @@ mod contract_b {
         external_non_starknet_dependencies: Vec::new(),
         path_dependency_roots: Vec::new(),
         crate_dependency_configs: Vec::new(),
+        toolchain_compat: false,
     };
     let tracked_sources = BTreeMap::from([(
         "src/lib.cairo".to_string(),
@@ -13400,63 +13413,6 @@ fn native_impacted_source_index_requires_complete_dependency_index_for_unmatched
 
 #[cfg(feature = "native-compile")]
 #[test]
-fn native_filter_changed_files_to_contract_source_index_skips_unrelated_sources_when_complete() {
-    let by_source = HashMap::from([
-        ("src/contract_a.cairo".to_string(), vec![0_usize]),
-        ("src/shared.cairo".to_string(), vec![0_usize, 1_usize]),
-        ("src/contract_b.cairo".to_string(), vec![1_usize]),
-    ]);
-    let (changed, removed) = native_filter_changed_files_to_contract_source_index(
-        &[
-            "src/contract_a.cairo".to_string(),
-            "src/unrelated_math.cairo".to_string(),
-        ],
-        &[
-            "src/unknown_removed.cairo".to_string(),
-            "src/contract_b.cairo".to_string(),
-        ],
-        &by_source,
-        true,
-    );
-    assert_eq!(
-        changed,
-        vec!["src/contract_a.cairo".to_string()],
-        "complete dependency index should scope changed-file overrides to tracked sources only"
-    );
-    assert_eq!(
-        removed,
-        vec!["src/contract_b.cairo".to_string()],
-        "complete dependency index should scope removed-file overrides to tracked sources only"
-    );
-}
-
-#[cfg(feature = "native-compile")]
-#[test]
-fn native_filter_changed_files_to_contract_source_index_keeps_full_set_when_incomplete() {
-    let by_source = HashMap::from([("src/contract_a.cairo".to_string(), vec![0_usize])]);
-    let changed_input = vec![
-        "src/contract_a.cairo".to_string(),
-        "src/untracked.cairo".to_string(),
-    ];
-    let removed_input = vec!["src/removed_untracked.cairo".to_string()];
-    let (changed, removed) = native_filter_changed_files_to_contract_source_index(
-        &changed_input,
-        &removed_input,
-        &by_source,
-        false,
-    );
-    assert_eq!(
-        changed, changed_input,
-        "incomplete dependency indexes must keep conservative changed-file coverage"
-    );
-    assert_eq!(
-        removed, removed_input,
-        "incomplete dependency indexes must keep conservative removed-file coverage"
-    );
-}
-
-#[cfg(feature = "native-compile")]
-#[test]
 fn native_contract_source_index_for_module_paths_tracks_per_source_indices_and_completeness() {
     let module_paths = vec!["pkg::a".to_string(), "pkg::b".to_string()];
     let dependencies = BTreeMap::from([(
@@ -14102,40 +14058,6 @@ fn native_apply_file_keyed_session_updates_batches_changed_and_removed_files() {
 
 #[cfg(feature = "native-compile")]
 #[test]
-fn native_filter_changed_files_to_contract_source_index_keeps_absolute_paths_conservative() {
-    let by_source = HashMap::from([("src/contract_a.cairo".to_string(), vec![0])]);
-    let changed_files = vec![unique_platform_absolute_fixture_path(
-        "uc-native-index-external-dep",
-    )];
-
-    let (scoped_changed, scoped_removed) =
-        native_filter_changed_files_to_contract_source_index(&changed_files, &[], &by_source, true);
-    assert_eq!(
-        scoped_changed, changed_files,
-        "absolute tracked-source edits should not be filtered into an apparently safe no-op set"
-    );
-    assert!(
-        scoped_removed.is_empty(),
-        "no removed files were provided for the conservative absolute-path case"
-    );
-
-    let removed_files = vec![unique_platform_absolute_fixture_path(
-        "uc-native-index-external-removed",
-    )];
-    let (scoped_changed, scoped_removed) =
-        native_filter_changed_files_to_contract_source_index(&[], &removed_files, &by_source, true);
-    assert!(
-        scoped_changed.is_empty(),
-        "no changed files were provided for the conservative removed-file case"
-    );
-    assert_eq!(
-        scoped_removed, removed_files,
-        "absolute removed tracked-source edits should not be filtered into an apparently safe no-op set"
-    );
-}
-
-#[cfg(feature = "native-compile")]
-#[test]
 fn native_apply_file_keyed_session_updates_skips_untracked_removed_file_slots() {
     let workspace = unique_test_dir("uc-native-file-keyed-removed-slot");
     let src_dir = workspace.join("src");
@@ -14649,6 +14571,7 @@ fn native_compile_source_roots_include_main_and_dependency_roots_without_duplica
             },
         ],
         crate_dependency_configs: Vec::new(),
+        toolchain_compat: false,
     };
 
     let roots = native_compile_source_roots(&context);
@@ -15063,8 +14986,9 @@ fn native_cached_noop_keep_files_requires_complete_manifest_artifacts() {
 #[test]
 fn native_compiler_config_sets_replace_ids_by_profile() {
     let _env = crate::test_env_shared();
-    let empty_inputs: Vec<CrateInput> = Vec::new();
-    let dev_config = native_compiler_config(&empty_inputs, "dev", true);
+    let crates = NativeDiagnosticCrates::default();
+    let diagnostics = NativeDiagnosticsLog::default();
+    let dev_config = native_compiler_config(&crates, &diagnostics, "dev", true);
     assert!(
         dev_config.add_statements_code_locations,
         "statement-location annotations should be enabled by default to support impacted-unit compile"
@@ -15073,7 +14997,7 @@ fn native_compiler_config_sets_replace_ids_by_profile() {
         dev_config.replace_ids,
         "dev profile should default to replace IDs"
     );
-    let release_config = native_compiler_config(&empty_inputs, "release", false);
+    let release_config = native_compiler_config(&crates, &diagnostics, "release", false);
     assert!(
         !release_config.add_statements_code_locations,
         "statement-location annotations should honor explicit compile configuration"
@@ -15383,6 +15307,7 @@ fn mark_native_fallback_eligible_for_external_dependencies_only_marks_when_prese
         external_non_starknet_dependencies: Vec::new(),
         path_dependency_roots: Vec::new(),
         crate_dependency_configs: Vec::new(),
+        toolchain_compat: false,
     };
 
     let plain = mark_native_fallback_eligible_for_external_dependencies(
@@ -16668,6 +16593,73 @@ fn native_build_targets_follow_the_manifest_like_scarb() {
     );
     assert_eq!(resolve_manifest_native_build_targets(&parse(&format!("{pkg}[executable]\n"))).unwrap(), (None, false));
     assert!(resolve_manifest_native_build_targets(&parse(&format!("{pkg}[lib]\ncasm = \"yes\"\n"))).is_err());
+}
+
+#[test]
+#[cfg(feature = "native-compile")]
+fn contract_target_without_contracts_still_fails_on_code_errors() {
+    let _env = crate::test_env_shared();
+    // Scarb checks the crate even when the contract target finds no contract. uc used to write
+    // an empty artifacts manifest and exit 0.
+    let root = std::env::temp_dir().join(format!("uc-no-contract-error-{}-{}", std::process::id(), epoch_ms_u64().unwrap_or(1)));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("Scarb.toml"), "[package]\nname = \"broken\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n\n[dependencies]\nstarknet = \"2.18.0\"\n\n[[target.starknet-contract]]\n").unwrap();
+    fs::write(root.join("src/lib.cairo"), "fn f() -> felt252 { undefined_thing() }\n").unwrap();
+    let common = BuildCommonArgs { manifest_path: Some(root.join("Scarb.toml")), package: None, workspace: false, features: Vec::new(), offline: true, release: false, profile: Some("dev".to_string()) };
+    let (run, _, _) = run_native_build(&common, &root.join("Scarb.toml"), &root, "dev", false)
+        .expect("a code error is the build's answer, not a reason to retry with scarb");
+    let _ = fs::remove_dir_all(&root);
+    assert_eq!(run.exit_code, 1);
+    assert!(run.stderr.contains("Function not found"), "{}", run.stderr);
+    assert!(run.stderr.ends_with("error: could not compile `broken` due to 1 previous error\n"), "{}", run.stderr);
+}
+
+#[test]
+#[cfg(feature = "native-compile")]
+fn dependency_code_errors_fail_the_build_like_scarb() {
+    let _env = crate::test_env_lock();
+    // Scarb checks every crate it compiles, so an error in an unused dependency function fails
+    // the build. uc used to check only the main crate.
+    let root = std::env::temp_dir().join(format!("uc-dep-error-{}-{}", std::process::id(), epoch_ms_u64().unwrap_or(1)));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("dep/src")).unwrap();
+    fs::create_dir_all(root.join("app/src")).unwrap();
+    fs::write(root.join("dep/Scarb.toml"), "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n").unwrap();
+    fs::write(root.join("dep/src/lib.cairo"), "pub fn good() -> felt252 { 1 }\nfn unused_broken() -> felt252 { undefined_thing() }\n").unwrap();
+    fs::write(root.join("app/Scarb.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n").unwrap();
+    fs::write(root.join("app/src/lib.cairo"), "fn main() -> felt252 { dep::good() }\n").unwrap();
+    // A path dependency lets uc retry with scarb; keep the answer uc's own.
+    std::env::set_var("UC_NATIVE_DISALLOW_SCARB_FALLBACK", "1");
+    let result = run_build(BuildArgs {
+        common: BuildCommonArgs { manifest_path: Some(root.join("app/Scarb.toml")), package: None, workspace: false, features: Vec::new(), offline: true, release: false, profile: Some("dev".to_string()) },
+        engine: EngineArg::Uc, daemon_mode: DaemonModeArg::Off, report_path: None, record_failure: None, json: false, plan_only: false,
+    });
+    std::env::remove_var("UC_NATIVE_DISALLOW_SCARB_FALLBACK");
+    let _ = fs::remove_dir_all(&root);
+    // Either uc's own failed compile or its refused retry; scarb never ran.
+    let chain = format!("{:#}", result.expect_err("a dependency error must fail the build"));
+    assert!(
+        chain.contains("build failed with exit code 1") || chain.contains("Compilation failed"),
+        "{chain}"
+    );
+}
+
+#[test]
+#[cfg(feature = "native-compile")]
+fn native_build_hands_its_warnings_to_the_caller() {
+    let _env = crate::test_env_shared();
+    // A daemon build printed warnings to the daemon's log, where nobody saw them.
+    let root = std::env::temp_dir().join(format!("uc-native-warnings-{}-{}", std::process::id(), epoch_ms_u64().unwrap_or(1)));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("Scarb.toml"), "[package]\nname = \"warns\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n").unwrap();
+    fs::write(root.join("src/lib.cairo"), "fn f() -> felt252 {\n    let unused = 5;\n    1\n}\n").unwrap();
+    let common = BuildCommonArgs { manifest_path: Some(root.join("Scarb.toml")), package: None, workspace: false, features: Vec::new(), offline: true, release: false, profile: Some("dev".to_string()) };
+    let (run, _, _) = run_native_build(&common, &root.join("Scarb.toml"), &root, "dev", false).expect("build");
+    let _ = fs::remove_dir_all(&root);
+    assert_eq!(run.exit_code, 0);
+    assert!(run.stderr.contains("Unused variable"), "{}", run.stderr);
 }
 
 #[test]
