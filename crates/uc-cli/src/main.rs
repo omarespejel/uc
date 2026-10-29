@@ -1591,6 +1591,17 @@ fn native_error_allows_scarb_fallback(err: &anyhow::Error) -> bool {
     err.downcast_ref::<NativeFallbackEligibleTag>().is_some()
 }
 
+/// The native compile found errors in the code, as opposed to failing to compile at all.
+#[cfg(feature = "native-compile")]
+fn native_error_is_code_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<DiagnosticsError>().is_some()
+}
+
+#[cfg(not(feature = "native-compile"))]
+fn native_error_is_code_error(_err: &anyhow::Error) -> bool {
+    false
+}
+
 #[cfg(feature = "native-compile")]
 static NATIVE_DAEMON_BACKEND_POISONED: AtomicBool = AtomicBool::new(false);
 
