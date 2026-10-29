@@ -2559,11 +2559,16 @@ pub(crate) struct UcSnforgeTestAttrPlugin;
 impl cairo_lang_defs::plugin::MacroPlugin for UcSnforgeTestAttrPlugin {
     fn generate_code<'db>(
         &self,
-        _db: &'db dyn salsa::Database,
-        _item_ast: cairo_lang_syntax::node::ast::ModuleItem<'db>,
+        db: &'db dyn salsa::Database,
+        item_ast: cairo_lang_syntax::node::ast::ModuleItem<'db>,
         _metadata: &cairo_lang_defs::plugin::MacroPluginMetadata<'_>,
     ) -> cairo_lang_defs::plugin::PluginResult<'db> {
-        cairo_lang_defs::plugin::PluginResult::default()
+        match item_ast {
+            cairo_lang_syntax::node::ast::ModuleItem::FreeFunction(func) => {
+                expand_snforge_test_cases(db, &func)
+            }
+            _ => cairo_lang_defs::plugin::PluginResult::default(),
+        }
     }
 
     fn declared_attributes<'db>(
@@ -2586,6 +2591,140 @@ impl cairo_lang_defs::plugin::MacroPlugin for UcSnforgeTestAttrPlugin {
             cairo_lang_filesystem::ids::SmolStrId::from(db, "budget"),
             cairo_lang_filesystem::ids::SmolStrId::from(db, "upgrades"),
         ]
+    }
+}
+
+/// Attributes that configure a snforge test, so they move from a `#[test_case]` function to its
+/// cases.
+#[cfg(feature = "native-test-runner")]
+const SNFORGE_TEST_CONFIG_ATTRS: &[&str] = &[
+    "test",
+    "should_panic",
+    "ignore",
+    "available_gas",
+    "fork",
+    "disable_predeployed_contracts",
+];
+
+/// snforge's `#[test_case(args)]`: each case becomes the test `<fn>_<args>` (or `<fn>_<name>`),
+/// which calls the function with those arguments. The function itself stays a test only when it
+/// also fuzzes.
+#[cfg(feature = "native-test-runner")]
+fn expand_snforge_test_cases<'db>(
+    db: &'db dyn salsa::Database,
+    func: &cairo_lang_syntax::node::ast::FunctionWithBody<'db>,
+) -> cairo_lang_defs::plugin::PluginResult<'db> {
+    use cairo_lang_defs::patcher::PatchBuilder;
+    use cairo_lang_defs::plugin::{PluginDiagnostic, PluginGeneratedFile, PluginResult};
+    use cairo_lang_syntax::attribute::structured::{AttributeArgVariant, AttributeStructurize};
+    use cairo_lang_syntax::node::{Terminal, TypedSyntaxNode};
+
+    let attributes: Vec<_> = func.attributes(db).elements(db).collect();
+    let name_of = |attr: &cairo_lang_syntax::node::ast::Attribute<'db>| {
+        attr.attr(db).as_syntax_node().get_text_without_trivia(db).long(db).to_string()
+    };
+    if !attributes.iter().any(|attr| name_of(attr) == "test_case") {
+        return PluginResult::default();
+    }
+    let fuzzes = attributes.iter().any(|attr| name_of(attr) == "fuzzer");
+    let declaration = func.declaration(db);
+    let fn_name = declaration.name(db).text(db).long(db).to_string();
+    let param_count = declaration.signature(db).parameters(db).elements(db).count();
+    let mut builder = PatchBuilder::new(db, func);
+    for attr in &attributes {
+        let name = name_of(attr);
+        if name != "test_case" && (fuzzes || !SNFORGE_TEST_CONFIG_ATTRS.contains(&name.as_str())) {
+            builder.add_node(attr.as_syntax_node());
+        }
+    }
+    builder.add_node(func.visibility(db).as_syntax_node());
+    builder.add_node(declaration.as_syntax_node());
+    builder.add_node(func.body(db).as_syntax_node());
+
+    let mut diagnostics = Vec::new();
+    for attr in attributes.iter().filter(|attr| name_of(attr) == "test_case") {
+        let mut case_name = None;
+        let mut args = Vec::new();
+        for arg in attr.clone().structurize(db).args {
+            match arg.variant {
+                AttributeArgVariant::Unnamed(expr) => args.push(expr),
+                AttributeArgVariant::Named { value, name } if name.text.long(db) == "name" => {
+                    case_name = Some(value)
+                }
+                _ => diagnostics.push(PluginDiagnostic::error(
+                    arg.arg.stable_ptr(db),
+                    "`#[test_case]` takes the function's arguments and an optional `name:`"
+                        .to_string(),
+                )),
+            }
+        }
+        let message = if param_count == 0 {
+            Some("The function must have at least one parameter to use #[test_case] attribute".to_string())
+        } else if args.len() != param_count {
+            Some(format!("Expected {param_count} arguments, but got {}", args.len()))
+        } else {
+            None
+        };
+        if let Some(message) = message {
+            diagnostics.push(PluginDiagnostic::error(attr.stable_ptr(db), message));
+            continue;
+        }
+        let text = |expr: &cairo_lang_syntax::node::ast::Expr<'db>| {
+            snforge_case_suffix(expr.as_syntax_node().get_text_without_trivia(db).long(db))
+        };
+        let suffix = match &case_name {
+            Some(name) => text(name),
+            None => args.iter().map(text).collect::<Vec<_>>().join("_"),
+        };
+        builder.add_str("\n#[test]\n");
+        for attr in &attributes {
+            if !matches!(name_of(attr).as_str(), "test" | "test_case" | "fuzzer") {
+                builder.add_node(attr.as_syntax_node());
+            }
+        }
+        builder.add_str(&format!("\nfn {fn_name}_{suffix}() {{\n    {fn_name}("));
+        for expr in &args {
+            builder.add_node(expr.as_syntax_node());
+            builder.add_str(", ");
+        }
+        builder.add_str(");\n}\n");
+    }
+    let (content, code_mappings) = builder.build();
+    PluginResult {
+        code: Some(PluginGeneratedFile {
+            name: "test_case".to_string(),
+            content,
+            code_mappings,
+            aux_data: None,
+            diagnostics_note: None,
+            is_unhygienic: false,
+        }),
+        diagnostics,
+        remove_original_item: true,
+    }
+}
+
+/// snforge's case suffix: runs of characters other than ASCII letters and digits become `_`,
+/// lowercased and trimmed of `_`.
+#[cfg(feature = "native-test-runner")]
+fn snforge_case_suffix(text: &str) -> String {
+    let mut suffix = String::new();
+    let mut gap = false;
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() {
+            if gap && !suffix.is_empty() {
+                suffix.push('_');
+            }
+            suffix.push(c.to_ascii_lowercase());
+            gap = false;
+        } else {
+            gap = true;
+        }
+    }
+    if suffix.is_empty() {
+        "_empty".to_string()
+    } else {
+        suffix
     }
 }
 
@@ -6019,6 +6158,99 @@ mod tests {
             .find(|t| t["name"].as_str().unwrap().ends_with("check_addition_commutes"))
             .expect("check_addition_commutes entry");
         assert_eq!(commute_test["fuzz_runs"], 12, "{commute_test}");
+    }
+
+    #[test]
+    fn snforge_test_cases_run_under_snforge_names() {
+        let _env = crate::test_env_shared();
+        // Names and outcomes match snforge 0.60 on this source. uc used to run `adds` once as a
+        // fuzz test.
+        let proj = TempTestProject::new("test_case_names");
+        let manifest_path = proj.dir.join("Scarb.toml");
+        fs::write(
+            &manifest_path,
+            "[package]\nname = \"cases\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n\n[dependencies]\nstarknet = \"2.18.0\"\n\n[dev-dependencies]\nsnforge_std = \"0.60.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            proj.dir.join("src/lib.cairo"),
+            r#"pub fn add(a: felt252, b: felt252) -> felt252 { a + b }
+
+#[cfg(test)]
+mod tests {
+    use super::add;
+
+    #[test]
+    #[test_case(1, 2, 3)]
+    #[test_case(name: "Zero Case!", 0, 0, 0)]
+    fn adds(a: felt252, b: felt252, sum: felt252) {
+        assert(add(a, b) == sum, 'sum');
+    }
+
+    #[test]
+    #[should_panic(expected: 'boom')]
+    #[test_case(true)]
+    #[test_case(false)]
+    fn panics(flag: bool) {
+        if flag { core::panic_with_felt252('boom'); }
+        core::panic_with_felt252('boom');
+    }
+
+    #[test]
+    #[test_case(2, 5)]
+    fn differs(a: u8, b: u8) {
+        assert(a == b, 'differ');
+    }
+
+    #[test]
+    #[fuzzer(runs: 5, seed: 7)]
+    #[test_case(10)]
+    fn fuzz_and_case(x: u64) {
+        assert(x + 1 > x, 'overflow');
+    }
+}
+"#,
+        )
+        .unwrap();
+        let rep_path = proj.dir.join("rep.json");
+        let _ = run_test(TestArgs {
+            manifest_path: Some(manifest_path),
+            json: true,
+            report_path: Some(rep_path.clone()),
+            ..Default::default()
+        });
+        let rep: serde_json::Value =
+            serde_json::from_slice(&fs::read(&rep_path).unwrap()).unwrap();
+        let mut outcomes: Vec<(String, String)> = rep["tests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| {
+                let name = t["name"].as_str().unwrap();
+                (name.rsplit("::").next().unwrap().to_string(), t["status"].as_str().unwrap().to_string())
+            })
+            .collect();
+        outcomes.sort();
+        let expected = [
+            ("adds_1_2_3", "ok"),
+            ("adds_zero_case", "ok"),
+            ("differs_2_5", "failed"),
+            ("fuzz_and_case", "ok"),
+            ("fuzz_and_case_10", "ok"),
+            ("panics_false", "ok"),
+            ("panics_true", "ok"),
+        ];
+        let expected: Vec<(String, String)> =
+            expected.iter().map(|(n, s)| (n.to_string(), s.to_string())).collect();
+        assert_eq!(outcomes, expected, "{rep}");
+    }
+
+    #[test]
+    fn snforge_case_suffix_follows_snforge() {
+        assert_eq!(snforge_case_suffix("Zero Case!"), "zero_case");
+        assert_eq!(snforge_case_suffix("'abc'"), "abc");
+        assert_eq!(snforge_case_suffix("array![1, 2]"), "array_1_2");
+        assert_eq!(snforge_case_suffix("-"), "_empty");
     }
 
     #[test]
