@@ -1272,10 +1272,23 @@ fn ensure_contract_artifacts_ready(
     inspect_contract_artifacts_in_workspace(manifest_path, profile, contract)
 }
 
+/// A target that names a file must exist. uc used to take a missing file for a contract name and
+/// report the Scarb.toml it then failed to find.
+pub(crate) fn ensure_named_file_exists(target: &str) -> Result<()> {
+    let names_file = target.ends_with(".json")
+        || target.contains('/')
+        || target.contains(std::path::MAIN_SEPARATOR);
+    if names_file && !Path::new(target).is_file() {
+        bail!("no such file: {target}");
+    }
+    Ok(())
+}
+
 pub(crate) fn run_class_hash(args: ClassHashArgs) -> Result<()> {
     let started = Instant::now();
     // Check if target is a direct file path or an on-chain 0x... address / class hash
     if let Some(target_str) = args.target.as_deref() {
+        ensure_named_file_exists(target_str)?;
         let candidate_path = PathBuf::from(target_str);
         if candidate_path.is_file() || target_str.starts_with("0x") {
             let (raw_text, source_label) = if candidate_path.is_file() {
@@ -1892,6 +1905,29 @@ fn compute_keystore_mac_hex(mac_key: &[u8], ciphertext: &[u8]) -> String {
     h.finalize().to_hex().to_string()
 }
 
+/// A transaction uc will send needs an account to send it from and a key to sign it. Without
+/// them uc used to send from 0x1 and fail at fee estimation with "Contract not found".
+fn ensure_sending_account(
+    prof: &ResolvedStarknetProfile,
+    keystore: Option<&Path>,
+    dry_run: bool,
+) -> Result<()> {
+    if dry_run || prof.url.is_none() {
+        return Ok(());
+    }
+    if prof.account_address.is_none() {
+        bail!(
+            "no account to send from: pass --account <name> or --account-address, or set STARKNET_ACCOUNT_ADDRESS (--dry-run builds the transaction without one)"
+        );
+    }
+    if prof.private_key.is_none() && keystore.is_none() {
+        bail!(
+            "no key to sign with: pass --private-key or --keystore, or set STARKNET_PRIVATE_KEY (--dry-run builds the transaction without one)"
+        );
+    }
+    Ok(())
+}
+
 fn resolve_effective_private_key(
     profile_private_key: Option<&str>,
     keystore: Option<&Path>,
@@ -2130,6 +2166,7 @@ pub(crate) fn run_declare(args: DeclareArgs) -> Result<()> {
             args.private_key.as_deref(),
             args.accounts_file.as_deref(),
         );
+        ensure_sending_account(&prof, args.keystore.as_deref(), args.dry_run)?;
         let contracts =
             ensure_contract_artifacts_ready(&manifest_path, "dev", false, Some(&args.contract))?;
         let contract = contracts
@@ -2346,6 +2383,7 @@ pub(crate) fn run_deploy(args: DeployArgs) -> Result<()> {
             args.private_key.as_deref(),
             args.accounts_file.as_deref(),
         );
+        ensure_sending_account(&prof, args.keystore.as_deref(), args.dry_run)?;
 
         let class_hash = if let Some(ch) = args.class_hash.as_deref() {
             format_felt_hex(&parse_felt_str(ch)?)
@@ -2529,6 +2567,7 @@ pub(crate) fn run_invoke(args: InvokeArgs) -> Result<()> {
             args.private_key.as_deref(),
             args.accounts_file.as_deref(),
         );
+        ensure_sending_account(&prof, args.keystore.as_deref(), args.dry_run)?;
 
         let selector_hex = if args.function.starts_with("0x") || args.function.starts_with("0X") {
             format_felt_hex(&parse_felt_str(&args.function)?)
@@ -3927,6 +3966,42 @@ mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    #[test]
+    fn sending_needs_an_account_and_a_key_unless_dry_run() {
+        let mut prof = ResolvedStarknetProfile {
+            profile_name: "default".to_string(),
+            url: Some("http://127.0.0.1:5050/rpc".to_string()),
+            network: None,
+            account: None,
+            account_address: None,
+            private_key: None,
+            accounts_file: None,
+        };
+        let err = ensure_sending_account(&prof, None, false).unwrap_err().to_string();
+        assert!(err.starts_with("no account to send from"), "{err}");
+        assert!(ensure_sending_account(&prof, None, true).is_ok());
+        prof.account_address = Some("0x64b4".to_string());
+        let err = ensure_sending_account(&prof, None, false).unwrap_err().to_string();
+        assert!(err.starts_with("no key to sign with"), "{err}");
+        assert!(ensure_sending_account(&prof, Some(Path::new("keystore.json")), false).is_ok());
+        prof.private_key = Some("0x1".to_string());
+        assert!(ensure_sending_account(&prof, None, false).is_ok());
+        // Without a node nothing is sent.
+        prof.url = None;
+        prof.account_address = None;
+        assert!(ensure_sending_account(&prof, None, false).is_ok());
+    }
+
+    #[test]
+    fn a_missing_artifact_path_is_named() {
+        let err = ensure_named_file_exists("nope.contract_class.json").unwrap_err().to_string();
+        assert_eq!(err, "no such file: nope.contract_class.json");
+        assert!(ensure_named_file_exists("target/dev/missing").is_err());
+        // Contract names and hashes are not files.
+        assert!(ensure_named_file_exists("Counter").is_ok());
+        assert!(ensure_named_file_exists("0x1234").is_ok());
+    }
 
     /// `sncast deploy --unique` on starknet-devnet 0.10.1 deployed this class at this address
     /// through the Cairo 1 UDC; the legacy UDC would have given another one.

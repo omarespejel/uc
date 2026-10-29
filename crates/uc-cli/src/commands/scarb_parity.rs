@@ -1666,6 +1666,7 @@ pub(crate) fn run_decompile(args: DecompileArgs) -> Result<()> {
         let mut target_label = String::from("workspace");
 
         if let Some(target) = &args.target {
+            crate::commands::starknet_onchain::ensure_named_file_exists(target)?;
             let path = PathBuf::from(target);
             if path.is_file() {
                 target_label = path.display().to_string();
