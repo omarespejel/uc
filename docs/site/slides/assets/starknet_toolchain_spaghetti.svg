@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 440" width="940" height="440">
+  <rect width="940" height="440" rx="10" fill="#ffffff" stroke="#0f172a" stroke-width="2.5"/>
+  <text x="470" y="34" text-anchor="middle" font-family="ui-monospace, monospace" font-size="18" font-weight="800" fill="#0f172a">HOW STARKNET DEVELOPER ENVIRONMENTS DEGRADE OVER TIME</text>
+
+  <!-- Left side: Legacy Spaghetti -->
+  <rect x="24" y="52" width="530" height="330" rx="8" fill="#fff1f2" fill-opacity="0.45" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6,4"/>
+  <text x="289" y="76" text-anchor="middle" font-family="system-ui, sans-serif" font-size="15" font-weight="700" fill="#9f1239">Before: 5 Binaries, 4 Version Managers, 3 Caches</text>
+
+  <rect x="44" y="96" width="135" height="40" rx="18" fill="#ffffff" stroke="#0f172a" stroke-width="2"/>
+  <text x="111" y="121" text-anchor="middle" font-family="ui-monospace, monospace" font-size="13" font-weight="700">$PATH / asdf</text>
+
+  <rect x="215" y="96" width="145" height="40" rx="18" fill="#ffffff" stroke="#0f172a" stroke-width="2"/>
+  <text x="287" y="121" text-anchor="middle" font-family="ui-monospace, monospace" font-size="13" font-weight="700">scarb 2.18.0</text>
+
+  <rect x="390" y="96" width="145" height="40" rx="18" fill="#ffffff" stroke="#0f172a" stroke-width="2"/>
+  <text x="462" y="121" text-anchor="middle" font-family="ui-monospace, monospace" font-size="13" font-weight="700">snforge 0.60</text>
+
+  <rect x="50" y="176" width="175" height="42" rx="18" fill="#ffffff" stroke="#0f172a" stroke-width="2"/>
+  <text x="137" y="202" text-anchor="middle" font-family="ui-monospace, monospace" font-size="12.5" font-weight="700">snforge_std git tag?</text>
+
+  <rect x="260" y="176" width="265" height="42" rx="18" fill="#ffffff" stroke="#0f172a" stroke-width="2"/>
+  <text x="392" y="202" text-anchor="middle" font-family="ui-monospace, monospace" font-size="12.5" font-weight="700">universal-sierra-compiler</text>
+
+  <rect x="50" y="258" width="155" height="42" rx="18" fill="#ffffff" stroke="#0f172a" stroke-width="2"/>
+  <text x="127" y="284" text-anchor="middle" font-family="ui-monospace, monospace" font-size="13" font-weight="700">sncast 0.60</text>
+
+  <rect x="240" y="258" width="180" height="42" rx="18" fill="#ffffff" stroke="#0f172a" stroke-width="2"/>
+  <text x="330" y="284" text-anchor="middle" font-family="ui-monospace, monospace" font-size="13" font-weight="700">starknet-devnet</text>
+
+  <!-- Tangled arrows -->
+  <path d="M 179 116 L 215 116" stroke="#be123c" stroke-width="2"/>
+  <path d="M 360 116 L 390 116" stroke="#be123c" stroke-width="2"/>
+  <path d="M 462 136 C 462 160, 137 150, 137 176" fill="none" stroke="#be123c" stroke-width="2"/>
+  <path d="M 287 136 L 392 176" stroke="#be123c" stroke-width="2"/>
+  <path d="M 462 136 L 392 176" stroke="#be123c" stroke-width="2"/>
+  <path d="M 137 218 L 127 258" stroke="#be123c" stroke-width="2"/>
+  <path d="M 392 218 L 330 258" stroke="#be123c" stroke-width="2"/>
+
+  <text x="289" y="342" text-anchor="middle" font-family="ui-monospace, monospace" font-size="12.5" font-weight="700" fill="#be123c">Error: package `snforge_std` requires Cairo &gt;=2.15, found 2.14</text>
+  <text x="289" y="364" text-anchor="middle" font-family="ui-monospace, monospace" font-size="12" fill="#64748b">(Recompiles corelib 3 separate times across target/dev &amp; snforge)</text>
+
+  <!-- Right side: Unified uc -->
+  <rect x="578" y="52" width="338" height="330" rx="8" fill="#f0fdf4" stroke="#22c55e" stroke-width="2"/>
+  <text x="747" y="78" text-anchor="middle" font-family="system-ui, sans-serif" font-size="15" font-weight="700" fill="#15803d">With uc: 1 Self-Contained Binary</text>
+
+  <rect x="642" y="112" width="210" height="58" rx="12" fill="#5c3cbe"/>
+  <text x="747" y="140" text-anchor="middle" font-family="ui-monospace, monospace" font-size="22" font-weight="800" fill="#ffffff">uc (single binary)</text>
+  <text x="747" y="159" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11.5" fill="#e0e7ff">Embedded Cairo Corelib + Salsa DB</text>
+
+  <text x="605" y="205" font-family="ui-monospace, monospace" font-size="13.5" font-weight="700" fill="#0f172a">✓ uc build / check   (27ms warm)</text>
+  <text x="605" y="233" font-family="ui-monospace, monospace" font-size="13.5" font-weight="700" fill="#0f172a">✓ uc test / fuzz     (20ms warm)</text>
+  <text x="605" y="261" font-family="ui-monospace, monospace" font-size="13.5" font-weight="700" fill="#0f172a">✓ uc prove / audit   (18ms symbolic)</text>
+  <text x="605" y="289" font-family="ui-monospace, monospace" font-size="13.5" font-weight="700" fill="#0f172a">✓ uc declare / call  (native RPC)</text>
+  <text x="605" y="317" font-family="ui-monospace, monospace" font-size="13.5" font-weight="700" fill="#0f172a">✓ uc devnet          (port 5050)</text>
+  <text x="605" y="355" font-family="system-ui, sans-serif" font-size="12.5" font-weight="600" fill="#166534">Works on bare Linux &amp; macOS with zero setup.</text>
+
+  <text x="470" y="416" text-anchor="middle" font-family="ui-monospace, monospace" font-size="14" fill="#334155">"Instead of a 15th standard, uc speaks Scarb.toml, snfoundry.toml, and starknet-devnet natively."</text>
+</svg>

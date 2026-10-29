@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 264" width="880" height="264">
+  <rect width="880" height="264" fill="#ffffff"/>
+  <line x1="196" y1="14" x2="196" y2="210" stroke="#e2e2e2" stroke-width="2"/>
+  <line x1="389" y1="14" x2="389" y2="210" stroke="#e2e2e2" stroke-width="2"/>
+  <line x1="583" y1="14" x2="583" y2="210" stroke="#e2e2e2" stroke-width="2"/>
+  <line x1="776" y1="14" x2="776" y2="210" stroke="#e2e2e2" stroke-width="2"/>
+  <text x="180" y="45" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="24" font-weight="700" fill="#222222">uc build</text>
+  <rect x="196" y="21" width="6" height="32" fill="#5c3cbe"/>
+  <text x="214" y="45" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="24" font-weight="600" fill="#222222">0.03s</text>
+  <text x="180" y="96" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="24" fill="#222222">scarb build</text>
+  <rect x="196" y="72" width="52" height="32" fill="#94a3b8"/>
+  <text x="260" y="96" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="24" font-weight="600" fill="#222222">0.27s</text>
+  <text x="180" y="147" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="24" font-weight="700" fill="#222222">uc test</text>
+  <rect x="196" y="123" width="164" height="32" fill="#5c3cbe"/>
+  <text x="372" y="147" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="24" font-weight="600" fill="#222222">0.85s</text>
+  <text x="180" y="198" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="24" fill="#222222">snforge test</text>
+  <rect x="196" y="174" width="470" height="32" fill="#94a3b8"/>
+  <text x="678" y="198" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="24" font-weight="600" fill="#222222">2.43s</text>
+  <text x="196" y="246" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="24" fill="#222222">0.0s</text>
+  <text x="389" y="246" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="24" fill="#222222">1.0s</text>
+  <text x="583" y="246" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="24" fill="#222222">2.0s</text>
+  <text x="776" y="246" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="24" fill="#222222">3.0s</text>
+</svg>

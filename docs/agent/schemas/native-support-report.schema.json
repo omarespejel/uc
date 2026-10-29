@@ -29,7 +29,26 @@
     "compiler_version": { "type": "string" },
     "package_cairo_version": { "type": "string" },
     "issue_kind": { "type": "string" },
-    "toolchain": { "type": "object" },
+    "toolchain": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "edition": { "type": "string" },
+        "requested_version": { "type": "string" },
+        "requested_major_minor": { "type": "string" },
+        "source": { "enum": ["builtin", "external_helper"] },
+        "binary_path": { "type": "string" },
+        "compiler_version": { "type": "string" },
+        "host_ready": {
+          "type": "boolean",
+          "description": "Whether this toolchain can run on this host now. `supported` describes the project's shape; `host_ready` describes the machine. A shape-supported external-helper lane whose helper was never built reports supported=true with host_ready=false, and the build would downgrade to scarb. Run `uc toolchain ensure` first."
+        },
+        "helper_built": {
+          "type": "boolean",
+          "description": "External-helper lanes only: whether the helper binary exists and is executable. Absent for the builtin lane."
+        }
+      }
+    },
     "diagnostics": {
       "type": "array",
       "items": { "$ref": "native-diagnostic.schema.json" }

@@ -1679,7 +1679,7 @@ enum ResolvedBase<'db> {
     Module(ModuleId<'db>),
     /// The base module is a crate.
     Crate(CrateId<'db>),
-    /// The base module to address is the statement
+    /// The base module to address is the statement.
     StatementEnvironment(ResolvedGenericItem<'db>),
     /// The item is imported using global use.
     FoundThroughGlobalUse { item_info: ModuleItemInfo<'db>, containing_module: ModuleId<'db> },
@@ -2189,7 +2189,7 @@ impl<'db, 'a> Resolution<'db, 'a> {
 
         let ident = identifier.text(db);
 
-        if identifier.text(db).long(db) == SELF_TYPE_KW {
+        if ident.long(db) == SELF_TYPE_KW {
             return Err(self.diagnostics.report(identifier.stable_ptr(db), SelfMustBeFirst));
         }
 

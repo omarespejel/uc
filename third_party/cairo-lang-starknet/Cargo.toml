@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "cairo-lang-starknet"
-version = "2.16.0"
+version = "2.18.0"
 build = false
 autolib = false
 autobins = false
@@ -33,43 +33,43 @@ path = "src/lib.rs"
 version = "1.0.98"
 
 [dependencies.cairo-lang-compiler]
-version = "=2.16.0"
+version = "=2.18.0"
 
 [dependencies.cairo-lang-defs]
-version = "=2.16.0"
+version = "=2.18.0"
 
 [dependencies.cairo-lang-diagnostics]
-version = "=2.16.0"
+version = "=2.18.0"
 
 [dependencies.cairo-lang-filesystem]
-version = "=2.16.0"
+version = "=2.18.0"
 
 [dependencies.cairo-lang-lowering]
-version = "=2.16.0"
+version = "=2.18.0"
 
 [dependencies.cairo-lang-parser]
-version = "=2.16.0"
+version = "=2.18.0"
 
 [dependencies.cairo-lang-plugins]
-version = "=2.16.0"
+version = "=2.18.0"
 
 [dependencies.cairo-lang-semantic]
-version = "=2.16.0"
+version = "=2.18.0"
 
 [dependencies.cairo-lang-sierra]
-version = "=2.16.0"
+version = "=2.18.0"
 
 [dependencies.cairo-lang-sierra-generator]
-version = "=2.16.0"
+version = "=2.18.0"
 
 [dependencies.cairo-lang-starknet-classes]
-version = "=2.16.0"
+version = "=2.18.0"
 
 [dependencies.cairo-lang-syntax]
-version = "=2.16.0"
+version = "=2.18.0"
 
 [dependencies.cairo-lang-utils]
-version = "=2.16.0"
+version = "=2.18.0"
 features = ["serde"]
 
 [dependencies.const_format]

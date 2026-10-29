@@ -137,6 +137,111 @@ pub(super) fn normalize_fingerprint_path(path: &Path) -> String {
     without_windows_prefix.replace('\\', "/")
 }
 
+pub(super) fn fingerprint_key_path(workspace_root: &Path, key: &str) -> PathBuf {
+    let key_path = Path::new(key);
+    if key_path.is_absolute() {
+        key_path.to_path_buf()
+    } else {
+        workspace_root.join(key_path)
+    }
+}
+
+pub(super) const MAX_EXTERNAL_PATH_DEPENDENCY_ROOTS: usize = 64;
+
+pub(super) fn manifest_path_dependency_dirs(manifest_path: &Path) -> Result<Vec<PathBuf>> {
+    let contents = fs::read_to_string(manifest_path).with_context(|| {
+        format!(
+            "failed to read manifest {} while collecting path dependency roots",
+            manifest_path.display()
+        )
+    })?;
+    let manifest = match toml::from_str::<TomlValue>(&contents) {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            // A manifest that is not valid TOML cannot declare path
+            // dependencies scarb would honor (it is outside the build graph,
+            // e.g. an intentionally-broken test fixture), and its raw bytes
+            // are already part of the fingerprint, so edits still invalidate.
+            eprintln!(
+                "uc: warning: skipping path-dependency scan of unparseable manifest {}: {err}",
+                manifest_path.display()
+            );
+            return Ok(Vec::new());
+        }
+    };
+    let manifest_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut dirs = Vec::new();
+    let mut collect_table = |table: Option<&TomlValue>| {
+        let Some(table) = table.and_then(TomlValue::as_table) else {
+            return;
+        };
+        for value in table.values() {
+            let Some(path) = value
+                .as_table()
+                .and_then(|table| table.get("path"))
+                .and_then(TomlValue::as_str)
+            else {
+                continue;
+            };
+            dirs.push(manifest_dir.join(path));
+        }
+    };
+    for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        collect_table(manifest.get(section));
+    }
+    collect_table(
+        manifest
+            .get("workspace")
+            .and_then(|workspace| workspace.get("dependencies")),
+    );
+    Ok(dirs)
+}
+
+pub(super) fn collect_external_path_dependency_roots(
+    canonical_workspace_root: &Path,
+    seed_manifests: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
+    let mut accepted: Vec<PathBuf> = Vec::new();
+    let mut visited_manifests: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut pending: Vec<PathBuf> = seed_manifests.to_vec();
+    while let Some(manifest_path) = pending.pop() {
+        let canonical_manifest = match manifest_path.canonicalize() {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        if !visited_manifests.insert(canonical_manifest.clone()) {
+            continue;
+        }
+        for dep_dir in manifest_path_dependency_dirs(&canonical_manifest)? {
+            let Ok(canonical_dir) = dep_dir.canonicalize() else {
+                continue;
+            };
+            if canonical_dir.starts_with(canonical_workspace_root) {
+                continue;
+            }
+            for candidate_name in ["Scarb.toml", "uc.toml", "Uc.toml"] {
+                let dep_manifest = canonical_dir.join(candidate_name);
+                if dep_manifest.is_file() {
+                    pending.push(dep_manifest);
+                    break;
+                }
+            }
+            if accepted.iter().any(|root| canonical_dir.starts_with(root)) {
+                continue;
+            }
+            accepted.retain(|root| !root.starts_with(&canonical_dir));
+            if accepted.len() >= MAX_EXTERNAL_PATH_DEPENDENCY_ROOTS {
+                bail!(
+                    "workspace references more than {MAX_EXTERNAL_PATH_DEPENDENCY_ROOTS} external path dependency roots; refusing to fingerprint"
+                );
+            }
+            accepted.push(canonical_dir);
+        }
+    }
+    accepted.sort();
+    Ok(accepted)
+}
+
 pub(super) fn atomic_write_bytes(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
     let parent = path
@@ -181,10 +286,11 @@ pub(super) fn load_fingerprint_index(path: &Path) -> Result<FingerprintIndex> {
         Ok(index) if index.schema_version == FINGERPRINT_INDEX_SCHEMA_VERSION => Ok(index),
         Ok(_) => Ok(FingerprintIndex::empty()),
         Err(err) => {
-            eprintln!(
-                "uc: warning: ignoring unreadable fingerprint index {}: {}",
-                path.display(),
-                err
+            let _ = fs::remove_file(path);
+            tracing::debug!(
+                path = %path.display(),
+                error = %err,
+                "ignoring and resetting unreadable fingerprint index"
             );
             Ok(FingerprintIndex::empty())
         }
@@ -387,6 +493,7 @@ pub(super) fn build_fingerprint_context_digest(
 ) -> String {
     let mut hasher = Hasher::new();
     hasher.update(b"uc-build-fingerprint-context-v1");
+    hasher.update(uc_build_identity().as_bytes());
     hasher.update(scarb_version.as_bytes());
     hasher.update(current_build_env_fingerprint().as_bytes());
     hasher.update(manifest_identity.as_bytes());
@@ -429,11 +536,11 @@ pub(super) fn try_reuse_hot_fingerprint(
         return Ok(None);
     }
 
-    for (relative_dir, expected_modified_unix_ms) in &index.directories {
+    for (relative_dir, expected_state) in &index.directories {
         let dir_path = if relative_dir == "." {
             workspace_root.to_path_buf()
         } else {
-            workspace_root.join(relative_dir)
+            fingerprint_key_path(workspace_root, relative_dir)
         };
         let metadata = match fs::metadata(&dir_path) {
             Ok(metadata) => metadata,
@@ -443,13 +550,28 @@ pub(super) fn try_reuse_hot_fingerprint(
             return Ok(None);
         }
         let modified_unix_ms = metadata_modified_unix_ms(&metadata)?;
-        if modified_unix_ms != *expected_modified_unix_ms {
+        if modified_unix_ms != expected_state.modified_unix_ms {
+            return Ok(None);
+        }
+        // An unchanged mtime does not imply unchanged contents; compare the child
+        // name set so archive extractions with preserved times cannot slip a new
+        // source file past the hot path.
+        let walk_root = if relative_dir == "." || !Path::new(relative_dir).is_absolute() {
+            workspace_root
+        } else {
+            dir_path.as_path()
+        };
+        let children_digest = match fingerprint_directory_children_digest(walk_root, &dir_path) {
+            Ok(digest) => digest,
+            Err(_) => return Ok(None),
+        };
+        if children_digest != expected_state.children_digest {
             return Ok(None);
         }
     }
 
     for (relative_path, cached_entry) in &index.entries {
-        let file_path = workspace_root.join(relative_path);
+        let file_path = fingerprint_key_path(workspace_root, relative_path);
         let metadata = match fs::metadata(&file_path) {
             Ok(metadata) => metadata,
             Err(_) => return Ok(None),
@@ -486,23 +608,157 @@ pub(super) fn track_fingerprint_directories_for_relative_path(
     }
 }
 
+pub(super) fn track_fingerprint_directories_for_external_path(
+    tracked_directories: &mut BTreeSet<String>,
+    external_root: &Path,
+    file_path: &Path,
+) {
+    let mut cursor = file_path.parent();
+    while let Some(parent) = cursor {
+        if !parent.starts_with(external_root) {
+            break;
+        }
+        tracked_directories.insert(normalize_fingerprint_path(parent));
+        cursor = parent.parent();
+    }
+}
+
+pub(super) fn collect_fingerprint_files_from_root(
+    walk_root: &Path,
+    external_root: Option<&Path>,
+    files: &mut Vec<(PathBuf, Option<PathBuf>)>,
+    fingerprint_started: &Instant,
+    fingerprint_timeout: Duration,
+    max_files: usize,
+) -> Result<()> {
+    // Walk one level past the cap so that content living below it is observable.
+    // Truncating silently would drop real inputs from the fingerprint and produce a
+    // false cache hit; the file-count and byte budgets already bail loudly, so this
+    // bound does too. See issue #76.
+    let walker = WalkDir::new(walk_root)
+        .follow_links(false)
+        .max_depth(MAX_FINGERPRINT_DEPTH.saturating_add(1))
+        .into_iter()
+        .filter_entry(|entry| !is_ignored_entry(walk_root, entry.path()));
+
+    for entry in walker {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to walk {} while collecting fingerprint files",
+                walk_root.display()
+            )
+        })?;
+        if entry.depth() > MAX_FINGERPRINT_DEPTH {
+            // A directory here may hide fingerprintable files deeper still, and a
+            // fingerprintable file here would itself be excluded. Either way the
+            // fingerprint would no longer cover the build inputs.
+            let hides_inputs =
+                entry.file_type().is_dir() || should_include_fingerprint_file(entry.path());
+            if hides_inputs {
+                bail!(
+                    "fingerprint traversal depth limit exceeded at {} (>{} levels below {}); \
+refusing to compute a fingerprint that would omit build inputs",
+                    entry.path().display(),
+                    MAX_FINGERPRINT_DEPTH,
+                    walk_root.display()
+                );
+            }
+            continue;
+        }
+        if fingerprint_started.elapsed() > fingerprint_timeout {
+            bail!(
+                "fingerprinting timed out after {} ms",
+                fingerprint_timeout.as_millis()
+            );
+        }
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if should_include_fingerprint_file(path) {
+            if files.len() >= max_files {
+                bail!(
+                    "workspace has too many fingerprintable files (>{max_files}); refusing to hash more"
+                );
+            }
+            files.push((path.to_path_buf(), external_root.map(Path::to_path_buf)));
+        }
+    }
+    Ok(())
+}
+
+/// Digest of the fingerprint-relevant child names of one directory.
+///
+/// Covers subdirectories that are not ignored plus files that would be
+/// fingerprinted. Names only: contents are covered by the per-file hashes, so
+/// this exists purely to notice additions and removals that leave the parent
+/// directory's mtime untouched.
+pub(super) fn fingerprint_directory_children_digest(
+    walk_root: &Path,
+    dir_path: &Path,
+) -> Result<String> {
+    let mut names: Vec<String> = Vec::new();
+    let read_dir = fs::read_dir(dir_path)
+        .with_context(|| format!("failed to read directory {}", dir_path.display()))?;
+    for entry in read_dir {
+        let entry =
+            entry.with_context(|| format!("failed to read entry under {}", dir_path.display()))?;
+        let path = entry.path();
+        if is_ignored_entry(walk_root, &path) {
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            // A racing removal is a change; treat it as one rather than guessing.
+            Err(_) => return Ok(String::from("unreadable")),
+        };
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if file_type.is_dir() {
+            names.push(format!("d:{name}"));
+        } else if file_type.is_file() && should_include_fingerprint_file(&path) {
+            names.push(format!("f:{name}"));
+        }
+    }
+    names.sort();
+    let mut hasher = Hasher::new();
+    hasher.update(b"uc-fingerprint-dir-children-v1");
+    for name in &names {
+        hasher.update(name.as_bytes());
+        hasher.update(b"\n");
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
 pub(super) fn snapshot_tracked_fingerprint_directories(
     workspace_root: &Path,
     tracked_directories: &BTreeSet<String>,
-) -> Result<BTreeMap<String, u64>> {
+) -> Result<BTreeMap<String, FingerprintDirectoryState>> {
     let mut snapshot = BTreeMap::new();
     for relative_dir in tracked_directories {
         let dir_path = if relative_dir == "." {
             workspace_root.to_path_buf()
         } else {
-            workspace_root.join(relative_dir)
+            fingerprint_key_path(workspace_root, relative_dir)
         };
         let metadata = fs::metadata(&dir_path)
             .with_context(|| format!("failed to stat {}", dir_path.display()))?;
         if !metadata.is_dir() {
             continue;
         }
-        snapshot.insert(relative_dir.clone(), metadata_modified_unix_ms(&metadata)?);
+        let walk_root = if relative_dir == "." || !Path::new(relative_dir).is_absolute() {
+            workspace_root
+        } else {
+            dir_path.as_path()
+        };
+        snapshot.insert(
+            relative_dir.clone(),
+            FingerprintDirectoryState {
+                modified_unix_ms: metadata_modified_unix_ms(&metadata)?,
+                children_digest: fingerprint_directory_children_digest(walk_root, &dir_path)?,
+            },
+        );
     }
     Ok(snapshot)
 }
@@ -553,55 +809,74 @@ pub(super) fn compute_build_fingerprint_with_scarb_version(
     }
 
     let mut hasher = Hasher::new();
-    hasher.update(b"uc-build-fingerprint-v2");
+    hasher.update(b"uc-build-fingerprint-v3");
     hasher.update(context_digest.as_bytes());
 
     let mut updated_entries: BTreeMap<String, FingerprintIndexEntry> = BTreeMap::new();
     let mut tracked_directories: BTreeSet<String> = BTreeSet::from([".".to_string()]);
 
-    let mut files = Vec::new();
-    let walker = WalkDir::new(workspace_root)
-        .follow_links(false)
-        .max_depth(MAX_FINGERPRINT_DEPTH)
-        .into_iter()
-        .filter_entry(|entry| !is_ignored_entry(workspace_root, entry.path()));
-
-    for entry in walker.filter_map(|e| e.ok()) {
-        if fingerprint_started.elapsed() > fingerprint_timeout {
-            bail!(
-                "fingerprinting timed out after {} ms",
-                fingerprint_timeout.as_millis()
-            );
-        }
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-        if should_include_fingerprint_file(path) {
-            if files.len() >= max_files {
-                bail!(
-                    "workspace has too many fingerprintable files (>{max_files}); refusing to hash more"
-                );
-            }
-            files.push(path.to_path_buf());
-        }
+    let mut files: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+    collect_fingerprint_files_from_root(
+        workspace_root,
+        None,
+        &mut files,
+        &fingerprint_started,
+        fingerprint_timeout,
+        max_files,
+    )?;
+    let mut seed_manifests: Vec<PathBuf> = files
+        .iter()
+        .filter(|(path, _)| {
+            matches!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some("Scarb.toml" | "uc.toml" | "Uc.toml")
+            )
+        })
+        .map(|(path, _)| path.clone())
+        .collect();
+    seed_manifests.push(canonical_manifest.clone());
+    let external_roots =
+        collect_external_path_dependency_roots(&canonical_workspace_root, &seed_manifests)?;
+    for external_root in &external_roots {
+        collect_fingerprint_files_from_root(
+            external_root,
+            Some(external_root),
+            &mut files,
+            &fingerprint_started,
+            fingerprint_timeout,
+            max_files,
+        )?;
     }
     files.sort();
+    files.dedup();
     let mut total_fingerprint_bytes = 0_u64;
 
-    for path in files {
+    for (path, external_root) in files {
         if fingerprint_started.elapsed() > fingerprint_timeout {
             bail!(
                 "fingerprinting timed out after {} ms",
                 fingerprint_timeout.as_millis()
             );
         }
-        let rel = path
-            .strip_prefix(workspace_root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        track_fingerprint_directories_for_relative_path(&mut tracked_directories, Path::new(&rel));
+        let rel = match external_root.as_deref() {
+            None => path
+                .strip_prefix(workspace_root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/"),
+            Some(_) => normalize_fingerprint_path(&path),
+        };
+        match external_root.as_deref() {
+            None => track_fingerprint_directories_for_relative_path(
+                &mut tracked_directories,
+                Path::new(&rel),
+            ),
+            Some(root) => track_fingerprint_directories_for_external_path(
+                &mut tracked_directories,
+                root,
+                &path,
+            ),
+        }
         let metadata =
             fs::metadata(&path).with_context(|| format!("failed to stat {}", path.display()))?;
         let file_size = metadata.len();
@@ -692,12 +967,18 @@ pub(super) fn should_include_fingerprint_file(path: &Path) -> bool {
         return false;
     };
 
-    if matches!(name, "Scarb.toml" | "Scarb.lock" | "Uc.toml") {
+    if matches!(
+        name,
+        "Scarb.toml" | "Scarb.lock" | "uc.toml" | "Uc.toml" | "uc.lock" | "Uc.lock"
+    ) {
         return true;
     }
 
+    // Case-insensitive to match hash_fingerprint_source_file, which already hashes any
+    // case variant semantically. Requiring exact "cairo" here meant a `Foo.CAIRO` file
+    // compiled by scarb was never fingerprinted at all. See issue #76.
     path.extension()
         .and_then(|s| s.to_str())
-        .map(|ext| ext == "cairo")
+        .map(|ext| ext.eq_ignore_ascii_case("cairo"))
         .unwrap_or(false)
 }

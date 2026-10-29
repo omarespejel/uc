@@ -1,0 +1,6 @@
+{
+  "git": {
+    "sha1": "8746d71d04ca94bb392206bbfc21bcb257d7930a"
+  },
+  "path_in_vcs": "crates/cairo-lang-filesystem"
+}

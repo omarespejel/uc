@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Working on projects | uc Documentation</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --bg-elevated: #161b22;
+      --bg-code: #11161d;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --border: #30363d;
+      --accent: #a371f7;
+      --accent-soft: rgba(163, 113, 247, 0.14);
+      --green: #3fb950;
+      --blue: #58a6ff;
+      --amber: #d29922;
+      --red: #f85149;
+    }
+    [data-theme="light"] {
+      --bg: #ffffff;
+      --bg-elevated: #f6f8fa;
+      --bg-code: #f1f3f5;
+      --fg: #1f2328;
+      --muted: #59636e;
+      --border: #d0d7de;
+      --accent: #6340ac;
+      --accent-soft: rgba(99, 64, 172, 0.1);
+      --green: #1a7f37;
+      --blue: #0969da;
+      --amber: #9a6700;
+      --red: #cf222e;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+      line-height: 1.65;
+      display: grid;
+      grid-template-rows: 56px 1fr;
+      min-height: 100vh;
+    }
+    header.topbar {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      background: var(--bg-elevated);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 24px;
+    }
+    .topbar-left {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .logo-badge {
+      background: var(--accent);
+      color: #fff;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-weight: 800;
+      font-size: 1rem;
+      padding: 4px 10px;
+      border-radius: 6px;
+      letter-spacing: -0.02em;
+    }
+    .topbar-title {
+      font-weight: 600;
+      font-size: 0.95rem;
+      color: var(--fg);
+    }
+    .topbar-right {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .topbar-link {
+      color: var(--fg);
+      text-decoration: none;
+      font-size: 0.85rem;
+      font-weight: 500;
+      padding: 6px 12px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+    }
+    .topbar-link.primary {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: 260px minmax(0, 820px) 220px;
+      gap: 32px;
+      max-width: 1380px;
+      margin: 0 auto;
+      width: 100%;
+      padding: 0 20px;
+    }
+    nav.sidebar {
+      position: sticky;
+      top: 56px;
+      height: calc(100vh - 56px);
+      overflow-y: auto;
+      padding: 24px 12px 40px 0;
+      border-right: 1px solid var(--border);
+    }
+    .nav-group {
+      font-size: 0.74rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      margin: 18px 0 6px 10px;
+    }
+    .nav-group:first-child { margin-top: 0; }
+    nav.sidebar a {
+      display: block;
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 0.88rem;
+      padding: 6px 10px;
+      border-radius: 6px;
+      margin-bottom: 2px;
+    }
+    nav.sidebar a:hover, nav.sidebar a.active {
+      color: var(--fg);
+      background: var(--accent-soft);
+    }
+    aside.toc {
+      position: sticky;
+      top: 56px;
+      height: calc(100vh - 56px);
+      overflow-y: auto;
+      padding: 28px 0;
+      font-size: 0.82rem;
+    }
+    aside.toc .toc-header {
+      font-weight: 700;
+      text-transform: uppercase;
+      font-size: 0.72rem;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      margin-bottom: 10px;
+    }
+    aside.toc a {
+      display: block;
+      color: var(--muted);
+      text-decoration: none;
+      padding: 4px 0;
+    }
+    aside.toc a:hover { color: var(--accent); }
+    main.content {
+      padding: 32px 8px 96px;
+      min-width: 0;
+    }
+    h1 {
+      font-size: 2.15rem;
+      font-weight: 800;
+      margin: 0 0 12px;
+      letter-spacing: -0.02em;
+    }
+    h2 {
+      font-size: 1.45rem;
+      font-weight: 700;
+      margin: 42px 0 12px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--border);
+    }
+    h3 {
+      font-size: 1.12rem;
+      font-weight: 600;
+      margin: 26px 0 8px;
+    }
+    p { margin: 0 0 14px; }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.86em;
+      background: var(--bg-code);
+      border: 1px solid var(--border);
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+    .code-card {
+      margin: 14px 0 20px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+      background: var(--bg-code);
+    }
+    .code-header {
+      background: var(--bg-elevated);
+      border-bottom: 1px solid var(--border);
+      padding: 6px 14px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: var(--muted);
+      display: flex;
+      justify-content: space-between;
+    }
+    pre {
+      margin: 0;
+      padding: 14px 16px;
+      overflow-x: auto;
+      line-height: 1.5;
+      background: var(--bg-code);
+    }
+    pre code {
+      background: none;
+      border: none;
+      padding: 0;
+      font-size: 0.85rem;
+    }
+    .admonition {
+      margin: 18px 0;
+      padding: 12px 16px;
+      border-left: 4px solid var(--accent);
+      background: var(--bg-elevated);
+      border-radius: 0 8px 8px 0;
+      font-size: 0.92rem;
+    }
+    .admonition.note { border-left-color: var(--blue); }
+    .admonition.tip { border-left-color: var(--green); }
+    .admonition.important { border-left-color: var(--accent); }
+    .admonition.warning { border-left-color: var(--amber); }
+    .admonition-title {
+      font-weight: 700;
+      margin-bottom: 4px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 16px 0 24px;
+      font-size: 0.9rem;
+    }
+    th, td {
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    th {
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      background: var(--bg-elevated);
+    }
+    .pill {
+      display: inline-block;
+      padding: 2px 9px;
+      border-radius: 999px;
+      font-size: 0.76rem;
+      font-weight: 600;
+      background: var(--accent-soft);
+      color: var(--accent);
+      margin-right: 6px;
+    }
+    @media (max-width: 1100px) {
+      .layout { grid-template-columns: 230px 1fr; }
+      aside.toc { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-left">
+      <span class="logo-badge">uc</span>
+      <span class="topbar-title">Ultra Cairo Toolchain &amp; Symbolic Prover</span>
+    </div>
+    <div class="topbar-right">
+      <a class="topbar-link primary" href="./slides/#/title-slide">Open Presentation Slides ↗</a>
+      <button class="topbar-link" onclick="document.body.dataset.theme = document.body.dataset.theme === 'light' ? 'dark' : 'light'">Toggle Theme</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav class="sidebar">
+      <div class="nav-group">Getting Started</div>
+      <a href="#overview" class="active">Overview</a>
+      <a href="#installation">Installation (Linux &amp; macOS)</a>
+      <a href="#drop-in">Drop-In Tool Replacement</a>
+
+      <div class="nav-group">Concepts: Projects</div>
+      <a href="#project-structure">Project Structure</a>
+      <a href="#creating-projects">Creating &amp; Initializing</a>
+      <a href="#dependencies">Managing Dependencies</a>
+      <a href="#building">Compiling &amp; Running</a>
+
+      <div class="nav-group">Testing &amp; Verification</div>
+      <a href="#testing">Testing, Fuzzing &amp; Cheatcodes</a>
+      <a href="#prove">Formal Verification (uc prove)</a>
+      <a href="#equivalence">Equivalence &amp; Upgrade Safety</a>
+      <a href="#decompile">Decompiler &amp; Tx Autopsy</a>
+      <a href="#profiling">Lint Auto-Fix &amp; Stwo AIR</a>
+
+      <div class="nav-group">Starknet &amp; Devnet</div>
+      <a href="#devnet">Local Devnet (starknet-devnet-rs)</a>
+      <a href="#onchain">Declaring, Deploying &amp; Multicall</a>
+      <a href="#agents">CLI JSON Schema &amp; LSP</a>
+    </nav>
+
+    <main class="content">
+      <h1 id="overview">Working on Cairo &amp; Starknet Projects</h1>
+      <p>
+        <span class="pill">scarb 2.18.0</span>
+        <span class="pill">snforge 0.60.0</span>
+        <span class="pill">sncast 0.60.0</span>
+        <span class="pill">starknet-devnet-rs</span>
+        <span class="pill">uc prove (Symbolic + Caracal)</span>
+      </p>
+      <p>
+        <code>uc</code> is a self-contained Cairo and Starknet project manager, compiler, test runner, formal verification engine, in-process devnet and chain CLI written in Rust. It replaces <code>scarb</code>, <code>snforge</code>, <code>sncast</code> and <code>starknet-devnet</code> in a single binary with the Cairo 2.18.0 compiler and <code>corelib</code> embedded. <code>uc --version</code> prints the compiler and Sierra versions in use.
+      </p>
+
+      <div class="admonition tip">
+        <div class="admonition-title">Tip: Zero-Configuration Compatibility</div>
+        <code>uc</code> reads your existing <code>Scarb.toml</code>, <code>Scarb.lock</code>, and <code>snfoundry.toml</code> files directly. You do not need to migrate manifests or rewrite tests.
+      </div>
+
+      <h2 id="installation">Installation (Linux &amp; macOS)</h2>
+      <p>
+        <code>uc</code> ships as a single self-contained binary for <strong>Linux (<code>x86_64-unknown-linux-gnu</code>, <code>aarch64-unknown-linux-gnu</code>)</strong> and <strong>macOS (Apple Silicon <code>aarch64-apple-darwin</code>, Intel <code>x86_64-apple-darwin</code>)</strong>. The Cairo standard library (<code>corelib</code>) is embedded directly inside the binary and extracted on first run to <code>~/.uc/cache/</code>.
+      </p>
+
+      <div class="code-card">
+        <div class="code-header"><span>macOS &amp; Linux (Standalone Installer)</span><span>sh</span></div>
+        <pre><code># Install uc into ~/.local/bin
+curl -LsSf https://raw.githubusercontent.com/omarespejel/uc/main/install.sh | sh
+
+# Install uc AND create drop-in symlinks for scarb, snforge, sncast, and starknet-devnet
+curl -LsSf https://raw.githubusercontent.com/omarespejel/uc/main/install.sh | sh -s -- --drop-in</code></pre>
+      </div>
+
+      <div class="code-card">
+        <div class="code-header"><span>GitHub Actions (.github/workflows/ci.yml)</span><span>yaml</span></div>
+        <pre><code>steps:
+  - uses: actions/checkout@v4
+  - uses: omarespejel/uc@v1
+    with:
+      drop-in-symlinks: true
+  - run: uc prove &amp;&amp; uc test</code></pre>
+      </div>
+
+      <h2 id="drop-in">Drop-In Tool Replacement (`argv[0]` Multi-Call Binary)</h2>
+      <p>
+        Like BusyBox or <code>uv</code>, <code>uc</code> inspects <code>argv[0]</code> at startup. When invoked via a symlink named <code>scarb</code>, <code>snforge</code>, <code>sncast</code>, or <code>starknet-devnet</code>, it adapts its CLI routing to match that tool:
+      </p>
+      <table>
+        <thead>
+          <tr><th>Legacy Tool</th><th>Replaced By</th><th>What was checked (2026-10-25, real projects)</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>scarb build</code> / <code>scarb check</code></td><td><code>uc build</code> / <code>uc check</code></td><td>All 13 erc8004 artifacts byte-identical to scarb 2.18 (Sierra, CASM, manifest). Registry packages fetched natively from <code>scarbs.xyz</code>, checksum verified, no scarb needed.</td></tr>
+          <tr><td><code>snforge test</code></td><td><code>uc test</code></td><td>Same verdicts as snforge 0.60: betshare 41/41, erc8004 168/168, plus 17,600 generated arithmetic/bitwise/signed tests and 400 multi-contract cheatcode tests across 16 packages. Mutation of a contract fails the expected test. Per-test timings and resource gas in text and JSON.</td></tr>
+          <tr><td><code>sncast call / get / balance / trace / declare / deploy / invoke</code></td><td><code>uc call / get / balance / trace / declare / deploy / invoke</code></td><td>Verified against mainnet through JSON-RPC (Cartridge public endpoint by default; the report names the RPC used).</td></tr>
+          <tr><td><code>starknet-devnet</code></td><td><code>uc devnet</code> (or <code>uc node</code>)</td><td>In-process chain: declare, deploy, invoke, call, receipts, events, blocks, state updates, traces. Verified with <code>uc declare / deploy / invoke / call / balance / trace</code> against it. Accounts validate signatures and pay fees in STRK; <code>estimateFee</code> and <code>simulateTransactions</code> run on a copy of the state. <code>--backend starknet-devnet</code> runs the external binary.</td></tr>
+        </tbody>
+      </table>
+      <h2 id="benchmarks">Benchmarks (measured, same window, same host)</h2>
+      <p>
+        <code>benchmarks/scripts/run_head_to_head.py</code> copies real projects to a scratch directory and times both toolchains cold (no <code>target/</code>, no caches) and warm (unchanged tree), median of 3, then checks artifact parity. Run of 2026-10-25 16:29 on an 18-core Apple Silicon laptop that was <em>also</em> running a dozen unrelated Python workers (load average 60), with uc 0.1.0 (cairo 2.18.0), scarb 2.18.0, snforge 0.60.0. Raw data: <code>benchmarks/results/head-to-head-20261025-162907.json</code>.
+      </p>
+      <table>
+        <thead><tr><th>project</th><th>scarb build cold</th><th>uc build cold</th><th>scarb build warm</th><th>uc build warm</th><th>snforge test warm</th><th>uc test warm</th><th>artifacts identical</th></tr></thead>
+        <tbody>
+          <tr><td>betshare (6 contracts, OpenZeppelin 2.0.0 from the registry, 41 tests)</td><td>11.90 s</td><td>5.23 s</td><td>0.27 s</td><td>0.03 s</td><td>2.43 s</td><td>0.85 s</td><td>13 / 13</td></tr>
+          <tr><td>erc8004 (6 contracts, OpenZeppelin v3 git, 168 tests)</td><td>15.0 s</td><td>5.96 s</td><td>7.0 s</td><td>0.02 s</td><td>16.9 s</td><td>11.6 s</td><td>13 / 13</td></tr>
+          <tr><td>agent_account (5 contracts, OpenZeppelin v3 git, 133 tests)</td><td>scarb could not reach the registry (see note)</td><td>5.36 s</td><td>n/a</td><td>0.03 s</td><td>n/a</td><td>2.24 s</td><td>n/a</td></tr>
+        </tbody>
+      </table>
+      <p>
+        Note: during the automated batch run, scarb's HTTP client failed to connect to <code>scarbs.xyz</code> when refreshing <code>Scarb.lock</code> for the git-dependency projects while uc's native fetches succeeded. Measured side-by-side on erc8004: cold <code>scarb build</code> 15.0 s, warm 7.0 s, warm <code>uc build</code> 2.9 s (0.02 s on an unchanged tree) producing the 13 byte-identical files. Because nested contract calls run on per-class program slices and each test runs on its own slice, the heavy erc8004 suite (seven tests with over a million VM steps each) runs in 11.6 s under <code>uc test</code> against 16.9 s under <code>snforge 0.60</code> (warm, same machine), with a peak RSS of 2.2 GB against 3.3 GB.
+      </p>
+      <p>
+        Where uc wins and why: warm <code>uc build</code> and <code>uc check</code> answer from a fingerprint that covers sources, dependencies, lockfile and compiler version, so an unchanged tree costs about 20 to 30 ms; cold builds skip scarb's process spawn and metadata round trips; unit and cheatcode tests run in-process with a lazy VM memory path, so betshare's 41 tests take 0.85 s warm against 2.43 s for snforge.
+      </p>
+
+      <h2 id="project-structure">Project Structure</h2>
+      <p>
+        A Cairo project is defined by a <code>Scarb.toml</code> manifest at its root, alongside a deterministic <code>Scarb.lock</code> lockfile and optional <code>snfoundry.toml</code> network profiles:
+      </p>
+      <div class="code-card">
+        <div class="code-header"><span>Workspace Layout</span><span>tree</span></div>
+        <pre><code>my_vault/
+├── Scarb.toml          # Package metadata, edition, dependencies, and [[target.starknet-contract]]
+├── Scarb.lock          # Exact resolved dependency versions and checksums
+├── snfoundry.toml      # Optional [sncast.<profile>] RPC URLs, account names, and keystores
+├── src/
+│   └── lib.cairo       # Root Cairo module and #[starknet::contract] definitions
+└── tests/
+    └── test_vault.cairo # Integration tests using snforge_std cheatcodes</code></pre>
+      </div>
+
+      <div class="code-card">
+        <div class="code-header"><span>Scarb.toml</span><span>toml</span></div>
+        <pre><code>[package]
+name = "my_vault"
+version = "0.1.0"
+edition = "2024_07"
+
+[dependencies]
+starknet = "&gt;=2.14.0"
+
+[[target.starknet-contract]]
+sierra = true
+casm = true</code></pre>
+      </div>
+
+      <h2 id="creating-projects">Creating &amp; Initializing Projects</h2>
+      <p>
+        Use <code>uc new &lt;path&gt;</code> to scaffold a new package or <code>uc init</code> inside an existing directory:
+      </p>
+      <div class="code-card">
+        <div class="code-header"><span>Terminal</span><span>bash</span></div>
+        <pre><code>$ uc new my_vault
+Created package `my_vault` at my_vault/Scarb.toml
+
+$ cd my_vault
+$ uc check
+uc check: my_vault (1 modules, 0 contracts) -&gt; ok in 277.4ms   # cold; a cache hit answers in about 1 ms</code></pre>
+      </div>
+
+      <h2 id="dependencies">Managing Dependencies</h2>
+      <p>
+        Modify dependencies declaratively with <code>uc add</code> and <code>uc rm</code>, inspect the dependency graph with <code>uc tree</code>, or update lockfiles with <code>uc update</code>:
+      </p>
+      <div class="code-card">
+        <div class="code-header"><span>Terminal</span><span>bash</span></div>
+        <pre><code>$ uc add openzeppelin_token@3.0.0
+$ uc add --dev snforge_std@0.60.0
+$ uc tree
+my_vault v0.1.0
+├── openzeppelin_token v3.0.0
+└── starknet v2.18.0
+$ uc fetch                       # resolve and download registry packages natively
+uc fetch: 5 fetched, 0 cached (2241.3ms)</code></pre>
+      </div>
+      <p>
+        Registry packages are resolved from <code>Scarb.lock</code> when present (exact versions, checksums from the lock) or from the <code>scarbs.xyz</code> index (highest version matching the requirement, caret semantics), downloaded over HTTPS, SHA-256 verified and extracted into scarb's cache layout. uc reuses whatever scarb already downloaded; scarb keeps a separate download ledger and does not pick up uc's downloads. <code>uc check</code> and <code>uc build</code> do this automatically; set <code>UC_REGISTRY_FETCH=0</code> to disable network access.
+      </p>
+
+      <h2 id="building">Compiling, Checking &amp; Executing</h2>
+      <p>
+        <code>uc</code> embeds the Cairo compiler (`cairo-lang-*`) and maintains a persistent Salsa incremental database plus a content-addressed BLAKE3 CASM cache in <code>.uc/</code>.
+      </p>
+      <table>
+        <thead>
+          <tr><th>Command</th><th>Description</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>uc check</code></td><td>Run syntax, macro expansion, semantic, and lowering diagnostics without Sierra/CASM codegen.</td></tr>
+          <tr><td><code>uc build</code></td><td>Compile Sierra (<code>.contract_class.json</code>, <code>.sierra.json</code>) and CASM (<code>.compiled_contract_class.json</code>) into <code>target/dev/</code>.</td></tr>
+          <tr><td><code>uc execute --arguments 15,27</code></td><td>Compile and run a standalone <code>#[executable]</code> or <code>main</code> function in-process (alias: <code>uc cairo-run</code>).</td></tr>
+          <tr><td><code>uc doc --open</code></td><td>Extract Cairo docstrings and build HTML/Markdown API documentation (alias: <code>uc mdbook</code>).</td></tr>
+          <tr><td><code>uc optimize-inlining</code></td><td>Sweep <code>inlining-strategy</code> weights (`--min-threshold 0 --max-threshold 250 --step 25`) to minimize CASM size or L2 gas.</td></tr>
+          <tr><td><code>uc package</code> / <code>uc publish</code></td><td>Pack a distributable <code>.tar.zst</code> archive or publish to a Scarb registry.</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="testing">Testing, Fuzzing &amp; `snforge_std` Cheatcodes</h2>
+      <p>
+        <code>uc test</code> executes both standard <code>#[test]</code> functions and Starknet Foundry (<code>snforge_std</code>) contract tests in-process. You do not need to download an external <code>snforge_std</code> git repository—<code>uc</code> injects a native <code>snforge_std</code> shim automatically.
+      </p>
+      <div class="code-card">
+        <div class="code-header"><span>Terminal</span><span>bash</span></div>
+        <pre><code># Run all unit &amp; integration tests with coverage-guided fuzzing
+$ uc test --fuzzer-runs 256 --fuzzer-seed 42 --gas-report
+
+# Run tests against live forked Starknet Mainnet/Sepolia state
+$ uc test --fork-url https://api.cartridge.gg/x/starknet/sepolia
+
+# CI sharding, fail-fast, and re-running only failed tests
+$ uc test --partition 1/4 --exit-first
+$ uc test --rerun-failed</code></pre>
+      </div>
+
+      <div class="admonition note">
+        <div class="admonition-title">Supported In-Process `snforge_std` Cheatcodes</div>
+        <code>declare</code>, <code>ContractClassTrait::precalculate_address</code>, <code>deploy</code>, <code>deploy_at</code>, <code>cheat_caller_address</code> / <code>start_cheat_caller_address</code> / <code>stop_cheat_caller_address</code> / <code>start_cheat_caller_address_global</code> / <code>stop_cheat_caller_address_global</code>, <code>cheat_block_timestamp</code> / <code>start_cheat_block_timestamp</code> / <code>*_global</code>, <code>cheat_block_number</code> / <code>start_cheat_block_number</code> / <code>*_global</code>, <code>cheat_sequencer_address</code> / <code>start_cheat_sequencer_address</code> / <code>*_global</code>, <code>CheatSpan::TargetCalls(N)</code>, <code>start_cheat_tx_info</code>, <code>spy_events</code>, <code>EventSpyAssertionsTrait</code>, <code>spy_messages_to_l1</code>, <code>MessageToL1SpyAssertionsTrait</code>, <code>mock_call</code> (counted <code>n_times</code>) / <code>start_mock_call</code> / <code>stop_mock_call</code>, <code>replace_bytecode</code>, <code>get_class_hash</code>, <code>load</code>, <code>store</code>, <code>map_entry_address</code>, <code>generate_random_felt</code>, and <code>#[fuzzer(runs: N, seed: S)]</code>.
+      </div>
+
+      <h2 id="prove">Formal Verification &amp; Symbolic Execution (`uc prove`)</h2>
+      <p>
+        Unit tests only check individual inputs. <code>uc prove</code> lowers your Cairo code to Sierra SSA IR and runs three verification passes (sub-second on typical packages; 161 functions of erc8004 in about one second):
+      </p>
+      <ol>
+        <li><strong>Symbolic Path &amp; Interval Solver</strong>: Explores every control-flow branch in Sierra SSA IR (up to 1024 statements per path and 1024 paths per function), tracks algebraic constraints across unsigned (<code>u8..u256</code>) and signed (<code>i8..i128</code>) integers including Cairo 2.18's bounded-int lowering of checked arithmetic and bitwise operations, and classifies each function: <code>PROVEN_SAFE</code> (every panic path explored, none satisfiable), <code>GUARDED_SAFE</code> (panics only behind caller or calldata guards), <code>COUNTEREXAMPLE_FOUND</code> (concrete inputs, emitted as parameter values and as wrapper calldata, replayed through the entry point on a fresh state), <code>BOUNDED_SAFE</code> (budget hit) or <code>UNDECIDED</code> (solver gave up). Counterexamples are reported only where the caller chooses the values; a bound-hitting overflow inside a helper is a precondition on its caller. <code>--emit-smt &lt;dir&gt;</code> writes every panic path as an SMT-LIB obligation with the expected verdict; <code>benchmarks/scripts/check_smt_obligations.py</code> checks them with z3 or cvc5 (z3 checked 182,964 obligations across erc8004, betshare, STRK and 525 generated signed/unsigned/bitwise functions on 2026-10-27 and agreed on all 172,186 decided obligations with 0 disagreements). <code>uc audit &lt;address&gt; --live-storage</code> decides state-dependent paths against the contract's real storage.</li>
+        <li><strong>Sierra taint detectors</strong> (Caracal-style, but on Sierra so they also run on deployed classes with no debug names): unprotected state mutation and arbitrary calls on the entry surface, check-effects-interactions (a lock slot that is read, written before the call and written back after it is recognised: the release is not reported and writes under the lock are <code>Low</code>; a pre-call write that was never read is called out as not a lock), caller-controlled loop bounds (interprocedural, numeric parameters only, capped bounds and calldata-array lengths excluded), unvalidated storage writes in constructors and setters, swallowed syscall errors, redundant <code>DivRem</code> and bitwise parity. Builtin pointers (<code>RangeCheck</code>, <code>Pedersen</code>) never carry taint. <code>#[test]</code> bodies are not symbolic targets; <code>prove_*</code>, <code>invariant_*</code> and <code>check_*</code> functions are.</li>
+        <li><strong>Medusa Stateful Invariant Campaign</strong>: Executes randomized multi-transaction sequences (`#[invariant]` / `invariant_*`) against `StarknetState` and shrinks any violating call sequence.</li>
+      </ol>
+
+      <div class="code-card">
+        <div class="code-header"><span>Terminal Output</span><span>bash</span></div>
+        <pre><code>$ uc prove --sarif report.sarif
+Package `my_vault` (14 Sierra functions, 412 statements):
+  ✓ compute_settlement   GUARDED_SAFE  (preconditions: ["amount &lt;= 10000", "rate_bps &lt;= 250"])
+  ✗ unsafe_mul_fee       COUNTEREXAMPLE_FOUND (witness: amount = 18446744073709551615, fee_bps = 2)
+
+$ uc audit 0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d --network mainnet --json
+# the deployed STRK token, no source: 178 functions, 106 proven safe, 72 guarded, 0 counterexamples, 5 findings</code></pre>
+      </div>
+      <p>
+        <code>uc audit</code> takes a contract address, a class hash, a <code>.contract_class.json</code> or a <code>Scarb.toml</code>. For deployed classes the entry points are named from the ABI by selector and <code>PanicResult</code> is recognised structurally, so every detector above runs on bytecode. <code>benchmarks/scripts/run_mainnet_audit.py</code> audits 20 well-known mainnet contracts this way (16 Sierra classes, 2,843 functions; no High finding, 22 Medium, 50 Low) and writes the results to <code>benchmarks/results/</code>.
+      </p>
+
+      <h2 id="watch">Watching a Deployment, Upgrade Gate, Starkscan</h2>
+      <p>
+        <code>uc watch &lt;address&gt;</code> polls the class hash at an address, re-audits when it changes and lists the findings and counterexamples that appeared or disappeared relative to the previous class (<code>--once --json</code> for cron; state in <code>.uc/watch/</code>). <code>uc declare -c Vault --upgrade-of &lt;address&gt;</code> fetches the deployed class and refuses to build the transaction when a storage slot or entry point disappears, calldata arity changes or a caller guard is lost (<code>--allow-unsafe-upgrade</code> overrides); <code>uc prove --check-upgrade 0x...</code> runs the same comparison. With <code>STARKSCAN_API_KEY</code> set, <code>--network</code> presets use Starkscan's JSON-RPC gateway, <code>uc trace</code> labels every address through Starkscan and names every call from the ABI of the class that ran it, <code>uc audit</code> reports the Starkscan verification record, and <code>uc audit --declared-since &lt;block&gt;</code> emits an audit entry for every class declared in a block range. <code>uc test --gas-report</code> adds builtin instance counts and a resource-gas breakdown per test (Starknet's L2 gas weights per step and builtin) with the heaviest tests ranked.
+      </p>
+
+      <h2 id="equivalence">Formal Equivalence &amp; Upgrade Safety</h2>
+      <p>
+        When refactoring a contract for gas optimization or preparing a proxy upgrade (`replace_class_syscall`), `uc prove` can mathematically verify compatibility against a baseline version:
+      </p>
+      <div class="code-card">
+        <div class="code-header"><span>Terminal</span><span>bash</span></div>
+        <pre><code># Prove mathematical equivalence (return values + panic conditions + storage writes) across all inputs
+$ uc prove --manifest-path v2/Scarb.toml --check-equivalence v1/Scarb.toml
+
+# Verify storage slot layout &amp; selector compatibility before an upgrade
+$ uc prove --manifest-path v2/Scarb.toml --check-upgrade v1/Scarb.toml
+
+# Audit a raw compiled .sierra.json or .contract_class.json without source code
+$ uc prove --sierra-file target/dev/my_vault.contract_class.json</code></pre>
+      </div>
+
+      <h2 id="decompile">Sierra Decompiler &amp; Transaction Autopsy</h2>
+      <p>
+        Because Starknet contracts preserve typed Sierra SSA IR, <code>uc decompile</code> reconstructs readable pseudo-Cairo from any compiled artifact, and <code>uc trace</code> decodes nested transaction execution traces:
+      </p>
+      <div class="code-card">
+        <div class="code-header"><span>Terminal</span><span>bash</span></div>
+        <pre><code># Reconstruct readable Cairo from a compiled ContractClass or Sierra JSON
+$ uc decompile target/dev/my_vault.contract_class.json -o decompiled.cairo
+
+# Decode a Starknet transaction call tree, storage diffs, L2 gas, and revert reason
+$ uc trace 0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7 --rpc-url $RPC_URL</code></pre>
+      </div>
+
+      <h2 id="profiling">Auto-Remediation (`uc lint --fix`) &amp; Stwo Circle STARK Profiler</h2>
+      <p>
+        Under StarkWare's <strong>Stwo (Circle STARK)</strong> prover (Haböck, Levit, Papini 2024), proving time is governed by AIR builtin table multiplicities (`Pedersen`, `Poseidon`, `RangeCheck`, `Bitwise`, `Blake2s`). <code>uc profile --prover-air</code> computes exact builtin multiplicities per function, and <code>uc lint --fix</code> automatically patches Cairo anti-patterns in place:
+      </p>
+      <div class="code-card">
+        <div class="code-header"><span>Terminal</span><span>bash</span></div>
+        <pre><code># Preview or apply automatic security &amp; gas rewrites (LegacyMap -&gt; Map, DivRem fusion)
+$ uc lint --diff
+$ uc lint --fix
+
+# Profile Stwo Circle STARK AIR builtin multiplicities &amp; CASM size
+$ uc profile --prover-air</code></pre>
+      </div>
+
+      <h2 id="devnet">Local Devnet (`uc devnet` / `starknet-devnet-rs`)</h2>
+      <p>
+        <code>uc devnet</code> (aliased as <code>uc node</code> and symlink-compatible with <code>starknet-devnet</code>) runs a Starknet chain inside the uc process. On start it compiles three embedded Cairo 2.18 contracts with its own compiler (an account, an ERC20 fee token, a universal deployer; cached per compiler version), deploys the tokens at the mainnet STRK and ETH addresses and the deployer at the mainnet UDC address, and funds the predeployed accounts. Each declared class gets a Sierra runner sharing one class table, so calls cross classes declared at any time. Accounts validate ECDSA signatures in <code>__validate__</code>, transactions pay fees in STRK to the sequencer (<code>0x1000</code>), and sealed blocks populate the block-hash table for <code>get_block_hash_syscall</code>. Served: declare, deploy_account and invoke transactions with nonce and balance checks, <code>starknet_call</code>, <code>estimateFee</code>, <code>simulateTransactions</code>, nonces, classes, storage, receipts with events and nested revert reasons, blocks (<code>getBlockWithTxHashes</code> / <code>WithTxs</code> / <code>WithReceipts</code>), <code>getEvents</code>, state updates, traces, and the <code>devnet_*</code> mint, createBlock, setTime and increaseTime routes. <code>--backend starknet-devnet</code> launches an external binary instead.
+      </p>
+      <div class="code-card">
+        <div class="code-header"><span>Terminal</span><span>bash</span></div>
+        <pre><code># Start local Starknet devnet on port 5050 with 10 predeployed accounts &amp; deterministic seed
+$ uc devnet --port 5050 --seed 42 --accounts 10
+
+# Start devnet forked from Starknet Mainnet or Sepolia at a specific block
+$ uc devnet --port 5050 --fork-network https://api.cartridge.gg/x/starknet/mainnet --fork-block 900000
+
+# Export predeployed accounts as JSON for scripts &amp; CI
+$ uc devnet --dump-accounts --json</code></pre>
+      </div>
+
+      <h2 id="onchain">Declaring, Deploying &amp; Multicall (`sncast` Parity)</h2>
+      <p>
+        The <code>sncast 0.60.0</code> subcommands run natively inside <code>uc</code>. RPC resolution: <code>--url</code>, else <code>STARKNET_RPC</code>, else the <code>snfoundry.toml</code> profile, else <code>--network mainnet|sepolia|devnet</code> (Cartridge public endpoints). Every JSON report includes <code>rpc_url</code>.
+      </p>
+      <div class="code-card">
+        <div class="code-header"><span>Terminal</span><span>bash</span></div>
+        <pre><code>$ uc declare --contract-name my_vault_contract --url http://127.0.0.1:5050/rpc
+$ uc deploy --class-hash 0x01a2... --constructor-calldata 0x1 0x2
+$ uc invoke --contract-address 0x049d... --function compute_settlement --arguments "1000, 50"
+$ uc call --contract-address 0x04718f5a...938d --function name --network mainnet
+$ uc balance --token strk --account 0x4678...61b5 --network mainnet
+Balance: 41163.469472512870815086 STRK
+$ uc get nonce 0x4678...61b5 --network mainnet
+Nonce for 0x4678...61b5 at latest: 0xbc694b
+$ uc trace 0x76029f41...de8 --network mainnet --json      # starknet_traceTransaction, decoded
+$ uc multicall run calls.toml --url http://127.0.0.1:5050/rpc</code></pre>
+      </div>
+
+      <h2 id="agents">CLI JSON Schema &amp; Language Server (`--json`, `uc lsp`)</h2>
+      <p>
+        Every <code>uc</code> command accepts <code>--json</code> and <code>--report-path &lt;file&gt;</code> for deterministic machine parsing (`schema_version: 1`) in CI pipelines and automated workflows. <code>uc lsp</code> starts the Cairo language server (LSP 3.17 over stdio).
+      </p>
+    </main>
+
+    <aside class="toc">
+      <div class="toc-header">On this page</div>
+      <a href="#overview">Overview</a>
+      <a href="#installation">Installation (Linux &amp; macOS)</a>
+      <a href="#drop-in">Drop-In Replacement</a>
+      <a href="#project-structure">Project Structure</a>
+      <a href="#creating-projects">Creating Projects</a>
+      <a href="#dependencies">Managing Dependencies</a>
+      <a href="#building">Compiling &amp; Running</a>
+      <a href="#testing">Testing &amp; Cheatcodes</a>
+      <a href="#prove">Formal Verification</a>
+      <a href="#equivalence">Equivalence &amp; Upgrades</a>
+      <a href="#decompile">Decompiler &amp; Trace</a>
+      <a href="#profiling">Lint Fix &amp; Stwo AIR</a>
+      <a href="#devnet">Local Devnet</a>
+      <a href="#onchain">On-Chain &amp; Multicall</a>
+      <a href="#agents">CLI JSON &amp; LSP</a>
+    </aside>
+  </div>
+</body>
+</html>

@@ -1,11 +1,19 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use blake3::Hasher;
 #[cfg(feature = "native-compile")]
 use cairo_lang_compiler::db::RootDatabase;
 #[cfg(feature = "native-compile")]
 use cairo_lang_compiler::project::setup_project;
+#[cfg(all(feature = "native-compile", not(feature = "helper-cairo-214")))]
+use cairo_lang_compiler::compile_prepared_db_program_artifact;
+#[cfg(all(feature = "native-compile", feature = "helper-cairo-214"))]
+use cairo_lang_compiler::compile_prepared_db_program;
 #[cfg(feature = "native-compile")]
-use cairo_lang_compiler::{compile_prepared_db_program, CompilerConfig};
+use cairo_lang_compiler::CompilerConfig;
+#[cfg(feature = "native-compile")]
+use cairo_lang_compiler::diagnostics::{DiagnosticsError, DiagnosticsReporter};
+#[cfg(all(feature = "native-compile", not(feature = "helper-cairo-214")))]
+use cairo_lang_sierra::program::VersionedProgram;
 #[cfg(feature = "native-compile")]
 use cairo_lang_defs::db::DefsGroup;
 #[cfg(feature = "native-compile")]
@@ -45,6 +53,7 @@ use cairo_lang_starknet::compile::compile_prepared_db as compile_starknet_prepar
 #[cfg(all(feature = "native-compile", not(feature = "helper-cairo-214")))]
 use cairo_lang_starknet::compile::{
     compile_prepared_db as compile_starknet_prepared_db,
+    compile_prepared_db_scoped as compile_starknet_prepared_db_scoped,
     compile_prepared_db_without_diagnostics as compile_starknet_prepared_db_without_diagnostics,
 };
 #[cfg(feature = "native-compile")]
@@ -98,6 +107,22 @@ use uc_core::compare::{compare_diagnostics, extract_diagnostic_lines, Diagnostic
 use uc_core::session::SessionInput;
 use walkdir::WalkDir;
 
+/// A JSON document went to stdout. A failing `--json` run prints its error as JSON only when
+/// nothing was printed yet, so stdout always holds exactly one document.
+static STDOUT_JSON_PRINTED: AtomicBool = AtomicBool::new(false);
+
+fn note_json_printed() {
+    STDOUT_JSON_PRINTED.store(true, Ordering::Relaxed);
+}
+
+/// `println!` for a JSON document on stdout.
+macro_rules! json_println {
+    ($($arg:tt)*) => {{
+        $crate::note_json_printed();
+        println!($($arg)*);
+    }};
+}
+
 #[cfg(feature = "dev-benchmark-command")]
 mod benchmark_cmd;
 mod cache;
@@ -105,7 +130,24 @@ mod commands;
 mod daemon;
 mod fingerprint;
 use cache::*;
-use commands::{run_build, run_compare_build, run_metadata, run_migrate};
+use commands::{
+    AbiArgs, AccountArgs, AddArgs, AuditArgs, BalanceArgs, CallArgs, CheckArgs,
+    CheckRequirementsArgs, ClassHashArgs, CleanArgs, CleanCacheArgs, CommandsListArgs,
+    CompletionsArgs, DeclareArgs, DeclareFromArgs, DecompileArgs, DeployArgs, DevnetArgs,
+    DiffArgs, DocArgs, ExecuteArgs, ExpandArgs, FmtArgs, GetArgs, InitArgs, InvokeArgs, LintArgs,
+    ListVersionsArgs, LspArgs, ManifestPathArgs, MulticallArgs, NewArgs, OptimizeInliningArgs,
+    PackageCmdArgs, ProcMacroServerArgs, ProfileArgs, ProveArgs, PublishArgs, RemoveArgs,
+    RunScriptArgs, ScriptCmdArgs, SelectorArgs, ShowConfigArgs, TestArgs, TraceTxArgs, TreeArgs,
+    TxStatusArgs, UpdateArgs, UtilsArgs, VerifyOnchainArgs, WatchArgs, DoctorArgs, LedgerArgs, run_abi, run_account, run_add,
+    run_audit, run_balance, run_build, run_call, run_check, run_check_requirements, run_class_hash,
+    run_clean, run_clean_cache, run_commands_list, run_compare_build, run_completions, run_declare,
+    run_declare_from, run_decompile, run_deploy, run_devnet, run_diff, run_doc, run_execute,
+    run_expand, run_fmt, run_get, run_init, run_invoke, run_lint, run_list_versions, run_lsp,
+    run_manifest_path, run_metadata, run_migrate, run_multicall, run_new, run_optimize_inlining,
+    run_package, run_proc_macro_server, run_profile, run_prove, run_publish, run_remove,
+    run_script, run_script_cmd, run_selector, run_show_config, run_test, run_trace_tx, run_tree,
+    run_tx_status, run_update, run_utils, run_verify_onchain, run_watch, run_doctor, run_ledger,
+};
 #[allow(unused_imports)]
 use daemon::*;
 use fingerprint::*;
@@ -130,7 +172,9 @@ const MAX_CAPTURE_STDOUT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CAPTURE_STDERR_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_MAX_CACHE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const DEFAULT_CACHE_BUDGET_MIN_INTERVAL_MS: u64 = 5 * 60 * 1000;
-const FINGERPRINT_INDEX_SCHEMA_VERSION: u32 = 2;
+// v4 adds per-directory child-name digests (FingerprintDirectoryState). Older
+// indexes deserialize into an empty index, which forces one full recompute.
+const FINGERPRINT_INDEX_SCHEMA_VERSION: u32 = 4;
 const ARTIFACT_INDEX_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_DIAGNOSTICS_SIMILARITY_THRESHOLD: f64 = 99.5;
 // Match Scarb's default package edition when manifests omit `[package].edition`.
@@ -182,7 +226,7 @@ const DEFAULT_NATIVE_INCREMENTAL_MAX_CHANGED_FILES: usize = 256;
 #[cfg(feature = "native-compile")]
 const DEFAULT_NATIVE_IMPACTED_SUBSET_ENABLED: bool = true;
 #[cfg(feature = "native-compile")]
-const DEFAULT_NATIVE_CAPTURE_STATEMENT_LOCATIONS: bool = true;
+const DEFAULT_NATIVE_CAPTURE_STATEMENT_LOCATIONS: bool = false;
 #[cfg(feature = "native-compile")]
 const DEFAULT_NATIVE_CAPTURE_STATEMENT_LOCATIONS_ON_COLD: bool = false;
 #[cfg(feature = "native-compile")]
@@ -245,7 +289,28 @@ const DEFAULT_SOURCE_STORE_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 #[cfg(feature = "native-compile")]
 const DEFAULT_NATIVE_MAX_CASM_BYTECODE_SIZE: usize = 81_290;
 const DEFAULT_SCARB_TOOLCHAIN_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
-const DAEMON_PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// This uc build: the package version plus the executable's size and modification time, which
+/// change with every rebuild or reinstall (one `stat`, no hashing). Every build so far reports
+/// the same package version, so caches of compiler output and the daemon handshake use this:
+/// a daemon or a cache left by an older build would otherwise serve that build's compiler.
+fn uc_build_identity() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION.get_or_init(|| {
+        let build = std::env::current_exe()
+            .and_then(fs::metadata)
+            .map(|meta| {
+                let modified = meta
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map(|elapsed| elapsed.as_nanos())
+                    .unwrap_or_default();
+                format!("{:x}-{modified:x}", meta.len())
+            })
+            .unwrap_or_else(|_| "unknown".to_string());
+        format!("{}+{build}", env!("CARGO_PKG_VERSION"))
+    })
+}
 const CACHEABLE_ARTIFACT_SUFFIXES: [&str; 7] = [
     ".sierra.json",
     ".sierra",
@@ -263,8 +328,28 @@ const UC_AGENT_DIAGNOSTICS_DOC_URL: &str =
 // When adding a helper lane, update this list with the root helper-builder metadata.
 const PRODUCTIZED_NATIVE_TOOLCHAIN_HELPER_LANES: &[&str] = &["2.14"];
 
+/// `uc --version` banner: crate version plus the embedded Cairo compiler and Sierra versions.
+fn uc_version_banner() -> &'static str {
+    static VALUE: OnceLock<String> = OnceLock::new();
+    VALUE.get_or_init(|| {
+        #[cfg(feature = "native-compile")]
+        {
+            format!(
+                "{} (cairo {}, sierra {})",
+                env!("CARGO_PKG_VERSION"),
+                native_cairo_lang_compiler_version(),
+                cairo_lang_starknet_classes::compiler_version::current_sierra_version_id()
+            )
+        }
+        #[cfg(not(feature = "native-compile"))]
+        {
+            format!("{} (native compile disabled)", env!("CARGO_PKG_VERSION"))
+        }
+    })
+}
+
 #[derive(Parser, Debug)]
-#[command(name = "uc")]
+#[command(name = "uc", version = uc_version_banner())]
 #[command(about = "uc: Cairo package manager and build/prove engine", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -291,6 +376,123 @@ enum Commands {
     CompareBuild(CompareBuildArgs),
     Migrate(MigrateArgs),
     Replay(ReplayArgs),
+    Inspect(InspectArgs),
+    Verify(VerifyArgs),
+    #[command(visible_alias = "cairo-test")]
+    Test(TestArgs),
+    /// Format Cairo source files natively in parallel (Scarb-compatible + faster)
+    Fmt(FmtArgs),
+    /// Check a package or workspace for errors without Sierra/CASM codegen
+    Check(CheckArgs),
+    /// Remove generated artifacts in target/ (and optionally .uc/ caches)
+    Clean(CleanArgs),
+    /// Create a new Cairo package or Starknet contract project at <PATH>
+    New(NewArgs),
+    /// Initialize a new Cairo package or Starknet contract in an existing directory
+    Init(InitArgs),
+    /// Add dependencies to a Scarb.toml manifest file
+    Add(AddArgs),
+    /// Remove dependencies from a Scarb.toml manifest file
+    #[command(visible_alias = "rm")]
+    Remove(RemoveArgs),
+    /// Display a tree visualization of the dependency graph
+    Tree(TreeArgs),
+    /// Expand Cairo macros and Starknet contract plugins to inspect generated code
+    Expand(ExpandArgs),
+    /// Next-gen Cairo & Starknet security, gas, and style static analyzer
+    Lint(LintArgs),
+    /// Next-gen Starknet contract Sierra/CASM size, syscall, and L2 gas profiler
+    #[command(visible_alias = "gas-report")]
+    Profile(ProfileArgs),
+    /// Next-gen semantic Starknet contract & artifact diff (selectors, ABI, Sierra/CASM sizes)
+    Diff(DiffArgs),
+    /// Next-gen ABI & typed client binding generator (JSON, TypeScript, Cairo, Rust)
+    #[command(visible_alias = "bindgen")]
+    Abi(AbiArgs),
+    /// Print the path to the resolved Scarb.toml manifest
+    ManifestPath(ManifestPathArgs),
+    /// Execute a custom script defined in [scripts] of Scarb.toml
+    Run(RunScriptArgs),
+    /// Generate shell completion scripts for uc
+    Completions(CompletionsArgs),
+    /// Compute Starknet Sierra class_hash and CASM compiled_class_hash offline
+    ClassHash(ClassHashArgs),
+    /// Compute or decode Starknet function/event selectors and Cairo short strings
+    Selector(SelectorArgs),
+    /// Execute an ABI-aware read-only Starknet JSON-RPC `starknet_call`
+    Call(CallArgs),
+    /// Build, estimate, or broadcast a Starknet V3 DECLARE transaction
+    Declare(DeclareArgs),
+    /// Deterministically compute address and deploy a contract via Starknet UDC
+    Deploy(DeployArgs),
+    /// Build, estimate, or broadcast a Starknet V3 INVOKE transaction
+    Invoke(InvokeArgs),
+    /// Query Starknet transaction finality, execution status, and receipt
+    TxStatus(TxStatusArgs),
+    /// Inspect and compute deterministic Starknet account addresses
+    Account(AccountArgs),
+    /// Verify local Starknet contracts against on-chain RPC bytecode and Starkscan Verifier
+    VerifyOnchain(VerifyOnchainArgs),
+    /// Start the Ultra Cairo Language Server (LSP 3.17 JSON-RPC 2.0 over stdio)
+    #[command(visible_alias = "cairo-language-server", visible_alias = "language-server")]
+    Lsp(LspArgs),
+    /// Formal verification, symbolic execution, stateful invariants, and Sierra IR taint analysis
+    #[command(visible_alias = "caracal", visible_alias = "verify-symbolic")]
+    Prove(ProveArgs),
+    /// Compile and execute a standalone Cairo `#[executable]` or `main` function in-process
+    #[command(visible_alias = "cairo-run")]
+    Execute(ExecuteArgs),
+    /// Generate HTML/Markdown API documentation from Cairo docstrings
+    #[command(visible_alias = "mdbook")]
+    Doc(DocArgs),
+    /// Assemble local Cairo package into a distributable `.tar.zst` archive
+    Package(PackageCmdArgs),
+    /// Upload a Cairo package archive to the Scarb registry
+    Publish(PublishArgs),
+    /// List available versions of a package from the Scarb registry
+    List(ListVersionsArgs),
+    /// Update dependencies in Scarb.lock to latest compatible versions
+    Update(UpdateArgs),
+    /// List all available built-in and external subcommands
+    Commands(CommandsListArgs),
+    /// Start the Scarb-compatible procedural macro JSON-RPC server
+    ProcMacroServer(ProcMacroServerArgs),
+    /// Sweep `inlining-strategy` thresholds to minimize CASM bytecode size or L2 gas
+    OptimizeInlining(OptimizeInliningArgs),
+    /// Clean global and workspace test/build caches (`snforge clean-cache` parity)
+    CleanCache(CleanCacheArgs),
+    /// Verify Cairo, Scarb, and native compiler requirements (`snforge check-requirements` parity)
+    CheckRequirements(CheckRequirementsArgs),
+    /// Decompile compiled Sierra JSON / Starknet ContractClass into readable pseudo-Cairo
+    Decompile(DecompileArgs),
+    /// Fetch and decode a Starknet transaction execution trace with call tree & gas autopsy
+    Trace(TraceTxArgs),
+    /// Query ERC-20 token balance (`strk`, `eth`, or custom token) on Starknet (`sncast balance`)
+    Balance(BalanceArgs),
+    /// Query on-chain Starknet state (`tx`, `tx-status`, `balance`, `nonce`, `class-hash-at`)
+    Get(GetArgs),
+    /// Create or execute batched Starknet multi-call transactions (`sncast multicall`)
+    Multicall(MulticallArgs),
+    /// Fetch a Sierra contract class from a source RPC/file and declare it (`sncast declare-from`)
+    DeclareFrom(DeclareFromArgs),
+    /// Display resolved `snfoundry.toml` / `Scarb.toml` profile configuration (`sncast show-config`)
+    ShowConfig(ShowConfigArgs),
+    /// Initialize or run a Cairo deployment script (`sncast script`)
+    Script(ScriptCmdArgs),
+    /// Starknet utility commands (`serialize`, `class-hash`, `contract-address`, `selector`)
+    Utils(UtilsArgs),
+    /// Interact with a Ledger hardware wallet (`get-public-key`, `sign-hash`, `app-version`) (`sncast ledger`)
+    Ledger(LedgerArgs),
+    /// Start a local Starknet Devnet node (`0xSpaceShard/starknet-devnet-rs` compatible + native in-process RPC)
+    #[command(visible_alias = "node", alias = "starknet-devnet")]
+    Devnet(DevnetArgs),
+    /// Run a unified security audit (Sierra Decompiler + Symbolic Prover + Caracal Taint + Stwo AIR Profile) on a local package, Sierra file, or on-chain contract/class hash
+    #[command(visible_alias = "security-audit")]
+    Audit(AuditArgs),
+    /// Watch a deployed contract: re-audit whenever its class changes and report new and resolved findings
+    Watch(WatchArgs),
+    /// Check this machine for what uc's network and build commands need (cache, HTTPS, RPC reachability, Starkscan key)
+    Doctor(DoctorArgs),
 }
 
 #[derive(Args, Debug)]
@@ -511,6 +713,85 @@ struct SupportArgs {
     command: SupportCommand,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum InspectFieldArg {
+    All,
+    ClassHash,
+    CompiledClassHash,
+    Abi,
+    EntryPoints,
+    CompilerVersion,
+    Receipt,
+}
+
+#[derive(Args, Debug, Clone)]
+struct InspectArgs {
+    /// Target contract name, artifact path, or package name (optional; defaults to all contracts in workspace).
+    target: Option<String>,
+
+    #[arg(long)]
+    manifest_path: Option<PathBuf>,
+
+    #[arg(long)]
+    profile: Option<String>,
+
+    #[arg(long)]
+    release: bool,
+
+    #[arg(long, value_enum, default_value_t = InspectFieldArg::All)]
+    field: InspectFieldArg,
+
+    #[arg(long)]
+    class_hash: bool,
+
+    #[arg(long)]
+    compiled_class_hash: bool,
+
+    #[arg(long)]
+    abi: bool,
+
+    #[arg(long)]
+    entry_points: bool,
+
+    #[arg(long)]
+    compiler_version: bool,
+
+    #[arg(long)]
+    json: bool,
+
+    #[arg(long)]
+    report_path: Option<PathBuf>,
+}
+
+#[derive(Args, Debug, Clone)]
+struct VerifyArgs {
+    #[arg(long)]
+    manifest_path: Option<PathBuf>,
+
+    #[arg(long)]
+    profile: Option<String>,
+
+    #[arg(long)]
+    release: bool,
+
+    /// Expected Starknet Sierra class hash (0x...) to assert against compiled contract(s).
+    #[arg(long)]
+    class_hash: Option<String>,
+
+    /// Expected Starknet CASM compiled class hash (0x...) to assert against compiled contract(s).
+    #[arg(long)]
+    compiled_class_hash: Option<String>,
+
+    #[arg(long)]
+    contract: Option<String>,
+
+    #[arg(long)]
+    json: bool,
+
+    #[arg(long)]
+    report_path: Option<PathBuf>,
+}
+
 #[derive(Subcommand, Debug)]
 enum SupportCommand {
     Native(NativeSupportArgs),
@@ -607,7 +888,7 @@ struct DaemonSocketArgs {
     socket_path: Option<PathBuf>,
 }
 
-#[derive(Copy, Clone, Debug, ValueEnum)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum EngineArg {
     Scarb,
     Uc,
@@ -767,6 +1048,26 @@ struct NativeToolchainReport {
     binary_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compiler_version: Option<String>,
+    /// Whether this toolchain can actually run on this host right now.
+    ///
+    /// `supported` answers "is this project's shape supported by the native
+    /// lane"; it does not answer "is the toolchain present". An external-helper
+    /// lane can be shape-supported while its helper binary has never been built,
+    /// in which case the build silently downgrades to scarb. Agents following
+    /// inspect -> support -> build (without `toolchain ensure`) saw a
+    /// contradiction. See issue #76.
+    #[serde(default = "native_toolchain_host_ready_default")]
+    host_ready: bool,
+    /// For external-helper lanes: whether the helper binary exists and is
+    /// executable. `None` for the builtin lane, which needs no helper.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    helper_built: Option<bool>,
+}
+
+/// Older reports predate `host_ready`; assume ready so replaying an archived
+/// report does not invent a readiness failure.
+fn native_toolchain_host_ready_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1290,6 +1591,17 @@ fn native_error_allows_scarb_fallback(err: &anyhow::Error) -> bool {
     err.downcast_ref::<NativeFallbackEligibleTag>().is_some()
 }
 
+/// The native compile found errors in the code, as opposed to failing to compile at all.
+#[cfg(feature = "native-compile")]
+fn native_error_is_code_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<DiagnosticsError>().is_some()
+}
+
+#[cfg(not(feature = "native-compile"))]
+fn native_error_is_code_error(_err: &anyhow::Error) -> bool {
+    false
+}
+
 #[cfg(feature = "native-compile")]
 static NATIVE_DAEMON_BACKEND_POISONED: AtomicBool = AtomicBool::new(false);
 
@@ -1438,16 +1750,27 @@ struct CompareBuildArgs {
     diagnostics_threshold: Option<f64>,
 }
 
-#[derive(Args, Debug)]
-struct MigrateArgs {
+#[derive(Args, Debug, Default, Clone)]
+pub(crate) struct MigrateArgs {
     #[arg(long)]
-    manifest_path: Option<PathBuf>,
+    pub(crate) manifest_path: Option<PathBuf>,
 
     #[arg(long)]
-    report_path: Option<PathBuf>,
+    pub(crate) report_path: Option<PathBuf>,
 
     #[arg(long)]
-    emit_uc_toml: Option<PathBuf>,
+    pub(crate) emit_uc_toml: Option<PathBuf>,
+
+    /// Preview migration without writing `uc.toml` / `uc.lock`.
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+
+    /// Remove legacy `Scarb.toml`, `Scarb.lock`, and `snfoundry.toml` after writing `uc.toml` + `uc.lock`.
+    #[arg(long)]
+    pub(crate) remove_legacy: bool,
+
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1550,10 +1873,16 @@ struct NativeCompileContext {
     cairo_project_dir: PathBuf,
     corelib_src: PathBuf,
     starknet_target: NativeStarknetTargetProps,
+    /// The `[lib]` target, present when the manifest declares it or declares no target at all.
+    lib_target: Option<NativeLibTargetProps>,
+    /// Whether the manifest declares `[[target.starknet-contract]]`.
+    contract_target: bool,
     manifest_content_hash: String,
     external_non_starknet_dependencies: Vec<String>,
     path_dependency_roots: Vec<NativePathDependencyRoot>,
     crate_dependency_configs: Vec<NativeCrateDependencyConfig>,
+    /// The manifest asks for another Cairo toolchain and uc compiles it in compatibility mode.
+    toolchain_compat: bool,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -1561,6 +1890,35 @@ struct NativeCompileContext {
 struct NativeStarknetTargetProps {
     sierra: bool,
     casm: bool,
+}
+
+/// `[lib]` target outputs, with Scarb's defaults: `<name>.sierra.json` on, `<name>.sierra` text
+/// and `<name>.casm` off.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[cfg(feature = "native-compile")]
+struct NativeLibTargetProps {
+    sierra: bool,
+    sierra_text: bool,
+    casm: bool,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[cfg(feature = "native-compile")]
+struct NativeCairoCodegenOptions {
+    casm_add_pythonic_hints: bool,
+    inlining_strategy: InliningStrategy,
+    sierra_replace_ids: Option<bool>,
+}
+
+#[cfg(feature = "native-compile")]
+impl Default for NativeCairoCodegenOptions {
+    fn default() -> Self {
+        Self {
+            casm_add_pythonic_hints: false,
+            inlining_strategy: InliningStrategy::Default,
+            sierra_replace_ids: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1612,6 +1970,7 @@ struct NativeScarbMetadataPackage {
 #[cfg(feature = "native-compile")]
 struct NativeScarbMetadataCompilationUnit {
     #[serde(default)]
+    #[allow(dead_code)]
     package: String,
     #[serde(default)]
     target: NativeScarbMetadataTarget,
@@ -1884,6 +2243,10 @@ struct BuildCacheEntry {
     fingerprint: String,
     profile: String,
     artifacts: Vec<CachedArtifact>,
+    /// Compiler warnings of the build that produced the artifacts; a cache hit replays them,
+    /// as scarb prints warnings on every build.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    warnings: String,
 }
 
 #[derive(Clone)]
@@ -2314,7 +2677,7 @@ struct FingerprintIndex {
     #[serde(default)]
     entries: BTreeMap<String, FingerprintIndexEntry>,
     #[serde(default)]
-    directories: BTreeMap<String, u64>,
+    directories: BTreeMap<String, FingerprintDirectoryState>,
     #[serde(default)]
     context_digest: Option<String>,
     #[serde(default)]
@@ -2326,6 +2689,20 @@ struct FingerprintIndexEntry {
     size_bytes: u64,
     modified_unix_ms: u64,
     blake3_hex: String,
+}
+
+/// Hot-path state for one tracked directory.
+///
+/// The modification time alone is not sufficient: an archive extracted with
+/// preserved directory times (`tar -p`, `rsync --times`) can add a new `.cairo`
+/// file without moving the parent's mtime, and a newly added file is by
+/// definition absent from `entries`, so nothing else would notice it.
+/// `children_digest` covers the set of fingerprint-relevant child names so that
+/// an addition or removal is a cache miss rather than a false hit. See issue #76.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FingerprintDirectoryState {
+    modified_unix_ms: u64,
+    children_digest: String,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -2663,11 +3040,73 @@ impl Drop for CacheLockGuard {
     }
 }
 
+fn normalize_multicall_cli_args(raw_args: Vec<String>) -> Vec<String> {
+    if raw_args.is_empty() {
+        return raw_args;
+    }
+    let stem = Path::new(&raw_args[0])
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("uc")
+        .to_ascii_lowercase();
+    let mut out = raw_args;
+
+    // 1. If invoked as `starknet-devnet`, route directly to `uc devnet ...`
+    if stem == "starknet-devnet" || stem == "katana" {
+        if out.get(1).map(|s| s.as_str()) != Some("devnet")
+            && out.get(1).map(|s| s.as_str()) != Some("node")
+        {
+            out.insert(1, "devnet".to_string());
+        }
+        return out;
+    }
+
+    // 2. If `--manifest-path <path>` appears BEFORE the subcommand (e.g. `scarb --manifest-path X check`),
+    // relocate it after the subcommand so Clap parses it cleanly.
+    if out.len() >= 4 && out[1] == "--manifest-path" && !out[3].starts_with('-') {
+        let mp_flag = out.remove(1);
+        let mp_val = out.remove(1);
+        // Now out[1] is the subcommand; insert after out[1]
+        out.insert(2, mp_flag);
+        out.insert(3, mp_val);
+    }
+
+    if stem == "sncast" {
+        if let Some(first_sub) = out.iter_mut().skip(1).find(|a| !a.starts_with('-')) {
+            if first_sub == "verify" {
+                *first_sub = "verify-onchain".to_string();
+            }
+        }
+    }
+    out
+}
+
 fn main() -> Result<()> {
     init_observability();
-    let cli = Cli::parse();
+    let normalized_args = normalize_multicall_cli_args(std::env::args().collect());
+    let json = normalized_args
+        .iter()
+        .skip(1)
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "--json");
+    let cli = Cli::parse_from(normalized_args);
+    let result = dispatch_command(cli.command);
+    if let Err(err) = &result {
+        if json && !STDOUT_JSON_PRINTED.load(Ordering::Relaxed) {
+            let envelope = serde_json::json!({
+                "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
+                "status": "failed",
+                "exit_code": 1,
+                "error": format!("{err:#}"),
+            });
+            println!("{envelope}");
+        }
+    }
+    result
+}
 
-    match cli.command {
+fn dispatch_command(command: Commands) -> Result<()> {
+    match command {
         Commands::Daemon(args) => run_daemon(args),
         #[cfg(feature = "dev-benchmark-command")]
         Commands::Benchmark(args) => benchmark_cmd::run(args),
@@ -2685,6 +3124,61 @@ fn main() -> Result<()> {
         Commands::CompareBuild(args) => run_compare_build(args),
         Commands::Migrate(args) => run_migrate(args),
         Commands::Replay(args) => run_replay(args),
+        Commands::Inspect(args) => run_inspect(args),
+        Commands::Verify(args) => run_verify(args),
+        Commands::Test(args) => run_test(args),
+        Commands::Fmt(args) => run_fmt(args),
+        Commands::Check(args) => run_check(args),
+        Commands::Clean(args) => run_clean(args),
+        Commands::New(args) => run_new(args),
+        Commands::Init(args) => run_init(args),
+        Commands::Add(args) => run_add(args),
+        Commands::Remove(args) => run_remove(args),
+        Commands::Tree(args) => run_tree(args),
+        Commands::Expand(args) => run_expand(args),
+        Commands::Lint(args) => run_lint(args),
+        Commands::Profile(args) => run_profile(args),
+        Commands::Diff(args) => run_diff(args),
+        Commands::Abi(args) => run_abi(args),
+        Commands::ManifestPath(args) => run_manifest_path(args),
+        Commands::Run(args) => run_script(args),
+        Commands::Completions(args) => run_completions(args),
+        Commands::ClassHash(args) => run_class_hash(args),
+        Commands::Selector(args) => run_selector(args),
+        Commands::Call(args) => run_call(args),
+        Commands::Declare(args) => run_declare(args),
+        Commands::Deploy(args) => run_deploy(args),
+        Commands::Invoke(args) => run_invoke(args),
+        Commands::TxStatus(args) => run_tx_status(args),
+        Commands::Account(args) => run_account(args),
+        Commands::VerifyOnchain(args) => run_verify_onchain(args),
+        Commands::Lsp(args) => run_lsp(args),
+        Commands::Prove(args) => run_prove(args),
+        Commands::Execute(args) => run_execute(args),
+        Commands::Doc(args) => run_doc(args),
+        Commands::Package(args) => run_package(args),
+        Commands::Publish(args) => run_publish(args),
+        Commands::List(args) => run_list_versions(args),
+        Commands::Update(args) => run_update(args),
+        Commands::Commands(args) => run_commands_list(args),
+        Commands::ProcMacroServer(args) => run_proc_macro_server(args),
+        Commands::OptimizeInlining(args) => run_optimize_inlining(args),
+        Commands::CleanCache(args) => run_clean_cache(args),
+        Commands::CheckRequirements(args) => run_check_requirements(args),
+        Commands::Decompile(args) => run_decompile(args),
+        Commands::Trace(args) => run_trace_tx(args),
+        Commands::Balance(args) => run_balance(args),
+        Commands::Get(args) => run_get(args),
+        Commands::Multicall(args) => run_multicall(args),
+        Commands::DeclareFrom(args) => run_declare_from(args),
+        Commands::ShowConfig(args) => run_show_config(args),
+        Commands::Script(args) => run_script_cmd(args),
+        Commands::Utils(args) => run_utils(args),
+        Commands::Ledger(args) => run_ledger(args),
+        Commands::Devnet(args) => run_devnet(args),
+        Commands::Audit(args) => run_audit(args),
+        Commands::Watch(args) => run_watch(args),
+        Commands::Doctor(args) => run_doctor(args),
     }
 }
 
@@ -2710,7 +3204,7 @@ fn emit_json_value<T: Serialize>(report_path: Option<&Path>, value: &T) -> Resul
     if let Some(path) = report_path {
         write_json_report(path, value)?;
     }
-    println!(
+    json_println!(
         "{}",
         serde_json::to_string_pretty(value).context("failed to serialize JSON report")?
     );
@@ -2763,9 +3257,44 @@ fn run_resolve(args: ResolveArgs) -> Result<()> {
     }
 }
 
+/// Fails fast when `Scarb.toml` is not a Cairo package/workspace manifest, before any metadata
+/// probe or directory fingerprinting (which can walk a whole monorepo).
+pub(crate) fn ensure_manifest_is_cairo_package(manifest_path: &Path) -> Result<()> {
+    let text = read_text_file_with_limit(manifest_path, MAX_MANIFEST_BYTES, "manifest")?;
+    let manifest = parse_manifest_toml(&text, manifest_path, "failed to parse manifest")?;
+    if manifest.get("package").is_none() && manifest.get("workspace").is_none() {
+        bail!(
+            "{} has no [package] or [workspace] table; this is not a Cairo project (run uc inside a package directory or pass --manifest-path)",
+            manifest_path.display()
+        );
+    }
+    Ok(())
+}
+
 fn run_fetch(args: FetchArgs) -> Result<()> {
     if !args.locked {
-        bail!("uc fetch currently requires --locked");
+        // Native registry fetch: resolve, download, verify and cache every registry dependency.
+        let manifest_path = resolve_manifest_path(&args.manifest_path)?;
+        if args.offline {
+            bail!("`uc fetch --offline` cannot download packages; drop --offline or use --locked");
+        }
+        let report = crate::commands::ensure_registry_dependencies(&manifest_path)?;
+        if args.json || args.report_path.is_some() || matches!(args.format, FetchFormatArg::Json) {
+            return emit_json_value(args.report_path.as_deref(), &report);
+        }
+        for pkg in &report.fetched {
+            println!("fetched {}@{}", pkg.name, pkg.version);
+        }
+        if let Some(lock) = &report.lockfile_written {
+            println!("wrote {lock}");
+        }
+        println!(
+            "uc fetch: {} fetched, {} cached ({:.1}ms)",
+            report.fetched.len(),
+            report.cached.len(),
+            report.elapsed_ms
+        );
+        return Ok(());
     }
     let report = fetch_report_from_args(&args)?;
     let format = if args.json {
@@ -2887,7 +3416,7 @@ fn project_inspect_report_from_manifest_path_with_native_support(
         .unwrap_or_default();
     let workspace_manifest =
         project_read_workspace_manifest_for_report(&workspace_root, manifest_path);
-    let workspace_manifest_path = workspace_root.join("Scarb.toml");
+    let workspace_manifest_path = manifest_file_in_dir(&workspace_root);
     let inspecting_workspace_root = workspace_manifest_path == manifest_path;
     let workspace_manifest_for_report = if inspecting_workspace_root {
         manifest.as_ref()
@@ -4731,7 +5260,7 @@ fn project_read_workspace_manifest_for_report(
     workspace_root: &Path,
     manifest_path: &Path,
 ) -> Option<TomlValue> {
-    let workspace_manifest_path = workspace_root.join("Scarb.toml");
+    let workspace_manifest_path = manifest_file_in_dir(&workspace_root);
     if workspace_manifest_path != manifest_path {
         match read_text_file_with_limit(&workspace_manifest_path, MAX_MANIFEST_BYTES, "manifest")
             .and_then(|text| {
@@ -5399,7 +5928,7 @@ fn project_lockfile_summary(
     workspace_root: &Path,
     diagnostics: &mut Vec<NativeDiagnostic>,
 ) -> Result<ProjectLockfileSummary> {
-    let lock_path = workspace_root.join("Scarb.lock");
+    let lock_path = lockfile_in_dir(workspace_root);
     let metadata = match fs::metadata(&lock_path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -7121,10 +7650,9 @@ fn run_build_entry(args: BuildArgs) -> Result<()> {
     match run_build(args) {
         Ok(()) => Ok(()),
         Err(err) => {
+            let err_str = format!("{err:#}");
             if let Some(path) = record_failure.as_ref() {
-                if let Err(record_err) =
-                    write_failure_bundle(path, &bundle_args, &format!("{err:#}"))
-                {
+                if let Err(record_err) = write_failure_bundle(path, &bundle_args, &err_str) {
                     tracing::warn!(
                         bundle_path = %path.display(),
                         error = %format!("{record_err:#}"),
@@ -7132,9 +7660,485 @@ fn run_build_entry(args: BuildArgs) -> Result<()> {
                     );
                 }
             }
+            if bundle_args.json && !err_str.starts_with("build failed with exit code ") {
+                let envelope = serde_json::json!({
+                    "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
+                    "status": "failed",
+                    "exit_code": 1,
+                    "engine": bundle_args.engine.as_str(),
+                    "daemon_mode": bundle_args.daemon_mode.as_str(),
+                    "manifest_path": bundle_args.common.manifest_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "Scarb.toml".to_string()),
+                    "error": err_str,
+                });
+                if let Ok(serialized) = serde_json::to_string(&envelope) {
+                    json_println!("{serialized}");
+                }
+            }
             Err(err)
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BuildReceiptContractEntry {
+    pub id: String,
+    pub package_name: String,
+    pub contract_name: String,
+    pub module_path: String,
+    pub sierra_artifact: String,
+    pub sierra_blake3: String,
+    pub class_hash: Option<String>,
+    pub casm_artifact: Option<String>,
+    pub casm_blake3: Option<String>,
+    pub compiled_class_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BuildReceiptFile {
+    pub schema_version: u32,
+    pub generated_at_epoch_ms: u64,
+    pub package_name: String,
+    pub profile: String,
+    pub compiler_version: String,
+    pub contracts: Vec<BuildReceiptContractEntry>,
+}
+
+#[cfg(feature = "native-compile")]
+/// JSON with Python's default separators (`", "` and `": "`) and non-ASCII characters escaped
+/// as `\uXXXX`, which is how starknet-rs (sncast, starkli) and the Python tooling serialize a
+/// class's ABI when they declare it. The class hash commits to that exact string, so every
+/// class hash uc computes for a local artifact uses this form.
+pub(crate) fn pythonic_json_string<T: serde::Serialize + ?Sized>(value: &T) -> String {
+    struct Pythonic;
+    impl serde_json::ser::Formatter for Pythonic {
+        fn begin_array_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W, first: bool) -> std::io::Result<()> {
+            if first { Ok(()) } else { w.write_all(b", ") }
+        }
+        fn begin_object_key<W: ?Sized + std::io::Write>(&mut self, w: &mut W, first: bool) -> std::io::Result<()> {
+            if first { Ok(()) } else { w.write_all(b", ") }
+        }
+        fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+            w.write_all(b": ")
+        }
+        fn write_string_fragment<W: ?Sized + std::io::Write>(&mut self, w: &mut W, fragment: &str) -> std::io::Result<()> {
+            let mut buf = [0u16; 2];
+            for c in fragment.chars() {
+                if c.is_ascii() {
+                    w.write_all(&[c as u8])?;
+                } else {
+                    for unit in c.encode_utf16(&mut buf) {
+                        write!(w, "\\u{:04x}", unit)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+    let mut out = Vec::with_capacity(256);
+    let mut ser = serde_json::Serializer::with_formatter(&mut out, Pythonic);
+    if value.serialize(&mut ser).is_err() {
+        return String::new();
+    }
+    String::from_utf8(out).unwrap_or_default()
+}
+
+/// The ABI string a declared class commits to: the string itself when the class came from a
+/// node or a DECLARE transaction (`abi` is a JSON string there), else the pythonic form of the
+/// ABI array of a local artifact.
+pub(crate) fn declared_abi_string(class_json: &serde_json::Value) -> String {
+    match class_json.get("abi") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(abi) if !abi.is_null() => serde_json::from_value::<ContractClass>(class_json.clone())
+            .ok()
+            .and_then(|c| c.abi.map(|a| pythonic_json_string(&a)))
+            .unwrap_or_else(|| pythonic_json_string(abi)),
+        _ => String::new(),
+    }
+}
+
+/// Class hash of a class given as JSON, with the ABI string exactly as it would be declared.
+pub(crate) fn compute_class_hash_from_json(class_json: &serde_json::Value) -> Option<String> {
+    let abi = declared_abi_string(class_json);
+    let mut typed = class_json.clone();
+    typed["abi"] = serde_json::Value::Array(Vec::new());
+    let class: ContractClass = serde_json::from_value(typed).ok()?;
+    Some(sierra_class_hash_with_abi(&class, &abi))
+}
+
+pub(crate) fn compute_starknet_sierra_class_hash(contract_class: &ContractClass) -> Option<String> {
+    let abi_str = contract_class.abi.as_ref().map(pythonic_json_string).unwrap_or_default();
+    Some(sierra_class_hash_with_abi(contract_class, &abi_str))
+}
+
+fn sierra_class_hash_with_abi(contract_class: &ContractClass, abi_str: &str) -> String {
+    use cairo_lang_starknet_classes::keccak::starknet_keccak;
+    use starknet_types_core::felt::Felt;
+    use starknet_types_core::hash::{Poseidon, StarkHash};
+
+    let version_felt = Felt::from_bytes_be_slice(b"CONTRACT_CLASS_V0.1.0");
+    let hash_entry_points =
+        |entries: &[cairo_lang_starknet_classes::contract_class::ContractEntryPoint]| -> Felt {
+            let mut elements = Vec::with_capacity(entries.len() * 2);
+            for ep in entries {
+                elements.push(Felt::from(&ep.selector));
+                elements.push(Felt::from(ep.function_idx));
+            }
+            Poseidon::hash_array(&elements)
+        };
+    let external_hash = hash_entry_points(&contract_class.entry_points_by_type.external);
+    let l1_handler_hash = hash_entry_points(&contract_class.entry_points_by_type.l1_handler);
+    let constructor_hash = hash_entry_points(&contract_class.entry_points_by_type.constructor);
+
+    let abi_hash = Felt::from(starknet_keccak(abi_str.as_bytes()));
+
+    let sierra_felts: Vec<Felt> = contract_class
+        .sierra_program
+        .iter()
+        .map(|big_uint| Felt::from(&big_uint.value))
+        .collect();
+    let sierra_program_hash = Poseidon::hash_array(&sierra_felts);
+
+    let class_hash = Poseidon::hash_array(&[
+        version_felt,
+        external_hash,
+        l1_handler_hash,
+        constructor_hash,
+        abi_hash,
+        sierra_program_hash,
+    ]);
+    format!("{:#x}", class_hash)
+}
+
+#[cfg(feature = "native-compile")]
+fn compute_starknet_compiled_class_hash(casm_contract: &CasmContractClass) -> String {
+    format!("{:#x}", casm_contract.compiled_class_hash())
+}
+
+fn resolve_inspect_profile(release: bool, profile: Option<&str>) -> String {
+    if let Some(p) = profile {
+        p.to_string()
+    } else if release {
+        "release".to_string()
+    } else {
+        "dev".to_string()
+    }
+}
+
+fn inspect_contract_artifacts_in_workspace(
+    manifest_path: &Path,
+    profile: &str,
+    target_filter: Option<&str>,
+) -> Result<Vec<serde_json::Value>> {
+    let workspace_root = metadata_cache_workspace_root(manifest_path)?;
+    let target_dir = workspace_root.join("target").join(profile);
+    if !target_dir.is_dir() {
+        bail!(
+            "target directory {} does not exist; run `uc build` first",
+            target_dir.display()
+        );
+    }
+    let manifest_package_filter: Option<String> = fs::read_to_string(manifest_path)
+        .ok()
+        .and_then(|txt| toml::from_str::<TomlValue>(&txt).ok())
+        .and_then(|doc| {
+            if doc.get("workspace").is_some() {
+                return None;
+            }
+            doc.get("package")
+                .and_then(|p| p.get("name"))
+                .and_then(TomlValue::as_str)
+                .map(str::to_string)
+        });
+    let mut results = Vec::new();
+    let mut manifest_files = Vec::new();
+    for entry in fs::read_dir(&target_dir)
+        .with_context(|| format!("failed to read {}", target_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| {
+                n.ends_with(".starknet_artifacts.json")
+                    && !n.ends_with(".test.starknet_artifacts.json")
+            })
+        {
+            manifest_files.push(path);
+        }
+    }
+    manifest_files.sort();
+    for manifest_file in manifest_files {
+        let bytes = fs::read(&manifest_file)?;
+        let artifacts_manifest: StarknetArtifactsManifest = serde_json::from_slice(&bytes)
+            .with_context(|| format!("failed to parse {}", manifest_file.display()))?;
+        let receipt_map: HashMap<String, BuildReceiptContractEntry> = manifest_file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".starknet_artifacts.json"))
+            .and_then(|pkg| {
+                let receipt_path = workspace_root
+                    .join(".uc/receipts")
+                    .join(profile)
+                    .join(format!("{pkg}.receipt.json"));
+                fs::read(&receipt_path).ok()
+            })
+            .and_then(|b| serde_json::from_slice::<BuildReceiptFile>(&b).ok())
+            .map(|r| {
+                r.contracts
+                    .into_iter()
+                    .map(|c| (c.id.clone(), c))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for entry in artifacts_manifest.contracts {
+            if let Some(pkg_name) = manifest_package_filter.as_deref() {
+                if !entry.package_name.eq_ignore_ascii_case(pkg_name)
+                    && normalize_package_name_for_cairo_crate(&entry.package_name)
+                        != normalize_package_name_for_cairo_crate(pkg_name)
+                {
+                    continue;
+                }
+            }
+            if let Some(filter) = target_filter {
+                let matches = entry.contract_name.eq_ignore_ascii_case(filter)
+                    || entry.package_name.eq_ignore_ascii_case(filter)
+                    || entry.module_path.eq_ignore_ascii_case(filter)
+                    || entry
+                        .module_path
+                        .rsplit("::")
+                        .next()
+                        .is_some_and(|seg| seg.eq_ignore_ascii_case(filter))
+                    || entry.artifacts.sierra == filter
+                    || entry.id.eq_ignore_ascii_case(filter);
+                if !matches {
+                    continue;
+                }
+            }
+            let sierra_path = target_dir.join(&entry.artifacts.sierra);
+            let sierra_bytes = fs::read(&sierra_path)
+                .with_context(|| format!("failed to read {}", sierra_path.display()))?;
+            let sierra_blake3 = blake3::hash(&sierra_bytes).to_hex().to_string();
+            let receipt_entry = receipt_map.get(&entry.id);
+
+            #[cfg(feature = "native-compile")]
+            let (class_hash, abi_value, entry_points_value, compiler_ver) = {
+                let contract_class: ContractClass = serde_json::from_slice(&sierra_bytes)
+                    .with_context(|| format!("failed to parse {}", sierra_path.display()))?;
+                // Recomputed every time (about a millisecond): receipts written by older uc
+                // versions carry class hashes over a differently serialized ABI.
+                let _ = receipt_entry;
+                let computed_hash = compute_starknet_sierra_class_hash(&contract_class);
+                let abi_val = serde_json::to_value(&contract_class.abi).unwrap_or(serde_json::Value::Null);
+                let ep_val = serde_json::to_value(&contract_class.entry_points_by_type)
+                    .unwrap_or(serde_json::Value::Null);
+                (
+                    computed_hash,
+                    abi_val,
+                    ep_val,
+                    native_cairo_lang_compiler_version().to_string(),
+                )
+            };
+            #[cfg(not(feature = "native-compile"))]
+            let (class_hash, abi_value, entry_points_value, compiler_ver) = (
+                receipt_entry.and_then(|r| r.class_hash.clone()),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                String::new(),
+            );
+
+            let (compiled_class_hash, casm_blake3) = if let Some(casm_file) = &entry.artifacts.casm {
+                let casm_path = target_dir.join(casm_file);
+                if casm_path.is_file() {
+                    let casm_bytes = fs::read(&casm_path)?;
+                    let c_blake3 = blake3::hash(&casm_bytes).to_hex().to_string();
+                    #[cfg(feature = "native-compile")]
+                    let c_hash = receipt_entry
+                        .filter(|r| r.casm_blake3.as_deref() == Some(c_blake3.as_str()))
+                        .and_then(|r| r.compiled_class_hash.clone())
+                        .or_else(|| {
+                            serde_json::from_slice::<CasmContractClass>(&casm_bytes)
+                                .ok()
+                                .map(|c| compute_starknet_compiled_class_hash(&c))
+                        });
+                    #[cfg(not(feature = "native-compile"))]
+                    let c_hash = receipt_entry.and_then(|r| r.compiled_class_hash.clone());
+                    (c_hash, Some(c_blake3))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+
+            results.push(serde_json::json!({
+                "id": entry.id,
+                "package_name": entry.package_name,
+                "contract_name": entry.contract_name,
+                "module_path": entry.module_path,
+                "compiler_version": compiler_ver,
+                "sierra_artifact": entry.artifacts.sierra,
+                "sierra_path": sierra_path.display().to_string(),
+                "sierra_blake3": sierra_blake3,
+                "class_hash": class_hash,
+                "casm_artifact": entry.artifacts.casm,
+                "casm_blake3": casm_blake3,
+                "compiled_class_hash": compiled_class_hash,
+                "entry_points_by_type": entry_points_value,
+                "abi": abi_value,
+            }));
+        }
+    }
+    Ok(results)
+}
+
+fn run_inspect(args: InspectArgs) -> Result<()> {
+    let manifest_path = resolve_manifest_path(&args.manifest_path)?;
+    let profile = resolve_inspect_profile(args.release, args.profile.as_deref());
+    let contracts = inspect_contract_artifacts_in_workspace(
+        &manifest_path,
+        &profile,
+        args.target.as_deref(),
+    )?;
+    if contracts.is_empty() {
+        bail!(
+            "no matching compiled Starknet contracts found for profile `{profile}` (manifest {})",
+            manifest_path.display()
+        );
+    }
+    let effective_field = if args.class_hash {
+        InspectFieldArg::ClassHash
+    } else if args.compiled_class_hash {
+        InspectFieldArg::CompiledClassHash
+    } else if args.abi {
+        InspectFieldArg::Abi
+    } else if args.entry_points {
+        InspectFieldArg::EntryPoints
+    } else if args.compiler_version {
+        InspectFieldArg::CompilerVersion
+    } else {
+        args.field
+    };
+
+    if !args.json && contracts.len() == 1 && effective_field != InspectFieldArg::All {
+        let c = &contracts[0];
+        match effective_field {
+            InspectFieldArg::ClassHash => {
+                if let Some(h) = c.get("class_hash").and_then(|v| v.as_str()) {
+                    println!("{h}");
+                    return Ok(());
+                }
+            }
+            InspectFieldArg::CompiledClassHash => {
+                if let Some(h) = c.get("compiled_class_hash").and_then(|v| v.as_str()) {
+                    println!("{h}");
+                    return Ok(());
+                }
+            }
+            InspectFieldArg::CompilerVersion => {
+                if let Some(v) = c.get("compiler_version").and_then(|v| v.as_str()) {
+                    println!("{v}");
+                    return Ok(());
+                }
+            }
+            InspectFieldArg::Abi => {
+                json_println!(
+                    "{}",
+                    serde_json::to_string_pretty(c.get("abi").unwrap_or(&serde_json::Value::Null))?
+                );
+                return Ok(());
+            }
+            InspectFieldArg::EntryPoints => {
+                json_println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        c.get("entry_points_by_type")
+                            .unwrap_or(&serde_json::Value::Null)
+                    )?
+                );
+                return Ok(());
+            }
+            InspectFieldArg::Receipt | InspectFieldArg::All => {}
+        }
+    }
+
+    let report = serde_json::json!({
+        "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
+        "manifest_path": manifest_path.display().to_string(),
+        "profile": profile,
+        "contract_count": contracts.len(),
+        "contracts": contracts,
+    });
+    emit_json_value(args.report_path.as_deref(), &report)
+}
+
+fn run_verify(args: VerifyArgs) -> Result<()> {
+    let manifest_path = resolve_manifest_path(&args.manifest_path)?;
+    let profile = resolve_inspect_profile(args.release, args.profile.as_deref());
+    let contracts = inspect_contract_artifacts_in_workspace(
+        &manifest_path,
+        &profile,
+        args.contract.as_deref(),
+    )?;
+    if contracts.is_empty() {
+        bail!(
+            "no matching compiled Starknet contracts found to verify in profile `{profile}`"
+        );
+    }
+    let mut all_verified = true;
+    let mut checks = Vec::with_capacity(contracts.len());
+    for c in &contracts {
+        let actual_class_hash = c
+            .get("class_hash")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let actual_compiled_hash = c
+            .get("compiled_class_hash")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let class_hash_ok = args.class_hash.as_ref().is_none_or(|expected| {
+            actual_class_hash
+                .as_deref()
+                .is_some_and(|actual| actual.eq_ignore_ascii_case(expected.trim()))
+        });
+        let compiled_hash_ok = args.compiled_class_hash.as_ref().is_none_or(|expected| {
+            actual_compiled_hash
+                .as_deref()
+                .is_some_and(|actual| actual.eq_ignore_ascii_case(expected.trim()))
+        });
+        let contract_ok = class_hash_ok && compiled_hash_ok && actual_class_hash.is_some();
+        if !contract_ok {
+            all_verified = false;
+        }
+        checks.push(serde_json::json!({
+            "contract_name": c.get("contract_name"),
+            "module_path": c.get("module_path"),
+            "compiler_version": c.get("compiler_version"),
+            "class_hash": actual_class_hash,
+            "expected_class_hash": args.class_hash,
+            "class_hash_verified": class_hash_ok,
+            "compiled_class_hash": actual_compiled_hash,
+            "expected_compiled_class_hash": args.compiled_class_hash,
+            "compiled_class_hash_verified": compiled_hash_ok,
+            "sierra_blake3": c.get("sierra_blake3"),
+            "casm_blake3": c.get("casm_blake3"),
+            "verified": contract_ok,
+        }));
+    }
+    let report = serde_json::json!({
+        "schema_version": UC_AGENT_JSON_SCHEMA_VERSION,
+        "status": if all_verified { "verified" } else { "mismatch" },
+        "verified": all_verified,
+        "manifest_path": manifest_path.display().to_string(),
+        "profile": profile,
+        "contracts": checks,
+    });
+    emit_json_value(args.report_path.as_deref(), &report)?;
+    if !all_verified {
+        bail!("contract class hash verification failed");
+    }
+    Ok(())
 }
 
 fn write_failure_bundle(path: &Path, args: &BuildArgs, error: &str) -> Result<()> {
@@ -7156,7 +8160,7 @@ fn write_failure_bundle(path: &Path, args: &BuildArgs, error: &str) -> Result<()
             .map(|hash| format!("blake3:{hash}"))
     });
     let lockfile_hash = workspace_root.as_ref().and_then(|root| {
-        let lockfile = root.join("Scarb.lock");
+        let lockfile = lockfile_in_dir(root);
         if lockfile.is_file() {
             hash_file_blake3(&lockfile)
                 .ok()
@@ -7451,7 +8455,7 @@ fn run_native_support(args: NativeSupportArgs) -> Result<()> {
             }
         }
         SupportFormatArg::Json => {
-            println!(
+            json_println!(
                 "{}",
                 serde_json::to_string(&report)
                     .context("failed to serialize native support report")?
@@ -7583,7 +8587,10 @@ fn parse_version_component_leading_u64(raw: &str) -> Option<u64> {
 
 #[cfg(feature = "native-compile")]
 fn parse_cairo_version_major_minor(raw: &str) -> Option<(u64, u64)> {
-    let normalized = raw.trim().trim_start_matches('v');
+    // Accept exact-ish pins (`v2.14.0`, `=2.14.0`, `^2.14.0`); ranges have no single lane.
+    let normalized = raw
+        .trim()
+        .trim_start_matches(|ch: char| matches!(ch, 'v' | '=' | '^' | ' '));
     let mut parts = normalized.split('.');
     let major = parse_version_component_leading_u64(parts.next()?)?;
     let minor = parse_version_component_leading_u64(parts.next()?)?;
@@ -7613,6 +8620,15 @@ fn manifest_effective_package_edition(manifest: &TomlValue) -> String {
         .and_then(TomlValue::as_table)
         .and_then(|table| table.get("edition"))
         .and_then(TomlValue::as_str)
+        .or_else(|| {
+            manifest
+                .get("workspace")
+                .and_then(TomlValue::as_table)
+                .and_then(|ws| ws.get("package"))
+                .and_then(TomlValue::as_table)
+                .and_then(|table| table.get("edition"))
+                .and_then(TomlValue::as_str)
+        })
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(DEFAULT_CAIRO_EDITION)
@@ -7728,11 +8744,15 @@ fn is_exact_cairo_version(raw: &str) -> bool {
 #[cfg(feature = "native-compile")]
 fn manifest_exact_dependency_version(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
-    let exact = trimmed.strip_prefix('=').map(str::trim).unwrap_or(trimmed);
+    let (pinned, exact) = match trimmed.strip_prefix('=') {
+        Some(rest) => (true, rest.trim()),
+        None => (false, trimmed),
+    };
     if !is_exact_cairo_version(exact) {
         return None;
     }
-    Some(exact.to_string())
+    // Keep the `=` so callers can tell an exact pin from a caret requirement.
+    Some(if pinned { format!("={exact}") } else { exact.to_string() })
 }
 
 #[cfg(feature = "native-compile")]
@@ -7787,7 +8807,7 @@ fn manifest_workspace_dependency_exact_version(
         return Ok(None);
     }
     let workspace_root = metadata_cache_workspace_root(manifest_path)?;
-    let workspace_manifest_path = workspace_root.join("Scarb.toml");
+    let workspace_manifest_path = manifest_file_in_dir(&workspace_root);
     let workspace_manifest;
     let workspace_manifest_ref = if workspace_manifest_path == manifest_path {
         manifest
@@ -7838,7 +8858,7 @@ fn project_lockfile_dependency_version(
     dependency_name: &str,
 ) -> Result<Option<String>> {
     let workspace_root = metadata_cache_workspace_root(manifest_path)?;
-    let lock_path = workspace_root.join("Scarb.lock");
+    let lock_path = lockfile_in_dir(&workspace_root);
     let lock_text = match fs::read_to_string(&lock_path) {
         Ok(text) => text,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -7903,42 +8923,115 @@ fn resolved_dependency_version_from_scarb_metadata(
     manifest_path: &Path,
     dependency_name: &str,
 ) -> Result<Option<String>> {
-    let metadata_args = MetadataArgs {
-        manifest_path: Some(manifest_path.to_path_buf()),
-        format_version: 1,
-        daemon_mode: DaemonModeArg::Off,
-        offline: false,
-        global_cache_dir: None,
-        report_path: None,
-    };
-    let run = match run_scarb_metadata_with_uc_cache(&metadata_args, manifest_path, true) {
-        Ok(run) => run,
-        Err(err) => {
-            tracing::debug!(
-                manifest_path = %manifest_path.display(),
-                dependency = dependency_name,
-                error = %format!("{err:#}"),
-                "native toolchain version resolution skipped: scarb metadata failed"
-            );
-            return Ok(None);
+    for offline in [true, false] {
+        let metadata_args = MetadataArgs {
+            manifest_path: Some(manifest_path.to_path_buf()),
+            format_version: 1,
+            daemon_mode: DaemonModeArg::Off,
+            offline,
+            global_cache_dir: None,
+            report_path: None,
+        };
+        let run = match run_scarb_metadata_with_uc_cache(&metadata_args, manifest_path, true) {
+            Ok(run) => run,
+            Err(err) => {
+                if !offline {
+                    tracing::debug!(
+                        manifest_path = %manifest_path.display(),
+                        dependency = dependency_name,
+                        error = %format!("{err:#}"),
+                        "native toolchain version resolution skipped: scarb metadata failed"
+                    );
+                }
+                continue;
+            }
+        };
+        if run.exit_code != 0 {
+            if !offline {
+                tracing::debug!(
+                    manifest_path = %manifest_path.display(),
+                    dependency = dependency_name,
+                    exit_code = run.exit_code,
+                    stderr = %run.stderr.trim(),
+                    "native toolchain version resolution skipped: scarb metadata exited non-zero"
+                );
+            }
+            continue;
         }
-    };
-    if run.exit_code != 0 {
-        tracing::debug!(
-            manifest_path = %manifest_path.display(),
-            dependency = dependency_name,
-            exit_code = run.exit_code,
-            stderr = %run.stderr.trim(),
-            "native toolchain version resolution skipped: scarb metadata exited non-zero"
-        );
-        return Ok(None);
+        let metadata = parse_native_scarb_metadata_document(&run.stdout)?;
+        return Ok(metadata
+            .packages
+            .iter()
+            .find(|package| native_scarb_metadata_package_name(package) == Some(dependency_name))
+            .and_then(native_scarb_metadata_package_version));
     }
-    let metadata = parse_native_scarb_metadata_document(&run.stdout)?;
-    Ok(metadata
-        .packages
-        .iter()
-        .find(|package| native_scarb_metadata_package_name(package) == Some(dependency_name))
-        .and_then(native_scarb_metadata_package_version))
+    Ok(None)
+}
+
+#[cfg(feature = "native-compile")]
+fn manifest_dependency_version_req_satisfied_by_native_compiler(
+    raw_version_req: &str,
+) -> bool {
+    let trimmed = raw_version_req.trim();
+    if trimmed.is_empty() || trimmed.starts_with('=') || is_exact_cairo_version(trimmed) {
+        return false;
+    }
+    let Ok(req) = semver::VersionReq::parse(trimmed) else {
+        return false;
+    };
+    let Ok(compiler_version) = semver::Version::parse(native_cairo_lang_compiler_version()) else {
+        return false;
+    };
+    req.matches(&compiler_version)
+}
+
+#[cfg(feature = "native-compile")]
+fn manifest_or_workspace_dependency_satisfied_by_native_compiler(
+    manifest_path: &Path,
+    manifest: &TomlValue,
+    dependency_name: &str,
+) -> Result<bool> {
+    if let Some(raw) = manifest_dependency_version_raw(manifest, dependency_name) {
+        if manifest_dependency_version_req_satisfied_by_native_compiler(&raw) {
+            return Ok(true);
+        }
+    }
+    if manifest_dependency_uses_workspace(manifest, dependency_name) {
+        let workspace_root = metadata_cache_workspace_root(manifest_path)?;
+        let workspace_manifest_path = manifest_file_in_dir(&workspace_root);
+        let workspace_manifest;
+        let workspace_manifest_ref = if workspace_manifest_path == manifest_path {
+            manifest
+        } else {
+            let workspace_manifest_text = read_text_file_with_limit(
+                &workspace_manifest_path,
+                MAX_MANIFEST_BYTES,
+                "workspace manifest",
+            )?;
+            workspace_manifest = parse_manifest_toml(
+                &workspace_manifest_text,
+                &workspace_manifest_path,
+                "failed to parse workspace manifest for native support probe",
+            )?;
+            &workspace_manifest
+        };
+        if let Some(entry) = native_workspace_dependency_entry_from_manifest(
+            workspace_manifest_ref,
+            dependency_name,
+        ) {
+            let raw_opt = match entry {
+                TomlValue::String(s) => Some(s.as_str()),
+                TomlValue::Table(t) => t.get("version").and_then(TomlValue::as_str),
+                _ => None,
+            };
+            if let Some(raw) = raw_opt {
+                if manifest_dependency_version_req_satisfied_by_native_compiler(raw) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(feature = "native-compile")]
@@ -7946,7 +9039,32 @@ fn resolve_native_toolchain_requirement(
     manifest_path: &Path,
     manifest: &TomlValue,
 ) -> Result<NativeToolchainRequirement> {
-    let edition = manifest_effective_package_edition(manifest);
+    let mut edition = manifest_effective_package_edition(manifest);
+    if edition == DEFAULT_CAIRO_EDITION
+        && manifest
+            .get("package")
+            .and_then(TomlValue::as_table)
+            .and_then(|t| t.get("edition"))
+            .and_then(TomlValue::as_table)
+            .and_then(|t| t.get("workspace"))
+            .and_then(TomlValue::as_bool)
+            == Some(true)
+    {
+        if let Ok(ws_root) = metadata_cache_workspace_root(manifest_path) {
+            let ws_manifest_path = manifest_file_in_dir(&ws_root);
+            if ws_manifest_path != manifest_path && ws_manifest_path.is_file() {
+                if let Ok(ws_text) =
+                    read_text_file_with_limit(&ws_manifest_path, MAX_MANIFEST_BYTES, "workspace manifest")
+                {
+                    if let Ok(ws_manifest) =
+                        parse_manifest_toml(&ws_text, &ws_manifest_path, "workspace manifest")
+                    {
+                        edition = manifest_effective_package_edition(&ws_manifest);
+                    }
+                }
+            }
+        }
+    }
     if let Some(requested_version) = manifest_package_cairo_version(manifest) {
         return Ok(NativeToolchainRequirement {
             edition,
@@ -7994,6 +9112,20 @@ fn resolve_native_toolchain_requirement(
                 .map(format_cairo_version_major_minor),
             requested_version: Some(requested_version),
             request_source: Some(NativeToolchainRequestSource::LockfileDependencyVersion),
+        });
+    }
+    if !cairo_edition_requires_pinned_native_version(&edition)
+        && manifest_or_workspace_dependency_satisfied_by_native_compiler(
+            manifest_path,
+            manifest,
+            "starknet",
+        )?
+    {
+        return Ok(NativeToolchainRequirement {
+            edition,
+            requested_version: None,
+            requested_major_minor: None,
+            request_source: None,
         });
     }
     if let Some(requested_version) =
@@ -8409,22 +9541,56 @@ fn format_productized_helper_lanes(lanes: &[String]) -> String {
     }
 }
 
+/// Whether a helper binary at `path` exists and is executable by this process.
+///
+/// Existence alone is not enough: a path pointing at a directory, or at a file
+/// without the execute bit, cannot back a build.
+#[cfg(feature = "native-compile")]
+fn native_toolchain_helper_binary_is_built(path: Option<&str>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    let candidate = Path::new(path);
+    let Ok(metadata) = fs::metadata(candidate) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return metadata.permissions().mode() & 0o111 != 0;
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 #[cfg(feature = "native-compile")]
 fn native_builtin_toolchain_report(
     requirement: &NativeToolchainRequirement,
 ) -> NativeToolchainReport {
+    let helper_active = native_toolchain_helper_active();
+    let binary_path = native_toolchain_helper_path_override();
+    let helper_built =
+        helper_active.then(|| native_toolchain_helper_binary_is_built(binary_path.as_deref()));
     NativeToolchainReport {
         edition: requirement.edition.clone(),
         requested_version: requirement.requested_version.clone(),
         requested_major_minor: requirement.requested_major_minor.clone(),
         request_source: requirement.request_source.clone(),
-        source: if native_toolchain_helper_active() {
+        source: if helper_active {
             NativeToolchainSource::ExternalHelper
         } else {
             NativeToolchainSource::Builtin
         },
-        binary_path: native_toolchain_helper_path_override(),
+        binary_path,
         compiler_version: Some(native_cairo_lang_compiler_version().to_string()),
+        // The builtin lane is compiled into this binary, so it is always ready.
+        host_ready: helper_built.unwrap_or(true),
+        helper_built,
     }
 }
 
@@ -8443,6 +9609,8 @@ fn native_toolchain_report_for_issue(
                 source: NativeToolchainSource::ExternalHelper,
                 binary_path: std::env::var(helper_env).ok(),
                 compiler_version: Some(native_cairo_lang_compiler_version().to_string()),
+                host_ready: false,
+                helper_built: Some(false),
             }
         }
         NativeCompileSupportIssue::UnsupportedToolchainHelperLane { helper_env, .. } => {
@@ -8454,6 +9622,8 @@ fn native_toolchain_report_for_issue(
                 source: NativeToolchainSource::ExternalHelper,
                 binary_path: std::env::var(helper_env).ok(),
                 compiler_version: Some(native_cairo_lang_compiler_version().to_string()),
+                host_ready: false,
+                helper_built: Some(false),
             }
         }
         NativeCompileSupportIssue::InvalidToolchainHelper { path, .. } => NativeToolchainReport {
@@ -8464,6 +9634,8 @@ fn native_toolchain_report_for_issue(
             source: NativeToolchainSource::ExternalHelper,
             binary_path: Some(path.clone()),
             compiler_version: Some(native_cairo_lang_compiler_version().to_string()),
+            host_ready: false,
+            helper_built: Some(false),
         },
         _ => native_builtin_toolchain_report(requirement),
     }
@@ -8495,6 +9667,18 @@ fn native_compile_support_issue_with_compiler(
     };
     if format_cairo_version_major_minor(compiler_major_minor) == requested_major_minor {
         return None;
+    }
+    // Scarb semantics: a bare `starknet = "2.14.0"` / `cairo-version = "2.14.0"` is a caret
+    // requirement (`^2.14.0`). Scarb always compiles with its bundled compiler as long as the
+    // requirement is satisfied, so uc does the same with its in-process compiler. Only an
+    // unsatisfied requirement (for example an exact `=2.14.0` pin) routes to a helper lane.
+    if let (Ok(req), Ok(version)) = (
+        semver::VersionReq::parse(requested.trim()),
+        semver::Version::parse(compiler.trim()),
+    ) {
+        if req.matches(&version) {
+            return None;
+        }
     }
     Some(NativeCompileSupportIssue::CompilerVersionMismatch {
         requested,
@@ -8572,6 +9756,9 @@ fn select_native_toolchain_from_requirement_with_compiler(
                     source: NativeToolchainSource::ExternalHelper,
                     binary_path: Some(helper_path.display().to_string()),
                     compiler_version: None,
+                    // Reached only after native_toolchain_helper_path_is_usable above.
+                    host_ready: true,
+                    helper_built: Some(true),
                 },
                 helper_path: Some(helper_path),
             }));
@@ -8614,9 +9801,68 @@ fn select_native_toolchain_from_manifest_value(
 }
 
 #[cfg(feature = "native-compile")]
+thread_local! {
+    static NATIVE_COMPAT_TOOLCHAIN_FALLBACK_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(feature = "native-compile")]
+pub(crate) fn is_native_compat_toolchain_fallback_active() -> bool {
+    NATIVE_COMPAT_TOOLCHAIN_FALLBACK_ACTIVE.with(|cell| cell.get())
+}
+
+#[cfg(feature = "native-compile")]
+pub(crate) fn with_native_compat_toolchain_fallback<T>(f: impl FnOnce() -> T) -> T {
+    struct ResetGuard(bool);
+    impl Drop for ResetGuard {
+        fn drop(&mut self) {
+            NATIVE_COMPAT_TOOLCHAIN_FALLBACK_ACTIVE.with(|cell| cell.set(self.0));
+        }
+    }
+    let prev = NATIVE_COMPAT_TOOLCHAIN_FALLBACK_ACTIVE.with(|cell| {
+        let old = cell.get();
+        cell.set(true);
+        old
+    });
+    let _guard = ResetGuard(prev);
+    f()
+}
+
+#[cfg(not(feature = "native-compile"))]
+pub(crate) fn with_native_compat_toolchain_fallback<T>(f: impl FnOnce() -> T) -> T {
+    f()
+}
+
+#[cfg(feature = "native-compile")]
+pub(crate) fn native_issue_allows_in_process_compat(issue: &NativeCompileSupportIssue) -> bool {
+    match issue {
+        NativeCompileSupportIssue::LegacyEditionRequiresPinnedCairoVersion { .. }
+        | NativeCompileSupportIssue::UnsupportedManifestConstraint { .. }
+        | NativeCompileSupportIssue::CompilerVersionMismatch { .. }
+        | NativeCompileSupportIssue::MissingToolchainHelper { .. } => true,
+        NativeCompileSupportIssue::UnsupportedToolchainHelperLane {
+            configured_path,
+            ..
+        } => configured_path.is_none(),
+        NativeCompileSupportIssue::UnparseableCompilerVersion { .. }
+        | NativeCompileSupportIssue::InvalidToolchainHelper { .. } => false,
+    }
+}
+
+#[cfg(feature = "native-compile")]
 fn native_compile_support_reason(manifest_path: &Path) -> Result<Option<String>> {
     let (_, selection) = select_native_toolchain_from_manifest_path(manifest_path)?;
-    Ok(selection.err().map(|issue| issue.reason()))
+    match selection {
+        Ok(_) => Ok(None),
+        Err(issue) => {
+            if is_native_compat_toolchain_fallback_active()
+                && native_issue_allows_in_process_compat(&issue)
+            {
+                Ok(None)
+            } else {
+                Ok(Some(issue.reason()))
+            }
+        }
+    }
 }
 
 #[cfg(feature = "native-compile")]
@@ -8772,15 +10018,17 @@ fn ensure_native_manifest_cairo_version_supported(manifest: &TomlValue) -> Resul
 }
 
 #[cfg(feature = "native-compile")]
+/// Returns whether the manifest needs compatibility mode (it asks for another toolchain).
 fn ensure_native_manifest_cairo_version_supported_at_path(
     manifest_path: &Path,
     manifest: &TomlValue,
-) -> Result<()> {
+) -> Result<bool> {
     let requirement = resolve_native_toolchain_requirement(manifest_path, manifest)?;
     ensure_native_toolchain_requirement_supported_with_compiler(
         &requirement,
         native_cairo_lang_compiler_version(),
-    )
+    )?;
+    Ok(select_native_toolchain_from_requirement(&requirement)?.is_err())
 }
 
 #[cfg(feature = "native-compile")]
@@ -8792,6 +10040,16 @@ fn ensure_native_toolchain_requirement_supported_with_compiler(
     else {
         return Ok(());
     };
+    if is_native_compat_toolchain_fallback_active() && native_issue_allows_in_process_compat(&issue)
+    {
+        tracing::debug!(
+            compiler = %compiler,
+            edition = %requirement.edition,
+            requested = ?requirement.requested_version,
+            "using built-in native compiler compatibility mode for toolchain lane"
+        );
+        return Ok(());
+    }
     log_native_compile_support_issue(&issue, compiler);
     Err(native_fallback_eligible_error(issue.reason()))
 }
@@ -9670,13 +10928,13 @@ fn validate_metadata_format_version(version: u32) -> Result<()> {
 }
 
 fn validate_daemon_protocol_version(version: &str) -> Result<()> {
-    if version == DAEMON_PROTOCOL_VERSION {
+    if version == uc_build_identity() {
         return Ok(());
     }
     bail!(
-        "daemon protocol mismatch (daemon={}, client={})",
+        "daemon protocol mismatch (request={}, this build={})",
         version,
-        DAEMON_PROTOCOL_VERSION
+        uc_build_identity()
     );
 }
 
@@ -9707,10 +10965,7 @@ fn run_cache(args: CacheArgs) -> Result<()> {
 
 fn run_cache_clean(args: CacheCleanArgs) -> Result<()> {
     let manifest_path = resolve_manifest_path(&args.manifest_path)?;
-    let workspace_root = manifest_path
-        .parent()
-        .context("manifest path has no parent")?
-        .to_path_buf();
+    let workspace_root = metadata_cache_workspace_root(&manifest_path)?;
     let cache_root = workspace_root.join(".uc/cache");
     if !cache_root.exists() {
         println!("uc cache is already clean: {}", cache_root.display());
@@ -9777,6 +11032,7 @@ fn run_daemon_start(args: DaemonSocketArgs) -> Result<()> {
             .arg("serve")
             .arg("--socket-path")
             .arg(&socket_path)
+            .current_dir(std::env::temp_dir())
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(log_file_err));
@@ -9960,6 +11216,8 @@ fn run_daemon_stop(args: DaemonSocketArgs) -> Result<()> {
 }
 
 fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
+    // Fix the build identity before the executable can be replaced on disk.
+    let _ = uc_build_identity();
     #[cfg(not(unix))]
     {
         let _ = args;
@@ -9988,7 +11246,7 @@ fn run_daemon_serve(args: DaemonSocketArgs) -> Result<()> {
             pid: std::process::id(),
             started_at_epoch_ms: epoch_ms_u64()?,
             socket_path: socket_path.display().to_string(),
-            protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+            protocol_version: uc_build_identity().to_string(),
             healthy: true,
             total_requests: 0,
             failed_requests: 0,
@@ -10170,10 +11428,15 @@ fn try_uc_build_via_daemon(
             Ok(response) => response,
             Err(err) => {
                 if fallback_to_local {
-                    eprintln!(
-                        "uc: daemon request failed ({}), falling back to local engine",
-                        err
-                    );
+                    let msg = err.to_string();
+                    if msg.contains("failed to connect daemon socket") {
+                        let _ = fs::remove_file(&socket_path);
+                    } else {
+                        eprintln!(
+                            "uc: daemon request failed ({}), falling back to local engine",
+                            err
+                        );
+                    }
                     return Ok(None);
                 }
                 return Err(err).context("daemon build request failed");
@@ -10219,7 +11482,7 @@ fn try_uc_build_via_daemon(
                 if fallback_to_local {
                     if daemon_response_protocol_mismatch(&message) {
                         eprintln!(
-                            "uc: daemon protocol mismatch ({message}), falling back to local engine"
+                            "uc: daemon protocol mismatch ({message}), falling back to local engine; `uc daemon stop` retires the old daemon"
                         );
                     } else {
                         eprintln!(
@@ -10271,10 +11534,15 @@ fn try_uc_metadata_via_daemon(
             Ok(response) => response,
             Err(err) => {
                 if fallback_to_local {
-                    eprintln!(
-                        "uc: daemon request failed ({}), falling back to local metadata",
-                        err
-                    );
+                    let msg = err.to_string();
+                    if msg.contains("failed to connect daemon socket") {
+                        let _ = fs::remove_file(&socket_path);
+                    } else {
+                        eprintln!(
+                            "uc: daemon request failed ({}), falling back to local metadata",
+                            err
+                        );
+                    }
                     return Ok(None);
                 }
                 return Err(err).context("daemon metadata request failed");
@@ -10317,7 +11585,7 @@ fn daemon_build_request_from_common(
     native_fallback_to_scarb: bool,
 ) -> DaemonBuildRequest {
     DaemonBuildRequest {
-        protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+        protocol_version: uc_build_identity().to_string(),
         manifest_path: manifest_path.display().to_string(),
         package: common.package.clone(),
         workspace: common.workspace,
@@ -10350,7 +11618,7 @@ fn daemon_metadata_request_from_args(
     capture_output: bool,
 ) -> DaemonMetadataRequest {
     DaemonMetadataRequest {
-        protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+        protocol_version: uc_build_identity().to_string(),
         manifest_path: manifest_path.display().to_string(),
         format_version: args.format_version,
         offline: args.offline,
@@ -10491,6 +11759,8 @@ fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildRespon
     let common = common_args_from_daemon_request(&request);
     let manifest_path = resolve_manifest_path(&common.manifest_path)?;
     let requested_backend = request.compile_backend.into_compile_backend();
+    let is_pure_uc_toml = manifest_path.file_name().and_then(|s| s.to_str()) == Some("uc.toml")
+        && !manifest_path.with_file_name("Scarb.toml").is_file();
     let build_result = (|| -> Result<DaemonBuildResponse> {
         if requested_backend == BuildCompileBackend::Native {
             ensure_daemon_native_toolchain_request_supported(&manifest_path)?;
@@ -10509,6 +11779,7 @@ fn execute_daemon_build(request: DaemonBuildRequest) -> Result<DaemonBuildRespon
         Err(native_err)
             if requested_backend == BuildCompileBackend::Native
                 && request.native_fallback_to_scarb
+                && !is_pure_uc_toml
                 && native_error_allows_scarb_fallback(&native_err) =>
         {
             if native_disallow_scarb_fallback() {
@@ -10719,16 +11990,25 @@ fn manifest_has_workspace_table(manifest_path: &Path) -> bool {
     manifest.get("workspace").is_some()
 }
 
+fn manifest_file_in_dir(dir: impl AsRef<Path>) -> PathBuf {
+    let dir = dir.as_ref();
+    let uc_toml = dir.join("uc.toml");
+    if uc_toml.is_file() {
+        return uc_toml;
+    }
+    dir.join("Scarb.toml")
+}
+
 fn metadata_cache_workspace_root(manifest_path: &Path) -> Result<PathBuf> {
     let manifest_parent = manifest_path
         .parent()
         .context("manifest path has no parent")?;
     for ancestor in manifest_parent.ancestors() {
-        let ancestor_manifest = ancestor.join("Scarb.toml");
+        let ancestor_manifest = manifest_file_in_dir(ancestor);
         if !ancestor_manifest.is_file() {
             continue;
         }
-        if ancestor.join("Scarb.lock").is_file() {
+        if ancestor.join("uc.lock").is_file() || ancestor.join("Scarb.lock").is_file() {
             return Ok(ancestor.to_path_buf());
         }
         if ancestor != manifest_parent && manifest_has_workspace_table(&ancestor_manifest) {
@@ -10755,7 +12035,7 @@ fn run_scarb_metadata_with_uc_cache(
         .with_context(|| format!("failed to stat {}", manifest_path.display()))?;
     let manifest_size_bytes = manifest_metadata.len();
     let manifest_modified_unix_ms = metadata_modified_unix_ms(&manifest_metadata)?;
-    let workspace_manifest_path = workspace_root.join("Scarb.toml");
+    let workspace_manifest_path = manifest_file_in_dir(&workspace_root);
     let (_, _, lock_hash) = daemon_lock_state(&workspace_manifest_path)?;
     let workspace_manifests_hash = metadata_workspace_manifests_hash(&workspace_root)?;
     let scarb_version = scarb_version_line()?;
@@ -10913,7 +12193,7 @@ fn try_local_uc_cache_hit(
             "uc: cache hit, restored {} artifacts\n",
             entry.artifacts.len()
         ),
-        stderr: String::new(),
+        stderr: entry.warnings.clone(),
     };
     Ok(Some((run, fingerprint, telemetry)))
 }
@@ -11017,15 +12297,17 @@ fn run_build_with_uc_cache(
                         "uc: cache hit, restored {} artifacts\n",
                         entry.artifacts.len()
                     ),
-                    stderr: String::new(),
+                    stderr: entry.warnings.clone(),
                 };
-                if compile_backend == BuildCompileBackend::Native && options.use_daemon_shared_cache
-                {
-                    schedule_native_daemon_session_prewarm(
-                        common,
-                        manifest_path,
-                        &canonical_workspace_root,
-                    );
+                if compile_backend == BuildCompileBackend::Native {
+                    native_sync_state_on_cache_hit(&canonical_workspace_root);
+                    if options.use_daemon_shared_cache {
+                        schedule_native_daemon_session_prewarm(
+                            common,
+                            manifest_path,
+                            &canonical_workspace_root,
+                        );
+                    }
                 }
                 return Ok((
                     run,
@@ -11053,7 +12335,7 @@ fn run_build_with_uc_cache(
                 None
             };
         telemetry.cache_lookup_ms += shared_lookup_start.elapsed().as_secs_f64() * 1000.0;
-        if let Some(restored_count) = shared_restore {
+        if let Some((restored_count, warnings)) = shared_restore {
             let total_elapsed_ms =
                 telemetry.fingerprint_ms + telemetry.cache_lookup_ms + telemetry.cache_restore_ms;
             let run = CommandRun {
@@ -11068,14 +12350,17 @@ fn run_build_with_uc_cache(
                 exit_code: 0,
                 elapsed_ms: total_elapsed_ms,
                 stdout: format!("uc: cache hit, restored {} artifacts\n", restored_count),
-                stderr: String::new(),
+                stderr: warnings,
             };
-            if compile_backend == BuildCompileBackend::Native && options.use_daemon_shared_cache {
-                schedule_native_daemon_session_prewarm(
-                    common,
-                    manifest_path,
-                    &canonical_workspace_root,
-                );
+            if compile_backend == BuildCompileBackend::Native {
+                native_sync_state_on_cache_hit(&canonical_workspace_root);
+                if options.use_daemon_shared_cache {
+                    schedule_native_daemon_session_prewarm(
+                        common,
+                        manifest_path,
+                        &canonical_workspace_root,
+                    );
+                }
             }
             return Ok((
                 run,
@@ -11133,6 +12418,10 @@ fn run_build_with_uc_cache(
     if run.exit_code == 0 {
         ensure_fingerprint(&mut fingerprint, &mut telemetry)?;
         let fingerprint_value = fingerprint.as_deref().unwrap_or_default();
+        let warnings = match compile_backend {
+            BuildCompileBackend::Native => run.stderr.as_str(),
+            BuildCompileBackend::Scarb => "",
+        };
         if options.async_cache_persist {
             telemetry.cache_persist_async = true;
             let mut precomputed_cached_artifacts: Option<Vec<CachedArtifact>> = None;
@@ -11152,6 +12441,7 @@ fn run_build_with_uc_cache(
                     fingerprint_value,
                     &objects_dir,
                     &shared_cached_artifacts,
+                    warnings,
                 ) {
                     tracing::warn!(
                         error = %format!("{err:#}"),
@@ -11172,6 +12462,7 @@ fn run_build_with_uc_cache(
                     workspace_root: canonical_workspace_root.clone(),
                     profile: profile.to_string(),
                     fingerprint: fingerprint_value.to_string(),
+                    warnings: warnings.to_string(),
                     artifact_relative_paths: native_artifact_relative_paths.clone(),
                     cached_artifacts: precomputed_cached_artifacts,
                     cache_root: cache_root.clone(),
@@ -11206,6 +12497,7 @@ fn run_build_with_uc_cache(
                 &canonical_workspace_root,
                 profile,
                 fingerprint_value,
+                warnings,
                 native_artifact_relative_paths.as_deref(),
                 &cache_root,
                 &objects_dir,
@@ -11219,6 +12511,7 @@ fn run_build_with_uc_cache(
                     fingerprint_value,
                     &objects_dir,
                     &cached_artifacts,
+                    warnings,
                 )?;
             }
             telemetry.cache_persist_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
@@ -11357,6 +12650,11 @@ fn native_corelib_manifest_version(corelib_src: &Path) -> Option<String> {
 
 #[cfg(feature = "native-compile")]
 fn native_corelib_version_matches_compiler(corelib_src: &Path) -> bool {
+    if corelib_src.join("starknet").is_dir()
+        && !corelib_src.join("starknet/deployment.cairo").is_file()
+    {
+        return false;
+    }
     let Some(found) = native_corelib_manifest_version(corelib_src) else {
         // Some dev layouts do not include Scarb.toml near corelib/src; treat as best-effort.
         return true;
@@ -11433,6 +12731,15 @@ fn native_corelib_candidate_paths(workspace_root: &Path) -> Vec<(&'static str, P
                 .join("core/src"),
         ));
     }
+    if let Ok(current_exe) = std::env::current_exe() {
+        for ancestor in current_exe.ancestors().skip(1).take(8) {
+            candidates.push(("exe-ancestor", ancestor.join("third_party/corelib/src")));
+        }
+    }
+    candidates.push((
+        "vendored-corelib",
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../third_party/corelib/src"),
+    ));
     candidates
 }
 
@@ -11530,6 +12837,17 @@ fn resolve_native_corelib_src(workspace_root: &Path) -> Result<PathBuf> {
         );
     }
 
+    if let Ok(embedded_src) = materialize_embedded_corelib_src() {
+        if native_corelib_layout_looks_compatible(&embedded_src) {
+            tracing::debug!(
+                source = "embedded-binary",
+                corelib_src = %embedded_src.display(),
+                "selected embedded native corelib source path"
+            );
+            return Ok(embedded_src);
+        }
+    }
+
     Err(native_fallback_eligible_error(
         format!(
             "native compile requires a Cairo corelib source path compatible with cairo-lang {}; set UC_NATIVE_CORELIB_SRC=<.../corelib/src> (tried {} candidates)",
@@ -11537,6 +12855,87 @@ fn resolve_native_corelib_src(workspace_root: &Path) -> Result<PathBuf> {
             attempted.len()
         ),
     ))
+}
+
+#[cfg(feature = "native-compile")]
+const UC_EMBEDDED_CORELIB_PACK: &[u8] = include_bytes!("embedded_corelib.bin");
+
+/// Unpacks the corelib embedded in the binary under the global cache. The directory name carries
+/// the pack's digest and only appears by renaming a fully written staging directory, so a
+/// compile never reads a half-written corelib, even when several uc processes start at once on a
+/// fresh cache, and a binary with a different pack never reuses another binary's files.
+#[cfg(feature = "native-compile")]
+fn materialize_embedded_corelib_src() -> Result<PathBuf> {
+    let pack = UC_EMBEDDED_CORELIB_PACK;
+    let digest = blake3::hash(pack).to_hex();
+    let cache_root = native_global_cache_root_dir()
+        .unwrap_or_else(|| std::env::temp_dir().join("uc-global-cache"));
+    let base_dir = cache_root.join(format!(
+        "embedded-corelib-v{}-{}",
+        native_cairo_lang_compiler_version(),
+        &digest[..12]
+    ));
+    let src_dir = base_dir.join("src");
+    if !src_dir.join("lib.cairo").is_file() {
+        fs::create_dir_all(&cache_root)
+            .with_context(|| format!("failed to create {}", cache_root.display()))?;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        let staging = cache_root.join(format!(
+            ".embedded-corelib-{}-{nanos}.tmp",
+            std::process::id()
+        ));
+        let installed = unpack_embedded_corelib(pack, &staging).and_then(|()| {
+            match fs::rename(&staging, &base_dir) {
+                Ok(()) => Ok(()),
+                // Another process installed the same pack first.
+                Err(_) if src_dir.join("lib.cairo").is_file() => Ok(()),
+                Err(err) => Err(err.into()),
+            }
+        });
+        let _ = fs::remove_dir_all(&staging);
+        installed.with_context(|| {
+            format!(
+                "failed to unpack the embedded corelib into {}",
+                base_dir.display()
+            )
+        })?;
+    }
+    Ok(src_dir.canonicalize().unwrap_or(src_dir))
+}
+
+/// Writes the files of the embedded corelib pack (format in `scripts/pack_embedded_corelib.py`)
+/// under `dest`.
+#[cfg(feature = "native-compile")]
+fn unpack_embedded_corelib(pack: &[u8], dest: &Path) -> Result<()> {
+    fn take<'a>(pack: &'a [u8], offset: &mut usize, len: usize) -> Result<&'a [u8]> {
+        let bytes = pack
+            .get(*offset..*offset + len)
+            .context("embedded corelib archive is truncated")?;
+        *offset += len;
+        Ok(bytes)
+    }
+    fn take_u32(pack: &[u8], offset: &mut usize) -> Result<usize> {
+        let bytes = take(pack, offset, 4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize)
+    }
+    let mut offset = 0usize;
+    let count = take_u32(pack, &mut offset)?;
+    for _ in 0..count {
+        let path_len = take_u32(pack, &mut offset)?;
+        let rel_path = std::str::from_utf8(take(pack, &mut offset, path_len)?)
+            .context("invalid utf-8 in embedded corelib path")?;
+        let data_len = take_u32(pack, &mut offset)?;
+        let content = take(pack, &mut offset, data_len)?;
+        let file = dest.join(rel_path);
+        if let Some(parent) = file.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&file, content)?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "native-compile")]
@@ -11549,6 +12948,150 @@ fn native_manifest_package_name(manifest: &TomlValue) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn expand_workspace_member_pattern(
+    workspace_root: &Path,
+    canonical_workspace_root: &Path,
+    pattern: &str,
+) -> Vec<PathBuf> {
+    if !pattern.contains('*') {
+        let member_path = Path::new(pattern);
+        if member_path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
+            return Vec::new();
+        }
+        let candidate_manifest = manifest_file_in_dir(&workspace_root.join(member_path));
+        if let Ok(canonical) = candidate_manifest.canonicalize() {
+            if ensure_path_within_root(
+                canonical_workspace_root,
+                &canonical,
+                "workspace member manifest",
+            )
+            .is_ok()
+                && canonical.is_file()
+            {
+                return vec![canonical];
+            }
+        }
+        return Vec::new();
+    }
+
+    // Support glob patterns like `*`, `packages/*`, `crates/*`, or `packages/**`
+    let prefix = pattern
+        .split('*')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('/');
+    let search_root = if prefix.is_empty() {
+        workspace_root.to_path_buf()
+    } else {
+        let rel = Path::new(prefix);
+        if rel.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
+            return Vec::new();
+        }
+        workspace_root.join(rel)
+    };
+    let max_depth = if pattern.contains("**") { 6 } else { 2 };
+    let mut manifests = Vec::new();
+    if search_root.is_dir() {
+        for entry in WalkDir::new(&search_root)
+            .min_depth(1)
+            .max_depth(max_depth)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(std::result::Result::ok)
+        {
+            if !entry.file_type().is_dir() {
+                continue;
+            }
+            let candidate_manifest = manifest_file_in_dir(entry.path());
+            if let Ok(canonical) = candidate_manifest.canonicalize() {
+                if ensure_path_within_root(
+                    canonical_workspace_root,
+                    &canonical,
+                    "workspace member manifest",
+                )
+                .is_ok()
+                    && canonical.is_file()
+                {
+                    manifests.push(canonical);
+                }
+            }
+        }
+    }
+    manifests.sort();
+    manifests.dedup();
+    manifests
+}
+
+pub(crate) fn resolve_all_workspace_member_manifests(
+    manifest_path: &Path,
+    workspace_root: &Path,
+) -> Result<Vec<PathBuf>> {
+    let canonical_workspace_root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let manifest_text = read_text_file_with_limit(manifest_path, MAX_MANIFEST_BYTES, "manifest")?;
+    let manifest = parse_manifest_toml(
+        &manifest_text,
+        manifest_path,
+        "failed to parse manifest for workspace member resolution",
+    )?;
+    let mut manifests = Vec::new();
+    if manifest
+        .get("package")
+        .and_then(TomlValue::as_table)
+        .and_then(|pkg| pkg.get("name"))
+        .and_then(TomlValue::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .is_some()
+    {
+        manifests.push(
+            manifest_path
+                .canonicalize()
+                .unwrap_or_else(|_| manifest_path.to_path_buf()),
+        );
+    }
+    if let Some(members) = manifest
+        .get("workspace")
+        .and_then(TomlValue::as_table)
+        .and_then(|ws| ws.get("members"))
+        .and_then(TomlValue::as_array)
+    {
+        for member in members {
+            let Some(member_str) = member
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            for candidate_manifest in expand_workspace_member_pattern(
+                workspace_root,
+                &canonical_workspace_root,
+                member_str,
+            ) {
+                if !manifests.contains(&candidate_manifest) {
+                    manifests.push(candidate_manifest);
+                }
+            }
+        }
+    }
+    if manifests.is_empty() {
+        manifests.push(manifest_path.to_path_buf());
+    }
+    Ok(manifests)
 }
 
 #[cfg(feature = "native-compile")]
@@ -11566,8 +13109,12 @@ fn resolve_native_effective_manifest_path(
         manifest_path,
         "failed to parse manifest for native compile resolution",
     )?;
-    if native_manifest_package_name(&manifest).is_some() {
-        return Ok(manifest_path.to_path_buf());
+    if let Some(pkg_name) = native_manifest_package_name(&manifest) {
+        if manifest.get("workspace").is_none()
+            || requested_package.is_none_or(|req| req.trim() == pkg_name)
+        {
+            return Ok(manifest_path.to_path_buf());
+        }
     }
 
     let Some(workspace_table) = manifest.get("workspace").and_then(TomlValue::as_table) else {
@@ -11590,51 +13137,29 @@ fn resolve_native_effective_manifest_path(
         else {
             continue;
         };
-        if member_path.contains('*') {
-            return Err(native_fallback_eligible_error(
-                "native compile does not support globbed [workspace].members yet",
-            ));
-        }
-        let member_path = Path::new(member_path);
-        if member_path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        }) {
-            continue;
-        }
-        let candidate_manifest = workspace_root.join(member_path).join("Scarb.toml");
-        let canonical_candidate_manifest = match candidate_manifest.canonicalize() {
-            Ok(path) => path,
-            Err(_) => continue,
-        };
-        if ensure_path_within_root(
+        let expanded_manifests = expand_workspace_member_pattern(
+            workspace_root,
             &canonical_workspace_root,
-            &canonical_candidate_manifest,
-            "native workspace member manifest",
-        )
-        .is_err()
-        {
-            continue;
+            member_path,
+        );
+        for canonical_candidate_manifest in expanded_manifests {
+            let candidate_text = read_text_file_with_limit(
+                &canonical_candidate_manifest,
+                MAX_MANIFEST_BYTES,
+                "manifest",
+            )?;
+            let candidate_manifest_value = parse_manifest_toml(
+                &candidate_text,
+                &canonical_candidate_manifest,
+                "failed to parse workspace member manifest for native compile",
+            )?;
+            let Some(package_name) = native_manifest_package_name(&candidate_manifest_value) else {
+                continue;
+            };
+            if !candidates.iter().any(|(_, p)| p == &canonical_candidate_manifest) {
+                candidates.push((package_name, canonical_candidate_manifest));
+            }
         }
-        if !canonical_candidate_manifest.is_file() {
-            continue;
-        }
-        let candidate_text = read_text_file_with_limit(
-            &canonical_candidate_manifest,
-            MAX_MANIFEST_BYTES,
-            "manifest",
-        )?;
-        let candidate_manifest_value = parse_manifest_toml(
-            &candidate_text,
-            &canonical_candidate_manifest,
-            "failed to parse workspace member manifest for native compile",
-        )?;
-        let Some(package_name) = native_manifest_package_name(&candidate_manifest_value) else {
-            continue;
-        };
-        candidates.push((package_name, canonical_candidate_manifest));
     }
 
     if candidates.is_empty() {
@@ -11680,12 +13205,6 @@ fn build_native_compile_context(
     manifest_path: &Path,
     workspace_root: &Path,
 ) -> Result<NativeCompileContext> {
-    if !common.features.is_empty() {
-        return Err(native_fallback_eligible_error(
-            "native compile does not support --features yet",
-        ));
-    }
-
     let effective_manifest_path = resolve_native_effective_manifest_path(
         manifest_path,
         workspace_root,
@@ -11696,7 +13215,7 @@ fn build_native_compile_context(
     let manifest_size_bytes = manifest_metadata.len();
     let manifest_modified_unix_ms = metadata_modified_unix_ms(&manifest_metadata)?;
     let manifest_change_unix_ms = metadata_change_unix_ms(&manifest_metadata);
-    let workspace_manifest_path = workspace_root.join("Scarb.toml");
+    let workspace_manifest_path = manifest_file_in_dir(&workspace_root);
     let workspace_manifest_stats = if normalize_fingerprint_path(&workspace_manifest_path)
         == normalize_fingerprint_path(&effective_manifest_path)
         || !workspace_manifest_path.is_file()
@@ -11713,12 +13232,19 @@ fn build_native_compile_context(
     };
     let corelib_override = normalized_env_var("UC_NATIVE_CORELIB_SRC");
     let home_dir = normalized_env_var("HOME");
-    let cache_key = native_compile_context_cache_key(
+    let base_cache_key = native_compile_context_cache_key(
         &effective_manifest_path,
         workspace_root,
         corelib_override.as_deref(),
         home_dir.as_deref(),
     );
+    let normalized_req_features =
+        resolve_manifest_native_features(&TomlValue::Table(Default::default()), &common.features);
+    let cache_key = if normalized_req_features.is_empty() {
+        base_cache_key
+    } else {
+        format!("{}:{}", base_cache_key, normalized_req_features.join(","))
+    };
     let cache_now_ms = epoch_ms_u64().unwrap_or_default();
     {
         let mut cache = native_compile_context_cache()
@@ -11742,6 +13268,14 @@ fn build_native_compile_context(
                 && entry.workspace_manifest_change_unix_ms
                     == workspace_manifest_stats.and_then(|stats| stats.2)
                 && cairo_project_path.is_file()
+                && fs::read_to_string(&cairo_project_path)
+                    .ok()
+                    .is_some_and(|t| {
+                        t.contains(&format!(
+                            "[config.override.{}]",
+                            entry.context.crate_name
+                        )) && (normalized_req_features.is_empty() == !t.contains("cfg_set = ["))
+                    })
                 && native_corelib_layout_looks_compatible(&entry.context.corelib_src)
             {
                 validate_native_requested_package(
@@ -11754,10 +13288,11 @@ fn build_native_compile_context(
         }
     }
 
-    let context = build_native_compile_context_uncached(
+    let context = build_native_compile_context_uncached_with_features(
         &effective_manifest_path,
         workspace_root,
         common.offline,
+        &common.features,
     )?;
     validate_native_requested_package(common.package.as_deref(), &context.package_name)?;
     validate_native_workspace_mode(common.workspace, &context)?;
@@ -11946,12 +13481,242 @@ fn native_dependency_path_from_value(
 }
 
 #[cfg(feature = "native-compile")]
+fn parse_semver_sort_key(ver: &str) -> (u64, u64, u64, bool, String) {
+    let trimmed = ver.trim().trim_start_matches('v');
+    let (core, pre) = match trimmed.split_once('-') {
+        Some((c, p)) => (c, Some(p)),
+        None => (trimmed, None),
+    };
+    let mut parts = core.split('.');
+    let major = parts
+        .next()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let minor = parts
+        .next()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let patch = parts
+        .next()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    (major, minor, patch, pre.is_none(), trimmed.to_string())
+}
+
+#[cfg(feature = "native-compile")]
+fn resolve_cached_scarb_registry_dependency_source_root(
+    dependency_name: &str,
+    dependency_value: &TomlValue,
+) -> Option<PathBuf> {
+    let requested_version = dependency_value
+        .as_str()
+        .or_else(|| {
+            dependency_value.as_table().and_then(|t| {
+                t.get("version")
+                    .and_then(TomlValue::as_str)
+                    .or_else(|| t.get("tag").and_then(TomlValue::as_str))
+            })
+        })
+        .map(|v| {
+            v.trim()
+                .trim_start_matches('^')
+                .trim_start_matches('~')
+                .trim_start_matches(">=")
+                .trim_start_matches('=')
+                .trim_start_matches('v')
+                .trim()
+        })
+        .unwrap_or("");
+
+    let mut cache_roots = Vec::new();
+    if let Ok(scarb_cache) = std::env::var("SCARB_CACHE") {
+        let p = PathBuf::from(scarb_cache.trim());
+        if p.is_dir() {
+            cache_roots.push(p);
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let mac_cache = PathBuf::from(&home).join("Library/Caches/com.swmansion.scarb");
+        if mac_cache.is_dir() {
+            cache_roots.push(mac_cache);
+        }
+        let xdg_cache = PathBuf::from(&home).join(".cache/scarb");
+        if xdg_cache.is_dir() {
+            cache_roots.push(xdg_cache);
+        }
+    }
+
+    let prefix = format!("{dependency_name}-");
+    let mut candidates: Vec<(String, PathBuf)> = Vec::new();
+    for cache_root in cache_roots {
+        let registry_src = cache_root.join("registry/src");
+        if let Ok(reg_entries) = fs::read_dir(&registry_src) {
+            for reg_entry in reg_entries.flatten() {
+                let reg_path = reg_entry.path();
+                if !reg_path.is_dir() {
+                    continue;
+                }
+                let Ok(pkg_entries) = fs::read_dir(&reg_path) else {
+                    continue;
+                };
+                for pkg_entry in pkg_entries.flatten() {
+                    let pkg_path = pkg_entry.path();
+                    let Some(dir_name) = pkg_path.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+                    if let Some(ver) = dir_name.strip_prefix(&prefix) {
+                        let src_dir = pkg_path.join("src");
+                        if src_dir.join("lib.cairo").is_file() {
+                            if let Ok(canon) = src_dir.canonicalize() {
+                                candidates.push((ver.to_string(), canon));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let git_checkouts = cache_root.join("registry/git/checkouts");
+        if let Ok(repo_entries) = fs::read_dir(&git_checkouts) {
+            for repo_entry in repo_entries.flatten() {
+                let Ok(rev_entries) = fs::read_dir(repo_entry.path()) else {
+                    continue;
+                };
+                for rev_entry in rev_entries.flatten() {
+                    let rev_path = rev_entry.path();
+                    let rev_workspace_version = ["uc.toml", "Scarb.toml"]
+                        .into_iter()
+                        .find_map(|f| fs::read_to_string(rev_path.join(f)).ok())
+                        .and_then(|t| toml::from_str::<TomlValue>(&t).ok())
+                        .and_then(|v| {
+                            v.get("workspace")
+                                .and_then(|w| w.get("package"))
+                                .and_then(|p| p.get("version"))
+                                .and_then(TomlValue::as_str)
+                                .or_else(|| {
+                                    v.get("package")
+                                        .or_else(|| v.get("project"))
+                                        .and_then(|p| p.get("version"))
+                                        .and_then(TomlValue::as_str)
+                                })
+                                .map(str::to_string)
+                        });
+                    let mut check_dirs = Vec::new();
+                    fn collect_git_pkg_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+                        if depth > 3 {
+                            return;
+                        }
+                        if (dir.join("Scarb.toml").is_file() || dir.join("uc.toml").is_file())
+                            && dir.join("src/lib.cairo").is_file()
+                        {
+                            out.push(dir.to_path_buf());
+                        }
+                        let Ok(entries) = fs::read_dir(dir) else {
+                            return;
+                        };
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if !p.is_dir() {
+                                continue;
+                            }
+                            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                                continue;
+                            };
+                            if name.starts_with('.') || name == "target" || name == "tests" {
+                                continue;
+                            }
+                            if name == "src"
+                                && dir.join("src/lib.cairo").is_file()
+                                && !p.join("Scarb.toml").is_file()
+                                && !p.join("uc.toml").is_file()
+                            {
+                                continue;
+                            }
+                            collect_git_pkg_dirs(&p, depth + 1, out);
+                        }
+                    }
+                    collect_git_pkg_dirs(&rev_path, 0, &mut check_dirs);
+                    for pkg_dir in check_dirs {
+                        let manifest_file = if pkg_dir.join("uc.toml").is_file() {
+                            pkg_dir.join("uc.toml")
+                        } else {
+                            pkg_dir.join("Scarb.toml")
+                        };
+                        let src_dir = pkg_dir.join("src");
+                        if manifest_file.is_file() && src_dir.join("lib.cairo").is_file() {
+                            if let Ok(text) = fs::read_to_string(&manifest_file) {
+                                if let Ok(val) = toml::from_str::<TomlValue>(&text) {
+                                    let pkg_tbl = val
+                                        .get("package")
+                                        .or_else(|| val.get("project"));
+                                    let pkg_name = pkg_tbl
+                                        .and_then(|p| p.get("name"))
+                                        .and_then(TomlValue::as_str);
+                                    if pkg_name == Some(dependency_name) {
+                                        let default_git_ver = if dependency_value
+                                            .as_table()
+                                            .is_some_and(|t| t.contains_key("git"))
+                                        {
+                                            "999.0.0"
+                                        } else {
+                                            "0.0.0-git"
+                                        };
+                                        let ver = pkg_tbl
+                                            .and_then(|p| p.get("version"))
+                                            .and_then(TomlValue::as_str)
+                                            .or_else(|| {
+                                                val.get("workspace")
+                                                    .and_then(|w| w.get("package"))
+                                                    .and_then(|p| p.get("version"))
+                                                    .and_then(TomlValue::as_str)
+                                            })
+                                            .or(rev_workspace_version.as_deref())
+                                            .unwrap_or(default_git_ver)
+                                            .to_string();
+                                        if let Ok(canon) = src_dir.canonicalize() {
+                                            candidates.push((ver, canon));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    if !requested_version.is_empty() {
+        if let Some((_, exact)) = candidates
+            .iter()
+            .find(|(v, _)| v.trim_start_matches('v') == requested_version)
+        {
+            return Some(exact.clone());
+        }
+        let req_key = parse_semver_sort_key(requested_version);
+        candidates.sort_by_key(|(v, _)| {
+            let ck = parse_semver_sort_key(v);
+            let dist = ck.0.abs_diff(req_key.0) * 1_000_000
+                + ck.1.abs_diff(req_key.1) * 1_000
+                + ck.2.abs_diff(req_key.2);
+            (dist, std::cmp::Reverse(ck))
+        });
+        return candidates.into_iter().next().map(|(_, path)| path);
+    }
+    candidates.sort_by(|a, b| parse_semver_sort_key(&a.0).cmp(&parse_semver_sort_key(&b.0)));
+    candidates.pop().map(|(_, path)| path)
+}
+
+#[cfg(feature = "native-compile")]
 struct NativeDependencyCollectionContext<'a> {
     dependency_label_prefix: &'a str,
     manifest: &'a TomlValue,
     workspace_manifest_fallback: Option<&'a TomlValue>,
     manifest_dir: &'a Path,
     workspace_root: &'a Path,
+    allow_cached_registry_fallback: bool,
 }
 
 #[cfg(feature = "native-compile")]
@@ -11963,9 +13728,19 @@ fn collect_native_dependency_table_surface(
     path_roots: &mut BTreeMap<String, PathBuf>,
 ) {
     for (dependency_name, dependency_value) in table {
-        // `starknet` is provided by the compiler/plugin suite directly; every
-        // other dependency must resolve to a supported local path source.
-        if dependency_name == "starknet" {
+        // `starknet` and built-in compiler macro packages are provided by the
+        // compiler/plugin suite directly; every other dependency must resolve
+        // to a supported local or cached path source.
+        if matches!(
+            dependency_name.as_str(),
+            "starknet"
+                | "core"
+                | "assert_macros"
+                | "cairo_execute"
+                | "cairo_test"
+                | "cairo_run"
+                | "snforge_scarb_plugin"
+        ) {
             continue;
         }
         let dependency_label = format!(
@@ -11979,6 +13754,31 @@ fn collect_native_dependency_table_surface(
             dependency_value,
         ) else {
             external.insert(dependency_label);
+            if context.allow_cached_registry_fallback {
+                let effective_dep_value = if dependency_value
+                    .as_table()
+                    .and_then(|t| t.get("workspace"))
+                    .and_then(TomlValue::as_bool)
+                    == Some(true)
+                {
+                    native_workspace_dependency_entry(
+                        context.manifest,
+                        context.workspace_manifest_fallback,
+                        dependency_name,
+                    )
+                    .unwrap_or(dependency_value)
+                } else {
+                    dependency_value
+                };
+                if let Some(cached_src) = resolve_cached_scarb_registry_dependency_source_root(
+                    dependency_name,
+                    effective_dep_value,
+                ) {
+                    let dependency_crate_name =
+                        normalize_package_name_for_cairo_crate(dependency_name);
+                    path_roots.entry(dependency_crate_name).or_insert(cached_src);
+                }
+            }
             continue;
         };
 
@@ -11988,13 +13788,16 @@ fn collect_native_dependency_table_surface(
             context.manifest_dir.join(&raw_path)
         };
         let dependency_root = dependency_root.canonicalize().unwrap_or(dependency_root);
-        if ensure_path_within_root(
+        let within_workspace = ensure_path_within_root(
             context.workspace_root,
             &dependency_root,
             "native path dependency root",
         )
-        .is_err()
-        {
+        .is_ok();
+        let within_cached_pkg = context.allow_cached_registry_fallback
+            && (!context.manifest_dir.starts_with(context.workspace_root)
+                || dependency_root.join("src/lib.cairo").is_file());
+        if !within_workspace && !within_cached_pkg {
             external.insert(dependency_label);
             continue;
         }
@@ -12034,6 +13837,7 @@ fn collect_native_manifest_dependency_surface(
     manifest_dir: &Path,
     workspace_root: &Path,
     dependency_label_prefix: &str,
+    allow_cached_registry_fallback: bool,
 ) -> (BTreeSet<String>, BTreeMap<String, PathBuf>) {
     let mut external = BTreeSet::new();
     let mut path_roots = BTreeMap::new();
@@ -12043,6 +13847,7 @@ fn collect_native_manifest_dependency_surface(
         workspace_manifest_fallback,
         manifest_dir,
         workspace_root,
+        allow_cached_registry_fallback,
     };
 
     for section_name in ["dependencies"] {
@@ -12085,10 +13890,12 @@ fn collect_native_manifest_dependency_surface(
 
 #[cfg(feature = "native-compile")]
 fn native_dependency_manifest_path(source_root: &Path) -> PathBuf {
-    source_root
-        .parent()
-        .unwrap_or(source_root)
-        .join("Scarb.toml")
+    let parent = source_root.parent().unwrap_or(source_root);
+    let uc_toml = parent.join("uc.toml");
+    if uc_toml.is_file() {
+        return uc_toml;
+    }
+    parent.join("Scarb.toml")
 }
 
 fn parse_scarb_metadata_document(stdout: &str) -> Result<ScarbMetadataDocument> {
@@ -12128,35 +13935,48 @@ fn collect_native_dependency_surface_from_scarb_metadata(
     manifest_path: &Path,
     root_package_name: &str,
     offline: bool,
+    include_test_units: bool,
 ) -> Result<Option<NativeDependencySurface>> {
-    let metadata_args = MetadataArgs {
-        manifest_path: Some(manifest_path.to_path_buf()),
-        format_version: 1,
-        daemon_mode: DaemonModeArg::Off,
-        offline,
-        global_cache_dir: None,
-        report_path: None,
-    };
-    let run = match run_scarb_metadata_with_uc_cache(&metadata_args, manifest_path, true) {
-        Ok(run) => run,
-        Err(err) => {
-            tracing::debug!(
-                manifest_path = %manifest_path.display(),
-                error = %format!("{err:#}"),
-                "native dependency metadata resolution skipped: failed to resolve scarb metadata"
-            );
-            return Ok(None);
+    let candidate_modes: &[bool] = if offline { &[true] } else { &[true, false] };
+    let mut run_opt = None;
+    for &try_offline in candidate_modes {
+        let metadata_args = MetadataArgs {
+            manifest_path: Some(manifest_path.to_path_buf()),
+            format_version: 1,
+            daemon_mode: DaemonModeArg::Off,
+            offline: try_offline,
+            global_cache_dir: None,
+            report_path: None,
+        };
+        match run_scarb_metadata_with_uc_cache(&metadata_args, manifest_path, true) {
+            Ok(run) if run.exit_code == 0 => {
+                run_opt = Some(run);
+                break;
+            }
+            Ok(run) => {
+                if try_offline == offline {
+                    tracing::debug!(
+                        manifest_path = %manifest_path.display(),
+                        exit_code = run.exit_code,
+                        stderr = %run.stderr.trim(),
+                        "native dependency metadata resolution skipped: scarb metadata failed"
+                    );
+                }
+            }
+            Err(err) => {
+                if try_offline == offline {
+                    tracing::debug!(
+                        manifest_path = %manifest_path.display(),
+                        error = %format!("{err:#}"),
+                        "native dependency metadata resolution skipped: failed to resolve scarb metadata"
+                    );
+                }
+            }
         }
-    };
-    if run.exit_code != 0 {
-        tracing::debug!(
-            manifest_path = %manifest_path.display(),
-            exit_code = run.exit_code,
-            stderr = %run.stderr.trim(),
-            "native dependency metadata resolution skipped: scarb metadata failed"
-        );
-        return Ok(None);
     }
+    let Some(run) = run_opt else {
+        return Ok(None);
+    };
 
     let metadata: NativeScarbMetadataDocument = match parse_native_scarb_metadata_document(
         &run.stdout,
@@ -12182,11 +14002,8 @@ fn collect_native_dependency_surface_from_scarb_metadata(
 
     let matching_component =
         |component: &NativeScarbMetadataComponentData,
-         unit: &NativeScarbMetadataCompilationUnit| {
+         _unit: &NativeScarbMetadataCompilationUnit| {
             if normalize_package_name_for_cairo_crate(&component.name) == root_crate_name {
-                return true;
-            }
-            if unit.package == component.id {
                 return true;
             }
             package_by_id
@@ -12197,37 +14014,63 @@ fn collect_native_dependency_surface_from_scarb_metadata(
                 })
         };
 
-    let selected_unit = metadata
-        .compilation_units
-        .iter()
-        .find(|unit| {
-            unit.target.kind == "starknet-contract"
-                && unit
-                    .components_data
-                    .iter()
-                    .any(|component| matching_component(component, unit))
-        })
-        .or_else(|| {
-            metadata.compilation_units.iter().find(|unit| {
+    let matching_units = if include_test_units {
+        metadata
+            .compilation_units
+            .iter()
+            .filter(|unit| {
                 unit.components_data
                     .iter()
                     .any(|component| matching_component(component, unit))
             })
-        });
-    let Some(selected_unit) = selected_unit else {
-        return Ok(None);
+            .collect::<Vec<_>>()
+    } else {
+        metadata
+            .compilation_units
+            .iter()
+            .find(|unit| {
+                unit.target.kind != "test"
+                    && unit
+                        .components_data
+                        .iter()
+                        .any(|component| matching_component(component, unit))
+            })
+            .or_else(|| {
+                metadata.compilation_units.iter().find(|unit| {
+                    unit.components_data
+                        .iter()
+                        .any(|component| matching_component(component, unit))
+                })
+            })
+            .into_iter()
+            .collect::<Vec<_>>()
     };
-    let component_by_id = selected_unit
-        .components_data
-        .iter()
-        .map(|component| (component.id.as_str(), component))
-        .collect::<HashMap<_, _>>();
-    let root_component_ids = selected_unit
-        .components_data
-        .iter()
-        .filter(|component| matching_component(component, selected_unit))
-        .map(|component| component.id.clone())
-        .collect::<Vec<_>>();
+    if matching_units.is_empty() {
+        return Ok(None);
+    }
+    let mut component_by_id = HashMap::<&str, &NativeScarbMetadataComponentData>::new();
+    let mut merged_component_deps = HashMap::<&str, Vec<String>>::new();
+    let mut root_component_ids = Vec::<String>::new();
+    for unit in &matching_units {
+        for component in &unit.components_data {
+            component_by_id
+                .entry(component.id.as_str())
+                .or_insert(component);
+            let deps_entry = merged_component_deps
+                .entry(component.id.as_str())
+                .or_default();
+            for dep in &component.dependencies {
+                if !deps_entry.iter().any(|d| d == &dep.id) {
+                    deps_entry.push(dep.id.clone());
+                }
+            }
+            if matching_component(component, unit)
+                && !root_component_ids.iter().any(|id| id == &component.id)
+            {
+                root_component_ids.push(component.id.clone());
+            }
+        }
+    }
     if root_component_ids.is_empty() {
         return Ok(None);
     }
@@ -12262,15 +14105,17 @@ fn collect_native_dependency_surface_from_scarb_metadata(
                 .or_insert_with(|| package.edition.clone());
         }
         let dependency_names = crate_dependencies.entry(crate_name.clone()).or_default();
-        for dependency in &component.dependencies {
-            queue.push_back(dependency.id.clone());
-            let Some(dependency_component) = component_by_id.get(dependency.id.as_str()) else {
-                continue;
-            };
-            let dependency_name =
-                normalize_package_name_for_cairo_crate(&dependency_component.name);
-            if dependency_name != "core" {
-                dependency_names.insert(dependency_name);
+        if let Some(dep_ids) = merged_component_deps.get(component.id.as_str()) {
+            for dep_id in dep_ids {
+                queue.push_back(dep_id.clone());
+                let Some(dependency_component) = component_by_id.get(dep_id.as_str()) else {
+                    continue;
+                };
+                let dependency_name =
+                    normalize_package_name_for_cairo_crate(&dependency_component.name);
+                if dependency_name != "core" {
+                    dependency_names.insert(dependency_name);
+                }
             }
         }
     }
@@ -12324,23 +14169,48 @@ fn collect_native_dependency_surface(
         .unwrap_or_else(|_| workspace_root.to_path_buf());
     let manifest_dir = manifest_path.parent().unwrap_or(&canonical_workspace_root);
     let workspace_manifest_fallback = workspace_manifest_fallback.or(Some(manifest));
+    if !offline && crate::commands::registry_fetch_enabled() {
+        // Make registry packages available natively (no scarb needed); failures are logged and
+        // the cached-package discovery below proceeds so offline-ish hosts still build.
+        match crate::commands::ensure_registry_dependencies(manifest_path) {
+            Ok(report) if !report.fetched.is_empty() => {
+                for pkg in &report.fetched {
+                    eprintln!("uc: fetched {}@{} from {}", pkg.name, pkg.version, report.registry);
+                }
+            }
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!("uc: warning: registry fetch failed ({err:#}); using cached packages only");
+            }
+        }
+    }
     let (manifest_external, mut path_roots) = collect_native_manifest_dependency_surface(
         manifest,
         workspace_manifest_fallback,
         manifest_dir,
         &canonical_workspace_root,
         "",
+        false,
     );
-    let use_dependency_metadata = native_should_use_dependency_metadata_with_flags(
-        native_dependency_metadata_enabled(),
-        path_roots.len(),
-        manifest_external.len(),
-    );
+    let is_uc_toml = manifest_path.file_name().and_then(|s| s.to_str()) == Some("uc.toml");
+    let in_scarb_registry_cache = manifest_dir.to_string_lossy().contains("registry/src");
+    let use_dependency_metadata = !is_uc_toml
+        && !in_scarb_registry_cache
+        && native_should_use_dependency_metadata_with_flags(
+            native_dependency_metadata_enabled(),
+            path_roots.len(),
+            manifest_external.len(),
+        );
     if use_dependency_metadata {
+        let include_test_units = manifest
+            .get("__uc_include_test_units")
+            .and_then(TomlValue::as_bool)
+            .unwrap_or(false);
         match collect_native_dependency_surface_from_scarb_metadata(
             manifest_path,
             root_package_name,
             offline,
+            include_test_units,
         ) {
             Ok(Some(mut surface)) => {
                 if !manifest_external.is_empty() {
@@ -12375,17 +14245,37 @@ fn collect_native_dependency_surface(
         );
     }
 
+    if !manifest_external.is_empty() {
+        let (_, cached_roots) = collect_native_manifest_dependency_surface(
+            manifest,
+            workspace_manifest_fallback,
+            manifest_dir,
+            &canonical_workspace_root,
+            "",
+            true,
+        );
+        for (k, v) in cached_roots {
+            path_roots.entry(k).or_insert(v);
+        }
+    }
+
     let has_manifest_external_dependencies = !manifest_external.is_empty();
     let mut external = manifest_external;
     let root_crate_name = normalize_package_name_for_cairo_crate(root_package_name);
-    let (root_cairo_edition, _) = resolve_manifest_cairo_settings_from_manifest(manifest);
+    let (mut root_cairo_edition, _) = resolve_manifest_cairo_settings_from_manifest(manifest);
+    if root_cairo_edition.is_none() {
+        if let Some(ws_m) = workspace_manifest_fallback {
+            let (ws_ed, _) = resolve_manifest_cairo_settings_from_manifest(ws_m);
+            root_cairo_edition = ws_ed;
+        }
+    }
     let mut root_dependencies = path_roots.keys().cloned().collect::<BTreeSet<_>>();
     if !root_dependencies.is_empty() || has_manifest_external_dependencies {
         root_dependencies.insert(root_crate_name.clone());
     }
     let mut crate_dependency_configs =
         BTreeMap::<String, (Option<String>, BTreeSet<String>)>::new();
-    crate_dependency_configs.insert(root_crate_name, (root_cairo_edition, root_dependencies));
+    crate_dependency_configs.insert(root_crate_name, (root_cairo_edition.clone(), root_dependencies));
 
     let mut dependency_queue: VecDeque<(String, PathBuf)> = path_roots
         .iter()
@@ -12442,19 +14332,58 @@ fn collect_native_dependency_surface(
             );
             continue;
         }
-        let (dependency_cairo_edition, _) =
+        let (mut dependency_cairo_edition, _) =
             resolve_manifest_cairo_settings_from_manifest(&dependency_manifest);
         let dependency_manifest_dir = dependency_manifest_path
             .parent()
             .unwrap_or(&canonical_workspace_root);
+        let (local_dep_ws_root, local_dep_ws_manifest): (Option<PathBuf>, Option<TomlValue>) =
+            dependency_manifest_dir
+                .ancestors()
+                .skip(1)
+                .take(4)
+                .find_map(|ancestor| {
+                    for file_name in ["uc.toml", "Scarb.toml"] {
+                        let candidate = ancestor.join(file_name);
+                        if candidate != dependency_manifest_path && candidate.is_file() {
+                            let txt = fs::read_to_string(&candidate).ok()?;
+                            let parsed = toml::from_str::<TomlValue>(&txt).ok()?;
+                            if parsed.get("workspace").is_some() {
+                                return Some((Some(ancestor.to_path_buf()), Some(parsed)));
+                            }
+                        }
+                    }
+                    None
+                })
+                .unwrap_or((None, None));
+        if dependency_cairo_edition.is_none() {
+            let dep_inherits_ws_edition = dependency_manifest
+                .get("package")
+                .or_else(|| dependency_manifest.get("project"))
+                .and_then(TomlValue::as_table)
+                .and_then(|t| t.get("edition"))
+                .and_then(TomlValue::as_table)
+                .and_then(|t| t.get("workspace"))
+                .and_then(TomlValue::as_bool)
+                == Some(true);
+            if dep_inherits_ws_edition {
+                if let Some(ws_m) = local_dep_ws_manifest.as_ref().or(workspace_manifest_fallback) {
+                    let (ws_ed, _) = resolve_manifest_cairo_settings_from_manifest(ws_m);
+                    dependency_cairo_edition = ws_ed;
+                }
+            }
+        }
         let dependency_label_prefix = format!("[dependency.{dependency_crate_name}]");
         let (dependency_external, dependency_path_roots) =
             collect_native_manifest_dependency_surface(
                 &dependency_manifest,
-                workspace_manifest_fallback,
+                local_dep_ws_manifest.as_ref().or(workspace_manifest_fallback),
                 dependency_manifest_dir,
-                &canonical_workspace_root,
+                local_dep_ws_root
+                    .as_deref()
+                    .unwrap_or(&canonical_workspace_root),
                 &dependency_label_prefix,
+                true,
             );
         external.extend(dependency_external);
 
@@ -12467,6 +14396,13 @@ fn collect_native_dependency_surface(
         dependency_entry
             .1
             .extend(dependency_path_roots.keys().cloned());
+        if dependency_entry.1.is_empty()
+            && dependency_entry.0.is_some()
+            && root_cairo_edition.is_some()
+            && dependency_entry.0.as_deref() != root_cairo_edition.as_deref()
+        {
+            dependency_entry.1.insert(dependency_crate_name.clone());
+        }
 
         for (nested_crate_name, nested_source_root) in dependency_path_roots {
             match path_roots.entry(nested_crate_name.clone()) {
@@ -12526,10 +14462,61 @@ fn native_should_use_dependency_metadata_with_flags(
 }
 
 #[cfg(feature = "native-compile")]
+fn resolve_manifest_native_features(
+    manifest: &TomlValue,
+    requested_features: &[String],
+) -> Vec<String> {
+    let features_table = manifest.get("features").and_then(TomlValue::as_table);
+    let mut queue = std::collections::VecDeque::new();
+    let mut resolved = BTreeSet::new();
+
+    if let Some(table) = features_table {
+        if table.contains_key("default") {
+            queue.push_back("default".to_string());
+        }
+    }
+    for raw in requested_features {
+        for part in raw.split(',') {
+            let trimmed = part.trim();
+            if !trimmed.is_empty() {
+                queue.push_back(trimmed.to_string());
+            }
+        }
+    }
+    while let Some(feat) = queue.pop_front() {
+        if !resolved.insert(feat.clone()) {
+            continue;
+        }
+        if let Some(deps) = features_table
+            .and_then(|t| t.get(&feat))
+            .and_then(TomlValue::as_array)
+        {
+            for dep in deps {
+                if let Some(dep_str) = dep.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    queue.push_back(dep_str.to_string());
+                }
+            }
+        }
+    }
+    resolved.into_iter().collect()
+}
+
+#[cfg(feature = "native-compile")]
+#[allow(dead_code)]
 fn build_native_compile_context_uncached(
     manifest_path: &Path,
     workspace_root: &Path,
     offline: bool,
+) -> Result<NativeCompileContext> {
+    build_native_compile_context_uncached_with_features(manifest_path, workspace_root, offline, &[])
+}
+
+#[cfg(feature = "native-compile")]
+fn build_native_compile_context_uncached_with_features(
+    manifest_path: &Path,
+    workspace_root: &Path,
+    offline: bool,
+    requested_features: &[String],
 ) -> Result<NativeCompileContext> {
     let manifest_text = read_text_file_with_limit(manifest_path, MAX_MANIFEST_BYTES, "manifest")?;
     let manifest = parse_manifest_toml(
@@ -12537,11 +14524,22 @@ fn build_native_compile_context_uncached(
         manifest_path,
         "failed to parse manifest for native compile",
     )?;
-    ensure_native_manifest_cairo_version_supported_at_path(manifest_path, &manifest)?;
-    let manifest_content_hash = compute_manifest_content_hash_bytes(manifest_text.as_bytes());
+    let toolchain_compat =
+        ensure_native_manifest_cairo_version_supported_at_path(manifest_path, &manifest)?;
+    let resolved_features = resolve_manifest_native_features(&manifest, requested_features);
+    let manifest_content_hash = if resolved_features.is_empty() {
+        compute_manifest_content_hash_bytes(manifest_text.as_bytes())
+    } else {
+        let mut combined = manifest_text.as_bytes().to_vec();
+        combined.extend_from_slice(b"\n# uc-resolved-features:");
+        combined.extend_from_slice(resolved_features.join(",").as_bytes());
+        compute_manifest_content_hash_bytes(&combined)
+    };
     validate_manifest_dependency_sanity_from_manifest(manifest_path, &manifest)?;
     let starknet_target = resolve_manifest_native_starknet_target_props(&manifest)
         .map_err(mark_native_fallback_eligible)?;
+    let (lib_target, contract_target) =
+        resolve_manifest_native_build_targets(&manifest).map_err(mark_native_fallback_eligible)?;
     let package_table = manifest
         .get("package")
         .and_then(TomlValue::as_table)
@@ -12555,7 +14553,7 @@ fn build_native_compile_context_uncached(
         .context("native compile requires [package].name in Scarb.toml")?;
     let workspace_mode_supported = native_manifest_workspace_mode_supported(&manifest);
     let workspace_manifest_fallback = {
-        let workspace_manifest_path = workspace_root.join("Scarb.toml");
+        let workspace_manifest_path = manifest_file_in_dir(&workspace_root);
         if normalize_fingerprint_path(&workspace_manifest_path)
             == normalize_fingerprint_path(manifest_path)
         {
@@ -12631,7 +14629,13 @@ fn build_native_compile_context_uncached(
     }
 
     let crate_name = normalize_package_name_for_cairo_crate(&package_name);
-    let cairo_project_dir = workspace_root.join(".uc/native-project");
+    let cairo_project_dir = if normalize_fingerprint_path(&manifest_dir)
+        == normalize_fingerprint_path(workspace_root)
+    {
+        workspace_root.join(".uc/native-project")
+    } else {
+        workspace_root.join(".uc/native-project").join(&crate_name)
+    };
     ensure_path_within_root(
         workspace_root,
         &cairo_project_dir,
@@ -12660,11 +14664,38 @@ fn build_native_compile_context_uncached(
             )
         })
         .collect::<Vec<_>>();
-    let (cairo_edition, _) = resolve_manifest_cairo_settings_from_manifest(&manifest);
+    let (mut cairo_edition, _) = resolve_manifest_cairo_settings_from_manifest(&manifest);
+    if cairo_edition.is_none() {
+        if let Some(ws_manifest) = workspace_manifest_fallback.as_ref() {
+            let (ws_edition, _) = resolve_manifest_cairo_settings_from_manifest(ws_manifest);
+            cairo_edition = ws_edition;
+        }
+    }
+    for cfg in &mut crate_dependency_configs {
+        if !cfg.dependencies.iter().any(|d| d == &cfg.crate_name) {
+            cfg.dependencies.push(cfg.crate_name.clone());
+            cfg.dependencies.sort();
+        }
+    }
+    for root in &path_dependency_roots {
+        if !crate_dependency_configs
+            .iter()
+            .any(|cfg| cfg.crate_name == root.crate_name)
+        {
+            crate_dependency_configs.push(NativeCrateDependencyConfig {
+                crate_name: root.crate_name.clone(),
+                cairo_edition: cairo_edition.clone(),
+                dependencies: vec![root.crate_name.clone()],
+            });
+        }
+    }
     if let Some(root_config) = crate_dependency_configs
         .iter_mut()
         .find(|config| config.crate_name == crate_name)
     {
+        if root_config.cairo_edition.is_none() {
+            root_config.cairo_edition = cairo_edition.clone();
+        }
         if !root_config
             .dependencies
             .iter()
@@ -12680,10 +14711,12 @@ fn build_native_compile_context_uncached(
             dependencies: vec![crate_name.clone()],
         });
     }
-    let cairo_project_toml = native_cairo_project_toml(
+    let cairo_project_toml = native_cairo_project_toml_with_features(
         &escaped_crate_roots,
         &crate_dependency_configs,
         cairo_edition.as_deref(),
+        &crate_name,
+        &resolved_features,
     );
     write_text_file_if_changed(
         &cairo_project_path,
@@ -12702,10 +14735,13 @@ fn build_native_compile_context_uncached(
         cairo_project_dir,
         corelib_src,
         starknet_target,
+        lib_target,
+        contract_target,
         manifest_content_hash,
         external_non_starknet_dependencies,
         path_dependency_roots,
         crate_dependency_configs,
+        toolchain_compat,
     })
 }
 
@@ -12766,13 +14802,20 @@ fn mark_native_fallback_eligible_for_external_dependencies(
     err: anyhow::Error,
     context: &NativeCompileContext,
 ) -> anyhow::Error {
-    if context.external_non_starknet_dependencies.is_empty() {
-        return err;
+    if !context.external_non_starknet_dependencies.is_empty() {
+        let deps = context.external_non_starknet_dependencies.join(", ");
+        return mark_native_fallback_eligible(err.context(format!(
+            "native compile manifest includes non-starknet dependencies ({deps}); retrying with scarb fallback is allowed"
+        )));
     }
-    let deps = context.external_non_starknet_dependencies.join(", ");
-    mark_native_fallback_eligible(err.context(format!(
-        "native compile manifest includes non-starknet dependencies ({deps}); retrying with scarb fallback is allowed"
-    )))
+    // Code errors in a project on uc's own toolchain are final: scarb would print them again.
+    let code_error = err.downcast_ref::<DiagnosticsError>().is_some();
+    if is_native_compat_toolchain_fallback_active() && (context.toolchain_compat || !code_error) {
+        return mark_native_fallback_eligible(err.context(
+            "native compile compat toolchain lane encountered syntax/API mismatch; retrying with scarb fallback is allowed",
+        ));
+    }
+    err
 }
 
 #[cfg(feature = "native-compile")]
@@ -13021,10 +15064,28 @@ fn update_native_compile_session_cached_estimated_bytes(
 }
 
 #[cfg(feature = "native-compile")]
+#[allow(dead_code)]
 fn native_cairo_project_toml(
     crate_roots: &[(String, String)],
     crate_dependency_configs: &[NativeCrateDependencyConfig],
     cairo_edition: Option<&str>,
+) -> String {
+    native_cairo_project_toml_with_features(
+        crate_roots,
+        crate_dependency_configs,
+        cairo_edition,
+        "",
+        &[],
+    )
+}
+
+#[cfg(feature = "native-compile")]
+fn native_cairo_project_toml_with_features(
+    crate_roots: &[(String, String)],
+    crate_dependency_configs: &[NativeCrateDependencyConfig],
+    cairo_edition: Option<&str>,
+    root_crate_name: &str,
+    enabled_features: &[String],
 ) -> String {
     let mut content = String::from("[crate_roots]\n");
     for (crate_name, escaped_source_root) in crate_roots {
@@ -13042,6 +15103,7 @@ fn native_cairo_project_toml(
     content.push_str("edition = \"");
     content.push_str(&escaped_edition);
     content.push_str("\"\n");
+    content.push_str("experimental_features = { negative_impls = true, associated_item_constraints = true, coupons = true, user_defined_inline_macros = true }\n");
     for crate_config in crate_dependency_configs
         .iter()
         .filter(|config| !config.dependencies.is_empty())
@@ -13060,6 +15122,22 @@ fn native_cairo_project_toml(
         content.push_str("edition = \"");
         content.push_str(&escaped_edition);
         content.push_str("\"\n");
+        content.push_str("experimental_features = { negative_impls = true, associated_item_constraints = true, coupons = true, user_defined_inline_macros = true }\n");
+
+        if !enabled_features.is_empty()
+            && (root_crate_name.is_empty() || crate_config.crate_name == root_crate_name)
+        {
+            content.push_str("cfg_set = [");
+            for (idx, feat) in enabled_features.iter().enumerate() {
+                if idx > 0 {
+                    content.push_str(", ");
+                }
+                content.push_str("[\"feature\", \"");
+                content.push_str(&toml_escape_basic_string(feat));
+                content.push_str("\"]");
+            }
+            content.push_str("]\n");
+        }
 
         content.push_str("\n[config.override.");
         content.push_str(&crate_config.crate_name);
@@ -13297,6 +15375,29 @@ fn native_extract_starknet_contract_module_names(source: &str) -> Vec<String> {
 }
 
 #[cfg(feature = "native-compile")]
+fn native_source_contains_identifier(source: &str, ident: &str) -> bool {
+    if ident.is_empty() {
+        return false;
+    }
+    let bytes = source.as_bytes();
+    let ident_bytes = ident.as_bytes();
+    let mut offset = 0usize;
+    while let Some(pos) = source[offset..].find(ident) {
+        let start = offset + pos;
+        let end = start + ident_bytes.len();
+        let prev_ok =
+            start == 0 || !(bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_');
+        let next_ok =
+            end == bytes.len() || !(bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_');
+        if prev_ok && next_ok {
+            return true;
+        }
+        offset = start + 1;
+    }
+    false
+}
+
+#[cfg(feature = "native-compile")]
 fn native_bootstrap_contract_metadata_from_sources(
     workspace_root: &Path,
     context: &NativeCompileContext,
@@ -13308,7 +15409,9 @@ fn native_bootstrap_contract_metadata_from_sources(
     )>,
 > {
     let mut module_paths = BTreeSet::new();
-    let mut contract_source_dependencies = BTreeMap::new();
+    let mut contract_source_dependencies: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut contract_defining_sources: BTreeMap<String, String> = BTreeMap::new();
+    let mut non_contract_modules: Vec<(String, String)> = Vec::new();
     for source_path in tracked_sources.keys() {
         let absolute_path = workspace_root.join(source_path);
         if !absolute_path.starts_with(&context.main_source_root) {
@@ -13325,7 +15428,14 @@ fn native_bootstrap_contract_metadata_from_sources(
         };
         let source = fs::read_to_string(&absolute_path)
             .with_context(|| format!("failed to read {}", absolute_path.display()))?;
-        for module_name in native_extract_starknet_contract_module_names(&source) {
+        let extracted_contracts = native_extract_starknet_contract_module_names(&source);
+        if extracted_contracts.is_empty() {
+            if let Some(leaf_ident) = module_segments.last() {
+                non_contract_modules.push((source_path.clone(), leaf_ident.clone()));
+            }
+            continue;
+        }
+        for module_name in extracted_contracts {
             let mut path_segments = Vec::with_capacity(1 + module_segments.len() + 1);
             path_segments.push(context.crate_name.clone());
             path_segments.extend(module_segments.iter().cloned());
@@ -13333,12 +15443,24 @@ fn native_bootstrap_contract_metadata_from_sources(
             let module_path = path_segments.join("::");
             if module_paths.insert(module_path.clone()) {
                 contract_source_dependencies
-                    .insert(module_path, BTreeSet::from([source_path.clone()]));
+                    .insert(module_path.clone(), BTreeSet::from([source_path.clone()]));
+                contract_defining_sources.insert(module_path, source.clone());
             }
         }
     }
     if module_paths.is_empty() {
         return Ok(None);
+    }
+    if !non_contract_modules.is_empty() {
+        for (module_path, deps) in &mut contract_source_dependencies {
+            if let Some(defining_source) = contract_defining_sources.get(module_path) {
+                for (shared_path, leaf_ident) in &non_contract_modules {
+                    if native_source_contains_identifier(defining_source, leaf_ident) {
+                        deps.insert(shared_path.clone());
+                    }
+                }
+            }
+        }
     }
     let module_paths = module_paths.into_iter().collect::<Vec<_>>();
     let contract_output_plans = native_contract_output_plans_from_module_paths(
@@ -13348,6 +15470,434 @@ fn native_bootstrap_contract_metadata_from_sources(
     );
     Ok(Some((contract_source_dependencies, contract_output_plans)))
 }
+
+#[cfg(feature = "native-compile")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct NativeSubfileContractDigests {
+    shared_envelope_blake3: String,
+    module_blake3: BTreeMap<String, String>,
+}
+
+#[cfg(feature = "native-compile")]
+fn native_line_brace_delta(line: &str) -> (i32, bool) {
+    let mut delta = 0_i32;
+    let mut saw_open = false;
+    let bytes = line.as_bytes();
+    let mut idx = 0usize;
+    let mut in_double_quote = false;
+    let mut in_single_quote = false;
+    while idx < bytes.len() {
+        let b = bytes[idx];
+        if in_double_quote {
+            if b == b'\\' {
+                idx = idx.saturating_add(2);
+                continue;
+            }
+            if b == b'"' {
+                in_double_quote = false;
+            }
+        } else if in_single_quote {
+            if b == b'\\' {
+                idx = idx.saturating_add(2);
+                continue;
+            }
+            if b == b'\'' {
+                in_single_quote = false;
+            }
+        } else {
+            match b {
+                b'"' => in_double_quote = true,
+                b'\'' => in_single_quote = true,
+                b'{' => {
+                    delta += 1;
+                    saw_open = true;
+                }
+                b'}' => {
+                    delta -= 1;
+                }
+                _ => {}
+            }
+        }
+        idx += 1;
+    }
+    (delta, saw_open)
+}
+
+#[cfg(feature = "native-compile")]
+fn native_extract_subfile_contract_digests(source: &str) -> Option<NativeSubfileContractDigests> {
+    let stripped_bytes = strip_cairo_comments(source.as_bytes());
+    let stripped = String::from_utf8_lossy(&stripped_bytes);
+    let mut shared_hasher = Hasher::new();
+    shared_hasher.update(b"uc-subfile-shared-envelope-v1\n");
+    let mut module_blake3 = BTreeMap::new();
+    let mut pending_attr_lines: Vec<String> = Vec::new();
+    let mut active_contract: Option<(String, i32, bool, Hasher)> = None;
+
+    for raw_line in stripped.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((ref name, ref mut depth, ref mut seen_open, ref mut hasher)) = active_contract
+        {
+            hasher.update(line.as_bytes());
+            hasher.update(b"\n");
+            let (delta, line_saw_open) = native_line_brace_delta(line);
+            if line_saw_open {
+                *seen_open = true;
+            }
+            *depth += delta;
+            if *seen_open && *depth <= 0 {
+                let digest = hasher.finalize().to_hex().to_string();
+                let finished_name = name.clone();
+                active_contract = None;
+                if module_blake3.insert(finished_name, digest).is_some() {
+                    return None;
+                }
+            }
+            continue;
+        }
+
+        if !pending_attr_lines.is_empty() {
+            if let Some(module_name) = native_parse_starknet_contract_module_decl(line) {
+                let mut hasher = Hasher::new();
+                hasher.update(b"uc-subfile-contract-module-v1\n");
+                for attr_line in pending_attr_lines.drain(..) {
+                    hasher.update(attr_line.as_bytes());
+                    hasher.update(b"\n");
+                }
+                hasher.update(line.as_bytes());
+                hasher.update(b"\n");
+                let (delta, line_saw_open) = native_line_brace_delta(line);
+                if line_saw_open && delta <= 0 {
+                    let digest = hasher.finalize().to_hex().to_string();
+                    if module_blake3.insert(module_name, digest).is_some() {
+                        return None;
+                    }
+                } else {
+                    active_contract = Some((module_name, delta, line_saw_open, hasher));
+                }
+                continue;
+            }
+            if line.starts_with("#[") {
+                pending_attr_lines.push(line.to_string());
+                continue;
+            }
+            for attr_line in pending_attr_lines.drain(..) {
+                shared_hasher.update(attr_line.as_bytes());
+                shared_hasher.update(b"\n");
+            }
+        }
+
+        if let Some(attr_start) = line.find("#[starknet::contract") {
+            let prefix = line[..attr_start].trim();
+            if !prefix.is_empty() {
+                shared_hasher.update(prefix.as_bytes());
+                shared_hasher.update(b"\n");
+            }
+            let attr_suffix = &line[attr_start..];
+            if let Some(attr_end) = attr_suffix.find(']') {
+                let remainder = attr_suffix[attr_end + 1..].trim();
+                if let Some(module_name) = native_parse_starknet_contract_module_decl(remainder) {
+                    let mut hasher = Hasher::new();
+                    hasher.update(b"uc-subfile-contract-module-v1\n");
+                    hasher.update(attr_suffix.as_bytes());
+                    hasher.update(b"\n");
+                    let (delta, line_saw_open) = native_line_brace_delta(remainder);
+                    if line_saw_open && delta <= 0 {
+                        let digest = hasher.finalize().to_hex().to_string();
+                        if module_blake3.insert(module_name, digest).is_some() {
+                            return None;
+                        }
+                    } else {
+                        active_contract = Some((module_name, delta, line_saw_open, hasher));
+                    }
+                    continue;
+                }
+            }
+            pending_attr_lines.push(attr_suffix.to_string());
+            continue;
+        }
+
+        shared_hasher.update(line.as_bytes());
+        shared_hasher.update(b"\n");
+    }
+
+    if active_contract.is_some() || !pending_attr_lines.is_empty() || module_blake3.len() <= 1 {
+        return None;
+    }
+
+    Some(NativeSubfileContractDigests {
+        shared_envelope_blake3: shared_hasher.finalize().to_hex().to_string(),
+        module_blake3,
+    })
+}
+
+#[cfg(feature = "native-compile")]
+fn native_subfile_contract_digests_cache(
+) -> &'static Mutex<HashMap<PathBuf, BTreeMap<String, NativeSubfileContractDigests>>> {
+    static CACHE: OnceLock<
+        Mutex<HashMap<PathBuf, BTreeMap<String, NativeSubfileContractDigests>>>,
+    > = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(feature = "native-compile")]
+fn native_subfile_contract_digests_sidecar_path(workspace_root: &Path) -> Result<PathBuf> {
+    let path = workspace_root.join(".uc/cache/native-session/subfile-contract-digests-v1.json");
+    ensure_path_within_root(
+        workspace_root,
+        &path,
+        "native subfile contract digests sidecar path",
+    )?;
+    Ok(path)
+}
+
+#[cfg(feature = "native-compile")]
+fn load_native_subfile_contract_digests_map(
+    workspace_root: &Path,
+) -> BTreeMap<String, NativeSubfileContractDigests> {
+    if let Some(cached) = native_subfile_contract_digests_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(workspace_root)
+        .cloned()
+    {
+        return cached;
+    }
+    let Ok(path) = native_subfile_contract_digests_sidecar_path(workspace_root) else {
+        return BTreeMap::new();
+    };
+    let Ok(bytes) = fs::read(&path) else {
+        return BTreeMap::new();
+    };
+    let decoded: BTreeMap<String, NativeSubfileContractDigests> =
+        serde_json::from_slice(&bytes).unwrap_or_default();
+    if !decoded.is_empty() {
+        native_subfile_contract_digests_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(workspace_root.to_path_buf(), decoded.clone());
+    }
+    decoded
+}
+
+#[cfg(feature = "native-compile")]
+fn record_native_subfile_contract_digests_for_workspace(workspace_root: &Path) {
+    let src_dir = workspace_root.join("src");
+    let Ok((tracked_sources, _)) = native_collect_tracked_sources(workspace_root, &[src_dir])
+    else {
+        return;
+    };
+    let mut map = BTreeMap::new();
+    for rel_path in tracked_sources.keys() {
+        let abs_path = workspace_root.join(rel_path);
+        let Ok(source) = fs::read_to_string(&abs_path) else {
+            continue;
+        };
+        if let Some(digests) = native_extract_subfile_contract_digests(&source) {
+            map.insert(rel_path.clone(), digests);
+        }
+    }
+    native_subfile_contract_digests_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(workspace_root.to_path_buf(), map.clone());
+    if let Ok(path) = native_subfile_contract_digests_sidecar_path(workspace_root) {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(bytes) = serde_json::to_vec(&map) {
+            let _ = atomic_write_bytes(&path, &bytes, "native subfile contract digests");
+        }
+    }
+}
+
+#[cfg(feature = "native-compile")]
+fn native_refine_impacted_indices_with_subfile_digests(
+    workspace_root: &Path,
+    module_paths: &[String],
+    contract_source_paths: &[Option<String>],
+    changed_files: &[String],
+    removed_files: &[String],
+    impacted_indices: Vec<usize>,
+) -> Vec<usize> {
+    if !removed_files.is_empty() || changed_files.is_empty() || impacted_indices.len() <= 1 {
+        return impacted_indices;
+    }
+    let previous_map = load_native_subfile_contract_digests_map(workspace_root);
+    if previous_map.is_empty() {
+        return impacted_indices;
+    }
+    let mut excluded_indices = BTreeSet::new();
+    for changed_rel in changed_files {
+        let Some(prev_digests) = previous_map.get(changed_rel) else {
+            continue;
+        };
+        let file_contract_indices: Vec<usize> = impacted_indices
+            .iter()
+            .copied()
+            .filter(|&idx| {
+                contract_source_paths
+                    .get(idx)
+                    .and_then(|opt| opt.as_deref())
+                    == Some(changed_rel.as_str())
+            })
+            .collect();
+        if file_contract_indices.len() <= 1 {
+            continue;
+        }
+        let Ok(curr_source) = fs::read_to_string(workspace_root.join(changed_rel)) else {
+            continue;
+        };
+        let Some(curr_digests) = native_extract_subfile_contract_digests(&curr_source) else {
+            continue;
+        };
+        if prev_digests.shared_envelope_blake3 != curr_digests.shared_envelope_blake3 {
+            continue;
+        }
+        if !prev_digests
+            .module_blake3
+            .keys()
+            .eq(curr_digests.module_blake3.keys())
+        {
+            continue;
+        }
+        for idx in file_contract_indices {
+            let Some(module_path) = module_paths.get(idx) else {
+                continue;
+            };
+            let contract_name = native_contract_name(module_path);
+            let Some(prev_mod_hash) = prev_digests.module_blake3.get(contract_name) else {
+                continue;
+            };
+            let Some(curr_mod_hash) = curr_digests.module_blake3.get(contract_name) else {
+                continue;
+            };
+            if prev_mod_hash == curr_mod_hash {
+                excluded_indices.insert(idx);
+            }
+        }
+    }
+    if excluded_indices.is_empty() {
+        return impacted_indices;
+    }
+    impacted_indices
+        .into_iter()
+        .filter(|idx| !excluded_indices.contains(idx))
+        .collect()
+}
+
+#[cfg(feature = "native-compile")]
+fn native_pending_cold_drift_map() -> &'static Mutex<HashMap<PathBuf, (Vec<String>, Vec<String>)>> {
+    static MAP: OnceLock<Mutex<HashMap<PathBuf, (Vec<String>, Vec<String>)>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(feature = "native-compile")]
+fn try_record_pending_cold_drift_from_persisted_image(
+    workspace_root: &Path,
+    signature: &NativeCompileSessionSignature,
+    current_tracked_sources: &BTreeMap<String, NativeTrackedFileState>,
+) {
+    let signature_hash = native_compile_session_signature_hash(signature);
+    let Ok(image_path) = native_compile_session_image_path(workspace_root) else {
+        return;
+    };
+    let Ok(bytes) = read_bytes_with_limit(
+        &image_path,
+        MAX_NATIVE_COMPILE_SESSION_IMAGE_BYTES,
+        "native session image drift probe",
+    ) else {
+        return;
+    };
+    let Ok(decoded) = postcard::from_bytes::<NativeCompileSessionImageFile>(&bytes) else {
+        return;
+    };
+    if decoded.schema_version != NATIVE_COMPILE_SESSION_IMAGE_SCHEMA_VERSION
+        || decoded.signature_hash != signature_hash
+    {
+        return;
+    }
+    let (changed, removed) =
+        native_diff_tracked_sources(&decoded.tracked_sources, current_tracked_sources);
+    if (!changed.is_empty() || !removed.is_empty())
+        && changed.len().saturating_add(removed.len()) <= native_incremental_max_changed_files()
+    {
+        native_pending_cold_drift_map()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(workspace_root.to_path_buf(), (changed, removed));
+    }
+}
+
+#[cfg(feature = "native-compile")]
+fn take_pending_cold_drift(workspace_root: &Path) -> Option<(Vec<String>, Vec<String>)> {
+    native_pending_cold_drift_map()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(workspace_root)
+}
+
+#[cfg(feature = "native-compile")]
+fn native_sync_state_on_cache_hit(workspace_root: &Path) {
+    let _ = take_pending_cold_drift(workspace_root);
+    record_native_subfile_contract_digests_for_workspace(workspace_root);
+    let cache_key = native_compile_session_cache_key(workspace_root);
+    let session_handle = {
+        let cache = native_compile_session_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.get(&cache_key).map(|entry| entry.session.clone())
+    };
+    if let Some(session_handle) = session_handle {
+        let mut session = session_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_roots = native_compile_source_roots(&session.signature.context);
+        if let Ok((current_sources, current_bytes, source_root_mtime)) =
+            native_collect_tracked_sources_with_source_root_mtime(workspace_root, &source_roots)
+        {
+            let (changed, removed) =
+                native_diff_tracked_sources(&session.tracked_sources, &current_sources);
+            if !changed.is_empty() || !removed.is_empty() {
+                let _ = native_apply_file_keyed_session_updates(
+                    &mut session.db,
+                    workspace_root,
+                    &changed,
+                    &removed,
+                );
+                session.tracked_sources = current_sources;
+                session.tracked_source_bytes = current_bytes;
+                if let Ok(hash) =
+                    native_tracked_sources_content_hash(workspace_root, &session.tracked_sources)
+                {
+                    session.tracked_sources_content_hash = hash;
+                }
+                if source_root_mtime != 0 {
+                    session.source_root_modified_unix_ms = source_root_mtime;
+                }
+                let snapshot = native_compile_session_image_snapshot_from_state(&session);
+                persist_native_compile_session_image_snapshot_best_effort(
+                    workspace_root,
+                    &snapshot,
+                );
+            }
+            if let Ok(journal) = ensure_native_source_change_watcher(workspace_root, &source_roots)
+            {
+                let mut state = journal
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.changed_files.clear();
+                state.removed_files.clear();
+                state.applied_cursor = state.cursor;
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "native-compile"))]
+fn native_sync_state_on_cache_hit(_workspace_root: &Path) {}
 
 #[cfg(feature = "native-compile")]
 fn native_workspace_relative_cairo_path_from_debug(
@@ -13621,36 +16171,6 @@ fn native_indexed_source_metric(
         .len()
         .saturating_add(removed_files.len())
         .saturating_sub(unmatched_sources.len())
-}
-
-#[cfg(feature = "native-compile")]
-fn native_filter_changed_files_to_contract_source_index(
-    changed_files: &[String],
-    removed_files: &[String],
-    by_source: &HashMap<String, Vec<usize>>,
-    dependency_index_complete: bool,
-) -> (Vec<String>, Vec<String>) {
-    let has_absolute_paths = changed_files
-        .iter()
-        .chain(removed_files.iter())
-        .any(|source| Path::new(source).is_absolute());
-    if has_absolute_paths {
-        return (changed_files.to_vec(), removed_files.to_vec());
-    }
-    if !dependency_index_complete {
-        return (changed_files.to_vec(), removed_files.to_vec());
-    }
-    let scoped_changed = changed_files
-        .iter()
-        .filter(|source| by_source.contains_key(source.as_str()))
-        .cloned()
-        .collect();
-    let scoped_removed = removed_files
-        .iter()
-        .filter(|source| by_source.contains_key(source.as_str()))
-        .cloned()
-        .collect();
-    (scoped_changed, scoped_removed)
 }
 
 #[cfg(feature = "native-compile")]
@@ -14016,6 +16536,7 @@ fn prune_native_target_outputs(
         return Ok(());
     }
     let sierra_name = format!("{package_name}.sierra");
+    let sierra_json_name = format!("{package_name}.sierra.json");
     let artifacts_name = format!("{package_name}.starknet_artifacts.json");
     for entry in fs::read_dir(target_dir)
         .with_context(|| format!("failed to read {}", target_dir.display()))?
@@ -14029,6 +16550,7 @@ fn prune_native_target_outputs(
         }
         let file_name = entry.file_name().to_string_lossy().to_string();
         let should_remove = file_name == sierra_name
+            || file_name == sierra_json_name
             || file_name == artifacts_name
             || (file_name.starts_with(&format!("{package_name}_"))
                 && (file_name.ends_with(".contract_class.json")
@@ -14049,20 +16571,42 @@ fn compile_native_casm_contract(
     contract_class: ContractClass,
     max_casm_bytecode_size: usize,
 ) -> Result<CasmContractClass> {
+    compile_native_casm_contract_with_hints(contract_class, false, max_casm_bytecode_size)
+}
+
+#[cfg(feature = "native-compile")]
+fn compile_native_casm_contract_with_hints(
+    contract_class: ContractClass,
+    add_pythonic_hints: bool,
+    max_casm_bytecode_size: usize,
+) -> Result<CasmContractClass> {
     #[cfg(not(feature = "helper-cairo-214"))]
-    let extracted_program = contract_class
+    let mut extracted_program = contract_class
         .extract_sierra_program(false)
         .context("failed to extract native Sierra program for CASM emission")?;
+    #[cfg(not(feature = "helper-cairo-214"))]
+    {
+        let current_sierra_version =
+            cairo_lang_starknet_classes::compiler_version::current_sierra_version_id();
+        if extracted_program.sierra_version.major == current_sierra_version.major
+            && extracted_program.sierra_version.minor > current_sierra_version.minor
+        {
+            extracted_program.sierra_version = current_sierra_version;
+        }
+    }
     #[cfg(not(feature = "helper-cairo-214"))]
     let casm = CasmContractClass::from_contract_class(
         contract_class,
         extracted_program,
-        false,
+        add_pythonic_hints,
         max_casm_bytecode_size,
     );
     #[cfg(feature = "helper-cairo-214")]
-    let casm =
-        CasmContractClass::from_contract_class(contract_class, false, max_casm_bytecode_size);
+    let casm = CasmContractClass::from_contract_class(
+        contract_class,
+        add_pythonic_hints,
+        max_casm_bytecode_size,
+    );
     casm.context("failed to compile native CASM contract class")
 }
 
@@ -14140,7 +16684,8 @@ fn native_compile_session_signature(
 #[cfg(feature = "native-compile")]
 fn native_compile_session_signature_hash(signature: &NativeCompileSessionSignature) -> String {
     let mut hasher = Hasher::new();
-    hasher.update(b"uc-native-session-image-signature-v1");
+    hasher.update(b"uc-native-session-image-signature-v2");
+    hasher.update(uc_build_identity().as_bytes());
     hasher.update(normalize_fingerprint_path(&signature.manifest_path).as_bytes());
     hasher.update(signature.manifest_content_hash.as_bytes());
     hasher.update(signature.context.package_name.as_bytes());
@@ -14157,6 +16702,7 @@ fn native_compile_session_signature_hash(signature: &NativeCompileSessionSignatu
     } else {
         b"0"
     });
+    hasher.update(format!("{:?}{}", signature.context.lib_target, signature.context.contract_target).as_bytes());
     #[cfg(not(feature = "helper-cairo-214"))]
     {
         hasher.update(if signature.skip_unused_import_diagnostics {
@@ -14770,6 +17316,15 @@ fn persist_native_source_change_journal_best_effort(
     workspace_root: &Path,
     state: &NativeSourceChangeJournal,
 ) {
+    // Best-effort writes never create directories: a daemon thread can still commit a journal
+    // while its workspace is being deleted, and recreating `.uc/cache` there leaves a stray tree.
+    let journal_dir_exists = native_source_journal_path(workspace_root)
+        .ok()
+        .and_then(|path| path.parent().map(Path::is_dir))
+        .unwrap_or(false);
+    if !journal_dir_exists {
+        return;
+    }
     if let Err(err) = persist_native_source_change_journal(workspace_root, state) {
         tracing::warn!(
             workspace_root = %workspace_root.display(),
@@ -15199,6 +17754,7 @@ fn native_crate_cache_root_path(workspace_root: &Path) -> Result<PathBuf> {
 fn native_crate_cache_entry_hash(signature_hash: &str, crate_cache_key: &str) -> String {
     let mut hasher = Hasher::new();
     hasher.update(b"uc-native-crate-cache-entry-v1");
+    hasher.update(uc_build_identity().as_bytes());
     hasher.update(signature_hash.as_bytes());
     hasher.update(b"\x1F");
     hasher.update(crate_cache_key.as_bytes());
@@ -15618,15 +18174,16 @@ fn native_persist_crate_cache_after_build_best_effort(
     removed_files_count: u64,
     compiled_contracts: u64,
 ) {
-    if !native_should_persist_crate_cache_after_build(
-        daemon_context,
-        changed_files_count,
-        removed_files_count,
-        compiled_contracts,
-    ) {
-        // Non-daemon invocations should minimize synchronous cold-path overhead.
-        // Keeping crate-cache persistence daemon-scoped preserves warm worker use
-        // while avoiding heavy per-invocation writes in CLI mode.
+    if !parse_env_bool("UC_PERSIST_WORKSPACE_CRATE_CACHE", false)
+        || !native_should_persist_crate_cache_after_build(
+            daemon_context,
+            changed_files_count,
+            removed_files_count,
+            compiled_contracts,
+        )
+    {
+        // Global corelib lowering cache already persists corelib machine-wide,
+        // and unchanged main-crate builds hit the L1/L2 artifact cache directly.
         return;
     }
     let signature_hash = native_compile_session_signature_hash(signature);
@@ -15694,22 +18251,291 @@ fn native_setup_project(db: &mut RootDatabase, path: &Path) -> Result<Vec<CrateI
 }
 
 #[cfg(feature = "native-compile")]
+pub(crate) fn native_global_cache_root_dir() -> Option<PathBuf> {
+    if let Some(custom) = std::env::var_os("UC_GLOBAL_CACHE_DIR") {
+        let p = PathBuf::from(custom);
+        if !p.as_os_str().is_empty() {
+            return Some(p);
+        }
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))?;
+    Some(home.join(".uc").join("cache"))
+}
+
+#[cfg(feature = "native-compile")]
+fn native_global_corelib_memory_cache() -> &'static Mutex<HashMap<String, Vec<u8>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Vec<u8>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(feature = "native-compile")]
+fn native_global_corelib_cache_key(
+    corelib_src: &Path,
+    skip_unused_import_diagnostics: bool,
+) -> Option<String> {
+    if !parse_env_bool("UC_GLOBAL_CORELIB_CACHE_ENABLED", true) || !native_crate_cache_enabled() {
+        return None;
+    }
+    let root_fp = native_crate_cache_root_fingerprint(corelib_src).ok()?;
+    let mut hasher = Hasher::new();
+    hasher.update(b"uc-global-corelib-lowering-cache-v1");
+    hasher.update(uc_build_identity().as_bytes());
+    hasher.update(native_cairo_lang_compiler_version().as_bytes());
+    hasher.update(if skip_unused_import_diagnostics { b"1" } else { b"0" });
+    hasher.update(root_fp.as_bytes());
+    Some(hasher.finalize().to_hex().to_string())
+}
+
+#[cfg(feature = "native-compile")]
+fn try_restore_global_corelib_cache_into_db(
+    db: &mut RootDatabase,
+    corelib_src: &Path,
+    skip_unused_import_diagnostics: bool,
+) -> bool {
+    let Some(key) = native_global_corelib_cache_key(corelib_src, skip_unused_import_diagnostics)
+    else {
+        return false;
+    };
+    let blob_opt = {
+        let mem = native_global_corelib_memory_cache()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        mem.get(&key).cloned()
+    }
+    .or_else(|| {
+        let dir = native_global_cache_root_dir()?.join("corelib-blobs-v1");
+        let path = dir.join(format!("{key}.bin"));
+        let bytes = read_bytes_with_limit(
+            &path,
+            MAX_NATIVE_CRATE_CACHE_BLOB_BYTES,
+            "global corelib cache blob",
+        )
+        .ok()?;
+        if bytes.is_empty() {
+            return None;
+        }
+        let mut mem = native_global_corelib_memory_cache()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        mem.insert(key.clone(), bytes.clone());
+        Some(bytes)
+    });
+    let Some(blob_bytes) = blob_opt else {
+        return false;
+    };
+    let core_input = CrateLongId::core(db).into_crate_input(db);
+    let db_ref: &dyn salsa::Database = db;
+    let mut crate_configs = files_group_input(db_ref)
+        .crate_configs(db_ref)
+        .clone()
+        .unwrap_or_default();
+    let Some(existing) = crate_configs.get(&core_input).cloned() else {
+        return false;
+    };
+    crate_configs.insert(
+        core_input,
+        CrateConfigurationInput {
+            root: existing.root,
+            settings: existing.settings,
+            cache_file: Some(BlobLongId::Virtual(blob_bytes)),
+        },
+    );
+    #[cfg(not(feature = "helper-cairo-214"))]
+    set_crate_configs_input(db, crate_configs);
+    #[cfg(feature = "helper-cairo-214")]
+    set_crate_configs_input(db, Some(crate_configs));
+    true
+}
+
+#[cfg(feature = "native-compile")]
+fn persist_global_corelib_cache_best_effort(
+    workspace_root: &Path,
+    signature: &NativeCompileSessionSignature,
+    compiled_contracts: u64,
+) {
+    if compiled_contracts == 0 {
+        return;
+    }
+    let Some(key) = native_global_corelib_cache_key(
+        &signature.context.corelib_src,
+        signature.skip_unused_import_diagnostics,
+    ) else {
+        return;
+    };
+    {
+        let mem = native_global_corelib_memory_cache()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if mem.contains_key(&key) {
+            return;
+        }
+    }
+    if let Some(dir) = native_global_cache_root_dir() {
+        let path = dir.join("corelib-blobs-v1").join(format!("{key}.bin"));
+        if path.is_file() {
+            return;
+        }
+    }
+    let Ok((session_handle, _)) = native_compile_session_handle(workspace_root, signature) else {
+        return;
+    };
+    let db_snapshot = {
+        let session = session_handle.lock().unwrap_or_else(|p| p.into_inner());
+        session.db.snapshot()
+    };
+    let core_input = CrateLongId::core(&db_snapshot).into_crate_input(&db_snapshot);
+    let Some(core_id) = CrateInput::into_crate_ids(&db_snapshot, vec![core_input])
+        .into_iter()
+        .next()
+    else {
+        return;
+    };
+    let Ok(blob) = generate_crate_cache(&db_snapshot, core_id) else {
+        return;
+    };
+    if blob.is_empty() || (blob.len() as u64) > MAX_NATIVE_CRATE_CACHE_BLOB_BYTES {
+        return;
+    }
+    if let Some(dir) = native_global_cache_root_dir() {
+        let corelib_dir = dir.join("corelib-blobs-v1");
+        if fs::create_dir_all(&corelib_dir).is_ok() {
+            let path = corelib_dir.join(format!("{key}.bin"));
+            let _ = atomic_write_bytes(&path, &blob, "global corelib cache blob");
+        }
+    }
+    let mut mem = native_global_corelib_memory_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    mem.insert(key, blob);
+}
+
+#[cfg(feature = "native-compile")]
+#[derive(Serialize, Deserialize)]
+struct GlobalCasmCacheBlob {
+    casm_bytes: Vec<u8>,
+    compiled_class_hash: String,
+}
+
+#[cfg(feature = "native-compile")]
+fn native_global_casm_memory_cache() -> &'static Mutex<HashMap<String, (Vec<u8>, String)>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (Vec<u8>, String)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(feature = "native-compile")]
+fn try_load_global_casm_cache(
+    sierra_blake3: &str,
+    max_casm_size: usize,
+) -> Option<(Vec<u8>, String)> {
+    if std::env::var("UC_GLOBAL_CASM_CACHE_ENABLED")
+        .ok()
+        .is_some_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+    {
+        return None;
+    }
+    let key = format!("{sierra_blake3}_{max_casm_size}");
+    if let Some(entry) = native_global_casm_memory_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        return Some(entry);
+    }
+    let dir = native_global_cache_root_dir()?;
+    let path = dir.join("casm-blobs-v1").join(format!("{key}.bin"));
+    let raw = fs::read(&path).ok()?;
+    let decoded: GlobalCasmCacheBlob = postcard::from_bytes(&raw).ok()?;
+    let value = (decoded.casm_bytes, decoded.compiled_class_hash);
+    native_global_casm_memory_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key, value.clone());
+    Some(value)
+}
+
+#[cfg(feature = "native-compile")]
+fn persist_global_casm_cache_best_effort(
+    sierra_blake3: &str,
+    max_casm_size: usize,
+    casm_bytes: &[u8],
+    compiled_class_hash: &str,
+) {
+    if std::env::var("UC_GLOBAL_CASM_CACHE_ENABLED")
+        .ok()
+        .is_some_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+    {
+        return;
+    }
+    let key = format!("{sierra_blake3}_{max_casm_size}");
+    native_global_casm_memory_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key.clone(), (casm_bytes.to_vec(), compiled_class_hash.to_string()));
+    let Some(dir) = native_global_cache_root_dir() else {
+        return;
+    };
+    let casm_dir = dir.join("casm-blobs-v1");
+    if fs::create_dir_all(&casm_dir).is_ok() {
+        let blob = GlobalCasmCacheBlob {
+            casm_bytes: casm_bytes.to_vec(),
+            compiled_class_hash: compiled_class_hash.to_string(),
+        };
+        if let Ok(encoded) = postcard::to_allocvec(&blob) {
+            let path = casm_dir.join(format!("{key}.bin"));
+            let _ = atomic_write_bytes(&path, &encoded, "global casm cache blob");
+        }
+    }
+}
+
+#[cfg(feature = "native-compile")]
 fn native_seeded_root_database(
     corelib_src: &Path,
     skip_unused_import_diagnostics: bool,
 ) -> Result<RootDatabase> {
+    native_seeded_root_database_with_inlining(
+        corelib_src,
+        skip_unused_import_diagnostics,
+        InliningStrategy::Default,
+    )
+}
+
+#[cfg(feature = "native-compile")]
+fn native_seeded_root_database_with_inlining(
+    corelib_src: &Path,
+    skip_unused_import_diagnostics: bool,
+    inlining_strategy: InliningStrategy,
+) -> Result<RootDatabase> {
     let mut db = RootDatabase::builder()
         .with_optimizations(Optimizations::enabled_with_default_movable_functions(
-            InliningStrategy::Default,
+            inlining_strategy,
         ))
         .with_default_plugin_suite(starknet_plugin_suite())
+        .with_default_plugin_suite({
+            #[cfg(feature = "native-test-runner")]
+            let mut s = crate::commands::uc_unconditional_assert_plugin_suite();
+            #[cfg(not(feature = "native-test-runner"))]
+            let mut s = cairo_lang_semantic::plugin::PluginSuite::default();
+            #[cfg(feature = "native-test-runner")]
+            s.add_plugin::<crate::commands::UcSnforgeTestAttrPlugin>();
+            s
+        })
         .build()
         .context("failed to initialize native cairo compiler database")?;
     native_set_skip_unused_import_diagnostics(&mut db, skip_unused_import_diagnostics);
     init_dev_corelib(&mut db, corelib_src.to_path_buf());
+    let global_corelib_restored = if inlining_strategy == InliningStrategy::Default {
+        try_restore_global_corelib_cache_into_db(&mut db, corelib_src, skip_unused_import_diagnostics)
+    } else {
+        false
+    };
     tracing::debug!(
         corelib_src = %corelib_src.display(),
         skip_unused_import_diagnostics,
+        ?inlining_strategy,
+        global_corelib_restored,
         "native root database initialized"
     );
     Ok(db)
@@ -15729,9 +18555,11 @@ fn build_native_compile_session_state(
     ));
     let _heartbeat = NativeProgressHeartbeat::start("native session-state build");
     let db_start = Instant::now();
-    let mut db = native_seeded_root_database(
+    let codegen_opts = resolve_manifest_native_cairo_codegen_options(&signature.manifest_path);
+    let mut db = native_seeded_root_database_with_inlining(
         &signature.context.corelib_src,
         signature.skip_unused_import_diagnostics,
+        codegen_opts.inlining_strategy,
     )?;
     let db_init_ms = db_start.elapsed().as_secs_f64() * 1000.0;
     native_progress_log(format!(
@@ -15744,7 +18572,24 @@ fn build_native_compile_session_state(
     ));
     let setup_start = Instant::now();
     let _setup_heartbeat = NativeProgressHeartbeat::start("native session-state setup_project");
-    let main_crate_inputs = native_setup_project(&mut db, &signature.context.cairo_project_dir)?;
+    let all_crate_inputs = native_setup_project(&mut db, &signature.context.cairo_project_dir)?;
+    let main_crate_inputs = if !signature.context.external_non_starknet_dependencies.is_empty() {
+        let root_only: Vec<CrateInput> = all_crate_inputs
+            .iter()
+            .filter(|input| match input {
+                CrateInput::Real { name, .. } => name == &signature.context.crate_name,
+                _ => true,
+            })
+            .cloned()
+            .collect();
+        if root_only.is_empty() {
+            all_crate_inputs
+        } else {
+            root_only
+        }
+    } else {
+        all_crate_inputs
+    };
     let setup_project_ms = setup_start.elapsed().as_secs_f64() * 1000.0;
     native_progress_log(format!(
         "native session-state setup_project finished in {:.1}ms",
@@ -15877,6 +18722,11 @@ fn build_native_compile_session_state(
                     tracked_sources_content_hash,
                 )
             };
+        try_record_pending_cold_drift_from_persisted_image(
+            workspace_root,
+            &signature,
+            &tracked_sources,
+        );
         (
             tracked_sources,
             tracked_source_bytes,
@@ -15890,6 +18740,9 @@ fn build_native_compile_session_state(
             native_current_source_journal_cursor(workspace_root),
         )
     };
+    if session_image_hit || buildinfo_hit || buildinfo_replay_hit {
+        let _ = take_pending_cold_drift(workspace_root);
+    }
     let source_scan_ms = scan_start.elapsed().as_secs_f64() * 1000.0;
     native_progress_log(format!(
         "native session-state source scan finished in {:.1}ms (tracked={}, bytes={}, image_hit={}, buildinfo_hit={}, replay_hit={})",
@@ -16809,7 +19662,7 @@ fn with_native_compile_session<T>(
         source_root_mtime,
         mut journal_fallback_full_scan,
     ) = if needs_full_rebuild {
-        (Vec::new(), Vec::new(), None, 0_u64, false)
+        (Vec::new(), Vec::new(), None, 0_u64, true)
     } else if daemon_context {
         match native_take_source_journal_delta(
             workspace_root,
@@ -16818,7 +19671,30 @@ fn with_native_compile_session<T>(
         ) {
             NativeSourceJournalDelta::NoChanges { commit } => {
                 source_journal_commit = Some(commit);
-                (Vec::new(), Vec::new(), None, 0_u64, false)
+                if rebuild_on_empty_delta && session_cache_hit {
+                    let previous_sources = snapshot_previous_sources();
+                    let (current_sources, current_source_bytes) =
+                        native_collect_tracked_sources(workspace_root, &source_roots)?;
+                    let current_sources_content_hash =
+                        native_tracked_sources_content_hash(workspace_root, &current_sources)?;
+                    let (changed_files, removed_files) =
+                        native_diff_tracked_sources(&previous_sources, &current_sources);
+                    let source_root_mtime =
+                        native_source_roots_modified_unix_ms(workspace_root, &source_roots)?;
+                    (
+                        changed_files,
+                        removed_files,
+                        Some((
+                            current_sources,
+                            current_source_bytes,
+                            current_sources_content_hash,
+                        )),
+                        source_root_mtime,
+                        false,
+                    )
+                } else {
+                    (Vec::new(), Vec::new(), None, 0_u64, false)
+                }
             }
             NativeSourceJournalDelta::Changed {
                 changed_files,
@@ -16842,13 +19718,44 @@ fn with_native_compile_session<T>(
                     )) => {
                         session.tracked_source_bytes = tracked_source_bytes;
                         source_delta_applied_pre_refresh = true;
-                        (
-                            effective_changed_files,
-                            effective_removed_files,
-                            None,
-                            0_u64,
-                            false,
-                        )
+                        if effective_changed_files.is_empty()
+                            && effective_removed_files.is_empty()
+                            && rebuild_on_empty_delta
+                            && session_cache_hit
+                        {
+                            drop(session);
+                            let previous_sources = snapshot_previous_sources();
+                            let (current_sources, current_source_bytes) =
+                                native_collect_tracked_sources(workspace_root, &source_roots)?;
+                            let current_sources_content_hash =
+                                native_tracked_sources_content_hash(
+                                    workspace_root,
+                                    &current_sources,
+                                )?;
+                            let (changed_files, removed_files) =
+                                native_diff_tracked_sources(&previous_sources, &current_sources);
+                            let source_root_mtime =
+                                native_source_roots_modified_unix_ms(workspace_root, &source_roots)?;
+                            (
+                                changed_files,
+                                removed_files,
+                                Some((
+                                    current_sources,
+                                    current_source_bytes,
+                                    current_sources_content_hash,
+                                )),
+                                source_root_mtime,
+                                false,
+                            )
+                        } else {
+                            (
+                                effective_changed_files,
+                                effective_removed_files,
+                                None,
+                                0_u64,
+                                false,
+                            )
+                        }
                     }
                     Err(err) => {
                         drop(session);
@@ -16935,13 +19842,18 @@ fn with_native_compile_session<T>(
         journal_fallback_full_scan
     ));
 
+    let pending_cold_drift = take_pending_cold_drift(workspace_root);
     let changed_source_set_detected = !changed_files.is_empty() || !removed_files.is_empty();
-    let force_full_rebuild_on_empty_delta = native_should_force_full_rebuild_on_empty_delta(
-        rebuild_on_empty_delta,
-        session_cache_hit,
-        needs_full_rebuild,
-        changed_source_set_detected,
-    );
+    let force_full_rebuild_on_empty_delta = if pending_cold_drift.is_some() {
+        false
+    } else {
+        native_should_force_full_rebuild_on_empty_delta(
+            rebuild_on_empty_delta,
+            session_cache_hit,
+            needs_full_rebuild,
+            changed_source_set_detected,
+        )
+    };
     if force_full_rebuild_on_empty_delta {
         // Cache-miss compile paths should not trust an empty changed-file delta.
         // File watcher latency or coarse filesystem mtimes can transiently hide edits.
@@ -17005,31 +19917,20 @@ fn with_native_compile_session<T>(
             refresh_action,
             NativeSessionRefreshAction::IncrementalChangedSet
         ) {
-            let (by_source, dependency_index_complete) = native_contract_source_index(
-                &session.contract_output_plans,
-                &session.contract_source_dependencies,
-            );
-            let (scoped_changed_files, scoped_removed_files) =
-                native_filter_changed_files_to_contract_source_index(
-                    &changed_files,
-                    &removed_files,
-                    &by_source,
-                    dependency_index_complete,
-                );
-            if !scoped_changed_files.is_empty() || !scoped_removed_files.is_empty() {
-                // Prefer file-keyed override updates for relevant source changes to avoid coarse
-                // full-DB invalidation on every incremental refresh.
+            if !changed_files.is_empty() || !removed_files.is_empty() {
+                // Every change reaches the db, also one no contract depends on: the build still
+                // checks that file, as scarb does.
+                // Prefer file-keyed override updates to avoid coarse full-DB invalidation on every
+                // incremental refresh.
                 match native_apply_file_keyed_session_updates(
                     &mut session.db,
                     workspace_root,
-                    &scoped_changed_files,
-                    &scoped_removed_files,
+                    &changed_files,
+                    &removed_files,
                 ) {
                     Ok(applied_override_update) => {
                         if applied_override_update {
                             tracing::debug!(
-                                scoped_changed_files = scoped_changed_files.len(),
-                                scoped_removed_files = scoped_removed_files.len(),
                                 changed_files = changed_files.len(),
                                 removed_files = removed_files.len(),
                                 drift_scan_ms,
@@ -17037,8 +19938,6 @@ fn with_native_compile_session<T>(
                             );
                         } else {
                             tracing::debug!(
-                                scoped_changed_files = scoped_changed_files.len(),
-                                scoped_removed_files = scoped_removed_files.len(),
                                 changed_files = changed_files.len(),
                                 removed_files = removed_files.len(),
                                 drift_scan_ms,
@@ -17067,13 +19966,6 @@ fn with_native_compile_session<T>(
                         state_mutated = true;
                     }
                 }
-            } else {
-                tracing::debug!(
-                    changed_files = changed_files.len(),
-                    removed_files = removed_files.len(),
-                    drift_scan_ms,
-                    "native changed-file set does not affect tracked contracts; skipping file-keyed session update"
-                );
             }
             if let Some((tracked_sources, tracked_source_bytes, tracked_sources_content_hash)) =
                 current_source_snapshot.take()
@@ -17097,23 +19989,44 @@ fn with_native_compile_session<T>(
             session.source_root_modified_unix_ms = source_root_mtime;
             state_mutated = true;
         }
-        if session.contract_output_plans.is_empty() {
+        if session.contract_output_plans.is_empty()
+            || matches!(
+                refresh_action,
+                NativeSessionRefreshAction::IncrementalChangedSet
+            )
+        {
             match native_bootstrap_contract_metadata_from_sources(
                 workspace_root,
                 &signature.context,
                 &session.tracked_sources,
             ) {
                 Ok(Some((bootstrapped_dependencies, bootstrapped_plans))) => {
-                    native_progress_log(format!(
-                        "native session refresh contract bootstrap seeded {} plan(s)",
-                        bootstrapped_plans.len()
-                    ));
-                    session.contract_source_dependencies = bootstrapped_dependencies;
-                    session.contract_output_plans = bootstrapped_plans;
-                    session.contract_output_plans_verified = false;
-                    state_mutated = true;
+                    if session.contract_output_plans != bootstrapped_plans {
+                        native_progress_log(format!(
+                            "native session refresh contract bootstrap seeded {} plan(s)",
+                            bootstrapped_plans.len()
+                        ));
+                        session.contract_source_dependencies = bootstrapped_dependencies;
+                        session.contract_output_plans = bootstrapped_plans;
+                        session.contract_output_plans_verified = false;
+                        state_mutated = true;
+                    } else if session.contract_source_dependencies.is_empty()
+                        || !native_capture_statement_locations()
+                    {
+                        if session.contract_source_dependencies != bootstrapped_dependencies {
+                            session.contract_source_dependencies = bootstrapped_dependencies;
+                            state_mutated = true;
+                        }
+                    }
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    if !session.contract_output_plans.is_empty() {
+                        session.contract_output_plans.clear();
+                        session.contract_source_dependencies.clear();
+                        session.contract_output_plans_verified = false;
+                        state_mutated = true;
+                    }
+                }
                 Err(err) => {
                     tracing::warn!(
                         workspace_root = %workspace_root.display(),
@@ -17124,12 +20037,22 @@ fn with_native_compile_session<T>(
             }
         }
         estimated_bytes = native_compile_session_state_estimated_bytes(&session);
+        let (snapshot_changed_files, snapshot_removed_files) =
+            if changed_files.is_empty() && removed_files.is_empty() {
+                if let Some((cold_changed, cold_removed)) = pending_cold_drift {
+                    (cold_changed, cold_removed)
+                } else {
+                    (changed_files.clone(), removed_files.clone())
+                }
+            } else {
+                (changed_files.clone(), removed_files.clone())
+            };
         (
             NativeCompileSessionSnapshot {
                 db: session.db.snapshot(),
                 main_crate_inputs: session.main_crate_inputs.clone(),
-                changed_files: changed_files.clone(),
-                removed_files: removed_files.clone(),
+                changed_files: snapshot_changed_files,
+                removed_files: snapshot_removed_files,
                 journal_fallback_full_scan,
                 contract_source_dependencies: session.contract_source_dependencies.clone(),
                 contract_output_plans: session.contract_output_plans.clone(),
@@ -17268,16 +20191,204 @@ fn validate_native_profile_name(profile: &str) -> Result<()> {
     Ok(())
 }
 
+/// What the native compiler reported. The caller prints it, so a daemon build shows its
+/// diagnostics in the client's terminal instead of the daemon's.
+#[derive(Clone, Default)]
+#[cfg(feature = "native-compile")]
+struct NativeDiagnosticsLog(Arc<Mutex<NativeDiagnosticsText>>);
+
+#[derive(Default)]
+#[cfg(feature = "native-compile")]
+struct NativeDiagnosticsText {
+    text: String,
+    errors: usize,
+    warnings: usize,
+    /// Each compile of a build (contract batches, the `[lib]` target) checks the same crates.
+    seen: HashSet<String>,
+    /// A compile checked every crate, so nothing is left to check.
+    full_check_done: bool,
+    /// Recorded once a successful build has checked its dependencies.
+    clean_dependencies_marker: Option<PathBuf>,
+}
+
+#[cfg(feature = "native-compile")]
+impl NativeDiagnosticsLog {
+    fn record(&self, entry: &cairo_lang_diagnostics::FormattedDiagnosticEntry) {
+        let text = entry.to_string();
+        let mut log = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !log.seen.insert(text.clone()) {
+            return;
+        }
+        match entry.severity() {
+            cairo_lang_diagnostics::Severity::Error => log.errors += 1,
+            cairo_lang_diagnostics::Severity::Warning => log.warnings += 1,
+        }
+        log.text.push_str(&text);
+    }
+
+    fn mark_full_check(&self, crates: &NativeDiagnosticCrates) {
+        let mut log = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        log.full_check_done = true;
+        if crates.clean_dependencies_marker.is_some() {
+            log.clean_dependencies_marker = crates.clean_dependencies_marker.clone();
+        }
+    }
+
+    fn clean_dependencies_marker(&self) -> Option<PathBuf> {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clean_dependencies_marker.clone()
+    }
+
+    fn full_check_done(&self) -> bool {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).full_check_done
+    }
+
+    fn text(&self) -> String {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).text.clone()
+    }
+
+    /// The diagnostics followed by Scarb's closing line for a failed compile.
+    fn failure_report(&self, package: &str) -> String {
+        let log = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+        let mut report = format!(
+            "{}error: could not compile `{package}` due to {}",
+            log.text,
+            count(log.errors.max(1), "previous error")
+        );
+        if log.warnings > 0 {
+            report.push_str(&format!(" and {}", count(log.warnings, "warning")));
+        }
+        report.push('\n');
+        report
+    }
+}
+
+/// The crates whose errors fail a native compile.
+#[derive(Debug, Default)]
+#[cfg(feature = "native-compile")]
+struct NativeDiagnosticCrates {
+    checked: Vec<CrateInput>,
+    dependencies: Vec<CrateInput>,
+    /// Where to record that the dependencies passed, when this build checks them.
+    clean_dependencies_marker: Option<PathBuf>,
+}
+
+/// Scarb fails on an error in any crate it compiles, dependencies included, and hides
+/// dependency warnings. The pinned corelib is error-free, so uc skips it, and so are
+/// dependencies an earlier build already checked.
+#[cfg(feature = "native-compile")]
+fn native_diagnostic_crates(
+    db: &RootDatabase,
+    main_crate_inputs: &[CrateInput],
+) -> NativeDiagnosticCrates {
+    let mut dependencies = Vec::new();
+    for crate_id in db.crates() {
+        let input = crate_id.long(db).clone().into_crate_input(db);
+        let corelib = matches!(&input, CrateInput::Real { name, .. } if name == cairo_lang_filesystem::db::CORELIB_CRATE_NAME);
+        if corelib || main_crate_inputs.contains(&input) || dependencies.contains(&input) {
+            continue;
+        }
+        dependencies.push(input);
+    }
+    let mut checked = main_crate_inputs.to_vec();
+    let marker = native_clean_dependencies_marker(db, &dependencies);
+    let clean = marker.as_ref().is_some_and(|path| path.is_file());
+    if !clean {
+        checked.extend(dependencies.iter().cloned());
+    }
+    NativeDiagnosticCrates {
+        checked,
+        dependencies,
+        clean_dependencies_marker: if clean { None } else { marker },
+    }
+}
+
+/// Best effort: without the marker the next build checks the dependencies again.
+#[cfg(feature = "native-compile")]
+fn native_record_clean_dependencies(marker: &Path) {
+    if let Some(parent) = marker.parent() {
+        let _ = fs::create_dir_all(parent).and_then(|()| fs::write(marker, b""));
+    }
+}
+
+/// Names one exact set of dependencies for this build of uc. Scarb skips the crates it loads
+/// from its cache, which it writes only for crates without errors; uc checks a set once.
+#[cfg(feature = "native-compile")]
+fn native_clean_dependencies_marker(
+    db: &RootDatabase,
+    dependencies: &[CrateInput],
+) -> Option<PathBuf> {
+    if dependencies.is_empty() {
+        return None;
+    }
+    let mut keys = Vec::with_capacity(dependencies.len());
+    for crate_id in CrateInput::into_crate_ids(db, dependencies.iter().cloned()) {
+        let descriptor = native_crate_cache_descriptor_for_crate(db, crate_id)?;
+        let settings = &db.crate_config(crate_id)?.settings;
+        keys.push(format!("{}\n{settings:?}", descriptor.cache_key));
+    }
+    keys.sort();
+    let mut hasher = Hasher::new();
+    hasher.update(b"uc-clean-dependencies-v1");
+    hasher.update(uc_build_identity().as_bytes());
+    for key in keys {
+        hasher.update(b"\0");
+        hasher.update(key.as_bytes());
+    }
+    Some(
+        native_global_cache_root_dir()?
+            .join("clean-dependencies-v1")
+            .join(hasher.finalize().to_hex().as_str()),
+    )
+}
+
+/// Checks every crate unless a compile of this build did. Builds that reuse artifacts or compile
+/// only the contracts a change touched skip that check, but scarb would still report the rest.
+#[cfg(feature = "native-compile")]
+fn native_ensure_diagnostics(
+    session: &NativeCompileSessionSnapshot,
+    context: &NativeCompileContext,
+    diagnostics: &NativeDiagnosticsLog,
+) -> Result<()> {
+    if diagnostics.full_check_done() {
+        return Ok(());
+    }
+    let started = Instant::now();
+    let crates = native_diagnostic_crates(&session.db, &session.main_crate_inputs);
+    let log = diagnostics.clone();
+    let checked = DiagnosticsReporter::callback(move |entry| log.record(&entry))
+        .with_crates(&crates.checked)
+        .with_ignore_warnings_crates(&crates.dependencies)
+        .allow_warnings()
+        .ensure(&session.db);
+    native_progress_log(format!(
+        "native diagnostics check finished in {:.1}ms (crates={})",
+        started.elapsed().as_secs_f64() * 1000.0,
+        crates.checked.len()
+    ));
+    checked.map_err(|err| {
+        mark_native_fallback_eligible_for_external_dependencies(
+            anyhow::Error::new(err).context("native cairo compile failed"),
+            context,
+        )
+    })?;
+    diagnostics.mark_full_check(&crates);
+    Ok(())
+}
+
 #[cfg(feature = "native-compile")]
 fn native_compiler_config<'a>(
-    main_crate_inputs: &'a [CrateInput],
+    crates: &NativeDiagnosticCrates,
+    diagnostics: &NativeDiagnosticsLog,
     profile: &str,
     capture_statement_locations: bool,
 ) -> CompilerConfig<'a> {
     let mut compiler_config = CompilerConfig::default();
-    compiler_config.diagnostics_reporter = compiler_config
-        .diagnostics_reporter
-        .with_crates(main_crate_inputs)
+    let diagnostics = diagnostics.clone();
+    compiler_config.diagnostics_reporter =
+        DiagnosticsReporter::callback(move |entry| diagnostics.record(&entry))
+        .with_crates(&crates.checked)
+        .with_ignore_warnings_crates(&crates.dependencies)
         // Match Scarb UX: warnings should not fail `build`.
         .allow_warnings();
     // Scarb built-in profiles default to `sierra-replace-ids = true` for dev-like
@@ -17340,21 +20451,24 @@ fn native_target_dir(workspace_root: &Path, profile: &str) -> Result<PathBuf> {
     Ok(target_dir)
 }
 
+/// Writes target outputs into `target_dir`, removes this package's stale outputs, and returns
+/// the written file names.
 #[cfg(feature = "native-compile")]
-fn write_native_sierra_artifact(
+fn write_native_target_outputs(
     target_dir: &Path,
     package_name: &str,
-    output_name: &str,
-    sierra_program: &str,
-) -> Result<()> {
-    let output_path = target_dir.join(output_name);
-    ensure_path_within_root(target_dir, &output_path, "native sierra artifact path")?;
+    outputs: &[(String, Vec<u8>)],
+) -> Result<Vec<String>> {
     let mut keep_files = BTreeSet::new();
-    keep_files.insert(output_name.to_string());
-    fs::write(&output_path, sierra_program)
-        .with_context(|| format!("failed to write native artifact {}", output_name))?;
+    for (name, bytes) in outputs {
+        let output_path = target_dir.join(name);
+        ensure_path_within_root(target_dir, &output_path, "native artifact output path")?;
+        fs::write(&output_path, bytes)
+            .with_context(|| format!("failed to write native artifact {name}"))?;
+        keep_files.insert(name.clone());
+    }
     prune_native_target_outputs(target_dir, package_name, &keep_files)?;
-    Ok(())
+    Ok(keep_files.into_iter().collect())
 }
 
 #[inline(never)]
@@ -17378,21 +20492,8 @@ fn run_native_build_inner(
     let signature = native_compile_session_signature(manifest_path, &context);
     let compile_start = Instant::now();
     let session_scope_start = Instant::now();
-    let (
-        artifact_count,
-        frontend_compile_ms,
-        casm_ms,
-        artifact_write_ms,
-        produced_paths,
-        changed_files_count,
-        removed_files_count,
-        total_contracts,
-        compiled_contracts,
-        impacted_subset_used,
-        journal_fallback_full_scan,
-        dependency_updates,
-        contract_output_plans,
-    ) = with_native_compile_session(
+    let diagnostics = NativeDiagnosticsLog::default();
+    let session_result = with_native_compile_session(
         workspace_root,
         &signature,
         daemon_context,
@@ -17410,7 +20511,8 @@ fn run_native_build_inner(
                 &session.removed_files,
                 session.contract_output_plans.is_empty(),
             );
-            if native_should_try_cached_noop_reuse(
+            if context.contract_target
+                && native_should_try_cached_noop_reuse(
                 &session.changed_files,
                 &session.removed_files,
                 session.journal_fallback_full_scan,
@@ -17425,6 +20527,7 @@ fn run_native_build_inner(
                         contracts = session.contract_output_plans.len(),
                         "native compile reused cached artifacts for unchanged source set"
                     );
+                    native_ensure_diagnostics(session, &context, &diagnostics)?;
                     return Ok((
                         keep_files.len(),
                         0.0,
@@ -17442,7 +20545,8 @@ fn run_native_build_inner(
                     ));
                 }
             }
-            if !session.contract_output_plans.is_empty()
+            if context.contract_target
+                && !session.contract_output_plans.is_empty()
                 && (!session.changed_files.is_empty() || !session.removed_files.is_empty())
             {
                 if !native_changed_files_affect_tracked_contracts(
@@ -17463,6 +20567,7 @@ fn run_native_build_inner(
                             contracts = session.contract_output_plans.len(),
                             "native compile reused cached artifacts for changed files outside the tracked contract set"
                         );
+                        native_ensure_diagnostics(session, &context, &diagnostics)?;
                         return Ok((
                             keep_files.len(),
                             0.0,
@@ -17484,8 +20589,9 @@ fn run_native_build_inner(
             let crate_ids =
                 CrateInput::into_crate_ids(&session.db, session.main_crate_inputs.iter().cloned());
             let (contracts, mut module_paths, mut contract_source_paths, mut all_plans) =
-                if session.changed_files.is_empty()
-                    && session.removed_files.is_empty()
+                if !context.contract_target {
+                    (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                } else if session.removed_files.is_empty()
                     && !session.contract_output_plans.is_empty()
                 {
                     native_progress_log(format!(
@@ -17547,45 +20653,92 @@ fn run_native_build_inner(
                     (contracts, Vec::new(), Vec::new(), Vec::new())
                 };
 
+            let codegen_opts = resolve_manifest_native_cairo_codegen_options(manifest_path);
             if contracts.is_empty() {
-                native_progress_log("native cairo program compile start");
-                let _heartbeat = NativeProgressHeartbeat::start("native cairo program compile");
                 let frontend_compile_start = Instant::now();
-                let program = compile_prepared_db_program(
-                    &session.db,
-                    crate_ids,
-                    native_compiler_config(
-                        &session.main_crate_inputs,
-                        profile,
-                        capture_statement_locations,
-                    ),
-                )
-                .map_err(|err| {
-                    mark_native_fallback_eligible_for_external_dependencies(
-                        err.context("native cairo compile failed"),
-                        &context,
+                let diagnostic_crates =
+                    native_diagnostic_crates(&session.db, &session.main_crate_inputs);
+                let mut compiler_config = native_compiler_config(
+                    &diagnostic_crates,
+                    &diagnostics,
+                    profile,
+                    capture_statement_locations,
+                );
+                if let Some(replace_ids) = codegen_opts.sierra_replace_ids {
+                    compiler_config.replace_ids = replace_ids;
+                }
+                #[cfg(not(feature = "helper-cairo-214"))]
+                let mut outputs = match context.lib_target {
+                    Some(props) => {
+                        native_progress_log("native cairo program compile start");
+                        let _heartbeat =
+                            NativeProgressHeartbeat::start("native cairo program compile");
+                        let program_artifact = compile_prepared_db_program_artifact(
+                            &session.db,
+                            crate_ids,
+                            compiler_config,
+                        )
+                        .map_err(|err| {
+                            mark_native_fallback_eligible_for_external_dependencies(
+                                err.context("native cairo compile failed"),
+                                &context,
+                            )
+                        })?;
+                        native_lib_target_outputs(program_artifact, &context.package_name, props)?
+                    }
+                    None => {
+                        // Scarb's contract target still checks the crate when it finds no
+                        // contract, so code errors fail the build here too.
+                        compile_starknet_prepared_db(&session.db, &[], compiler_config).map_err(
+                            |err| {
+                                mark_native_fallback_eligible_for_external_dependencies(
+                                    err.context("native cairo compile failed"),
+                                    &context,
+                                )
+                            },
+                        )?;
+                        Vec::new()
+                    }
+                };
+                #[cfg(feature = "helper-cairo-214")]
+                let mut outputs = {
+                    let program = compile_prepared_db_program(
+                        &session.db,
+                        crate_ids,
+                        compiler_config,
                     )
-                })?;
+                    .map_err(|err| {
+                        mark_native_fallback_eligible_for_external_dependencies(
+                            err.context("native cairo compile failed"),
+                            &context,
+                        )
+                    })?;
+                    vec![(format!("{}.sierra", context.package_name), program.to_string().into_bytes())]
+                };
+                if context.contract_target {
+                    // Scarb writes the manifest even when the target finds no contract.
+                    let manifest = StarknetArtifactsManifest { version: 1, contracts: Vec::new() };
+                    outputs.push((
+                        format!("{}.starknet_artifacts.json", context.package_name),
+                        serde_json::to_vec(&manifest)?,
+                    ));
+                }
+                diagnostics.mark_full_check(&diagnostic_crates);
                 let frontend_compile_ms = frontend_compile_start.elapsed().as_secs_f64() * 1000.0;
                 native_progress_log(format!(
                     "native cairo program compile finished in {:.1}ms",
                     frontend_compile_ms
                 ));
                 let artifact_write_start = Instant::now();
-                let output_name = format!("{}.sierra", context.package_name);
-                write_native_sierra_artifact(
-                    &target_dir,
-                    &context.package_name,
-                    &output_name,
-                    &program.to_string(),
-                )?;
+                let produced =
+                    write_native_target_outputs(&target_dir, &context.package_name, &outputs)?;
                 let artifact_write_ms = artifact_write_start.elapsed().as_secs_f64() * 1000.0;
                 return Ok((
-                    1,
+                    produced.len(),
                     frontend_compile_ms,
                     0.0,
                     artifact_write_ms,
-                    vec![output_name],
+                    produced,
                     session.changed_files.len() as u64,
                     session.removed_files.len() as u64,
                     0_u64,
@@ -17641,6 +20794,14 @@ fn run_native_build_inner(
                     &session.removed_files,
                     &session.contract_source_dependencies,
                 ) {
+                    let impacted_indices = native_refine_impacted_indices_with_subfile_digests(
+                        workspace_root,
+                        &module_paths,
+                        &contract_source_paths,
+                        &session.changed_files,
+                        &session.removed_files,
+                        impacted_indices,
+                    );
                     if impacted_indices.len() < contracts.len() {
                         let impacted_set =
                             impacted_indices.iter().copied().collect::<BTreeSet<_>>();
@@ -17685,7 +20846,11 @@ fn run_native_build_inner(
                         "native contract compile using verified no-diagnostics fast path",
                     );
                 }
-                native_run_contract_compile_batches(
+                let diagnostic_crates =
+                    native_diagnostic_crates(&session.db, &session.main_crate_inputs);
+                let full_check = selected_indices.len() == contracts.len()
+                    && (cfg!(feature = "helper-cairo-214") || !skip_global_contract_diagnostics);
+                let compiled = native_run_contract_compile_batches(
                     &all_plans,
                     &selected_indices,
                     native_progress_compile_batch_size(),
@@ -17694,15 +20859,25 @@ fn run_native_build_inner(
                             .iter()
                             .map(|index| &contracts[*index])
                             .collect();
-                        let compiler_config = native_compiler_config(
-                            &session.main_crate_inputs,
+                        let mut compiler_config = native_compiler_config(
+                            &diagnostic_crates,
+                            &diagnostics,
                             profile,
                             capture_statement_locations,
                         );
+                        if let Some(replace_ids) = codegen_opts.sierra_replace_ids {
+                            compiler_config.replace_ids = replace_ids;
+                        }
                         #[cfg(not(feature = "helper-cairo-214"))]
                         let result = {
                             if skip_global_contract_diagnostics {
                                 compile_starknet_prepared_db_without_diagnostics(
+                                    &session.db,
+                                    &contract_refs,
+                                    compiler_config,
+                                )
+                            } else if selected_indices.len() < contracts.len() {
+                                compile_starknet_prepared_db_scoped(
                                     &session.db,
                                     &contract_refs,
                                     compiler_config,
@@ -17731,7 +20906,11 @@ fn run_native_build_inner(
                             )
                         })
                     },
-                )?
+                )?;
+                if full_check {
+                    diagnostics.mark_full_check(&diagnostic_crates);
+                }
+                compiled
             };
             #[cfg(debug_assertions)]
             {
@@ -17741,7 +20920,8 @@ fn run_native_build_inner(
                         &session.db,
                         &[contract],
                         native_compiler_config(
-                            &session.main_crate_inputs,
+                            &native_diagnostic_crates(&session.db, &session.main_crate_inputs),
+                            &NativeDiagnosticsLog::default(),
                             profile,
                             capture_statement_locations,
                         ),
@@ -17778,36 +20958,119 @@ fn run_native_build_inner(
                 Vec::with_capacity(contract_classes.len().saturating_mul(2));
             let mut keep_files = reused_keep_files;
             let mut contracts_manifest = reused_contract_entries;
-            for (contract_index, contract_class) in selected_indices
+            let max_casm_size = native_max_casm_bytecode_size();
+            let emit_casm = context.starknet_target.casm;
+            let add_pythonic_hints = codegen_opts.casm_add_pythonic_hints;
+            let indexed_classes: Vec<(usize, ContractClass)> = selected_indices
                 .iter()
                 .copied()
                 .zip(contract_classes.into_iter())
-            {
-                let plan = &all_plans[contract_index];
-                let artifact_bytes = serde_json::to_vec(&contract_class)
-                    .with_context(|| format!("failed to serialize {}", plan.artifact_file))?;
+                .collect();
+            let per_contract_outputs: Vec<
+                Result<(
+                    &NativeContractOutputPlan,
+                    Vec<u8>,
+                    String,
+                    Option<(String, Vec<u8>, String)>,
+                    f64,
+                    Option<String>,
+                )>,
+            > = thread::scope(|s| {
+                let handles: Vec<_> = indexed_classes
+                    .into_iter()
+                    .map(|(contract_index, contract_class)| {
+                        let plan = &all_plans[contract_index];
+                        s.spawn(move || {
+                            let class_hash = compute_starknet_sierra_class_hash(&contract_class);
+                            let artifact_bytes = serde_json::to_vec(&contract_class)
+                                .with_context(|| format!("failed to serialize {}", plan.artifact_file))?;
+                            let sierra_blake3 = blake3::hash(&artifact_bytes).to_hex().to_string();
+                            let casm_cache_key = if add_pythonic_hints {
+                                format!("{sierra_blake3}_hints1")
+                            } else {
+                                sierra_blake3.clone()
+                            };
+                            let (casm_tuple, elapsed_casm_ms) = if emit_casm {
+                                let casm_compile_start = Instant::now();
+                                let file_name = plan.casm_file.clone().context(
+                                    "native contract output plan missing CASM file while CASM target is enabled",
+                                )?;
+                                if let Some((cached_casm_bytes, cached_compiled_hash)) =
+                                    try_load_global_casm_cache(&casm_cache_key, max_casm_size)
+                                {
+                                    let elapsed = casm_compile_start.elapsed().as_secs_f64() * 1000.0;
+                                    (
+                                        Some((file_name, cached_casm_bytes, cached_compiled_hash)),
+                                        elapsed,
+                                    )
+                                } else {
+                                    let casm_contract = compile_native_casm_contract_with_hints(
+                                        contract_class,
+                                        add_pythonic_hints,
+                                        max_casm_size,
+                                    )?;
+                                    let compiled_hash =
+                                        compute_starknet_compiled_class_hash(&casm_contract);
+                                    let casm_bytes = serde_json::to_vec(&casm_contract)
+                                        .with_context(|| format!("failed to serialize {}", file_name))?;
+                                    persist_global_casm_cache_best_effort(
+                                        &casm_cache_key,
+                                        max_casm_size,
+                                        &casm_bytes,
+                                        &compiled_hash,
+                                    );
+                                    let elapsed = casm_compile_start.elapsed().as_secs_f64() * 1000.0;
+                                    (Some((file_name, casm_bytes, compiled_hash)), elapsed)
+                                }
+                            } else {
+                                (None, 0.0)
+                            };
+                            Ok((
+                                plan,
+                                artifact_bytes,
+                                sierra_blake3,
+                                casm_tuple,
+                                elapsed_casm_ms,
+                                class_hash,
+                            ))
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join()
+                            .unwrap_or_else(|_| Err(anyhow::anyhow!("contract CASM worker panicked")))
+                    })
+                    .collect()
+            });
+            let mut receipt_entries = Vec::with_capacity(per_contract_outputs.len());
+            for item in per_contract_outputs {
+                let (plan, artifact_bytes, sierra_blake3, casm_tuple, elapsed_casm_ms, class_hash) = item?;
+                casm_ms += elapsed_casm_ms;
                 serialized_artifacts.push((plan.artifact_file.clone(), artifact_bytes));
                 keep_files.insert(plan.artifact_file.clone());
-
-                let casm_file = if context.starknet_target.casm {
-                    let casm_compile_start = Instant::now();
-                    let casm_contract = compile_native_casm_contract(
-                        contract_class,
-                        native_max_casm_bytecode_size(),
-                    )?;
-                    casm_ms += casm_compile_start.elapsed().as_secs_f64() * 1000.0;
-                    let file_name = plan.casm_file.clone().context(
-                    "native contract output plan missing CASM file while CASM target is enabled",
-                )?;
-                    let casm_bytes = serde_json::to_vec(&casm_contract)
-                        .with_context(|| format!("failed to serialize {}", file_name))?;
-                    serialized_artifacts.push((file_name.clone(), casm_bytes));
-                    keep_files.insert(file_name.clone());
-                    Some(file_name)
-                } else {
-                    None
-                };
-
+                let (casm_file, casm_blake3, compiled_class_hash) =
+                    if let Some((file_name, casm_bytes, compiled_hash)) = casm_tuple {
+                        let c_blake3 = blake3::hash(&casm_bytes).to_hex().to_string();
+                        serialized_artifacts.push((file_name.clone(), casm_bytes));
+                        keep_files.insert(file_name.clone());
+                        (Some(file_name), Some(c_blake3), Some(compiled_hash))
+                    } else {
+                        (None, None, None)
+                    };
+                receipt_entries.push(BuildReceiptContractEntry {
+                    id: plan.artifact_id.clone(),
+                    package_name: plan.package_name.clone(),
+                    contract_name: plan.contract_name.clone(),
+                    module_path: plan.module_path.clone(),
+                    sierra_artifact: plan.artifact_file.clone(),
+                    sierra_blake3,
+                    class_hash,
+                    casm_artifact: casm_file.clone(),
+                    casm_blake3,
+                    compiled_class_hash,
+                });
                 contracts_manifest.push(StarknetArtifactEntry {
                     id: plan.artifact_id.clone(),
                     package_name: plan.package_name.clone(),
@@ -17818,6 +21081,22 @@ fn run_native_build_inner(
                         casm: casm_file,
                     },
                 });
+            }
+            if !receipt_entries.is_empty() {
+                let receipt_dir = workspace_root.join(".uc/receipts").join(profile);
+                if fs::create_dir_all(&receipt_dir).is_ok() {
+                    let receipt_path =
+                        receipt_dir.join(format!("{}.receipt.json", context.package_name));
+                    let receipt = BuildReceiptFile {
+                        schema_version: 1,
+                        generated_at_epoch_ms: epoch_ms_u64().unwrap_or_default(),
+                        package_name: context.package_name.clone(),
+                        profile: profile.to_string(),
+                        compiler_version: native_cairo_lang_compiler_version().to_string(),
+                        contracts: receipt_entries,
+                    };
+                    let _ = write_json_file_compact(&receipt_path, &receipt);
+                }
             }
             contracts_manifest.sort_by(|left, right| left.id.cmp(&right.id));
             let manifest = StarknetArtifactsManifest {
@@ -17844,6 +21123,45 @@ fn run_native_build_inner(
             )?;
             write_json_file_compact(&manifest_path, &manifest)
                 .with_context(|| format!("failed to write {}", manifest_path.display()))?;
+            // A package that declares `[lib]` next to the contract target builds both, as Scarb does.
+            #[cfg(not(feature = "helper-cairo-214"))]
+            let lib_compile_ms = if let Some(props) = context.lib_target {
+                let lib_started = Instant::now();
+                let diagnostic_crates =
+                    native_diagnostic_crates(&session.db, &session.main_crate_inputs);
+                let mut compiler_config = native_compiler_config(
+                    &diagnostic_crates,
+                    &diagnostics,
+                    profile,
+                    capture_statement_locations,
+                );
+                if let Some(replace_ids) = codegen_opts.sierra_replace_ids {
+                    compiler_config.replace_ids = replace_ids;
+                }
+                let crate_ids = CrateInput::into_crate_ids(
+                    &session.db,
+                    session.main_crate_inputs.iter().cloned(),
+                );
+                let program_artifact =
+                    compile_prepared_db_program_artifact(&session.db, crate_ids, compiler_config)
+                        .context("native cairo compile of the [lib] target failed")?;
+                diagnostics.mark_full_check(&diagnostic_crates);
+                for (name, bytes) in
+                    native_lib_target_outputs(program_artifact, &context.package_name, props)?
+                {
+                    let output_path = target_dir.join(&name);
+                    ensure_path_within_root(&target_dir, &output_path, "native artifact output path")?;
+                    fs::write(&output_path, bytes)
+                        .with_context(|| format!("failed to write {}", output_path.display()))?;
+                    keep_files.insert(name);
+                }
+                lib_started.elapsed().as_secs_f64() * 1000.0
+            } else {
+                0.0
+            };
+            #[cfg(feature = "helper-cairo-214")]
+            let lib_compile_ms = 0.0;
+            let frontend_compile_ms = frontend_compile_ms + lib_compile_ms;
             prune_native_target_outputs(&target_dir, &context.package_name, &keep_files)?;
             let artifact_pipeline_ms = artifact_pipeline_start.elapsed().as_secs_f64() * 1000.0;
             let artifact_write_ms = (artifact_pipeline_ms - casm_ms).max(0.0);
@@ -17852,6 +21170,7 @@ fn run_native_build_inner(
             let total_contracts = contracts.len() as u64;
             let impacted_subset_used =
                 native_impacted_subset_used(total_contracts as usize, compiled_contracts as usize);
+            native_ensure_diagnostics(session, &context, &diagnostics)?;
             Ok((
                 keep_files.len(),
                 frontend_compile_ms,
@@ -17868,7 +21187,44 @@ fn run_native_build_inner(
                 Some(all_plans),
             ))
         },
-    )?;
+    );
+    let (
+        artifact_count,
+        frontend_compile_ms,
+        casm_ms,
+        artifact_write_ms,
+        produced_paths,
+        changed_files_count,
+        removed_files_count,
+        total_contracts,
+        compiled_contracts,
+        impacted_subset_used,
+        journal_fallback_full_scan,
+        dependency_updates,
+        contract_output_plans,
+    ) = match session_result {
+        Ok(values) => values,
+        // A code error on uc's own toolchain is the build's answer: report it like scarb.
+        Err(err)
+            if err.downcast_ref::<DiagnosticsError>().is_some()
+                && !native_error_allows_scarb_fallback(&err) =>
+        {
+            let run = CommandRun {
+                command: vec![
+                    "uc-native".to_string(),
+                    "build".to_string(),
+                    "--manifest-path".to_string(),
+                    manifest_path.display().to_string(),
+                ],
+                exit_code: 1,
+                elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+                stdout: String::new(),
+                stderr: diagnostics.failure_report(&context.package_name),
+            };
+            return Ok((run, NativeBuildPhaseTelemetry::default(), Vec::new()));
+        }
+        Err(err) => return Err(err),
+    };
     native_update_compile_session_post_build_state(
         workspace_root,
         &signature,
@@ -17876,6 +21232,7 @@ fn run_native_build_inner(
         contract_output_plans.as_deref(),
         contract_output_plans.as_ref().map(|_| true),
     );
+    record_native_subfile_contract_digests_for_workspace(workspace_root);
     native_persist_crate_cache_after_build_best_effort(
         workspace_root,
         &signature,
@@ -17884,6 +21241,7 @@ fn run_native_build_inner(
         removed_files_count,
         compiled_contracts,
     );
+    persist_global_corelib_cache_best_effort(workspace_root, &signature, compiled_contracts);
     let compile_ms = compile_start.elapsed().as_secs_f64() * 1000.0;
     let session_scope_ms = session_scope_start.elapsed().as_secs_f64() * 1000.0;
     let session_prepare_ms =
@@ -17914,8 +21272,11 @@ fn run_native_build_inner(
         exit_code: 0,
         elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
         stdout: format!("uc: native compile produced {} artifacts\n", artifact_count),
-        stderr: String::new(),
+        stderr: diagnostics.text(),
     };
+    if let Some(marker) = diagnostics.clean_dependencies_marker() {
+        native_record_clean_dependencies(&marker);
+    }
     tracing::debug!(
         manifest_path = %manifest_path.display(),
         workspace_root = %workspace_root.display(),
@@ -18716,15 +22077,17 @@ fn remove_build_outputs(workspace_root: &Path) -> Result<()> {
             canonical_root.display()
         );
     }
-    if !canonical_root.join("Scarb.toml").is_file() {
+    if !canonical_root.join("Scarb.toml").is_file() && !canonical_root.join("uc.toml").is_file() {
         bail!(
-            "workspace root {} has no Scarb.toml marker; refusing cleanup",
+            "workspace root {} has no Scarb.toml or uc.toml marker; refusing cleanup",
             canonical_root.display()
         );
     }
     if !canonical_root.join("Scarb.lock").exists()
+        && !canonical_root.join("uc.lock").exists()
         && !canonical_root.join("src").is_dir()
         && !canonical_root.join("crates").is_dir()
+        && !canonical_root.join("packages").is_dir()
     {
         bail!(
             "workspace root {} is missing expected project markers; refusing cleanup",
@@ -18754,12 +22117,149 @@ fn remove_build_outputs(workspace_root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Extracts an embedded `// /// uc ... // ///` (or `// --- uc ... // ---`) TOML block from the top
+/// of a standalone `.cairo` file (`PEP 723` / `cargo -Zscript` single-file mode).
+fn extract_embedded_uc_manifest_from_cairo(cairo_source: &str) -> Option<String> {
+    let mut lines = cairo_source.lines();
+    let mut in_block = false;
+    let mut out = String::new();
+    while let Some(raw_line) = lines.next() {
+        let trimmed = raw_line.trim();
+        if !in_block {
+            if trimmed.is_empty() {
+                continue;
+            }
+            if matches!(
+                trimmed,
+                "// /// uc" | "// --- uc" | "/// uc" | "// ```uc" | "// [uc]"
+            ) {
+                in_block = true;
+                continue;
+            }
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            break;
+        } else {
+            if matches!(trimmed, "// ///" | "// ---" | "///" | "// ```") {
+                return Some(out);
+            }
+            if let Some(rest) = trimmed.strip_prefix("//") {
+                let content = rest.strip_prefix(' ').unwrap_or(rest);
+                out.push_str(content);
+                out.push('\n');
+            } else if trimmed.is_empty() {
+                out.push('\n');
+            } else {
+                break;
+            }
+        }
+    }
+    None
+}
+
+/// Materializes a standalone `.cairo` script into a synthetic `<parent>/.uc/scripts/<stem>-<hash>/uc.toml`
+/// workspace so `uc build`, `uc check`, `uc test`, `uc prove`, and `uc execute` can run directly on `.cairo` files.
+fn materialize_single_file_cairo_manifest(cairo_file: &Path) -> Result<PathBuf> {
+    let source = fs::read_to_string(cairo_file)
+        .with_context(|| format!("failed to read standalone Cairo file {}", cairo_file.display()))?;
+    let raw_stem = cairo_file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("script");
+    let mut pkg_name = String::new();
+    for ch in raw_stem.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            pkg_name.push(ch.to_ascii_lowercase());
+        } else {
+            pkg_name.push('_');
+        }
+    }
+    let pkg_name = pkg_name.trim_matches('_').to_string();
+    let pkg_name = if pkg_name.is_empty() {
+        "uc_script".to_string()
+    } else if pkg_name.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        format!("script_{pkg_name}")
+    } else {
+        pkg_name
+    };
+
+    let embedded_toml = extract_embedded_uc_manifest_from_cairo(&source).unwrap_or_default();
+    let mut doc: TomlValue = if embedded_toml.trim().is_empty() {
+        TomlValue::Table(toml::map::Map::new())
+    } else {
+        toml::from_str(&embedded_toml).with_context(|| {
+            format!(
+                "failed to parse embedded `// /// uc` TOML block in {}",
+                cairo_file.display()
+            )
+        })?
+    };
+    if let Some(root_tbl) = doc.as_table_mut() {
+        if !root_tbl.contains_key("project") && !root_tbl.contains_key("package") {
+            let mut proj = toml::map::Map::new();
+            proj.insert("name".to_string(), TomlValue::String(pkg_name.clone()));
+            proj.insert("version".to_string(), TomlValue::String("0.1.0".to_string()));
+            proj.insert("edition".to_string(), TomlValue::String("2024_07".to_string()));
+            root_tbl.insert("project".to_string(), TomlValue::Table(proj));
+        } else {
+            let key = if root_tbl.contains_key("project") {
+                "project"
+            } else {
+                "package"
+            };
+            if let Some(proj) = root_tbl.get_mut(key).and_then(TomlValue::as_table_mut) {
+                proj.entry("name".to_string())
+                    .or_insert_with(|| TomlValue::String(pkg_name.clone()));
+                proj.entry("version".to_string())
+                    .or_insert_with(|| TomlValue::String("0.1.0".to_string()));
+                proj.entry("edition".to_string())
+                    .or_insert_with(|| TomlValue::String("2024_07".to_string()));
+            }
+        }
+    }
+
+    let mut hasher = Hasher::new();
+    hasher.update(cairo_file.to_string_lossy().as_bytes());
+    let path_hash = &hasher.finalize().to_hex()[..10];
+    let parent_dir = cairo_file.parent().unwrap_or_else(|| Path::new("."));
+    let script_dir = parent_dir
+        .join(".uc/scripts")
+        .join(format!("{pkg_name}-{path_hash}"));
+    let src_dir = script_dir.join("src");
+    fs::create_dir_all(&src_dir).with_context(|| {
+        format!(
+            "failed to create single-file workspace directory {}",
+             src_dir.display()
+        )
+    })?;
+    let manifest_out = toml::to_string_pretty(&doc)
+        .unwrap_or_else(|_| format!("[project]\nname = \"{pkg_name}\"\n"));
+    let manifest_path = script_dir.join("uc.toml");
+    let lib_path = src_dir.join("lib.cairo");
+    if fs::read_to_string(&manifest_path).ok().as_deref() != Some(manifest_out.as_str()) {
+        fs::write(&manifest_path, &manifest_out)?;
+    }
+    if fs::read_to_string(&lib_path).ok().as_deref() != Some(source.as_str()) {
+        fs::write(&lib_path, &source)?;
+    }
+    manifest_path
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", manifest_path.display()))
+}
+
 fn resolve_manifest_path(manifest_path: &Option<PathBuf>) -> Result<PathBuf> {
-    let requested = manifest_path
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| PathBuf::from("Scarb.toml"));
-    let resolved = if requested.is_absolute() {
+    let requested = match manifest_path {
+        Some(p) => p.clone(),
+        None => {
+            if Path::new("uc.toml").is_file() {
+                PathBuf::from("uc.toml")
+            } else {
+                PathBuf::from("Scarb.toml")
+            }
+        }
+    };
+    let mut resolved = if requested.is_absolute() {
         requested
             .canonicalize()
             .with_context(|| format!("failed to resolve manifest path {}", requested.display()))?
@@ -18778,14 +22278,46 @@ fn resolve_manifest_path(manifest_path: &Option<PathBuf>) -> Result<PathBuf> {
         resolved
     };
 
-    if resolved.file_name().and_then(|s| s.to_str()) != Some("Scarb.toml") {
+    if resolved.is_dir() {
+        let uc_candidate = resolved.join("uc.toml");
+        if uc_candidate.is_file() {
+            resolved = uc_candidate;
+        } else {
+            let scarb_candidate = resolved.join("Scarb.toml");
+            if scarb_candidate.is_file() {
+                resolved = scarb_candidate;
+            }
+        }
+    }
+
+    if resolved.extension().and_then(|s| s.to_str()) == Some("cairo") && resolved.is_file() {
+        return materialize_single_file_cairo_manifest(&resolved);
+    }
+
+    let file_name = resolved.file_name().and_then(|s| s.to_str());
+    if !matches!(file_name, Some("Scarb.toml" | "uc.toml")) {
         bail!(
-            "manifest path must reference Scarb.toml, got {}",
+            "manifest path must reference Scarb.toml or uc.toml, got {}",
             resolved.display()
         );
     }
 
     Ok(resolved)
+}
+
+pub(crate) fn lockfile_in_dir(dir: &Path) -> PathBuf {
+    let uc_lock = dir.join("uc.lock");
+    let scarb_lock = dir.join("Scarb.lock");
+    if uc_lock.is_file() {
+        return uc_lock;
+    }
+    if scarb_lock.is_file() {
+        return scarb_lock;
+    }
+    if dir.join("uc.toml").is_file() && !dir.join("Scarb.toml").is_file() {
+        return uc_lock;
+    }
+    scarb_lock
 }
 
 #[cfg(test)]
@@ -18856,7 +22388,9 @@ fn scarb_version_line() -> Result<String> {
     let output = Command::new("scarb")
         .arg("--version")
         .output()
-        .context("failed to execute `scarb --version`")?;
+        .context(
+            "scarb is not installed or not on PATH. uc only needs scarb as a fallback for projects its native compiler cannot build; run `uc support native --json` to see why the native path was not used, or install scarb",
+        )?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("`scarb --version` failed: {}", stderr.trim());
@@ -18978,8 +22512,39 @@ fn build_session_input_with_compiler_version(
     )?;
     validate_manifest_dependency_sanity_from_manifest(manifest_path, &manifest)?;
     let manifest_content_hash = compute_manifest_content_hash_bytes(manifest_text.as_bytes());
-    let (cairo_edition, cairo_lang_version) =
+    let (mut cairo_edition, cairo_lang_version) =
         resolve_manifest_cairo_settings_from_manifest(&manifest);
+    if cairo_edition.is_none() {
+        let inherits_ws_edition = manifest
+            .get("package")
+            .or_else(|| manifest.get("project"))
+            .and_then(TomlValue::as_table)
+            .and_then(|t| t.get("edition"))
+            .and_then(TomlValue::as_table)
+            .and_then(|t| t.get("workspace"))
+            .and_then(TomlValue::as_bool)
+            == Some(true);
+        if inherits_ws_edition {
+            if let Ok(ws_root) = metadata_cache_workspace_root(manifest_path) {
+                let ws_manifest_path = manifest_file_in_dir(&ws_root);
+                if ws_manifest_path != manifest_path && ws_manifest_path.is_file() {
+                    if let Ok(ws_text) = read_text_file_with_limit(
+                        &ws_manifest_path,
+                        MAX_MANIFEST_BYTES,
+                        "workspace manifest",
+                    ) {
+                        if let Ok(ws_manifest) =
+                            parse_manifest_toml(&ws_text, &ws_manifest_path, "workspace manifest")
+                        {
+                            let (ws_ed, _) =
+                                resolve_manifest_cairo_settings_from_manifest(&ws_manifest);
+                            cairo_edition = ws_ed;
+                        }
+                    }
+                }
+            }
+        }
+    }
     let mut cfg_set = build_session_cfg_set_from_manifest(&manifest)?;
     cfg_set.push(format!("workspace:{}", common.workspace));
     cfg_set.push(format!("release:{}", common.release));
@@ -19241,7 +22806,7 @@ fn metadata_workspace_manifests_hash(workspace_root: &Path) -> Result<String> {
         if !entry.file_type().is_file() {
             continue;
         }
-        if entry.file_name() == "Scarb.toml" {
+        if entry.file_name() == "Scarb.toml" || entry.file_name() == "uc.toml" {
             manifests.push(entry.into_path());
         }
     }
@@ -19332,10 +22897,11 @@ fn daemon_build_plan_cache_key(
 }
 
 fn daemon_lock_state(manifest_path: &Path) -> Result<(Option<u64>, Option<u64>, String)> {
-    let lock_path = manifest_path
-        .parent()
-        .context("manifest path has no parent")?
-        .join("Scarb.lock");
+    let lock_path = lockfile_in_dir(
+        manifest_path
+            .parent()
+            .context("manifest path has no parent")?,
+    );
     let metadata = match fs::metadata(&lock_path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -19404,10 +22970,11 @@ fn daemon_lock_state(manifest_path: &Path) -> Result<(Option<u64>, Option<u64>, 
 }
 
 fn daemon_lock_metadata_state(manifest_path: &Path) -> Result<(Option<u64>, Option<u64>, String)> {
-    let lock_path = manifest_path
-        .parent()
-        .context("manifest path has no parent")?
-        .join("Scarb.lock");
+    let lock_path = lockfile_in_dir(
+        manifest_path
+            .parent()
+            .context("manifest path has no parent")?,
+    );
     let metadata = match fs::metadata(&lock_path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -19529,10 +23096,7 @@ fn prepare_daemon_build_plan_with_compiler_version(
         }
     }
 
-    let workspace_root = manifest_path
-        .parent()
-        .context("manifest path has no parent")?
-        .to_path_buf();
+    let workspace_root = metadata_cache_workspace_root(manifest_path)?;
     let session_input = build_session_input_with_compiler_version(
         common,
         manifest_path,
@@ -19621,7 +23185,7 @@ fn try_restore_daemon_shared_cache(
     profile: &str,
     session_key: &str,
     fingerprint: &str,
-) -> Result<Option<usize>> {
+) -> Result<Option<(usize, String)>> {
     if !daemon_shared_cache_enabled() {
         return Ok(None);
     }
@@ -19662,7 +23226,7 @@ fn try_restore_daemon_shared_cache(
     )?) {
         return Ok(None);
     }
-    Ok(Some(entry.artifacts.len()))
+    Ok(Some((entry.artifacts.len(), entry.warnings)))
 }
 
 fn persist_daemon_shared_cache_entry_with_artifacts(
@@ -19672,6 +23236,7 @@ fn persist_daemon_shared_cache_entry_with_artifacts(
     fingerprint: &str,
     source_objects_dir: &Path,
     cached_artifacts: &[CachedArtifact],
+    warnings: &str,
 ) -> Result<()> {
     if !daemon_shared_cache_enabled() {
         return Ok(());
@@ -19706,12 +23271,152 @@ fn persist_daemon_shared_cache_entry_with_artifacts(
         }
     }
 
-    persist_cache_entry(profile, fingerprint, cached_artifacts, &shared_entry_path)?;
+    persist_cache_entry(profile, fingerprint, warnings, cached_artifacts, &shared_entry_path)?;
     let max_bytes = daemon_shared_cache_max_bytes();
     if max_bytes > 0 {
         enforce_cache_size_budget_with_budget(&shared_cache_root, max_bytes)?;
     }
     Ok(())
+}
+
+#[cfg(feature = "native-compile")]
+fn resolve_manifest_native_cairo_codegen_options(manifest_path: &Path) -> NativeCairoCodegenOptions {
+    let Ok(text) = read_text_file_with_limit(manifest_path, MAX_MANIFEST_BYTES, "manifest") else {
+        return NativeCairoCodegenOptions::default();
+    };
+    let Ok(manifest) = parse_manifest_toml(&text, manifest_path, "manifest") else {
+        return NativeCairoCodegenOptions::default();
+    };
+    resolve_manifest_native_cairo_codegen_options_from_toml(&manifest)
+}
+
+#[cfg(feature = "native-compile")]
+fn resolve_manifest_native_cairo_codegen_options_from_toml(
+    manifest: &TomlValue,
+) -> NativeCairoCodegenOptions {
+    let mut opts = NativeCairoCodegenOptions::default();
+    if let Some(cairo_table) = manifest.get("cairo").and_then(TomlValue::as_table) {
+        if let Some(replace_ids) = cairo_table.get("sierra-replace-ids").and_then(TomlValue::as_bool)
+        {
+            opts.sierra_replace_ids = Some(replace_ids);
+        }
+        if let Some(inlining) = cairo_table.get("inlining-strategy") {
+            if let Some(s) = inlining.as_str() {
+                opts.inlining_strategy = match s.trim() {
+                    "default" => InliningStrategy::Default,
+                    "avoid" => InliningStrategy::Avoid,
+                    other => {
+                        if let Ok(weight) = other.parse::<usize>() {
+                            InliningStrategy::InlineSmallFunctions(weight)
+                        } else {
+                            InliningStrategy::Default
+                        }
+                    }
+                };
+            } else if let Some(weight) = inlining.as_integer() {
+                if weight >= 0 {
+                    opts.inlining_strategy =
+                        InliningStrategy::InlineSmallFunctions(weight as usize);
+                }
+            }
+        }
+    }
+    if let Some(target_table) = manifest.get("target").and_then(TomlValue::as_table) {
+        if let Some(starknet_target) = target_table.get("starknet-contract") {
+            let maybe_table = match starknet_target {
+                TomlValue::Table(t) => Some(t),
+                TomlValue::Array(arr) => arr.first().and_then(TomlValue::as_table),
+                _ => None,
+            };
+            if let Some(t) = maybe_table {
+                if let Some(hints) = t.get("casm-add-pythonic-hints").and_then(TomlValue::as_bool) {
+                    opts.casm_add_pythonic_hints = hints;
+                }
+            }
+        }
+    }
+    opts
+}
+
+/// The targets `scarb build` builds for this manifest. Scarb decides from the manifest alone:
+/// `[lib]` when declared, a default `[lib]` when no target is declared at all, and
+/// `[[target.starknet-contract]]` when declared, whatever the sources contain.
+#[cfg(feature = "native-compile")]
+fn resolve_manifest_native_build_targets(
+    manifest: &TomlValue,
+) -> Result<(Option<NativeLibTargetProps>, bool)> {
+    let targets = manifest.get("target").and_then(TomlValue::as_table);
+    let contract_target = targets.is_some_and(|t| t.contains_key("starknet-contract"));
+    let any_target = contract_target
+        || manifest.get("executable").is_some()
+        || targets.is_some_and(|t| !t.is_empty());
+    let lib_target = match manifest.get("lib") {
+        Some(TomlValue::Table(table)) => {
+            let flag = |key: &str, default: bool| -> Result<bool> {
+                table.get(key).map_or(Ok(default), |value| {
+                    value
+                        .as_bool()
+                        .with_context(|| format!("native compile expects [lib].{key} to be a boolean"))
+                })
+            };
+            Some(NativeLibTargetProps {
+                sierra: flag("sierra", true)?,
+                sierra_text: flag("sierra-text", false)?,
+                casm: flag("casm", false)?,
+            })
+        }
+        Some(_) => bail!("native compile expects [lib] to be a table"),
+        None if !any_target => Some(NativeLibTargetProps {
+            sierra: true,
+            sierra_text: false,
+            casm: false,
+        }),
+        None => None,
+    };
+    Ok((lib_target, contract_target))
+}
+
+/// The files a `[lib]` target writes, byte for byte as Scarb 2.18 writes them: the
+/// `VersionedProgram` as compact JSON, the program text, and the CASM text.
+#[cfg(all(feature = "native-compile", not(feature = "helper-cairo-214")))]
+fn native_lib_target_outputs(
+    program_artifact: cairo_lang_sierra::program::ProgramArtifact,
+    package_name: &str,
+    props: NativeLibTargetProps,
+) -> Result<Vec<(String, Vec<u8>)>> {
+    let versioned = VersionedProgram::from(program_artifact);
+    let mut outputs = Vec::new();
+    if props.sierra {
+        let json = serde_json::to_vec(&versioned)
+            .context("failed to serialize native VersionedProgram (.sierra.json)")?;
+        outputs.push((format!("{package_name}.sierra.json"), json));
+    }
+    if props.sierra_text {
+        outputs.push((format!("{package_name}.sierra"), versioned.to_string().into_bytes()));
+    }
+    if props.casm {
+        let program = versioned.into_v1()?.program;
+        let program_info = cairo_lang_sierra_type_size::ProgramRegistryInfo::new(&program)
+            .map_err(|err| anyhow!("failed to build the Sierra registry for CASM: {err}"))?;
+        let metadata = cairo_lang_sierra_to_casm::metadata::calc_metadata(
+            &program,
+            &program_info,
+            Default::default(),
+        )
+        .map_err(|err| anyhow!("failed to compute CASM metadata: {err}"))?;
+        let casm = cairo_lang_sierra_to_casm::compiler::compile(
+            &program,
+            &program_info,
+            &metadata,
+            cairo_lang_sierra_to_casm::compiler::SierraToCasmConfig {
+                gas_usage_check: true,
+                max_bytecode_size: usize::MAX,
+            },
+        )
+        .map_err(|err| anyhow!("failed to compile the library to CASM: {err}"))?;
+        outputs.push((format!("{package_name}.casm"), casm.to_string().into_bytes()));
+    }
+    Ok(outputs)
 }
 
 #[cfg(feature = "native-compile")]
@@ -19763,9 +23468,19 @@ fn resolve_manifest_cairo_settings_from_manifest(
 ) -> (Option<String>, Option<String>) {
     let edition_from_manifest = manifest
         .get("package")
+        .or_else(|| manifest.get("project"))
         .and_then(TomlValue::as_table)
         .and_then(|tbl| tbl.get("edition"))
         .and_then(TomlValue::as_str)
+        .or_else(|| {
+            manifest
+                .get("workspace")
+                .and_then(TomlValue::as_table)
+                .and_then(|ws| ws.get("package").or_else(|| ws.get("project")))
+                .and_then(TomlValue::as_table)
+                .and_then(|tbl| tbl.get("edition"))
+                .and_then(TomlValue::as_str)
+        })
         .map(str::to_string);
 
     let cairo_lang_from_manifest = manifest
@@ -19881,14 +23596,131 @@ fn build_session_cfg_set_from_manifest(manifest: &TomlValue) -> Result<Vec<Strin
     Ok(cfg_set)
 }
 
+fn dir_contains_starknet_contract(src_dir: &Path, depth: usize) -> bool {
+    if depth > 4 || !src_dir.is_dir() {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(src_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            if dir_contains_starknet_contract(&p, depth + 1) {
+                return true;
+            }
+        } else if p.extension().and_then(|s| s.to_str()) == Some("cairo") {
+            if let Ok(text) = fs::read_to_string(&p) {
+                if text.contains("#[starknet::contract") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Normalizes a `uc.toml` (or `[project]`-based) manifest into the internal representation
+/// consumed by all `uc` subsystems:
+/// - Maps `[project]` -> `[package]` (defaulting `version = "0.1.0"` and `edition = "2024_07"`).
+/// - Injects `starknet = ">=2.14.0"` into `[dependencies]` for `uc.toml` packages unless disabled.
+/// - Auto-infers `[[target.starknet-contract]]` (`sierra = true`, `casm = true`) when `src/`
+///   contains any `#[starknet::contract]` module and no explicit `[target]` is declared.
+/// - Mirrors top-level `[prove]`, `[test]`, `[devnet]`, and `[networks]` into `[uc.*]`.
+fn normalize_uc_manifest_toml(doc: &mut TomlValue, manifest_path: &Path) {
+    let is_uc_toml = manifest_path.file_name().and_then(|s| s.to_str()) == Some("uc.toml");
+    let Some(root) = doc.as_table_mut() else {
+        return;
+    };
+    let has_project = root.get("project").and_then(TomlValue::as_table).is_some();
+    if has_project && !root.contains_key("package") {
+        if let Some(proj) = root.get("project").cloned() {
+            root.insert("package".to_string(), proj);
+        }
+    }
+    if let Some(ws) = root.get_mut("workspace").and_then(TomlValue::as_table_mut) {
+        if ws.get("project").and_then(TomlValue::as_table).is_some() && !ws.contains_key("package")
+        {
+            if let Some(ws_proj) = ws.get("project").cloned() {
+                ws.insert("package".to_string(), ws_proj);
+            }
+        }
+    }
+    if !(is_uc_toml || has_project) {
+        return;
+    }
+
+    let starknet_disabled = root
+        .get("project")
+        .or_else(|| root.get("package"))
+        .and_then(TomlValue::as_table)
+        .and_then(|p| p.get("starknet"))
+        .and_then(TomlValue::as_bool)
+        == Some(false);
+
+    if let Some(pkg) = root.get_mut("package").and_then(TomlValue::as_table_mut) {
+        pkg.entry("version".to_string())
+            .or_insert_with(|| TomlValue::String("0.1.0".to_string()));
+        pkg.entry("edition".to_string())
+            .or_insert_with(|| TomlValue::String("2024_07".to_string()));
+    }
+
+    let has_package = root.get("package").and_then(TomlValue::as_table).is_some();
+    if has_package && !starknet_disabled {
+        let deps = root
+            .entry("dependencies".to_string())
+            .or_insert_with(|| TomlValue::Table(toml::map::Map::new()));
+        if let Some(deps_tbl) = deps.as_table_mut() {
+            deps_tbl
+                .entry("starknet".to_string())
+                .or_insert_with(|| TomlValue::String(">=2.14.0".to_string()));
+        }
+    }
+
+    if has_package && !root.contains_key("target") {
+        if let Some(parent) = manifest_path.parent() {
+            if dir_contains_starknet_contract(&parent.join("src"), 0) {
+                let mut contract_target = toml::map::Map::new();
+                contract_target.insert("sierra".to_string(), TomlValue::Boolean(true));
+                contract_target.insert("casm".to_string(), TomlValue::Boolean(true));
+                let mut target_tbl = toml::map::Map::new();
+                target_tbl.insert(
+                    "starknet-contract".to_string(),
+                    TomlValue::Array(vec![TomlValue::Table(contract_target)]),
+                );
+                root.insert("target".to_string(), TomlValue::Table(target_tbl));
+            }
+        }
+    }
+
+    let mut mirrored = Vec::new();
+    for section in ["prove", "test", "devnet", "networks"] {
+        if let Some(val) = root.get(section).cloned() {
+            mirrored.push((section.to_string(), val));
+        }
+    }
+    if !mirrored.is_empty() {
+        let uc_tbl = root
+            .entry("uc".to_string())
+            .or_insert_with(|| TomlValue::Table(toml::map::Map::new()));
+        if let Some(uc_map) = uc_tbl.as_table_mut() {
+            for (k, v) in mirrored {
+                uc_map.entry(k).or_insert(v);
+            }
+        }
+    }
+}
+
 fn parse_manifest_toml(
     manifest_text: &str,
     manifest_path: &Path,
     context: &str,
 ) -> Result<TomlValue> {
-    manifest_text
+    let mut doc = manifest_text
         .parse::<TomlValue>()
-        .with_context(|| format!("{context} {}", manifest_path.display()))
+        .with_context(|| format!("{context} {}", manifest_path.display()))?;
+    normalize_uc_manifest_toml(&mut doc, manifest_path);
+    Ok(doc)
 }
 
 fn stable_toml_fragment_hash(value: &TomlValue) -> Result<String> {
@@ -20136,6 +23968,7 @@ fn read_text_file_with_limit(path: &Path, max_bytes: u64, label: &str) -> Result
         .with_context(|| format!("{} is not valid UTF-8: {}", label, path.display()))
 }
 
+#[cfg(test)]
 fn write_uc_toml(
     path: &Path,
     source_manifest: &Path,
@@ -20219,7 +24052,7 @@ fn workspace_root() -> Result<PathBuf> {
     let cwd = std::env::current_dir()?.canonicalize()?;
     for candidate in cwd.ancestors() {
         let root = candidate.to_path_buf();
-        if root.join("Scarb.toml").is_file() {
+        if root.join("Scarb.toml").is_file() || root.join("uc.toml").is_file() {
             return Ok(root);
         }
     }
@@ -20385,6 +24218,22 @@ fn validate_scarb_toolchain() -> Result<()> {
     store_cached_scarb_toolchain_version_line(&version);
     let _ = VALIDATED_THIS_PROCESS.set(());
     Ok(())
+}
+
+/// Process environment shared by the tests in this binary. Tests that change variables such as
+/// `HOME` or `UC_NATIVE_CORELIB_SRC` hold it for writing; tests that compile Cairo hold it for
+/// reading, so a compile never resolves another test's temporary home or mock corelib.
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> &'static std::sync::RwLock<()> {
+    static LOCK: OnceLock<std::sync::RwLock<()>> = OnceLock::new();
+    LOCK.get_or_init(|| std::sync::RwLock::new(()))
+}
+
+#[cfg(test)]
+pub(crate) fn test_env_shared() -> std::sync::RwLockReadGuard<'static, ()> {
+    test_env_lock()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]

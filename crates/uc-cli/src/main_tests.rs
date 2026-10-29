@@ -59,9 +59,8 @@ fn unique_unix_socket_path(prefix: &str) -> PathBuf {
     ))
 }
 
-fn integration_env_lock() -> &'static Mutex<()> {
-    static LOCK: TestOnceLock<Mutex<()>> = TestOnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+fn integration_env_lock() -> &'static std::sync::RwLock<()> {
+    crate::test_env_lock()
 }
 
 struct CurrentDirRestore {
@@ -88,10 +87,10 @@ struct ScopedEnvVar {
 }
 
 impl ScopedEnvVar {
-    // All process-global env mutation in tests must run under `integration_env_lock()`
-    // to avoid cross-test races when the harness executes tests in parallel.
+    // All process-global env mutation in tests must hold `integration_env_lock()` for writing;
+    // tests that compile Cairo hold `crate::test_env_shared()`, so neither sees the other's env.
     fn set_with_lock(
-        _guard: &std::sync::MutexGuard<'_, ()>,
+        _guard: &std::sync::RwLockWriteGuard<'_, ()>,
         key: &'static str,
         value: impl AsRef<std::ffi::OsStr>,
     ) -> Self {
@@ -100,7 +99,7 @@ impl ScopedEnvVar {
         Self { key, previous }
     }
 
-    fn unset_with_lock(_guard: &std::sync::MutexGuard<'_, ()>, key: &'static str) -> Self {
+    fn unset_with_lock(_guard: &std::sync::RwLockWriteGuard<'_, ()>, key: &'static str) -> Self {
         let previous = std::env::var_os(key);
         std::env::remove_var(key);
         Self { key, previous }
@@ -124,7 +123,7 @@ struct ScopedDynamicEnvVar {
 
 impl ScopedDynamicEnvVar {
     fn set_with_lock(
-        _guard: &std::sync::MutexGuard<'_, ()>,
+        _guard: &std::sync::RwLockWriteGuard<'_, ()>,
         key: impl Into<String>,
         value: impl AsRef<std::ffi::OsStr>,
     ) -> Self {
@@ -134,7 +133,10 @@ impl ScopedDynamicEnvVar {
         Self { key, previous }
     }
 
-    fn unset_with_lock(_guard: &std::sync::MutexGuard<'_, ()>, key: impl Into<String>) -> Self {
+    fn unset_with_lock(
+        _guard: &std::sync::RwLockWriteGuard<'_, ()>,
+        key: impl Into<String>,
+    ) -> Self {
         let key = key.into();
         let previous = std::env::var_os(&key);
         std::env::remove_var(&key);
@@ -245,6 +247,69 @@ exit 64
 }
 
 #[cfg(feature = "native-compile")]
+#[test]
+fn embedded_corelib_installs_whole_when_many_processes_start_at_once() {
+    let guard = integration_env_lock()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cache = unique_test_dir("uc-embedded-corelib-race");
+    let _cache = ScopedEnvVar::set_with_lock(&guard, "UC_GLOBAL_CACHE_DIR", &cache);
+    let done = AtomicBool::new(false);
+    let installed: Vec<PathBuf> = thread::scope(|scope| {
+        // A compile that finds `lib.cairo` must also find the rest of the corelib.
+        let observer = scope.spawn(|| {
+            let mut torn_reads = 0usize;
+            while !done.load(Ordering::Acquire) {
+                for entry in fs::read_dir(&cache).into_iter().flatten().flatten() {
+                    let dir = entry.path();
+                    let staging = entry.file_name().to_string_lossy().starts_with('.');
+                    if !staging
+                        && dir.join("src/lib.cairo").is_file()
+                        && !dir.join("Scarb.toml").is_file()
+                    {
+                        torn_reads += 1;
+                    }
+                }
+            }
+            torn_reads
+        });
+        let workers: Vec<_> = (0..8)
+            .map(|_| scope.spawn(materialize_embedded_corelib_src))
+            .collect();
+        let installed = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("worker").expect("corelib installs"))
+            .collect();
+        done.store(true, Ordering::Release);
+        assert_eq!(
+            observer.join().expect("observer"),
+            0,
+            "saw a partial corelib"
+        );
+        installed
+    });
+    assert!(installed.windows(2).all(|pair| pair[0] == pair[1]));
+    let lib = fs::read_to_string(installed[0].join("lib.cairo")).expect("lib.cairo");
+    assert!(lib.contains("mod traits;") && lib.contains("mod integer;"));
+    let entries: Vec<String> = fs::read_dir(&cache)
+        .expect("cache dir")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "one install and no staging leftovers: {entries:?}"
+    );
+    fs::remove_dir_all(&cache).ok();
+}
+
+#[cfg(feature = "native-compile")]
 fn native_progress_hook_lock() -> &'static Mutex<()> {
     static LOCK: TestOnceLock<Mutex<()>> = TestOnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -253,7 +318,7 @@ fn native_progress_hook_lock() -> &'static Mutex<()> {
 #[cfg(feature = "native-compile")]
 struct NativeProgressHookRestore {
     previous: Option<NativeProgressTestHook>,
-    _integration_guard: std::sync::MutexGuard<'static, ()>,
+    _integration_guard: std::sync::RwLockWriteGuard<'static, ()>,
     _guard: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -267,7 +332,7 @@ impl Drop for NativeProgressHookRestore {
 
 #[cfg(feature = "native-compile")]
 fn capture_native_progress_messages(
-    integration_guard: std::sync::MutexGuard<'static, ()>,
+    integration_guard: std::sync::RwLockWriteGuard<'static, ()>,
 ) -> (Arc<Mutex<Vec<String>>>, NativeProgressHookRestore) {
     let guard = native_progress_hook_lock()
         .lock()
@@ -710,6 +775,7 @@ fn toolchain_ensure_cli_accepts_json_and_report_path() {
 
 #[test]
 fn toolchain_ensure_report_json_contract_includes_blocked_fields() {
+    let _env = crate::test_env_shared();
     let dir = unique_test_dir("uc-toolchain-ensure-json-contract");
     let _cleanup = TestDirCleanup::new(&dir);
     let missing_manifest = dir.join("missing").join("Scarb.toml");
@@ -1281,6 +1347,7 @@ fn fetch_report_from_args_marks_missing_manifest_build_blocked() {
 
 #[test]
 fn toolchain_ensure_report_from_args_marks_missing_manifest_build_blocked() {
+    let _env = crate::test_env_shared();
     let dir = unique_test_dir("uc-toolchain-ensure-missing-manifest");
     let _cleanup = TestDirCleanup::new(&dir);
     let missing_manifest = dir.join("missing").join("Scarb.toml");
@@ -1318,7 +1385,9 @@ fn toolchain_ensure_report_from_args_marks_missing_manifest_build_blocked() {
 #[cfg(feature = "native-compile")]
 #[test]
 fn toolchain_ensure_report_from_manifest_path_marks_builtin_lane_ready() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-toolchain-ensure-builtin-ready");
     let _cleanup = TestDirCleanup::new(&dir);
     let manifest_path = dir.join("Scarb.toml");
@@ -1353,7 +1422,9 @@ cairo-version = "{compiler_major}.{compiler_minor}.0"
 #[cfg(all(feature = "native-compile", unix))]
 #[test]
 fn toolchain_ensure_report_from_manifest_path_builds_productized_helper_to_default_path() {
-    let guard = integration_env_lock().lock().unwrap();
+    let guard = integration_env_lock()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-toolchain-ensure-build-helper");
     let _cleanup = TestDirCleanup::new(&dir);
     let manifest_path = dir.join("Scarb.toml");
@@ -1418,7 +1489,7 @@ chmod +x "$output"
 name = "demo"
 version = "0.1.0"
 edition = "2024_07"
-cairo-version = "{requested_major_minor}.0"
+cairo-version = "={requested_major_minor}.0"
 "#
         ),
     )
@@ -1460,7 +1531,9 @@ cairo-version = "{requested_major_minor}.0"
 #[cfg(feature = "native-compile")]
 #[test]
 fn toolchain_ensure_report_from_manifest_path_reports_missing_builder_as_structured_block() {
-    let guard = integration_env_lock().lock().unwrap();
+    let guard = integration_env_lock()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-toolchain-ensure-missing-builder");
     let _cleanup = TestDirCleanup::new(&dir);
     let manifest_path = dir.join("Scarb.toml");
@@ -1489,7 +1562,7 @@ fn toolchain_ensure_report_from_manifest_path_reports_missing_builder_as_structu
 name = "demo"
 version = "0.1.0"
 edition = "2024_07"
-cairo-version = "{requested_major_minor}.0"
+cairo-version = "={requested_major_minor}.0"
 "#
         ),
     )
@@ -1527,7 +1600,9 @@ cairo-version = "{requested_major_minor}.0"
 #[cfg(all(feature = "native-compile", unix))]
 #[test]
 fn toolchain_ensure_report_from_manifest_path_reports_spawn_failure_as_structured_block() {
-    let guard = integration_env_lock().lock().unwrap();
+    let guard = integration_env_lock()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-toolchain-ensure-spawn-failure");
     let _cleanup = TestDirCleanup::new(&dir);
     let manifest_path = dir.join("Scarb.toml");
@@ -1565,7 +1640,7 @@ fn toolchain_ensure_report_from_manifest_path_reports_spawn_failure_as_structure
 name = "demo"
 version = "0.1.0"
 edition = "2024_07"
-cairo-version = "{requested_major_minor}.0"
+cairo-version = "={requested_major_minor}.0"
 "#
         ),
     )
@@ -1604,7 +1679,9 @@ cairo-version = "{requested_major_minor}.0"
 #[cfg(all(feature = "native-compile", unix))]
 #[test]
 fn toolchain_ensure_report_from_manifest_path_preserves_attempted_state_after_issue_revalidation() {
-    let guard = integration_env_lock().lock().unwrap();
+    let guard = integration_env_lock()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-toolchain-ensure-after-issue");
     let _cleanup = TestDirCleanup::new(&dir);
     let manifest_path = dir.join("Scarb.toml");
@@ -1669,7 +1746,7 @@ chmod 0644 "$output"
 name = "demo"
 version = "0.1.0"
 edition = "2024_07"
-cairo-version = "{requested_major_minor}.0"
+cairo-version = "={requested_major_minor}.0"
 "#
         ),
     )
@@ -1689,7 +1766,9 @@ cairo-version = "{requested_major_minor}.0"
 #[cfg(all(feature = "native-compile", unix))]
 #[test]
 fn toolchain_ensure_report_from_manifest_path_reports_revalidation_failure_as_structured_block() {
-    let guard = integration_env_lock().lock().unwrap();
+    let guard = integration_env_lock()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-toolchain-ensure-revalidation-failure");
     let _cleanup = TestDirCleanup::new(&dir);
     let manifest_path = dir.join("Scarb.toml");
@@ -1758,7 +1837,7 @@ printf '[package\n' > '{}'
 name = "demo"
 version = "0.1.0"
 edition = "2024_07"
-cairo-version = "{requested_major_minor}.0"
+cairo-version = "={requested_major_minor}.0"
 "#
         ),
     )
@@ -1788,6 +1867,7 @@ cairo-version = "{requested_major_minor}.0"
 #[cfg(feature = "native-compile")]
 #[test]
 fn toolchain_ensure_report_from_manifest_path_marks_manifest_probe_failures_non_retryable() {
+    let _env = crate::test_env_shared();
     let dir = unique_test_dir("uc-toolchain-ensure-parse-blocked");
     let _cleanup = TestDirCleanup::new(&dir);
     let manifest_path = dir.join("Scarb.toml");
@@ -1825,8 +1905,8 @@ cairo-version = "2.14.0
 #[test]
 fn fetch_report_from_manifest_path_is_ready_for_local_only_project_with_exact_toolchain_pin() {
     let guard = integration_env_lock()
-        .lock()
-        .expect("integration env lock should succeed");
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _scarb_version = ScopedEnvVar::set_with_lock(
         &guard,
         "UC_SCARB_VERSION_LINE",
@@ -2244,8 +2324,8 @@ fn materialize_fetch_entries_into_source_store_imports_remote_and_reports_missin
 #[test]
 fn source_store_prune_report_removes_oldest_entries_over_budget() {
     let guard = integration_env_lock()
-        .lock()
-        .expect("integration env lock should succeed");
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let store_root = unique_test_dir("uc-source-store-prune");
     let _cleanup = TestDirCleanup::new(&store_root);
     let source_a = store_root.join("sources/a");
@@ -2953,6 +3033,8 @@ fn agent_eval_decision_runs_safe_action_for_helper_lane_failure() {
             source: NativeToolchainSource::ExternalHelper,
             binary_path: None,
             compiler_version: None,
+            host_ready: false,
+            helper_built: Some(false),
         }),
         diagnostics: vec![NativeDiagnostic {
             schema_version: UC_AGENT_JSON_SCHEMA_VERSION,
@@ -3080,6 +3162,8 @@ fn agent_eval_decision_selects_first_runnable_safe_action() {
             source: NativeToolchainSource::ExternalHelper,
             binary_path: None,
             compiler_version: None,
+            host_ready: false,
+            helper_built: Some(false),
         }),
         diagnostics: Vec::new(),
     };
@@ -3177,7 +3261,7 @@ fn sanitized_failure_command_args_redacts_sensitive_values_and_strips_record_fai
 #[test]
 fn redacted_agent_environment_masks_common_token_names() {
     let guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _pat = ScopedEnvVar::set_with_lock(&guard, "UC_GITHUB_PAT", "secret-pat");
     let _auth = ScopedEnvVar::set_with_lock(&guard, "SCARB_REGISTRY_AUTH", "secret-auth");
@@ -3203,7 +3287,7 @@ fn redacted_agent_environment_masks_common_token_names() {
 #[test]
 fn write_failure_bundle_preserves_missing_manifest_cli_path() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _cwd_guard = CurrentDirRestore::capture();
     let dir = unique_test_dir("uc-failure-bundle-missing-manifest");
@@ -3410,7 +3494,7 @@ fn replay_execute_uses_original_cwd_when_workspace_root_missing() {
 #[test]
 fn repo_relative_command_resolves_from_stable_repo_anchor() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _cwd_guard = CurrentDirRestore::capture();
     let outside_repo = unique_test_dir("uc-repo-relative-command-outside-root");
@@ -3515,7 +3599,7 @@ fn replay_parse_failure_emits_structured_report() {
 #[test]
 fn agent_safe_action_execute_emits_report_when_spawn_fails() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-safe-action-spawn-failure");
     let manifest_path = dir.join("Scarb.toml");
@@ -3613,7 +3697,7 @@ fn daemon_metadata_request_roundtrip_preserves_fields() {
         Path::new("/tmp/workspace/Scarb.toml")
     );
     assert_eq!(restored.format_version, 2);
-    assert_eq!(request.protocol_version, DAEMON_PROTOCOL_VERSION);
+    assert_eq!(request.protocol_version, uc_build_identity());
     assert!(restored.offline);
     assert_eq!(
         restored.global_cache_dir,
@@ -3646,7 +3730,7 @@ fn daemon_build_request_roundtrip_preserves_async_cache_persist() {
 
     assert!(request.async_cache_persist);
     assert!(!request.capture_output);
-    assert_eq!(request.protocol_version, DAEMON_PROTOCOL_VERSION);
+    assert_eq!(request.protocol_version, uc_build_identity());
     assert_eq!(restored.package, common.package);
     assert_eq!(restored.workspace, common.workspace);
     assert_eq!(restored.features, common.features);
@@ -3660,7 +3744,9 @@ fn daemon_build_request_roundtrip_preserves_async_cache_persist() {
 #[cfg(all(feature = "native-compile", unix))]
 #[test]
 fn execute_daemon_build_rejects_external_helper_native_request() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let requested_major_minor = "2.5";
     let requested_version = "2.5.3";
     let helper_env = native_toolchain_env_var_name_for_major_minor(requested_major_minor);
@@ -3701,7 +3787,7 @@ starknet = "={requested_version}"
     let _helper = ScopedDynamicEnvVar::set_with_lock(&_guard, helper_env, &helper_path);
 
     let request = DaemonBuildRequest {
-        protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+        protocol_version: uc_build_identity().to_string(),
         manifest_path: manifest_path.display().to_string(),
         package: None,
         workspace: false,
@@ -3736,7 +3822,9 @@ starknet = "={requested_version}"
 #[cfg(unix)]
 #[test]
 fn daemon_socket_path_for_external_helper_is_stable_and_helper_scoped() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-helper-daemon-socket");
     let _cleanup = TestDirCleanup::new(&dir);
     let helper_a = dir.join("uc-helper-a");
@@ -3764,6 +3852,10 @@ fn daemon_socket_path_for_external_helper_is_stable_and_helper_scoped() {
 #[cfg(unix)]
 #[test]
 fn build_uc_build_command_sets_helper_scoped_daemon_socket_override() {
+    // Other tests rewrite HOME under the integration lock; the helper socket path depends on it.
+    let _guard = integration_env_lock()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-helper-build-command");
     let _cleanup = TestDirCleanup::new(&dir);
     let helper_path = dir.join("uc-helper-bin");
@@ -3864,6 +3956,7 @@ fn build_uc_build_command_skips_helper_socket_override_when_daemon_is_off() {
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_compile_session_heap_estimate_scales_with_tracked_source_bytes() {
+    let _env = crate::test_env_shared();
     let small = native_compile_session_estimated_heap_bytes(1024);
     let large = native_compile_session_estimated_heap_bytes(2 * 1024 * 1024);
     assert!(
@@ -3880,7 +3973,7 @@ fn native_compile_session_heap_estimate_scales_with_tracked_source_bytes() {
 fn daemon_build_request_serialization_supports_async_cache_persist_wire_field() {
     let request = DaemonRequest::Build {
         payload: DaemonBuildRequest {
-            protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+            protocol_version: uc_build_identity().to_string(),
             manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
             package: None,
             workspace: false,
@@ -3907,7 +4000,7 @@ fn daemon_build_request_serialization_supports_async_cache_persist_wire_field() 
         DaemonRequest::Build { payload } => {
             assert!(payload.async_cache_persist);
             assert!(payload.capture_output);
-            assert_eq!(payload.protocol_version, DAEMON_PROTOCOL_VERSION);
+            assert_eq!(payload.protocol_version, uc_build_identity());
             assert_eq!(payload.manifest_path, "/tmp/workspace/Scarb.toml");
             assert_eq!(payload.features, vec!["feature_a".to_string()]);
             assert_eq!(payload.compile_backend, DaemonBuildBackend::Native);
@@ -3921,14 +4014,14 @@ fn daemon_build_request_serialization_supports_async_cache_persist_wire_field() 
 fn daemon_build_request_defaults_capture_output_when_missing_from_wire() {
     let json = format!(
             "{{\"type\":\"build\",\"protocol_version\":\"{}\",\"manifest_path\":\"/tmp/workspace/Scarb.toml\",\"package\":null,\"workspace\":false,\"features\":[],\"offline\":false,\"release\":false,\"profile\":null,\"async_cache_persist\":false}}",
-            DAEMON_PROTOCOL_VERSION
+            uc_build_identity()
         );
     let decoded: DaemonRequest =
         serde_json::from_str(&json).expect("failed to decode daemon request");
     match decoded {
         DaemonRequest::Build { payload } => {
             assert!(payload.capture_output);
-            assert_eq!(payload.protocol_version, DAEMON_PROTOCOL_VERSION);
+            assert_eq!(payload.protocol_version, uc_build_identity());
             assert_eq!(payload.compile_backend, DaemonBuildBackend::Scarb);
             assert!(!payload.native_fallback_to_scarb);
         }
@@ -3956,12 +4049,12 @@ fn daemon_build_request_payload_wrapped_wire_format_is_decoded() {
                 "native_fallback_to_scarb":true
             }}
         }}"#,
-        DAEMON_PROTOCOL_VERSION
+        uc_build_identity()
     );
     let decoded = decode_daemon_request(&json).expect("failed to decode wrapped daemon request");
     match decoded {
         DaemonRequest::Build { payload } => {
-            assert_eq!(payload.protocol_version, DAEMON_PROTOCOL_VERSION);
+            assert_eq!(payload.protocol_version, uc_build_identity());
             assert_eq!(payload.features, vec!["feature_a".to_string()]);
             assert_eq!(payload.compile_backend, DaemonBuildBackend::Native);
             assert!(payload.async_cache_persist);
@@ -3992,7 +4085,7 @@ fn daemon_build_request_payload_fields_override_hybrid_root_fields() {
                 "native_fallback_to_scarb":true
             }}
         }}"#,
-        DAEMON_PROTOCOL_VERSION
+        uc_build_identity()
     );
     let decoded = decode_daemon_request(&json).expect("failed to decode hybrid daemon request");
     match decoded {
@@ -4269,7 +4362,7 @@ fn daemon_build_response_defaults_compile_backend_to_scarb_when_missing_from_wir
 fn daemon_metadata_request_serialization_supports_wire_format() {
     let request = DaemonRequest::Metadata {
         payload: DaemonMetadataRequest {
-            protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+            protocol_version: uc_build_identity().to_string(),
             manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
             format_version: 1,
             offline: false,
@@ -4284,7 +4377,7 @@ fn daemon_metadata_request_serialization_supports_wire_format() {
         serde_json::from_str(&json).expect("failed to decode daemon request");
     match decoded {
         DaemonRequest::Metadata { payload } => {
-            assert_eq!(payload.protocol_version, DAEMON_PROTOCOL_VERSION);
+            assert_eq!(payload.protocol_version, uc_build_identity());
             assert_eq!(payload.manifest_path, "/tmp/workspace/Scarb.toml");
             assert_eq!(payload.format_version, 1);
             assert!(!payload.offline);
@@ -4349,7 +4442,7 @@ fn daemon_request_protocol_validation_rejects_mismatch_for_build_and_metadata() 
 fn daemon_request_protocol_validation_accepts_current_protocol() {
     let build = DaemonRequest::Build {
         payload: DaemonBuildRequest {
-            protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+            protocol_version: uc_build_identity().to_string(),
             manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
             package: None,
             workspace: false,
@@ -4365,7 +4458,7 @@ fn daemon_request_protocol_validation_accepts_current_protocol() {
     };
     let metadata = DaemonRequest::Metadata {
         payload: DaemonMetadataRequest {
-            protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+            protocol_version: uc_build_identity().to_string(),
             manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
             format_version: 1,
             offline: false,
@@ -4381,7 +4474,7 @@ fn daemon_request_protocol_validation_accepts_current_protocol() {
 #[test]
 fn resolve_manifest_path_accepts_absolute_manifest() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _cwd_guard = CurrentDirRestore::capture();
     let workspace = unique_test_dir("uc-resolve-manifest-abs");
@@ -4404,7 +4497,7 @@ fn resolve_manifest_path_accepts_absolute_manifest() {
 #[test]
 fn resolve_manifest_path_rejects_relative_escape() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _cwd_guard = CurrentDirRestore::capture();
     let root = unique_test_dir("uc-resolve-manifest-escape");
@@ -4491,7 +4584,7 @@ fn daemon_response_size_limit_exceeds_request_and_capture_budget() {
 #[test]
 fn daemon_request_accepts_large_response_payload() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let socket_path = unique_unix_socket_path("uc-daemon-large-response");
     let _ = fs::remove_file(&socket_path);
@@ -4546,7 +4639,7 @@ fn daemon_request_accepts_large_response_payload() {
 #[test]
 fn try_uc_build_via_daemon_auto_mode_falls_back_on_daemon_error() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let socket_path = unique_unix_socket_path("uc-daemon-auto-fallback");
     let _ = fs::remove_file(&socket_path);
@@ -4605,7 +4698,7 @@ fn try_uc_build_via_daemon_auto_mode_falls_back_on_daemon_error() {
 #[test]
 fn try_uc_build_via_daemon_require_mode_surfaces_daemon_error() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let socket_path = unique_unix_socket_path("uc-daemon-require-error");
     let _ = fs::remove_file(&socket_path);
@@ -4668,7 +4761,7 @@ fn try_uc_build_via_daemon_require_mode_surfaces_daemon_error() {
 #[test]
 fn try_uc_build_via_daemon_require_mode_rejects_backend_mismatch() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let socket_path = unique_unix_socket_path("uc-daemon-require-backend-mismatch");
     let _ = fs::remove_file(&socket_path);
@@ -4816,7 +4909,7 @@ fn parse_scarb_semver_extracts_triplet() {
 #[test]
 fn scarb_version_line_uses_env_override() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     std::env::set_var("UC_SCARB_VERSION_LINE", "scarb 9.9.9 (override)");
     let version = scarb_version_line().expect("override version should be accepted");
@@ -4827,7 +4920,7 @@ fn scarb_version_line_uses_env_override() {
 #[test]
 fn prewarm_daemon_compiler_version_cache_uses_override() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     std::env::set_var("UC_SCARB_VERSION_LINE", "scarb 8.8.8 (prewarm-test)");
     prewarm_daemon_compiler_version_cache();
@@ -4839,7 +4932,7 @@ fn prewarm_daemon_compiler_version_cache_uses_override() {
 #[test]
 fn validate_scarb_version_constraints_respects_minimum_and_expected() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     std::env::set_var("UC_MIN_SCARB_VERSION", "2.14.0");
     std::env::remove_var("UC_EXPECT_SCARB_VERSION");
@@ -4859,7 +4952,7 @@ fn validate_scarb_version_constraints_respects_minimum_and_expected() {
 #[test]
 fn scarb_toolchain_cache_load_rejects_stale_entries() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-toolchain-cache");
     let cache_path = dir.join("scarb-toolchain.json");
@@ -4890,7 +4983,7 @@ fn scarb_toolchain_cache_load_rejects_stale_entries() {
 #[test]
 fn build_env_fingerprint_tracks_prefixed_vars_only() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     std::env::remove_var("UC_BUILD_ENV_PREFIXES_EXTRA");
     std::env::remove_var("SCARB_TEST_UC_FINGERPRINT");
@@ -4916,7 +5009,7 @@ fn build_env_fingerprint_tracks_prefixed_vars_only() {
 #[test]
 fn build_env_fingerprint_supports_extra_prefixes() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     std::env::remove_var("UC_BUILD_ENV_PREFIXES_EXTRA");
     std::env::set_var("XBUILD_TEST_FINGERPRINT", "v1");
@@ -4933,7 +5026,7 @@ fn build_env_fingerprint_supports_extra_prefixes() {
 #[test]
 fn build_env_fingerprint_prefix_override_can_disable_default_prefixes() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     std::env::remove_var("UC_BUILD_ENV_PREFIXES");
     std::env::set_var("SCARB_TEST_OVERRIDE_FINGERPRINT", "v1");
@@ -4950,7 +5043,7 @@ fn build_env_fingerprint_prefix_override_can_disable_default_prefixes() {
 #[test]
 fn scarb_build_command_disables_artifacts_fingerprint_by_default() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     std::env::remove_var("UC_DISABLE_SCARB_ARTIFACTS_FINGERPRINT");
     let common = BuildCommonArgs {
@@ -4974,7 +5067,7 @@ fn scarb_build_command_disables_artifacts_fingerprint_by_default() {
 #[test]
 fn scarb_build_command_can_reenable_artifacts_fingerprint() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     std::env::set_var("UC_DISABLE_SCARB_ARTIFACTS_FINGERPRINT", "0");
     let common = BuildCommonArgs {
@@ -5093,7 +5186,7 @@ fn session_input_cache_key_changes_with_compiler_version() {
 #[test]
 fn native_build_mode_parses_expected_values() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     std::env::remove_var("UC_NATIVE_BUILD_MODE");
     assert_eq!(native_build_mode(), NativeBuildMode::Auto);
@@ -5115,7 +5208,7 @@ fn native_build_mode_parses_expected_values() {
 #[test]
 fn native_disallow_scarb_fallback_parses_expected_values() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     std::env::remove_var("UC_NATIVE_DISALLOW_SCARB_FALLBACK");
     assert!(!native_disallow_scarb_fallback());
@@ -5135,7 +5228,7 @@ fn native_disallow_scarb_fallback_parses_expected_values() {
 #[test]
 fn native_skip_unused_import_diagnostics_parses_expected_values() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     std::env::remove_var("UC_NATIVE_SKIP_UNUSED_IMPORT_DIAGNOSTICS");
     assert!(native_skip_unused_import_diagnostics());
@@ -5155,7 +5248,7 @@ fn native_skip_unused_import_diagnostics_parses_expected_values() {
 #[test]
 fn native_helper_cairo214_skip_unused_import_diagnostics_is_not_session_keyed() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     std::env::set_var("UC_NATIVE_SKIP_UNUSED_IMPORT_DIAGNOSTICS", "1");
     assert!(
@@ -5286,6 +5379,7 @@ version = "2.0.0"
 
 #[test]
 fn native_compiler_version_line_includes_cairo_lang_version() {
+    let _env = crate::test_env_shared();
     let line = native_compiler_version_line();
     assert!(
         line.starts_with("uc-native "),
@@ -5310,6 +5404,7 @@ fn parse_cairo_version_major_minor_handles_common_formats() {
         Some((2, 14))
     );
     assert_eq!(parse_cairo_version_major_minor("2.15.0-rc1"), Some((2, 15)));
+    assert_eq!(parse_cairo_version_major_minor("=2.14.0"), Some((2, 14)));
     assert_eq!(parse_cairo_version_major_minor(">=2.14.0"), None);
     assert_eq!(parse_cairo_version_major_minor(""), None);
 }
@@ -5344,8 +5439,22 @@ cairo-version = "{compiler_major}.{}.0"
             compiler_minor - 1
         ))
         .expect("older-minor manifest should parse");
-        let err = ensure_native_manifest_cairo_version_supported(&older_minor_manifest)
-            .expect_err("older minor cairo-version should be rejected");
+        // Scarb semantics: a bare `2.{n-1}.0` is `^2.{n-1}.0`, satisfied by the in-process
+        // compiler, so it is accepted. Only an exact `=` pin needs a helper lane.
+        ensure_native_manifest_cairo_version_supported(&older_minor_manifest)
+            .expect("older minor caret cairo-version is satisfied by the in-process compiler");
+        let pinned_older_minor_manifest: TomlValue = toml::from_str(&format!(
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024_07"
+cairo-version = "={compiler_major}.{}.0"
+"#,
+            compiler_minor - 1
+        ))
+        .expect("pinned older-minor manifest should parse");
+        let err = ensure_native_manifest_cairo_version_supported(&pinned_older_minor_manifest)
+            .expect_err("exact older minor cairo-version pin should be rejected");
         let rendered = format!("{err:#}");
         assert!(
             rendered.contains("helper lane"),
@@ -5626,7 +5735,9 @@ cairo-version = "2.14.0
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_support_report_from_manifest_path_marks_supported_and_unsupported_manifests() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-native-support-report");
     fs::create_dir_all(&dir).expect("create temp dir");
     let manifest_path = dir.join("Scarb.toml");
@@ -5679,7 +5790,7 @@ cairo-version = "{compiler_major}.{compiler_minor}.0"
 name = "demo"
 version = "0.1.0"
 edition = "2024_07"
-cairo-version = "{requested_major_minor}.0"
+cairo-version = "={requested_major_minor}.0"
 "#
         ),
     )
@@ -5709,6 +5820,7 @@ cairo-version = "{requested_major_minor}.0"
 
 #[test]
 fn build_plan_report_from_args_marks_missing_manifest_build_blocked() {
+    let _env = crate::test_env_shared();
     let dir = unique_test_dir("uc-build-plan-missing-manifest");
     let _cleanup = TestDirCleanup::new(&dir);
     let missing_manifest = dir.join("missing").join("Scarb.toml");
@@ -5745,7 +5857,9 @@ fn build_plan_report_from_args_marks_missing_manifest_build_blocked() {
 #[cfg(feature = "native-compile")]
 #[test]
 fn build_plan_report_from_args_marks_builtin_native_ready_plan() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-build-plan-native-ready");
     let _cleanup = TestDirCleanup::new(&dir);
     fs::create_dir_all(&dir).expect("create temp dir");
@@ -5806,7 +5920,9 @@ cairo-version = "{compiler_major}.{compiler_minor}.0"
 #[cfg(feature = "native-compile")]
 #[test]
 fn build_plan_report_from_args_marks_missing_helper_as_uc_scarb_plan() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-build-plan-missing-helper");
     let _cleanup = TestDirCleanup::new(&dir);
     fs::create_dir_all(&dir).expect("create temp dir");
@@ -5832,7 +5948,7 @@ fn build_plan_report_from_args_marks_missing_helper_as_uc_scarb_plan() {
 name = "demo"
 version = "0.1.0"
 edition = "2024_07"
-cairo-version = "{requested_major_minor}.0"
+cairo-version = "={requested_major_minor}.0"
 "#
         ),
     )
@@ -5911,10 +6027,14 @@ fn productized_native_toolchain_helper_lanes_match_workspace_metadata() {
 #[cfg(all(feature = "native-compile", unix))]
 #[test]
 fn select_native_toolchain_from_manifest_path_uses_lockfile_lane_helper() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let current = parse_cairo_version_major_minor(native_cairo_lang_compiler_version())
         .expect("compiler version should parse");
-    let requested = if current == (2, 14) { (2, 16) } else { (2, 14) };
+    // A lock pinned to a *newer* minor than the in-process compiler cannot be satisfied in
+    // process (an older one is a caret match and compiles in process, like scarb would).
+    let requested = (current.0, current.1 + 1);
     let requested_major_minor = format_cairo_version_major_minor(requested);
     let requested_version = format!("{requested_major_minor}.0");
     let helper_env = native_toolchain_env_var_name_for_major_minor(&requested_major_minor);
@@ -5994,7 +6114,9 @@ version = "{requested_version}"
 #[cfg(all(feature = "native-compile", unix))]
 #[test]
 fn native_support_report_from_manifest_path_uses_external_helper_toolchain_fields() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let current = parse_cairo_version_major_minor(native_cairo_lang_compiler_version())
         .expect("compiler version should parse");
     let requested = if current == (2, 14) { (2, 16) } else { (2, 14) };
@@ -6012,7 +6134,7 @@ fn native_support_report_from_manifest_path_uses_external_helper_toolchain_field
 name = "demo"
 version = "0.1.0"
 edition = "2024_07"
-cairo-version = "{requested_version}"
+cairo-version = "={requested_version}"
 "#
         ),
     )
@@ -6039,6 +6161,8 @@ cairo-version = "{requested_version}"
                 source: NativeToolchainSource::Builtin,
                 binary_path: None,
                 compiler_version: Some(requested_version.clone()),
+                host_ready: true,
+                helper_built: None,
             }),
             diagnostics: Vec::new(),
         },
@@ -6069,7 +6193,9 @@ cairo-version = "{requested_version}"
 #[cfg(all(feature = "native-compile", unix))]
 #[test]
 fn build_report_from_external_helper_preserves_fallback_backend() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let current = parse_cairo_version_major_minor(native_cairo_lang_compiler_version())
         .expect("compiler version should parse");
     let current_major_minor = format_cairo_version_major_minor(current);
@@ -6097,7 +6223,7 @@ fn build_report_from_external_helper_preserves_fallback_backend() {
 name = "demo"
 version = "0.1.0"
 edition = "2024_07"
-cairo-version = "{requested_version}"
+cairo-version = "={requested_version}"
 "#
         ),
     )
@@ -6152,7 +6278,9 @@ cairo-version = "{requested_version}"
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_support_report_from_manifest_path_reports_missing_toolchain_helper_diagnostic() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let current = parse_cairo_version_major_minor(native_cairo_lang_compiler_version())
         .expect("compiler version should parse");
     let requested = if current == (2, 14) { (2, 16) } else { (2, 14) };
@@ -6174,7 +6302,7 @@ fn native_support_report_from_manifest_path_reports_missing_toolchain_helper_dia
 name = "demo"
 version = "0.1.0"
 edition = "2024_07"
-cairo-version = "{requested_version}"
+cairo-version = "={requested_version}"
 "#
         ),
     )
@@ -6242,7 +6370,9 @@ cairo-version = "{requested_version}"
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_support_report_json_contract_includes_doctor_fields() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let current = parse_cairo_version_major_minor(native_cairo_lang_compiler_version())
         .expect("compiler version should parse");
     let requested = if current == (2, 14) { (2, 16) } else { (2, 14) };
@@ -6264,7 +6394,7 @@ fn native_support_report_json_contract_includes_doctor_fields() {
 name = "demo"
 version = "0.1.0"
 edition = "2024_07"
-cairo-version = "{requested_version}"
+cairo-version = "={requested_version}"
 "#
         ),
     )
@@ -6363,7 +6493,10 @@ cairo-version = "{requested_version}"
         json["toolchain"]["requested_major_minor"],
         requested_major_minor
     );
-    assert_eq!(json["toolchain"]["requested_version"], requested_version);
+    assert_eq!(
+        json["toolchain"]["requested_version"],
+        format!("={requested_version}")
+    );
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -6371,7 +6504,9 @@ cairo-version = "{requested_version}"
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_support_report_from_manifest_path_reports_unproductized_helper_lane() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let requested_major_minor = "2.5";
     let requested_version = "2.5.3";
     let helper_env = native_toolchain_env_var_name_for_major_minor(requested_major_minor);
@@ -6391,7 +6526,7 @@ fn native_support_report_from_manifest_path_reports_unproductized_helper_lane() 
 name = "demo"
 version = "0.1.0"
 edition = "2023_11"
-cairo-version = "{requested_version}"
+cairo-version = "={requested_version}"
 
 [dependencies]
 starknet = "={requested_version}"
@@ -6472,7 +6607,10 @@ starknet = "={requested_version}"
         json["toolchain"]["requested_major_minor"],
         requested_major_minor
     );
-    assert_eq!(json["toolchain"]["requested_version"], requested_version);
+    assert_eq!(
+        json["toolchain"]["requested_version"],
+        format!("={requested_version}")
+    );
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -6480,7 +6618,9 @@ starknet = "={requested_version}"
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_support_report_keeps_invalid_unproductized_helper_manual() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let requested_major_minor = "2.5";
     let requested_version = "2.5.3";
     let helper_env = native_toolchain_env_var_name_for_major_minor(requested_major_minor);
@@ -6495,7 +6635,7 @@ fn native_support_report_keeps_invalid_unproductized_helper_manual() {
 name = "demo"
 version = "0.1.0"
 edition = "2023_11"
-cairo-version = "{requested_version}"
+cairo-version = "={requested_version}"
 "#
         ),
     )
@@ -6578,7 +6718,7 @@ cairo-version = "{requested_version}"
 #[test]
 fn build_native_compile_context_rejects_unproductized_helper_lane() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let requested_major_minor = "2.5";
     let requested_version = "2.5.3";
@@ -6600,7 +6740,7 @@ fn build_native_compile_context_rejects_unproductized_helper_lane() {
 name = "demo-native"
 version = "0.1.0"
 edition = "2023_11"
-cairo-version = "{requested_version}"
+cairo-version = "={requested_version}"
 
 [dependencies]
 starknet = "={requested_version}"
@@ -6644,7 +6784,9 @@ starknet = "={requested_version}"
 #[cfg(all(feature = "native-compile", unix))]
 #[test]
 fn native_support_report_from_manifest_path_allows_reviewed_unproductized_helper_env() {
-    let _guard = integration_env_lock().lock().unwrap();
+    let _guard = integration_env_lock()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let requested_major_minor = "2.5";
     let requested_version = "2.5.3";
     let helper_env = native_toolchain_env_var_name_for_major_minor(requested_major_minor);
@@ -7006,6 +7148,7 @@ fn metadata_result_cache_eviction_respects_entry_and_byte_budgets() {
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_compile_context_cache_ttl_eviction_prunes_stale_entries() {
+    let _env = crate::test_env_shared();
     let context = NativeCompileContext {
         package_name: "demo".to_string(),
         crate_name: "demo".to_string(),
@@ -7017,10 +7160,13 @@ fn native_compile_context_cache_ttl_eviction_prunes_stale_entries() {
             sierra: true,
             casm: true,
         },
+        lib_target: None,
+        contract_target: true,
         manifest_content_hash: "manifest-blake3:demo".to_string(),
         external_non_starknet_dependencies: Vec::new(),
         path_dependency_roots: Vec::new(),
         crate_dependency_configs: Vec::new(),
+        toolchain_compat: false,
     };
     let mut cache = HashMap::new();
     cache.insert(
@@ -7113,7 +7259,7 @@ fn native_fallback_telemetry_counters_accumulate_events() {
 #[test]
 fn daemon_lock_state_reuses_cache_when_metadata_is_unchanged() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     daemon_lock_hash_cache()
         .lock()
@@ -7159,7 +7305,7 @@ edition = "2024_07"
 #[test]
 fn daemon_lock_state_invalidates_cache_when_lockfile_changes() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     daemon_lock_hash_cache()
         .lock()
@@ -7197,7 +7343,7 @@ edition = "2024_07"
 #[test]
 fn daemon_lock_metadata_state_tracks_lockfile_changes_without_hash_cache() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     daemon_lock_hash_cache()
         .lock()
@@ -7281,7 +7427,7 @@ fn metadata_result_cache_key_changes_with_metadata_options() {
 #[test]
 fn metadata_result_cache_hit_ignores_lock_size_and_mtime_when_hash_matches() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     metadata_result_cache()
         .lock()
@@ -7369,7 +7515,7 @@ edition = "2024_07"
 #[test]
 fn metadata_result_cache_roundtrip_hits_when_inputs_match() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     metadata_result_cache()
         .lock()
@@ -7460,7 +7606,7 @@ edition = "2024_07"
 #[test]
 fn metadata_result_cache_misses_when_lock_hash_changes() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     metadata_result_cache()
         .lock()
@@ -7555,7 +7701,7 @@ edition = "2024_07"
 #[test]
 fn metadata_result_cache_misses_when_workspace_member_manifest_changes() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     metadata_result_cache()
         .lock()
@@ -7673,7 +7819,7 @@ opt-level = 1
 #[test]
 fn metadata_cache_workspace_root_prefers_workspace_lock_ancestor_for_member_manifest() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let workspace = unique_test_dir("uc-metadata-workspace-root-member-manifest");
     let member_dir = workspace.join("member");
@@ -7704,7 +7850,7 @@ fn metadata_cache_workspace_root_prefers_workspace_lock_ancestor_for_member_mani
 #[test]
 fn metadata_cache_workspace_root_falls_back_to_manifest_parent_without_workspace_lock() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let workspace = unique_test_dir("uc-metadata-workspace-root-fallback");
     let manifest_path = workspace.join("Scarb.toml");
@@ -7728,7 +7874,7 @@ fn metadata_cache_workspace_root_falls_back_to_manifest_parent_without_workspace
 #[test]
 fn native_dependency_surface_uses_cached_metadata_without_invoking_scarb() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     metadata_result_cache()
         .lock()
@@ -7831,7 +7977,7 @@ edition = "2024_07"
     let _path = ScopedEnvVar::set_with_lock(&_guard, "PATH", &no_scarb_path);
 
     let surface =
-        collect_native_dependency_surface_from_scarb_metadata(&manifest_path, "demo", false)
+        collect_native_dependency_surface_from_scarb_metadata(&manifest_path, "demo", false, false)
             .expect("native dependency surface collection should succeed")
             .expect("metadata cache hit should provide dependency surface");
     assert!(
@@ -7857,7 +8003,7 @@ edition = "2024_07"
 #[test]
 fn native_dependency_surface_merges_manifest_external_deps_with_cached_metadata() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     metadata_result_cache()
         .lock()
@@ -8010,7 +8156,7 @@ fn native_should_use_dependency_metadata_with_flags_requires_explicit_enable() {
 #[test]
 fn native_dependency_surface_uses_metadata_for_external_deps_by_default() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     metadata_result_cache()
         .lock()
@@ -8202,7 +8348,7 @@ fn parse_native_scarb_metadata_document_rejects_non_json_output() {
 #[test]
 fn native_dependency_surface_defaults_to_manifest_only_when_metadata_cache_exists() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     metadata_result_cache()
         .lock()
@@ -8400,7 +8546,7 @@ edition = "2024_07"
 #[test]
 fn prepare_daemon_build_plan_reuses_when_inputs_unchanged_and_invalidates_on_lock_change() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     std::env::set_var("UC_SCARB_VERSION_LINE", "scarb 2.14.0 (plan-cache-test)");
 
@@ -8466,7 +8612,7 @@ edition = "2024_07"
 #[test]
 fn prepare_daemon_build_plan_reuses_for_equivalent_feature_sets() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     std::env::set_var(
         "UC_SCARB_VERSION_LINE",
@@ -8536,7 +8682,7 @@ edition = "2024_07"
 #[test]
 fn prepare_daemon_build_plan_invalidates_on_profile_env_and_toolchain_changes() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     std::env::set_var(
         "UC_SCARB_VERSION_LINE",
@@ -8735,14 +8881,14 @@ fn timeout_duration_from_secs_zero_disables_timeout() {
 #[test]
 fn daemon_request_read_timeout_prefers_build_override_for_build_requests() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     std::env::set_var("UC_DAEMON_CLIENT_READ_TIMEOUT_SECS", "7");
     std::env::set_var("UC_DAEMON_BUILD_READ_TIMEOUT_SECS", "13");
 
     let build_request = DaemonRequest::Build {
         payload: DaemonBuildRequest {
-            protocol_version: DAEMON_PROTOCOL_VERSION.to_string(),
+            protocol_version: uc_build_identity().to_string(),
             manifest_path: "/tmp/workspace/Scarb.toml".to_string(),
             package: None,
             workspace: false,
@@ -8878,6 +9024,7 @@ fn build_entry_cache_eviction_removes_oldest_entries() {
         fingerprint: "fp".to_string(),
         profile: "dev".to_string(),
         artifacts: Vec::new(),
+        warnings: String::new(),
     };
     let mut cache = HashMap::new();
     cache.insert(
@@ -8997,10 +9144,12 @@ fn load_cache_entry_cached_invalidates_when_file_changes() {
         fingerprint: "fp-a".to_string(),
         profile: "dev".to_string(),
         artifacts: Vec::new(),
+        warnings: "warning[E0001]: Unused variable.\n".to_string(),
     };
     persist_cache_entry(
         &first.profile,
         &first.fingerprint,
+        &first.warnings,
         &first.artifacts,
         &entry_path,
     )
@@ -9009,6 +9158,8 @@ fn load_cache_entry_cached_invalidates_when_file_changes() {
         .expect("failed to load first cache entry")
         .expect("first cache entry should exist");
     assert_eq!(loaded_first.fingerprint, "fp-a");
+    // A cache hit replays the warnings of the build that filled the entry.
+    assert_eq!(loaded_first.warnings, first.warnings);
 
     // Ensure file mtime changes for the metadata-based cache validator.
     thread::sleep(Duration::from_millis(5));
@@ -9017,10 +9168,12 @@ fn load_cache_entry_cached_invalidates_when_file_changes() {
         fingerprint: "fp-b".to_string(),
         profile: "dev".to_string(),
         artifacts: Vec::new(),
+        warnings: String::new(),
     };
     persist_cache_entry(
         &second.profile,
         &second.fingerprint,
+        &second.warnings,
         &second.artifacts,
         &entry_path,
     )
@@ -9071,6 +9224,18 @@ fn cache_object_matches_expected_recomputes_when_object_changes() {
     );
 
     fs::remove_dir_all(&dir).ok();
+}
+
+/// A daemon or cache from another uc build must not be trusted, and every build so far shares
+/// the package version, so the identity carries the executable's stamp.
+#[test]
+fn build_identity_carries_the_executable_stamp() {
+    let identity = uc_build_identity();
+    let stamp = identity
+        .strip_prefix(concat!(env!("CARGO_PKG_VERSION"), "+"))
+        .expect("identity starts with the package version");
+    assert_ne!(stamp, "unknown");
+    assert!(stamp.contains('-'), "size-mtime stamp: {identity}");
 }
 
 #[test]
@@ -9460,6 +9625,7 @@ fn async_persist_worker_uses_precomputed_cached_artifacts() {
             workspace_root: workspace,
             profile: "dev".to_string(),
             fingerprint: "fingerprint".to_string(),
+            warnings: String::new(),
             artifact_relative_paths: None,
             cached_artifacts: Some(vec![artifact]),
             cache_root: cache_root.clone(),
@@ -9493,7 +9659,7 @@ fn daemon_shared_cache_root_is_workspace_scoped_and_stable() {
 #[test]
 fn run_build_with_uc_cache_restores_from_daemon_shared_cache_when_local_cache_is_missing() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     std::env::set_var(
         "UC_SCARB_VERSION_LINE",
@@ -9574,6 +9740,7 @@ edition = "2024_07"
     persist_cache_entry(
         profile,
         &fingerprint,
+        "",
         &[CachedArtifact {
             relative_path: artifact_rel.to_string(),
             blake3_hex: artifact_hash.clone(),
@@ -9662,7 +9829,7 @@ fn try_local_uc_cache_hit_skips_fingerprint_when_entry_is_missing() {
 #[test]
 fn run_build_with_uc_cache_defers_fingerprint_when_entry_is_missing() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if !scarb_available() {
         return;
@@ -9722,7 +9889,7 @@ fn run_build_with_uc_cache_defers_fingerprint_when_entry_is_missing() {
 #[test]
 fn run_build_with_uc_cache_defers_fingerprint_when_shared_entry_is_missing() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if !scarb_available() {
         return;
@@ -10260,7 +10427,7 @@ fn native_target_dir_rejects_profile_nul_byte() {
 #[test]
 fn build_native_compile_context_writes_cairo_project_and_normalizes_crate_name() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-native-context-project");
     let manifest_path = dir.join("Scarb.toml");
@@ -10327,7 +10494,7 @@ edition = "2024_07"
 #[test]
 fn build_native_compile_context_restores_self_edge_after_dev_only_surface() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-native-context-dev-only-surface");
     let manifest_path = dir.join("Scarb.toml");
@@ -10421,7 +10588,7 @@ dev-tool = { path = "deps/dev-tool" }
 #[test]
 fn build_native_compile_context_allows_workspace_for_single_member_workspace_root() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-native-context-workspace-single");
     let manifest_path = dir.join("Scarb.toml");
@@ -10467,7 +10634,7 @@ members = ["."]
 #[test]
 fn build_native_compile_context_rejects_workspace_for_multi_member_workspace_root() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-native-context-workspace-multi");
     let manifest_path = dir.join("Scarb.toml");
@@ -10513,7 +10680,7 @@ members = [".", "packages/other"]
 #[test]
 fn build_native_compile_context_cache_revalidates_requested_package_on_cache_hit() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-native-context-cache-package");
     let manifest_path = dir.join("Scarb.toml");
@@ -10651,7 +10818,7 @@ members = ["../outside"]
 #[test]
 fn build_native_compile_context_cache_tracks_corelib_override_changes() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-native-context-cache-corelib");
     let manifest_path = dir.join("Scarb.toml");
@@ -10702,7 +10869,7 @@ edition = "2024_07"
 #[test]
 fn build_native_compile_context_cache_tracks_workspace_manifest_changes() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-native-context-cache-workspace-manifest");
     let member_dir = dir.join("member");
@@ -10934,7 +11101,7 @@ fn native_contract_file_stems_disambiguate_non_injective_module_path_collisions(
 
 #[cfg(feature = "native-compile")]
 #[test]
-fn write_native_sierra_artifact_does_not_prune_when_write_fails() {
+fn write_native_target_outputs_does_not_prune_when_write_fails() {
     let dir = unique_test_dir("uc-native-write-before-prune");
     let target_dir = dir.join("target/dev");
     fs::create_dir_all(&target_dir).expect("failed to create target directory");
@@ -10943,7 +11110,8 @@ fn write_native_sierra_artifact_does_not_prune_when_write_fails() {
     fs::create_dir_all(target_dir.join("demo.sierra"))
         .expect("failed to create blocking output directory");
 
-    let err = write_native_sierra_artifact(&target_dir, "demo", "demo.sierra", "fn main() {}\n")
+    let outputs = [("demo.sierra".to_string(), b"fn main() {}\n".to_vec())];
+    let err = write_native_target_outputs(&target_dir, "demo", &outputs)
         .expect_err("write should fail when the output path is a directory");
     assert!(
         format!("{err:#}").contains("failed to write native artifact demo.sierra"),
@@ -10960,6 +11128,7 @@ fn write_native_sierra_artifact_does_not_prune_when_write_fails() {
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_compile_session_build_lock_is_per_key_and_released_when_idle() {
+    let _env = crate::test_env_shared();
     let key = format!("workspace-{}", epoch_ms_u64().unwrap_or_default());
     let other_key = format!("{key}-other");
     {
@@ -11037,6 +11206,8 @@ fn native_test_compile_session_signature(
                 sierra: true,
                 casm: true,
             },
+            lib_target: None,
+            contract_target: true,
             manifest_content_hash: manifest_hash.to_string(),
             external_non_starknet_dependencies: vec!["serde".to_string()],
             path_dependency_roots: vec![NativePathDependencyRoot {
@@ -11048,6 +11219,7 @@ fn native_test_compile_session_signature(
                 cairo_edition: Some("2024_07".to_string()),
                 dependencies: vec!["starknet".to_string()],
             }],
+            toolchain_compat: false,
         },
     }
 }
@@ -11055,6 +11227,7 @@ fn native_test_compile_session_signature(
 #[cfg(all(feature = "native-compile", not(feature = "helper-cairo-214")))]
 #[test]
 fn native_compile_session_signature_hash_changes_when_unused_import_diagnostics_toggle_changes() {
+    let _env = crate::test_env_shared();
     let dir = unique_test_dir("uc-native-signature-unused-import-toggle");
     let mut signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
     let with_skip = native_compile_session_signature_hash(&signature);
@@ -11099,6 +11272,7 @@ fn write_native_tracked_source_fixtures(
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_compile_session_image_round_trip_restores_tracked_sources_and_dependency_index() {
+    let _env = crate::test_env_shared();
     let dir = unique_test_dir("uc-native-session-image-roundtrip");
     let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
     let tracked_sources = write_native_tracked_source_fixtures(
@@ -11258,6 +11432,7 @@ fn native_tracked_sources_content_hash_rejects_parent_dir_escape_paths() {
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_compile_session_image_restore_rejects_signature_and_content_hash_mismatches() {
+    let _env = crate::test_env_shared();
     let dir = unique_test_dir("uc-native-session-image-invalidations");
     let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
     let tracked_sources = write_native_tracked_source_fixtures(
@@ -11325,6 +11500,7 @@ fn native_compile_session_image_restore_rejects_signature_and_content_hash_misma
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_compile_session_image_restore_normalizes_workspace_absolute_tracked_sources() {
+    let _env = crate::test_env_shared();
     let dir = unique_test_dir("uc-native-session-image-normalize-absolute");
     let signature = native_test_compile_session_signature(&dir, "manifest-blake3:absolute");
     let source_file = dir.join("src/lib.cairo");
@@ -11392,6 +11568,7 @@ fn native_compile_session_image_restore_normalizes_workspace_absolute_tracked_so
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_build_session_state_rewrites_stale_image_with_bootstrapped_contract_plans() {
+    let _env = crate::test_env_shared();
     let dir = unique_test_dir("uc-native-session-image-bootstrap-rewrite");
     let mut signature =
         native_test_compile_session_signature(&dir, "manifest-blake3:bootstrap-rewrite");
@@ -11597,6 +11774,7 @@ fn native_session_and_buildinfo_missing_verified_field_default_false() {
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_buildinfo_sidecar_round_trip_restores_tracked_sources_and_dependency_index() {
+    let _env = crate::test_env_shared();
     let dir = unique_test_dir("uc-native-buildinfo-roundtrip");
     let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
     let tracked_sources = write_native_tracked_source_fixtures(
@@ -11698,6 +11876,7 @@ fn native_buildinfo_sidecar_round_trip_restores_tracked_sources_and_dependency_i
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_buildinfo_sidecar_restore_normalizes_workspace_absolute_tracked_sources() {
+    let _env = crate::test_env_shared();
     let dir = unique_test_dir("uc-native-buildinfo-normalize-absolute");
     let signature = native_test_compile_session_signature(&dir, "manifest-blake3:absolute");
     let source_file = dir.join("src/lib.cairo");
@@ -11764,6 +11943,7 @@ fn native_buildinfo_sidecar_restore_normalizes_workspace_absolute_tracked_source
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_buildinfo_sidecar_journal_replay_seed_restores_when_pending_delta_exists() {
+    let _env = crate::test_env_shared();
     let dir = unique_test_dir("uc-native-buildinfo-journal-replay-seed");
     let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
     let tracked_sources = write_native_tracked_source_fixtures(
@@ -11826,6 +12006,7 @@ fn native_buildinfo_sidecar_journal_replay_seed_restores_when_pending_delta_exis
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_buildinfo_sidecar_journal_replay_seed_rejects_ambiguous_cursor_state() {
+    let _env = crate::test_env_shared();
     let dir = unique_test_dir("uc-native-buildinfo-journal-replay-ambiguous");
     let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
     let tracked_sources = write_native_tracked_source_fixtures(
@@ -12134,10 +12315,13 @@ mod AtomicLock {
             sierra: true,
             casm: true,
         },
+        lib_target: None,
+        contract_target: true,
         manifest_content_hash: "manifest-blake3:demo".to_string(),
         external_non_starknet_dependencies: Vec::new(),
         path_dependency_roots: Vec::new(),
         crate_dependency_configs: Vec::new(),
+        toolchain_compat: false,
     };
     let tracked_sources = BTreeMap::from([
         (
@@ -12236,10 +12420,13 @@ mod contract_b {
             sierra: true,
             casm: true,
         },
+        lib_target: None,
+        contract_target: true,
         manifest_content_hash: "manifest-blake3:pkg".to_string(),
         external_non_starknet_dependencies: Vec::new(),
         path_dependency_roots: Vec::new(),
         crate_dependency_configs: Vec::new(),
+        toolchain_compat: false,
     };
     let tracked_sources = BTreeMap::from([(
         "src/lib.cairo".to_string(),
@@ -12389,6 +12576,7 @@ fn native_resolve_contracts_from_output_plans_rejects_missing_modules() {
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_crate_cache_restore_injects_cached_blob_for_matching_signature() {
+    let _env = crate::test_env_shared();
     let dir = unique_test_dir("uc-native-crate-cache-restore");
     let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
     let signature_hash = native_compile_session_signature_hash(&signature);
@@ -12447,6 +12635,7 @@ fn native_crate_cache_restore_injects_cached_blob_for_matching_signature() {
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_crate_cache_restore_rejects_signature_mismatch() {
+    let _env = crate::test_env_shared();
     let dir = unique_test_dir("uc-native-crate-cache-signature-mismatch");
     let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
     let signature_hash = native_compile_session_signature_hash(&signature);
@@ -12505,6 +12694,7 @@ fn native_crate_cache_restore_rejects_signature_mismatch() {
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_crate_cache_restore_preserves_existing_config_fields() {
+    let _env = crate::test_env_shared();
     let dir = unique_test_dir("uc-native-crate-cache-preserve-config");
     let signature = native_test_compile_session_signature(&dir, "manifest-blake3:demo");
     let signature_hash = native_compile_session_signature_hash(&signature);
@@ -12653,6 +12843,42 @@ fn native_prune_crate_cache_files_removes_blob_metadata_companions() {
     );
 
     fs::remove_dir_all(&workspace).ok();
+}
+
+/// The embedded corelib must be Cairo 2.18.0's, packed from `third_party/corelib` by
+/// `scripts/pack_embedded_corelib.py`. From 2026-10-25 to 2026-10-28 macro-expanded dispatcher
+/// code sat in `starknet/account.cairo` and shipped in the binary unnoticed; the pin makes such an
+/// edit fail here. On a Cairo upgrade, repack from the release's corelib and update the digest.
+#[cfg(feature = "native-compile")]
+#[test]
+fn embedded_corelib_is_the_pinned_cairo_release() {
+    use sha2::{Digest, Sha256};
+    assert_eq!(
+        hex::encode(Sha256::digest(UC_EMBEDDED_CORELIB_PACK)),
+        "c2a016c16cd46d0ef8447b670c3d7ac8363d955596d2957d353ccbc43000c3cf",
+        "the embedded corelib changed; it must stay byte-identical to the Cairo release's corelib"
+    );
+}
+
+#[cfg(feature = "native-compile")]
+#[test]
+fn best_effort_journal_writes_never_recreate_a_deleted_cache() {
+    let dir = unique_test_dir("uc-native-source-journal-deleted-cache");
+    let state = NativeSourceChangeJournal {
+        changed_files: BTreeSet::from(["src/lib.cairo".to_string()]),
+        removed_files: BTreeSet::new(),
+        overflowed: false,
+        cursor: 3,
+        applied_cursor: 3,
+    };
+    persist_native_source_change_journal(&dir, &state).expect("journal persists");
+    fs::remove_dir_all(dir.join(".uc")).expect("delete the cache like a workspace cleanup");
+    persist_native_source_change_journal_best_effort(&dir, &state);
+    assert!(
+        !dir.join(".uc").exists(),
+        "a best-effort journal write must not recreate .uc in a deleted workspace"
+    );
+    fs::remove_dir_all(&dir).ok();
 }
 
 #[cfg(feature = "native-compile")]
@@ -12901,7 +13127,7 @@ fn native_commit_source_journal_delta_keeps_newer_events_when_apply_cursor_is_st
 #[test]
 fn with_native_compile_session_recomputes_content_hash_after_daemon_journal_delta() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-native-session-journal-hash-refresh");
     let source_file = dir.join("src/lib.cairo");
@@ -13187,63 +13413,6 @@ fn native_impacted_source_index_requires_complete_dependency_index_for_unmatched
 
 #[cfg(feature = "native-compile")]
 #[test]
-fn native_filter_changed_files_to_contract_source_index_skips_unrelated_sources_when_complete() {
-    let by_source = HashMap::from([
-        ("src/contract_a.cairo".to_string(), vec![0_usize]),
-        ("src/shared.cairo".to_string(), vec![0_usize, 1_usize]),
-        ("src/contract_b.cairo".to_string(), vec![1_usize]),
-    ]);
-    let (changed, removed) = native_filter_changed_files_to_contract_source_index(
-        &[
-            "src/contract_a.cairo".to_string(),
-            "src/unrelated_math.cairo".to_string(),
-        ],
-        &[
-            "src/unknown_removed.cairo".to_string(),
-            "src/contract_b.cairo".to_string(),
-        ],
-        &by_source,
-        true,
-    );
-    assert_eq!(
-        changed,
-        vec!["src/contract_a.cairo".to_string()],
-        "complete dependency index should scope changed-file overrides to tracked sources only"
-    );
-    assert_eq!(
-        removed,
-        vec!["src/contract_b.cairo".to_string()],
-        "complete dependency index should scope removed-file overrides to tracked sources only"
-    );
-}
-
-#[cfg(feature = "native-compile")]
-#[test]
-fn native_filter_changed_files_to_contract_source_index_keeps_full_set_when_incomplete() {
-    let by_source = HashMap::from([("src/contract_a.cairo".to_string(), vec![0_usize])]);
-    let changed_input = vec![
-        "src/contract_a.cairo".to_string(),
-        "src/untracked.cairo".to_string(),
-    ];
-    let removed_input = vec!["src/removed_untracked.cairo".to_string()];
-    let (changed, removed) = native_filter_changed_files_to_contract_source_index(
-        &changed_input,
-        &removed_input,
-        &by_source,
-        false,
-    );
-    assert_eq!(
-        changed, changed_input,
-        "incomplete dependency indexes must keep conservative changed-file coverage"
-    );
-    assert_eq!(
-        removed, removed_input,
-        "incomplete dependency indexes must keep conservative removed-file coverage"
-    );
-}
-
-#[cfg(feature = "native-compile")]
-#[test]
 fn native_contract_source_index_for_module_paths_tracks_per_source_indices_and_completeness() {
     let module_paths = vec!["pkg::a".to_string(), "pkg::b".to_string()];
     let dependencies = BTreeMap::from([(
@@ -13420,6 +13589,7 @@ fn native_prune_contract_source_dependencies_for_output_plans_drops_stale_module
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_compile_batch_ranges_default_to_single_batch() {
+    let _env = crate::test_env_shared();
     assert_eq!(
         native_compile_batch_ranges(0, 0),
         Vec::<(usize, usize)>::new()
@@ -13431,6 +13601,7 @@ fn native_compile_batch_ranges_default_to_single_batch() {
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_compile_batch_ranges_split_selected_contracts() {
+    let _env = crate::test_env_shared();
     assert_eq!(
         native_compile_batch_ranges(5, 2),
         vec![(0, 2), (2, 4), (4, 5)]
@@ -13445,7 +13616,7 @@ fn native_compile_batch_ranges_split_selected_contracts() {
 #[test]
 fn native_run_contract_compile_batches_emits_progress_for_every_batch() {
     let integration_guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (messages, _hook_restore) = capture_native_progress_messages(integration_guard);
     let plans = (0..5)
@@ -13506,7 +13677,7 @@ fn native_run_contract_compile_batches_emits_progress_for_every_batch() {
 #[test]
 fn native_run_contract_compile_batches_emits_in_flight_progress_before_batch_finish() {
     let integration_guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (messages, _hook_restore) = capture_native_progress_messages(integration_guard);
     let plans = (0..3)
@@ -13569,7 +13740,7 @@ fn native_run_contract_compile_batches_emits_in_flight_progress_before_batch_fin
 #[test]
 fn load_native_progress_compile_batch_size_reads_documented_env_var() {
     let guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _unset_legacy = ScopedEnvVar::unset_with_lock(&guard, "UC_NATIVE_COMPILE_BATCH_SIZE");
     let _batch_size =
@@ -13586,7 +13757,7 @@ fn load_native_progress_compile_batch_size_reads_documented_env_var() {
 #[test]
 fn load_native_progress_compile_batch_size_ignores_undocumented_legacy_env_var() {
     let guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _unset_documented =
         ScopedEnvVar::unset_with_lock(&guard, "UC_NATIVE_PROGRESS_COMPILE_BATCH_SIZE");
@@ -13883,40 +14054,6 @@ fn native_apply_file_keyed_session_updates_batches_changed_and_removed_files() {
     );
 
     fs::remove_dir_all(&workspace).ok();
-}
-
-#[cfg(feature = "native-compile")]
-#[test]
-fn native_filter_changed_files_to_contract_source_index_keeps_absolute_paths_conservative() {
-    let by_source = HashMap::from([("src/contract_a.cairo".to_string(), vec![0])]);
-    let changed_files = vec![unique_platform_absolute_fixture_path(
-        "uc-native-index-external-dep",
-    )];
-
-    let (scoped_changed, scoped_removed) =
-        native_filter_changed_files_to_contract_source_index(&changed_files, &[], &by_source, true);
-    assert_eq!(
-        scoped_changed, changed_files,
-        "absolute tracked-source edits should not be filtered into an apparently safe no-op set"
-    );
-    assert!(
-        scoped_removed.is_empty(),
-        "no removed files were provided for the conservative absolute-path case"
-    );
-
-    let removed_files = vec![unique_platform_absolute_fixture_path(
-        "uc-native-index-external-removed",
-    )];
-    let (scoped_changed, scoped_removed) =
-        native_filter_changed_files_to_contract_source_index(&[], &removed_files, &by_source, true);
-    assert!(
-        scoped_changed.is_empty(),
-        "no changed files were provided for the conservative removed-file case"
-    );
-    assert_eq!(
-        scoped_removed, removed_files,
-        "absolute removed tracked-source edits should not be filtered into an apparently safe no-op set"
-    );
 }
 
 #[cfg(feature = "native-compile")]
@@ -14296,6 +14433,7 @@ fn native_collect_tracked_sources_with_source_root_mtime_matches_individual_scan
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_has_persisted_session_state_hints_detects_session_image_and_buildinfo() {
+    let _env = crate::test_env_shared();
     let dir = unique_test_dir("uc-native-session-state-hints");
     fs::create_dir_all(&dir).expect("failed to create workspace root");
 
@@ -14404,6 +14542,7 @@ fn native_collect_tracked_sources_accepts_external_dependency_roots() {
 #[cfg(feature = "native-compile")]
 #[test]
 fn native_compile_source_roots_include_main_and_dependency_roots_without_duplicates() {
+    let _env = crate::test_env_shared();
     let workspace_root = PathBuf::from("/tmp/uc-native-source-roots");
     let duplicate_dep_root = workspace_root.join("deps/shared/src");
     let context = NativeCompileContext {
@@ -14417,6 +14556,8 @@ fn native_compile_source_roots_include_main_and_dependency_roots_without_duplica
             sierra: true,
             casm: true,
         },
+        lib_target: None,
+        contract_target: true,
         manifest_content_hash: "manifest-blake3:demo".to_string(),
         external_non_starknet_dependencies: Vec::new(),
         path_dependency_roots: vec![
@@ -14430,6 +14571,7 @@ fn native_compile_source_roots_include_main_and_dependency_roots_without_duplica
             },
         ],
         crate_dependency_configs: Vec::new(),
+        toolchain_compat: false,
     };
 
     let roots = native_compile_source_roots(&context);
@@ -14843,8 +14985,10 @@ fn native_cached_noop_keep_files_requires_complete_manifest_artifacts() {
 
 #[test]
 fn native_compiler_config_sets_replace_ids_by_profile() {
-    let empty_inputs: Vec<CrateInput> = Vec::new();
-    let dev_config = native_compiler_config(&empty_inputs, "dev", true);
+    let _env = crate::test_env_shared();
+    let crates = NativeDiagnosticCrates::default();
+    let diagnostics = NativeDiagnosticsLog::default();
+    let dev_config = native_compiler_config(&crates, &diagnostics, "dev", true);
     assert!(
         dev_config.add_statements_code_locations,
         "statement-location annotations should be enabled by default to support impacted-unit compile"
@@ -14853,7 +14997,7 @@ fn native_compiler_config_sets_replace_ids_by_profile() {
         dev_config.replace_ids,
         "dev profile should default to replace IDs"
     );
-    let release_config = native_compiler_config(&empty_inputs, "release", false);
+    let release_config = native_compiler_config(&crates, &diagnostics, "release", false);
     assert!(
         !release_config.add_statements_code_locations,
         "statement-location annotations should honor explicit compile configuration"
@@ -14916,8 +15060,8 @@ fn native_should_capture_statement_locations_with_flags_keeps_incremental_enable
 #[test]
 fn native_should_persist_crate_cache_after_build_requires_daemon_context() {
     let guard = integration_env_lock()
-        .lock()
-        .expect("failed to acquire integration env lock");
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _cache_enabled = ScopedEnvVar::set_with_lock(&guard, "UC_NATIVE_CRATE_CACHE_ENABLED", "1");
 
     assert!(
@@ -14946,8 +15090,8 @@ fn native_should_persist_crate_cache_after_build_requires_daemon_context() {
 #[test]
 fn native_should_persist_crate_cache_after_build_respects_cache_toggle() {
     let guard = integration_env_lock()
-        .lock()
-        .expect("failed to acquire integration env lock");
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _cache_disabled = ScopedEnvVar::set_with_lock(&guard, "UC_NATIVE_CRATE_CACHE_ENABLED", "0");
 
     assert!(
@@ -15049,9 +15193,9 @@ edition = "2024_07"
 
 #[test]
 fn compile_native_casm_contract_rejects_tiny_bytecode_limit() {
-    let fixture_contract = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
-        "../../benchmarks/fixtures/scarb_smoke/target/dev/uc_smoke_token.contract_class.json",
-    );
+    let _env = crate::test_env_shared();
+    let fixture_contract = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/uc_smoke_token.contract_class.json");
     let fixture_bytes = fs::read(&fixture_contract).unwrap_or_else(|err| {
         panic!(
             "failed to read starknet contract fixture {}: {err}",
@@ -15157,10 +15301,13 @@ fn mark_native_fallback_eligible_for_external_dependencies_only_marks_when_prese
             sierra: true,
             casm: true,
         },
+        lib_target: None,
+        contract_target: true,
         manifest_content_hash: "manifest-blake3:demo".to_string(),
         external_non_starknet_dependencies: Vec::new(),
         path_dependency_roots: Vec::new(),
         crate_dependency_configs: Vec::new(),
+        toolchain_compat: false,
     };
 
     let plain = mark_native_fallback_eligible_for_external_dependencies(
@@ -15192,7 +15339,7 @@ fn mark_native_fallback_eligible_for_external_dependencies_only_marks_when_prese
 #[test]
 fn ensure_native_daemon_backend_available_rejects_poisoned_state() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     set_native_daemon_backend_poisoned_for_test(false);
     mark_native_daemon_backend_poisoned();
@@ -15208,7 +15355,7 @@ fn ensure_native_daemon_backend_available_rejects_poisoned_state() {
 #[test]
 fn resolve_native_corelib_src_prefers_explicit_env_override() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-native-corelib-env-override");
     let workspace_root = dir.join("workspace");
@@ -15248,7 +15395,7 @@ fn resolve_native_corelib_src_prefers_explicit_env_override() {
 #[test]
 fn resolve_native_corelib_src_rejects_incompatible_env_override() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-native-corelib-bad-override");
     let workspace_root = dir.join("workspace");
@@ -15282,7 +15429,7 @@ fn resolve_native_corelib_src_rejects_incompatible_env_override() {
 #[test]
 fn resolve_native_corelib_src_skips_incompatible_home_and_uses_workspace_sibling() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-native-corelib-fallback");
     let workspace_root = dir.join("workspace");
@@ -15320,7 +15467,7 @@ fn resolve_native_corelib_src_skips_incompatible_home_and_uses_workspace_sibling
 #[test]
 fn resolve_native_corelib_src_skips_version_mismatched_home_candidate() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-native-corelib-version-mismatch");
     let workspace_root = dir.join("workspace");
@@ -15357,7 +15504,7 @@ fn resolve_native_corelib_src_skips_version_mismatched_home_candidate() {
 #[test]
 fn resolve_native_corelib_src_uses_versioned_scarb_cache_candidate() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = unique_test_dir("uc-native-corelib-scarb-cache");
     let workspace_root = dir.join("workspace");
@@ -15414,8 +15561,6 @@ fn hot_fingerprint_reuses_digest_when_tracked_metadata_is_unchanged() {
     fs::write(&source, b"fn main() -> felt252 { 1 }").expect("failed to write source file");
 
     let source_metadata = fs::metadata(&source).expect("failed to stat source");
-    let src_dir_metadata = fs::metadata(&src_dir).expect("failed to stat src dir");
-    let root_metadata = fs::metadata(&dir).expect("failed to stat workspace");
 
     let mut entries = BTreeMap::new();
     entries.insert(
@@ -15427,15 +15572,11 @@ fn hot_fingerprint_reuses_digest_when_tracked_metadata_is_unchanged() {
             blake3_hex: "abc123".to_string(),
         },
     );
-    let mut directories = BTreeMap::new();
-    directories.insert(
-        ".".to_string(),
-        metadata_modified_unix_ms(&root_metadata).expect("failed to read workspace mtime"),
-    );
-    directories.insert(
-        "src".to_string(),
-        metadata_modified_unix_ms(&src_dir_metadata).expect("failed to read src dir mtime"),
-    );
+    let directories = snapshot_tracked_fingerprint_directories(
+        &dir,
+        &BTreeSet::from([".".to_string(), "src".to_string()]),
+    )
+    .expect("failed to snapshot tracked directories");
 
     let index = FingerprintIndex {
         schema_version: FINGERPRINT_INDEX_SCHEMA_VERSION,
@@ -15459,8 +15600,6 @@ fn hot_fingerprint_invalidates_when_tracked_directory_mtime_changes() {
     fs::write(&source, b"fn main() -> felt252 { 1 }").expect("failed to write source file");
 
     let source_metadata = fs::metadata(&source).expect("failed to stat source");
-    let src_dir_metadata = fs::metadata(&src_dir).expect("failed to stat src dir");
-    let root_metadata = fs::metadata(&dir).expect("failed to stat workspace");
 
     let mut entries = BTreeMap::new();
     entries.insert(
@@ -15472,15 +15611,11 @@ fn hot_fingerprint_invalidates_when_tracked_directory_mtime_changes() {
             blake3_hex: "abc123".to_string(),
         },
     );
-    let mut directories = BTreeMap::new();
-    directories.insert(
-        ".".to_string(),
-        metadata_modified_unix_ms(&root_metadata).expect("failed to read workspace mtime"),
-    );
-    directories.insert(
-        "src".to_string(),
-        metadata_modified_unix_ms(&src_dir_metadata).expect("failed to read src dir mtime"),
-    );
+    let directories = snapshot_tracked_fingerprint_directories(
+        &dir,
+        &BTreeSet::from([".".to_string(), "src".to_string()]),
+    )
+    .expect("failed to snapshot tracked directories");
 
     let index = FingerprintIndex {
         schema_version: FINGERPRINT_INDEX_SCHEMA_VERSION,
@@ -15497,6 +15632,190 @@ fn hot_fingerprint_invalidates_when_tracked_directory_mtime_changes() {
     let reused = try_reuse_hot_fingerprint(&dir, &index, "ctx", u64::MAX, 0)
         .expect("hot-path check should succeed");
     assert!(reused.is_none());
+    fs::remove_dir_all(&dir).ok();
+}
+
+// Restoring a directory mtime needs an fd on the directory, which `File::open`
+// only provides on Unix. The daemon hot path is Unix-only anyway.
+#[cfg(unix)]
+#[test]
+fn hot_fingerprint_invalidates_when_file_added_with_preserved_directory_mtime() {
+    // Regression for #76.3: `tar -p` / `rsync --times` restore directory mtimes, so a
+    // newly added source file is invisible to both the directory mtime check and the
+    // per-file entry check (a new file has no entry). Only the child-name digest
+    // catches it.
+    let dir = unique_test_dir("uc-hot-fingerprint-preserved-mtime");
+    let src_dir = dir.join("src");
+    fs::create_dir_all(&src_dir).expect("failed to create src dir");
+    let source = src_dir.join("lib.cairo");
+    fs::write(&source, b"fn main() -> felt252 { 1 }").expect("failed to write source file");
+
+    let source_metadata = fs::metadata(&source).expect("failed to stat source");
+    let src_dir_metadata = fs::metadata(&src_dir).expect("failed to stat src dir");
+    let preserved_src_mtime = src_dir_metadata
+        .modified()
+        .expect("failed to read src dir mtime");
+
+    let mut entries = BTreeMap::new();
+    entries.insert(
+        "src/lib.cairo".to_string(),
+        FingerprintIndexEntry {
+            size_bytes: source_metadata.len(),
+            modified_unix_ms: metadata_modified_unix_ms(&source_metadata)
+                .expect("failed to read source mtime"),
+            blake3_hex: "abc123".to_string(),
+        },
+    );
+    let directories = snapshot_tracked_fingerprint_directories(
+        &dir,
+        &BTreeSet::from([".".to_string(), "src".to_string()]),
+    )
+    .expect("failed to snapshot tracked directories");
+
+    let index = FingerprintIndex {
+        schema_version: FINGERPRINT_INDEX_SCHEMA_VERSION,
+        entries,
+        directories,
+        context_digest: Some("ctx".to_string()),
+        last_fingerprint: Some("fp-hot-hit".to_string()),
+    };
+
+    // Sanity check: without any change the hot path reuses.
+    assert_eq!(
+        try_reuse_hot_fingerprint(&dir, &index, "ctx", u64::MAX, 0)
+            .expect("hot-path check should succeed"),
+        Some("fp-hot-hit".to_string())
+    );
+
+    fs::write(src_dir.join("added.cairo"), b"fn extra() -> felt252 { 2 }")
+        .expect("failed to add new source");
+    // Restore the directory mtime the way an archive extraction would.
+    let src_dir_handle = fs::File::open(&src_dir).expect("failed to open src dir");
+    src_dir_handle
+        .set_times(fs::FileTimes::new().set_modified(preserved_src_mtime))
+        .expect("failed to restore src dir mtime");
+
+    let reused = try_reuse_hot_fingerprint(&dir, &index, "ctx", u64::MAX, 0)
+        .expect("hot-path check should succeed");
+    assert!(
+        reused.is_none(),
+        "a source file added under a preserved directory mtime must invalidate the hot path"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn toolchain_helper_binary_is_built_requires_executable_file() {
+    // Regression for #76.4: `support native` reported a helper binary_path without
+    // checking the host actually has it, so agents saw "supported" and then watched
+    // the build downgrade to scarb.
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = unique_test_dir("uc-helper-built-probe");
+    fs::create_dir_all(&dir).expect("failed to create probe dir");
+
+    assert!(
+        !native_toolchain_helper_binary_is_built(None),
+        "absent path is not built"
+    );
+    let missing = dir.join("nope");
+    assert!(
+        !native_toolchain_helper_binary_is_built(Some(&missing.display().to_string())),
+        "missing file is not built"
+    );
+    assert!(
+        !native_toolchain_helper_binary_is_built(Some(&dir.display().to_string())),
+        "a directory is not a helper binary"
+    );
+
+    let not_executable = dir.join("helper-noexec");
+    fs::write(&not_executable, b"#!/bin/sh\n").expect("failed to write helper");
+    fs::set_permissions(&not_executable, fs::Permissions::from_mode(0o644))
+        .expect("failed to set permissions");
+    assert!(
+        !native_toolchain_helper_binary_is_built(Some(&not_executable.display().to_string())),
+        "a non-executable file is not a usable helper"
+    );
+
+    let executable = dir.join("helper-ok");
+    fs::write(&executable, b"#!/bin/sh\n").expect("failed to write helper");
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+        .expect("failed to set permissions");
+    assert!(
+        native_toolchain_helper_binary_is_built(Some(&executable.display().to_string())),
+        "an executable file is a usable helper"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fingerprint_includes_uppercase_cairo_extension() {
+    // Regression for #76.2: selection used an exact "cairo" match while the hasher
+    // accepted any case, so `Foo.CAIRO` was compiled by scarb but never fingerprinted.
+    assert!(should_include_fingerprint_file(Path::new("src/Foo.CAIRO")));
+    assert!(should_include_fingerprint_file(Path::new("src/foo.Cairo")));
+    assert!(should_include_fingerprint_file(Path::new("src/foo.cairo")));
+    assert!(!should_include_fingerprint_file(Path::new("src/foo.rs")));
+}
+
+#[test]
+fn fingerprint_collection_fails_loudly_past_depth_cap() {
+    // Regression for #76.1: exceeding MAX_FINGERPRINT_DEPTH silently dropped files
+    // from the fingerprint, which is a false-cache-hit bug. It must bail like the
+    // file-count and byte budgets do.
+    let dir = unique_test_dir("uc-fingerprint-depth-cap");
+    let mut deep = dir.clone();
+    for level in 0..(MAX_FINGERPRINT_DEPTH + 2) {
+        deep = deep.join(format!("l{level}"));
+    }
+    fs::create_dir_all(&deep).expect("failed to create deep tree");
+    fs::write(deep.join("lib.cairo"), b"fn deep() -> felt252 { 1 }")
+        .expect("failed to write deep source");
+
+    let mut files: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+    let started = Instant::now();
+    let result = collect_fingerprint_files_from_root(
+        &dir,
+        None,
+        &mut files,
+        &started,
+        Duration::from_secs(30),
+        10_000,
+    );
+    let err = result.expect_err("collection past the depth cap must fail");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("depth limit exceeded"),
+        "unexpected error: {message}"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn fingerprint_collection_allows_tree_at_depth_cap() {
+    let dir = unique_test_dir("uc-fingerprint-depth-ok");
+    let mut deep = dir.clone();
+    // One directory level below the cap leaves room for the file itself.
+    for level in 0..(MAX_FINGERPRINT_DEPTH - 1) {
+        deep = deep.join(format!("l{level}"));
+    }
+    fs::create_dir_all(&deep).expect("failed to create tree");
+    fs::write(deep.join("lib.cairo"), b"fn ok() -> felt252 { 1 }").expect("failed to write source");
+
+    let mut files: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+    let started = Instant::now();
+    collect_fingerprint_files_from_root(
+        &dir,
+        None,
+        &mut files,
+        &started,
+        Duration::from_secs(30),
+        10_000,
+    )
+    .expect("collection within the depth cap must succeed");
+    assert_eq!(files.len(), 1, "expected the single deep source file");
     fs::remove_dir_all(&dir).ok();
 }
 
@@ -15519,6 +15838,7 @@ fn strip_cairo_comments_preserves_literals() {
 
 #[test]
 fn fingerprint_ignores_cairo_comment_only_edits() {
+    let _env = crate::test_env_shared();
     let workspace = prepare_smoke_workspace("uc-fingerprint-comments");
     let manifest_path = workspace.join("Scarb.toml");
     let common = smoke_common_args(&manifest_path);
@@ -15579,10 +15899,329 @@ fn fingerprint_ignores_cairo_comment_only_edits() {
     fs::remove_dir_all(&workspace).ok();
 }
 
+fn prepare_external_path_dep_workspace(prefix: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let container = unique_test_dir(prefix);
+    let workspace = container.join("app");
+    let dep_root = container.join("dep_pkg");
+    fs::create_dir_all(workspace.join("src")).expect("failed to create app src dir");
+    fs::create_dir_all(dep_root.join("src")).expect("failed to create dep src dir");
+    fs::write(
+        workspace.join("Scarb.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n\n[dependencies]\ndep_pkg = { path = \"../dep_pkg\" }\n",
+    )
+    .expect("failed to write app manifest");
+    fs::write(
+        workspace.join("src/lib.cairo"),
+        "pub fn use_dep() -> felt252 { dep_pkg::answer() }\n",
+    )
+    .expect("failed to write app source");
+    fs::write(
+        dep_root.join("Scarb.toml"),
+        "[package]\nname = \"dep_pkg\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n",
+    )
+    .expect("failed to write dep manifest");
+    fs::write(
+        dep_root.join("src/lib.cairo"),
+        "pub fn answer() -> felt252 { 42 }\n",
+    )
+    .expect("failed to write dep source");
+    (container, workspace, dep_root)
+}
+
+#[test]
+fn fingerprint_changes_when_external_path_dep_source_changes() {
+    let _env = crate::test_env_shared();
+    let (container, workspace, dep_root) =
+        prepare_external_path_dep_workspace("uc-fingerprint-path-dep-edit");
+    let manifest_path = workspace.join("Scarb.toml");
+    let common = smoke_common_args(&manifest_path);
+    let profile = effective_profile(&common);
+
+    let baseline = compute_build_fingerprint_with_scarb_version(
+        &workspace,
+        &manifest_path,
+        &common,
+        &profile,
+        None,
+        "scarb 2.14.0 (test)",
+    )
+    .expect("failed to compute baseline fingerprint");
+
+    fs::write(
+        dep_root.join("src/lib.cairo"),
+        "pub fn answer() -> felt252 { 43 }\n",
+    )
+    .expect("failed to edit dep source");
+
+    let after_dep_edit = compute_build_fingerprint_with_scarb_version(
+        &workspace,
+        &manifest_path,
+        &common,
+        &profile,
+        None,
+        "scarb 2.14.0 (test)",
+    )
+    .expect("failed to compute post-edit fingerprint");
+    assert_ne!(
+        baseline, after_dep_edit,
+        "editing an external path dependency source must change the build fingerprint"
+    );
+
+    fs::write(
+        dep_root.join("src/lib.cairo"),
+        "pub fn answer() -> felt252 { 43 }\n// comment-only dep change\n",
+    )
+    .expect("failed to append dep comment");
+    let after_dep_comment = compute_build_fingerprint_with_scarb_version(
+        &workspace,
+        &manifest_path,
+        &common,
+        &profile,
+        None,
+        "scarb 2.14.0 (test)",
+    )
+    .expect("failed to compute comment fingerprint");
+    assert_eq!(
+        after_dep_edit, after_dep_comment,
+        "comment-only external dep edits should keep the semantic fingerprint stable"
+    );
+
+    fs::remove_dir_all(&container).ok();
+}
+
+#[test]
+fn fingerprint_changes_when_external_path_dep_adds_source_file() {
+    let _env = crate::test_env_shared();
+    let (container, workspace, dep_root) =
+        prepare_external_path_dep_workspace("uc-fingerprint-path-dep-add");
+    let manifest_path = workspace.join("Scarb.toml");
+    let common = smoke_common_args(&manifest_path);
+    let profile = effective_profile(&common);
+
+    let baseline = compute_build_fingerprint_with_scarb_version(
+        &workspace,
+        &manifest_path,
+        &common,
+        &profile,
+        None,
+        "scarb 2.14.0 (test)",
+    )
+    .expect("failed to compute baseline fingerprint");
+
+    fs::write(
+        dep_root.join("src/extra.cairo"),
+        "pub fn extra() -> felt252 { 7 }\n",
+    )
+    .expect("failed to add dep source file");
+
+    let after_new_file = compute_build_fingerprint_with_scarb_version(
+        &workspace,
+        &manifest_path,
+        &common,
+        &profile,
+        None,
+        "scarb 2.14.0 (test)",
+    )
+    .expect("failed to compute post-add fingerprint");
+    assert_ne!(
+        baseline, after_new_file,
+        "adding a source file to an external path dependency must change the build fingerprint"
+    );
+
+    fs::remove_dir_all(&container).ok();
+}
+
+#[test]
+fn fingerprint_tracks_transitive_external_path_deps() {
+    let _env = crate::test_env_shared();
+    let (container, workspace, dep_root) =
+        prepare_external_path_dep_workspace("uc-fingerprint-path-dep-transitive");
+    let inner_root = container.join("dep_inner");
+    fs::create_dir_all(inner_root.join("src")).expect("failed to create inner src dir");
+    fs::write(
+        inner_root.join("Scarb.toml"),
+        "[package]\nname = \"dep_inner\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n",
+    )
+    .expect("failed to write inner manifest");
+    fs::write(
+        inner_root.join("src/lib.cairo"),
+        "pub fn inner() -> felt252 { 1 }\n",
+    )
+    .expect("failed to write inner source");
+    fs::write(
+        dep_root.join("Scarb.toml"),
+        "[package]\nname = \"dep_pkg\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n\n[dependencies]\ndep_inner = { path = \"../dep_inner\" }\n",
+    )
+    .expect("failed to rewrite dep manifest with transitive path dep");
+
+    let manifest_path = workspace.join("Scarb.toml");
+    let common = smoke_common_args(&manifest_path);
+    let profile = effective_profile(&common);
+
+    let baseline = compute_build_fingerprint_with_scarb_version(
+        &workspace,
+        &manifest_path,
+        &common,
+        &profile,
+        None,
+        "scarb 2.14.0 (test)",
+    )
+    .expect("failed to compute baseline fingerprint");
+
+    fs::write(
+        inner_root.join("src/lib.cairo"),
+        "pub fn inner() -> felt252 { 2 }\n",
+    )
+    .expect("failed to edit inner source");
+
+    let after_inner_edit = compute_build_fingerprint_with_scarb_version(
+        &workspace,
+        &manifest_path,
+        &common,
+        &profile,
+        None,
+        "scarb 2.14.0 (test)",
+    )
+    .expect("failed to compute post-edit fingerprint");
+    assert_ne!(
+        baseline, after_inner_edit,
+        "editing a transitive external path dependency must change the build fingerprint"
+    );
+
+    fs::remove_dir_all(&container).ok();
+}
+
+#[test]
+fn collect_external_path_dependency_roots_skips_in_root_and_missing_paths() {
+    let (container, workspace, dep_root) =
+        prepare_external_path_dep_workspace("uc-fingerprint-path-dep-roots");
+    fs::create_dir_all(workspace.join("member/src")).expect("failed to create member dir");
+    fs::write(
+        workspace.join("member/Scarb.toml"),
+        "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n",
+    )
+    .expect("failed to write member manifest");
+    fs::write(
+        workspace.join("Scarb.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n\n[dependencies]\ndep_pkg = { path = \"../dep_pkg\" }\nmember = { path = \"member\" }\nmissing = { path = \"../does-not-exist\" }\n",
+    )
+    .expect("failed to rewrite app manifest");
+
+    let canonical_workspace = workspace
+        .canonicalize()
+        .expect("failed to canonicalize workspace");
+    let roots = collect_external_path_dependency_roots(
+        &canonical_workspace,
+        &[workspace.join("Scarb.toml")],
+    )
+    .expect("collecting external roots should succeed");
+    let canonical_dep = dep_root
+        .canonicalize()
+        .expect("failed to canonicalize dep root");
+    assert_eq!(
+        roots,
+        vec![canonical_dep],
+        "only existing roots outside the workspace should be collected"
+    );
+
+    fs::remove_dir_all(&container).ok();
+}
+
+#[test]
+fn fingerprint_tolerates_unparseable_stray_manifest_but_fails_on_unreadable() {
+    let _env = crate::test_env_shared();
+    let (container, workspace, _dep_root) =
+        prepare_external_path_dep_workspace("uc-fingerprint-path-dep-badtoml");
+    fs::create_dir_all(workspace.join("fixtures")).expect("failed to create fixtures dir");
+    fs::write(
+        workspace.join("fixtures/Scarb.toml"),
+        "this is [ not valid toml",
+    )
+    .expect("failed to write broken fixture manifest");
+
+    let manifest_path = workspace.join("Scarb.toml");
+    let common = smoke_common_args(&manifest_path);
+    let profile = effective_profile(&common);
+    compute_build_fingerprint_with_scarb_version(
+        &workspace,
+        &manifest_path,
+        &common,
+        &profile,
+        None,
+        "scarb 2.14.0 (test)",
+    )
+    .expect("a stray unparseable manifest must not fail fingerprinting");
+
+    let unreadable = manifest_path_dependency_dirs(Path::new(
+        container.join("does-not-exist/Scarb.toml").as_path(),
+    ));
+    assert!(
+        unreadable.is_err(),
+        "unreadable manifests must propagate an error instead of being treated as dependency-free"
+    );
+
+    fs::remove_dir_all(&container).ok();
+}
+
+#[test]
+fn hot_fingerprint_invalidates_when_external_dep_dir_gains_file() {
+    let _env = crate::test_env_shared();
+    let (container, workspace, dep_root) =
+        prepare_external_path_dep_workspace("uc-hot-fingerprint-external-add");
+    let manifest_path = workspace.join("Scarb.toml");
+    let common = smoke_common_args(&manifest_path);
+    let profile = effective_profile(&common);
+    let cache_root = workspace.join(".uc/cache");
+
+    let baseline = compute_build_fingerprint_with_scarb_version(
+        &workspace,
+        &manifest_path,
+        &common,
+        &profile,
+        Some(&cache_root),
+        "scarb 2.14.0 (test)",
+    )
+    .expect("failed to compute baseline fingerprint");
+
+    let index = load_fingerprint_index(&cache_root.join("fingerprint/index-v1.json"))
+        .expect("failed to load fingerprint index");
+    let dep_src_key = normalize_fingerprint_path(
+        &dep_root
+            .join("src")
+            .canonicalize()
+            .expect("failed to canonicalize dep src"),
+    );
+    assert!(
+        index.directories.contains_key(&dep_src_key),
+        "external dep src directory should be tracked in the fingerprint index"
+    );
+    assert_eq!(index.last_fingerprint.as_deref(), Some(baseline.as_str()));
+
+    thread::sleep(Duration::from_millis(20));
+    fs::write(
+        dep_root.join("src/new.cairo"),
+        "pub fn extra() -> felt252 { 9 }\n",
+    )
+    .expect("failed to add dep source file");
+
+    let context_digest = index
+        .context_digest
+        .clone()
+        .expect("index should record a context digest");
+    let reused = try_reuse_hot_fingerprint(&workspace, &index, &context_digest, u64::MAX, 0)
+        .expect("hot-path check should succeed");
+    assert!(
+        reused.is_none(),
+        "a new file in an external dep directory must invalidate the hot fingerprint"
+    );
+
+    fs::remove_dir_all(&container).ok();
+}
+
 #[test]
 fn async_persist_error_queue_retains_multiple_failures() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _ = take_async_persist_errors();
     record_async_persist_error("err-a".to_string());
@@ -15598,7 +16237,7 @@ fn async_persist_error_queue_retains_multiple_failures() {
 #[test]
 fn async_persist_error_queue_drops_oldest_when_over_capacity() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _ = take_async_persist_errors();
     let overflow = ASYNC_PERSIST_ERROR_QUEUE_LIMIT + 3;
@@ -15639,7 +16278,7 @@ fn async_persist_error_log_rotation_rolls_when_threshold_exceeded() {
 #[test]
 fn compute_build_fingerprint_changes_when_scarb_version_changes() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let workspace = prepare_smoke_workspace("uc-fingerprint-version");
     let manifest_path = workspace.join("Scarb.toml");
@@ -15672,7 +16311,7 @@ fn compute_build_fingerprint_changes_when_scarb_version_changes() {
 #[test]
 fn compute_build_fingerprint_is_path_portable_across_workspace_clones() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let workspace_a = prepare_smoke_workspace("uc-fingerprint-clone-a");
     let workspace_b = prepare_smoke_workspace("uc-fingerprint-clone-b");
@@ -15711,7 +16350,7 @@ fn compute_build_fingerprint_is_path_portable_across_workspace_clones() {
 #[test]
 fn run_build_with_uc_cache_hits_after_initial_compile() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if !scarb_available() {
         return;
@@ -15743,7 +16382,7 @@ fn run_build_with_uc_cache_hits_after_initial_compile() {
 #[test]
 fn run_build_with_uc_cache_recovers_from_corrupted_entry() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if !scarb_available() {
         return;
@@ -15776,7 +16415,7 @@ fn run_build_with_uc_cache_recovers_from_corrupted_entry() {
 #[test]
 fn run_build_with_uc_cache_allows_concurrent_builds() {
     let _guard = integration_env_lock()
-        .lock()
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if !scarb_available() {
         return;
@@ -15870,4 +16509,314 @@ mode = "safe"
     assert_ne!(cfg_a, cfg_b);
 
     fs::remove_dir_all(&dir).ok();
+}
+
+
+#[test]
+fn pythonic_json_uses_python_separators_and_ascii_escapes() {
+    let v = serde_json::json!([{"type": "function", "name": "f", "inputs": [], "note": "caf\u{e9}"}]);
+    // serde_json's default map sorts keys; the class hash path serializes the typed ABI, which
+    // keeps declaration order. Here only the separators and escapes are under test.
+    let s = pythonic_json_string(&v);
+    assert!(s.starts_with("[{\"inputs\": [], \"name\": \"f\", "), "{s}");
+    assert!(s.contains("\"note\": \"caf\\u00e9\""), "{s}");
+    assert!(!s.contains('\n'));
+    assert_eq!(pythonic_json_string(&serde_json::json!({"a": [1, 2]})), "{\"a\": [1, 2]}");
+}
+
+#[test]
+#[cfg(feature = "native-compile")]
+fn class_hash_matches_the_network_for_a_cairo_2_18_contract() {
+    let _env = crate::test_env_shared();
+    // Class hash attested by starknet-devnet 0.10.1 and sncast 0.60 when this exact source was
+    // declared (the network commits to the ABI in Python's JSON form; uc used to hash a
+    // pretty-printed ABI and got 0x6aede13e...a791 instead).
+    let root = std::env::temp_dir().join(format!("uc-classhash-golden-{}-{}", std::process::id(), epoch_ms_u64().unwrap_or(1)));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("Scarb.toml"), "[package]\nname = \"counter\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n\n[dependencies]\nstarknet = \"2.18.0\"\n\n[[target.starknet-contract]]\nsierra = true\ncasm = false\n").unwrap();
+    fs::write(root.join("src/lib.cairo"), r#"#[starknet::interface]
+pub trait ICounter<T> { fn increase(ref self: T, by: u64); fn get(self: @T) -> u64; }
+#[starknet::contract]
+pub mod Counter {
+    use starknet::storage::{StoragePointerReadAccess, StoragePointerWriteAccess};
+    #[storage]
+    struct Storage { value: u64 }
+    #[event]
+    #[derive(Drop, starknet::Event)]
+    pub enum Event { Increased: Increased }
+    #[derive(Drop, starknet::Event)]
+    pub struct Increased { pub by: u64, pub value: u64 }
+    #[constructor]
+    fn constructor(ref self: ContractState, start: u64) { self.value.write(start); }
+    #[abi(embed_v0)]
+    impl CounterImpl of super::ICounter<ContractState> {
+        fn increase(ref self: ContractState, by: u64) { let v = self.value.read() + by; self.value.write(v); self.emit(Increased { by, value: v }); }
+        fn get(self: @ContractState) -> u64 { self.value.read() }
+    }
+}
+"#).unwrap();
+    run_build(BuildArgs {
+        common: BuildCommonArgs { manifest_path: Some(root.join("Scarb.toml")), package: None, workspace: false, features: Vec::new(), offline: true, release: false, profile: Some("dev".to_string()) },
+        engine: EngineArg::Uc, daemon_mode: DaemonModeArg::Off, report_path: Some(root.join("build.json")), record_failure: None, json: false, plan_only: false,
+    }).expect("build counter");
+    let text = fs::read_to_string(root.join("target/dev/counter_Counter.contract_class.json")).unwrap();
+    let _ = fs::remove_dir_all(&root);
+    let class: ContractClass = serde_json::from_str(&text).unwrap();
+    let expected = "0x2e895de4b82503229f12daf608c7f99ac1b9933d5ce77ff57fa7832453f2391";
+    assert_eq!(compute_starknet_sierra_class_hash(&class).as_deref(), Some(expected));
+    // The same class as a node returns it (ABI as a string) hashes the same way.
+    let mut as_rpc: serde_json::Value = serde_json::from_str(&text).unwrap();
+    as_rpc["abi"] = serde_json::json!(declared_abi_string(&as_rpc));
+    assert_eq!(compute_class_hash_from_json(&as_rpc).as_deref(), Some(expected));
+}
+
+#[test]
+#[cfg(feature = "native-compile")]
+fn native_build_targets_follow_the_manifest_like_scarb() {
+    let _env = crate::test_env_shared();
+    let parse = |text: &str| -> toml::Value { toml::from_str(text).unwrap() };
+    let pkg = "[package]\nname = \"p\"\nversion = \"0.1.0\"\n";
+    let default_lib = NativeLibTargetProps { sierra: true, sierra_text: false, casm: false };
+    assert_eq!(resolve_manifest_native_build_targets(&parse(pkg)).unwrap(), (Some(default_lib), false));
+    assert_eq!(
+        resolve_manifest_native_build_targets(&parse(&format!("{pkg}[[target.starknet-contract]]\n"))).unwrap(),
+        (None, true)
+    );
+    assert_eq!(
+        resolve_manifest_native_build_targets(&parse(&format!("{pkg}[lib]\nsierra-text = true\ncasm = true\n[[target.starknet-contract]]\n"))).unwrap(),
+        (Some(NativeLibTargetProps { sierra: true, sierra_text: true, casm: true }), true)
+    );
+    assert_eq!(
+        resolve_manifest_native_build_targets(&parse(&format!("{pkg}[lib]\nsierra = false\nsierra-text = true\n"))).unwrap(),
+        (Some(NativeLibTargetProps { sierra: false, sierra_text: true, casm: false }), false)
+    );
+    assert_eq!(resolve_manifest_native_build_targets(&parse(&format!("{pkg}[executable]\n"))).unwrap(), (None, false));
+    assert!(resolve_manifest_native_build_targets(&parse(&format!("{pkg}[lib]\ncasm = \"yes\"\n"))).is_err());
+}
+
+#[test]
+#[cfg(feature = "native-compile")]
+fn contract_target_without_contracts_still_fails_on_code_errors() {
+    let _env = crate::test_env_shared();
+    // Scarb checks the crate even when the contract target finds no contract. uc used to write
+    // an empty artifacts manifest and exit 0.
+    let root = std::env::temp_dir().join(format!("uc-no-contract-error-{}-{}", std::process::id(), epoch_ms_u64().unwrap_or(1)));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("Scarb.toml"), "[package]\nname = \"broken\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n\n[dependencies]\nstarknet = \"2.18.0\"\n\n[[target.starknet-contract]]\n").unwrap();
+    fs::write(root.join("src/lib.cairo"), "fn f() -> felt252 { undefined_thing() }\n").unwrap();
+    let common = BuildCommonArgs { manifest_path: Some(root.join("Scarb.toml")), package: None, workspace: false, features: Vec::new(), offline: true, release: false, profile: Some("dev".to_string()) };
+    let (run, _, _) = run_native_build(&common, &root.join("Scarb.toml"), &root, "dev", false)
+        .expect("a code error is the build's answer, not a reason to retry with scarb");
+    let _ = fs::remove_dir_all(&root);
+    assert_eq!(run.exit_code, 1);
+    assert!(run.stderr.contains("Function not found"), "{}", run.stderr);
+    assert!(run.stderr.ends_with("error: could not compile `broken` due to 1 previous error\n"), "{}", run.stderr);
+}
+
+#[test]
+#[cfg(feature = "native-compile")]
+fn dependency_code_errors_fail_the_build_like_scarb() {
+    let _env = crate::test_env_lock();
+    // Scarb checks every crate it compiles, so an error in an unused dependency function fails
+    // the build. uc used to check only the main crate.
+    let root = std::env::temp_dir().join(format!("uc-dep-error-{}-{}", std::process::id(), epoch_ms_u64().unwrap_or(1)));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("dep/src")).unwrap();
+    fs::create_dir_all(root.join("app/src")).unwrap();
+    fs::write(root.join("dep/Scarb.toml"), "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n").unwrap();
+    fs::write(root.join("dep/src/lib.cairo"), "pub fn good() -> felt252 { 1 }\nfn unused_broken() -> felt252 { undefined_thing() }\n").unwrap();
+    fs::write(root.join("app/Scarb.toml"), "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n").unwrap();
+    fs::write(root.join("app/src/lib.cairo"), "fn main() -> felt252 { dep::good() }\n").unwrap();
+    // A path dependency lets uc retry with scarb; keep the answer uc's own.
+    std::env::set_var("UC_NATIVE_DISALLOW_SCARB_FALLBACK", "1");
+    let result = run_build(BuildArgs {
+        common: BuildCommonArgs { manifest_path: Some(root.join("app/Scarb.toml")), package: None, workspace: false, features: Vec::new(), offline: true, release: false, profile: Some("dev".to_string()) },
+        engine: EngineArg::Uc, daemon_mode: DaemonModeArg::Off, report_path: None, record_failure: None, json: false, plan_only: false,
+    });
+    std::env::remove_var("UC_NATIVE_DISALLOW_SCARB_FALLBACK");
+    let _ = fs::remove_dir_all(&root);
+    // Either uc's own failed compile or its refused retry; scarb never ran.
+    let chain = format!("{:#}", result.expect_err("a dependency error must fail the build"));
+    assert!(
+        chain.contains("build failed with exit code 1") || chain.contains("Compilation failed"),
+        "{chain}"
+    );
+}
+
+#[test]
+#[cfg(feature = "native-compile")]
+fn native_build_hands_its_warnings_to_the_caller() {
+    let _env = crate::test_env_shared();
+    // A daemon build printed warnings to the daemon's log, where nobody saw them.
+    let root = std::env::temp_dir().join(format!("uc-native-warnings-{}-{}", std::process::id(), epoch_ms_u64().unwrap_or(1)));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("Scarb.toml"), "[package]\nname = \"warns\"\nversion = \"0.1.0\"\nedition = \"2024_07\"\n").unwrap();
+    fs::write(root.join("src/lib.cairo"), "fn f() -> felt252 {\n    let unused = 5;\n    1\n}\n").unwrap();
+    let common = BuildCommonArgs { manifest_path: Some(root.join("Scarb.toml")), package: None, workspace: false, features: Vec::new(), offline: true, release: false, profile: Some("dev".to_string()) };
+    let (run, _, _) = run_native_build(&common, &root.join("Scarb.toml"), &root, "dev", false).expect("build");
+    let _ = fs::remove_dir_all(&root);
+    assert_eq!(run.exit_code, 0);
+    assert!(run.stderr.contains("Unused variable"), "{}", run.stderr);
+}
+
+#[test]
+fn uc_toml_and_uc_lock_parity_across_lockfile_summary_cleanup_and_account_contracts() {
+    let root = unique_test_dir("uc-toml-lock-parity");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("target/dev")).unwrap();
+    let manifest_path = root.join("uc.toml");
+    let lock_path = root.join("uc.lock");
+    fs::write(
+        &manifest_path,
+        r#"[project]
+name = "acct_pkg"
+
+[workspace.project]
+edition = "2024_07"
+"#,
+    )
+    .unwrap();
+    fs::write(&lock_path, "version = 1\n[[package]]\nname = \"acct_pkg\"\nversion = \"0.1.0\"\n")
+        .unwrap();
+    fs::write(
+        root.join("src/lib.cairo"),
+        "#[starknet::contract(account)]\npub mod MyAccount {}\n",
+    )
+    .unwrap();
+
+    assert_eq!(lockfile_in_dir(&root), lock_path);
+    let mut diags = Vec::new();
+    let summary = project_lockfile_summary(&root, &mut diags).unwrap();
+    assert!(summary.present);
+    assert!(summary.valid);
+    assert_eq!(summary.packages.len(), 1);
+    assert_eq!(summary.packages[0].name, "acct_pkg");
+
+    let (_, _, lock_hash_1) = daemon_lock_state(&manifest_path).unwrap();
+    assert!(lock_hash_1.starts_with("lock-blake3:"));
+
+    let parsed = parse_manifest_toml(
+        &fs::read_to_string(&manifest_path).unwrap(),
+        &manifest_path,
+        "test",
+    )
+    .unwrap();
+    assert!(
+        parsed.get("target").is_some(),
+        "#[starknet::contract(account)] in src/ must auto-infer [[target.starknet-contract]]"
+    );
+    assert!(
+        parsed
+            .get("workspace")
+            .and_then(|w| w.get("package"))
+            .is_some(),
+        "[workspace.project] must normalize to [workspace.package]"
+    );
+
+    remove_build_outputs(&root).expect("remove_build_outputs must accept uc.toml + uc.lock");
+    assert!(!root.join("target").exists());
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn workspace_member_edition_inheritance_and_migrate_external_contracts() {
+    let root = unique_test_dir("uc-ws-member-edition-inheritance");
+    let member_dir = root.join("packages/member_a");
+    fs::create_dir_all(member_dir.join("src")).unwrap();
+    let ws_manifest_path = root.join("uc.toml");
+    let member_manifest_path = member_dir.join("uc.toml");
+
+    fs::write(
+        &ws_manifest_path,
+        r#"[workspace]
+members = ["packages/member_a"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024_07"
+
+[workspace.dependencies]
+starknet = "2.16.0"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &member_manifest_path,
+        r#"[package]
+name = "member_a"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+starknet.workspace = true
+"#,
+    )
+    .unwrap();
+    fs::write(member_dir.join("src/lib.cairo"), "pub fn hello() -> felt252 { 1 }\n").unwrap();
+
+    let resolved_ws_root = metadata_cache_workspace_root(&member_manifest_path).unwrap();
+    assert_eq!(
+        normalize_fingerprint_path(&resolved_ws_root),
+        normalize_fingerprint_path(&root)
+    );
+
+    let ws_manifest: TomlValue =
+        parse_manifest_toml(&fs::read_to_string(&ws_manifest_path).unwrap(), &ws_manifest_path, "ws")
+            .unwrap();
+    let member_manifest: TomlValue = parse_manifest_toml(
+        &fs::read_to_string(&member_manifest_path).unwrap(),
+        &member_manifest_path,
+        "member",
+    )
+    .unwrap();
+    let surface = collect_native_dependency_surface(
+        &member_manifest,
+        Some(&ws_manifest),
+        &member_manifest_path,
+        &root,
+        "member_a",
+        false,
+    );
+    let root_cfg = surface
+        .crate_dependency_configs
+        .iter()
+        .find(|c| c.crate_name == "member_a")
+        .expect("member_a config must exist");
+    assert_eq!(root_cfg.cairo_edition.as_deref(), Some("2024_07"));
+
+    // Verify run_migrate preserves [[test]] build-external-contracts
+    let mig_dir = root.join("mig_pkg");
+    fs::create_dir_all(mig_dir.join("src")).unwrap();
+    let scarb_path = mig_dir.join("Scarb.toml");
+    fs::write(
+        &scarb_path,
+        r#"[package]
+name = "member_a"
+version.workspace = true
+edition.workspace = true
+
+[[test]]
+name = "member_a_unittest"
+build-external-contracts = ["ext_pkg::MyContract"]
+"#,
+    )
+    .unwrap();
+    run_migrate(MigrateArgs {
+        manifest_path: Some(scarb_path),
+        emit_uc_toml: None,
+        dry_run: false,
+        remove_legacy: false,
+        json: false,
+        report_path: None,
+    })
+    .unwrap();
+    let migrated = fs::read_to_string(mig_dir.join("uc.toml")).unwrap();
+    assert!(
+        migrated.contains("build-external-contracts") && migrated.contains("ext_pkg::MyContract"),
+        "migrated uc.toml must preserve build-external-contracts from [[test]]: {migrated}"
+    );
+    let _ = fs::remove_dir_all(&root);
 }

@@ -9,17 +9,33 @@ name = "uc"
 path = "src/main.rs"
 
 [features]
-default = ["native-compile"]
+default = ["native-compile", "native-test-runner"]
 native-compile = [
   "dep:cairo-lang-compiler",
   "dep:cairo-lang-defs",
+  "dep:cairo-lang-diagnostics",
   "dep:cairo-lang-filesystem",
+  "dep:cairo-lang-formatter",
   "dep:cairo-lang-lowering",
+  "dep:cairo-lang-parser",
   "dep:cairo-lang-semantic",
+  "dep:cairo-lang-sierra",
   "dep:cairo-lang-starknet",
   "dep:cairo-lang-starknet-classes",
+  "dep:cairo-lang-syntax",
   "dep:notify",
+  "dep:rayon",
   "dep:scarb-stable-hash",
+  "dep:starknet-types-core",
+  "dep:cairo-lang-sierra-to-casm",
+  "dep:cairo-lang-sierra-type-size",
+]
+native-test-runner = [
+  "native-compile",
+  "dep:cairo-lang-test-plugin",
+  "dep:cairo-lang-runner",
+  "dep:cairo-lang-sierra-to-casm",
+  "dep:starknet-crypto",
 ]
 dev-benchmark-command = []
 helper-cairo-214 = []
@@ -29,22 +45,39 @@ anyhow.workspace = true
 blake3.workspace = true
 cairo-lang-compiler = { workspace = true, optional = true }
 cairo-lang-defs = { workspace = true, optional = true }
+cairo-lang-diagnostics = { workspace = true, optional = true }
 cairo-lang-filesystem = { workspace = true, optional = true }
+cairo-lang-formatter = { workspace = true, optional = true }
 cairo-lang-lowering = { workspace = true, optional = true }
+cairo-lang-parser = { workspace = true, optional = true }
+cairo-lang-runner = { workspace = true, optional = true }
 cairo-lang-semantic = { workspace = true, optional = true }
+cairo-lang-sierra = { workspace = true, optional = true }
+cairo-lang-sierra-to-casm = { workspace = true, optional = true }
+cairo-lang-sierra-type-size = { workspace = true, optional = true }
 cairo-lang-starknet = { workspace = true, optional = true }
 cairo-lang-starknet-classes = { workspace = true, optional = true }
+cairo-lang-syntax = { workspace = true, optional = true }
+cairo-lang-test-plugin = { workspace = true, optional = true }
 clap.workspace = true
 libc.workspace = true
 notify = { workspace = true, optional = true }
 postcard.workspace = true
+ureq.workspace = true
+rayon = { workspace = true, optional = true }
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 scarb-stable-hash = { workspace = true, optional = true }
 salsa.workspace = true
+starknet-crypto = { workspace = true, optional = true }
+starknet-types-core = { workspace = true, optional = true }
 sysinfo.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uc-core = { path = "../uc-core" }
 walkdir.workspace = true
+ruzstd.workspace = true
+sha2.workspace = true
+hex.workspace = true

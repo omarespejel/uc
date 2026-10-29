@@ -123,7 +123,7 @@ impl<'db> ImplVar<'db> {
     }
 }
 
-/// A negative impl variable
+/// A negative impl variable.
 #[derive(
     Clone, Debug, PartialEq, Eq, Hash, DebugWithDb, SemanticObject, HeapSize, salsa::Update,
 )]
@@ -357,7 +357,7 @@ struct PendingInferenceError<'db> {
     stable_ptr: Option<SyntaxStablePtrId<'db>>,
 }
 
-/// A mapping of an impl var's trait items to concrete items
+/// A mapping of an impl var's trait items to concrete items.
 #[derive(Debug, Default, PartialEq, Eq, Hash, Clone, SemanticObject, salsa::Update)]
 pub struct ImplVarTraitItemMappings<'db> {
     /// The trait types of the impl var.
@@ -1198,9 +1198,24 @@ impl<'db, 'id> Inference<'db, 'id> {
             }
         }
 
+        let generic_args = concrete_trait_id.generic_args(self.db);
+        // Defer if the generic argument contains inference variables, with special handling for
+        // closures. Closures can only have one type even if not var-free, so they
+        // don't cause ambiguity.
+        if generic_args.iter().any(|garg| {
+            matches!(
+                garg,
+                GenericArgumentId::Type(ty)
+                if !matches!(ty.long(self.db), TypeLongId::Closure(_))
+                && !ty.is_var_free(self.db)
+            )
+        }) {
+            return Ok(SolutionSet::Ambiguous(Ambiguity::WillNotInfer(concrete_trait_id)));
+        }
+
         let mut neg_impl_generic_params = OrderedHashSet::default();
         let mut visited_types = OrderedHashSet::default();
-        for garg in concrete_trait_id.generic_args(self.db) {
+        for garg in generic_args {
             if garg
                 .extract_generic_params(self.db, &mut neg_impl_generic_params, &mut visited_types)
                 .is_err()
